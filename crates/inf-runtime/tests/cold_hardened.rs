@@ -336,7 +336,10 @@ fn build_demoted_corpus(
     let tier_frames = writer.data_len().div_ceil(TIER_FRAME_DATA as u64);
     let ctx = Rc::new(RefCell::new(Ctx {
         ks,
-        cold: ColdReads::new(pool),
+        cold: ColdReads::new(
+            pool,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        ),
         driver,
         tier_fd: writer.raw_fd().expect("std fs has real fds"),
         tier_file: TierFileId::new(0),

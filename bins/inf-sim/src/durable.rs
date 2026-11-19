@@ -2275,7 +2275,8 @@ pub(crate) fn boot_meshed(
 impl Drop for Node {
     /// The end of a life: its state observed, every cell's cap census
     /// judged after the cell's last iteration (the cap bound, the assembly
-    /// rule and their liveness), and its nets' invariants drained.
+    /// rule, their liveness and the gates' derived counts), and its nets'
+    /// invariants drained.
     fn drop(&mut self) {
         self.observe_state(b"node-end");
         let mut verdict = crate::census::CensusVerdict::default();
@@ -2296,6 +2297,9 @@ impl Drop for Node {
                 tiered_tables,
                 turn_refused,
                 maint_paced,
+                gate_full: plane.gate_full(),
+                gate_stale: plane.gate_stale(),
+                cold_gate_full: plane.cold_gate_full(),
             };
             verdict.judge(index, plane.cap_census(), facts);
         }

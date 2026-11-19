@@ -12,16 +12,62 @@ use std::task::{Context, Poll, Waker};
 
 use inf_foundation::CellId;
 use inf_foundation::bounded::{Cap, CapCensus, CapFill};
-use inf_runtime::gate::{KeyedGate, ListWait};
+use inf_runtime::gate::{KeyedGate, KeyedWait, ListWait};
 use inf_runtime::{
-    CellExecutor, CompletionToken, ExecutorLayout, FabricGate, IoGate, PollImmediate,
-    TaskAdmission, TaskClass, TaskId, TokenClass, WaitList, WatermarkGate, Woken, park,
+    CellExecutor, CompletionToken, Delivery, ExecutorLayout, FabricAdmission, FabricGate, GateKey,
+    IoGate, KeyedAdmission, PollImmediate, TaskAdmission, TaskClass, TaskId, TokenClass, WaitList,
+    WatermarkGate, Woken, park,
 };
 use proptest::prelude::*;
 
 #[path = "support/tasks.rs"]
 mod tasks;
 use tasks::TestExecutor;
+
+/// A task's wait on a fabric gate: the future owns the gate's handle and its
+/// one unit, which its wait borrows, and publishes the key it waits under,
+/// which the test completes.
+async fn fabric_wait<V>(gate: Rc<RefCell<FabricGate<V>>>, key: Rc<Cell<u64>>) -> V {
+    let units = gate.borrow().units(1).expect("a unit");
+    let wait = {
+        let mut open = gate.borrow_mut();
+        let FabricAdmission::Granted(permit) = open.reserve(&units) else {
+            panic!("a gate of one free holder");
+        };
+        key.set(permit.key());
+        permit.register(&gate, None)
+    };
+    wait.await
+}
+
+/// A fabric gate of `units` units over as many holders, on a census of its
+/// own, and the cell its wait's key is published in.
+fn fabric_gate<V>(units: u32) -> (Rc<RefCell<FabricGate<V>>>, Rc<Cell<u64>>) {
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let holders = Cap::derived(&TEST_GATE_HOLDERS, units).expect("a test gate's holders");
+    let gate = FabricGate::build(0, units, Some(holders), &census).expect("a test gate");
+    (Rc::new(RefCell::new(gate)), Rc::new(Cell::new(0)))
+}
+
+/// The tests' gate holders' ceiling.
+const TEST_GATE_HOLDERS: Cap = Cap::entries::<64>("test-gate-holders", CapFill::Serving);
+
+/// The tests' keyed gates' routes and holders: past any test's open waits.
+const TEST_KEYED_HOLDERS: Cap = Cap::entries::<256>("test-keyed-holders", CapFill::Serving);
+
+/// A keyed gate of [`TEST_KEYED_HOLDERS`] on a census of its own.
+fn keyed_gate<K: GateKey, V>() -> KeyedGate<K, V> {
+    let (census, _mark) = CapCensus::new(CellId(0));
+    KeyedGate::build(TEST_KEYED_HOLDERS, &census).expect("the test gate")
+}
+
+/// A registered wait on a keyed gate.
+fn keyed_wait<K: GateKey, V>(gate: &KeyedGate<K, V>, key: K) -> KeyedWait<K, V> {
+    let KeyedAdmission::Granted(permit) = gate.reserve(key) else {
+        panic!("a fresh key on a gate with room");
+    };
+    permit.register()
+}
 
 #[test]
 fn ready_future_never_allocates_a_task_slot() {
@@ -41,10 +87,10 @@ fn ready_future_never_allocates_a_task_slot() {
 #[test]
 fn suspended_future_promotes_resumes_and_frees() {
     let mut ex = TestExecutor::new();
-    let gate: FabricGate<u64> = FabricGate::new();
+    let (gate, key) = fabric_gate::<u64>(1);
     let seen = Rc::new(RefCell::new(Vec::new()));
 
-    let waiter = gate.waiter(7);
+    let waiter = fabric_wait(Rc::clone(&gate), Rc::clone(&key));
     let sink = Rc::clone(&seen);
     let outcome = ex.poll_immediate(async move {
         let value = waiter.await;
@@ -57,7 +103,10 @@ fn suspended_future_promotes_resumes_and_frees() {
     assert_eq!(ex.live_tasks(), 1);
     assert_eq!(ex.run_ready(64), 0, "nothing ready before completion");
 
-    assert!(gate.complete(7, 42));
+    assert_eq!(
+        FabricGate::complete(&gate, key.get(), 42, inf_foundation::time::Nanos(0)),
+        Delivery::Delivered
+    );
     assert_eq!(ex.run_ready(64), 1);
     assert_eq!(*seen.borrow(), vec![42]);
     assert_eq!(ex.live_tasks(), 0, "completed task must free its slot");
@@ -67,18 +116,33 @@ fn suspended_future_promotes_resumes_and_frees() {
 #[test]
 fn delivery_before_first_poll_keeps_the_fast_path() {
     let mut ex = TestExecutor::new();
-    let gate: FabricGate<&'static str> = FabricGate::new();
-    let waiter = gate.waiter(1);
-    // Reply lands before the future ever polls (same-iteration delivery).
-    assert!(gate.complete(1, "early"));
+    let (gate, _) = fabric_gate::<&'static str>(1);
     let seen = Rc::new(RefCell::new(None));
     let sink = Rc::clone(&seen);
+    let own = Rc::clone(&gate);
     let outcome = ex.poll_immediate(async move {
+        let gate = own;
+        let units = gate.borrow().units(1).expect("a unit");
+        let waiter = {
+            let mut open = gate.borrow_mut();
+            let FabricAdmission::Granted(permit) = open.reserve(&units) else {
+                panic!("a gate of one free holder");
+            };
+            let key = permit.key();
+            let waiter = permit.register(&gate, None);
+            drop(open);
+            // Reply lands before the waiter ever polls (same-iteration delivery).
+            assert_eq!(
+                FabricGate::complete(&gate, key, "early", inf_foundation::time::Nanos(0)),
+                Delivery::Delivered
+            );
+            waiter
+        };
         *sink.borrow_mut() = Some(waiter.await);
     });
     assert_eq!(outcome, PollImmediate::Completed, "parked value ⇒ no suspension");
     assert_eq!(*seen.borrow(), Some("early"));
-    assert_eq!(gate.pending(), 0);
+    assert_eq!(gate.borrow().holders(), 0);
 }
 
 #[test]
@@ -163,9 +227,9 @@ fn escaped_waker_clone_on_fast_path_is_harmless() {
 #[test]
 fn io_gate_routes_by_completion_token() {
     let mut ex = TestExecutor::new();
-    let gate = IoGate::new();
+    let gate: IoGate = keyed_gate();
     let token = CompletionToken::new(TokenClass::Recv, 3, 9);
-    let waiter = gate.waiter(token);
+    let waiter = keyed_wait(&gate, token);
     let seen = Rc::new(RefCell::new(false));
     let sink = Rc::clone(&seen);
     let outcome = ex.poll_immediate(async move {
@@ -303,11 +367,11 @@ proptest! {
         budget in 1usize..8,
     ) {
         let mut ex = TestExecutor::new();
-        let gate: KeyedGate<u64, u64> = KeyedGate::new();
+        let gate: KeyedGate<u64, u64> = keyed_gate();
         let done: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
 
         for key in 0..n_tasks as u64 {
-            let waiter = gate.waiter(key);
+            let waiter = keyed_wait(&gate, key);
             let done = Rc::clone(&done);
             let outcome = ex.poll_immediate(async move {
                 let payload = waiter.await;
@@ -321,7 +385,8 @@ proptest! {
             match step {
                 Some(idx) if idx < n_tasks && !completed[idx] => {
                     completed[idx] = true;
-                    prop_assert!(gate.complete(idx as u64, idx as u64 * 100));
+                    let delivery = gate.complete(idx as u64, idx as u64 * 100);
+                    prop_assert_eq!(delivery, Delivery::Delivered);
                 }
                 _ => { ex.run_ready(budget); }
             }
@@ -329,7 +394,8 @@ proptest! {
         // Drain the tail: complete the rest, run to quiescence.
         for (idx, was_done) in completed.iter().enumerate() {
             if !was_done {
-                prop_assert!(gate.complete(idx as u64, idx as u64 * 100));
+                let delivery = gate.complete(idx as u64, idx as u64 * 100);
+                prop_assert_eq!(delivery, Delivery::Delivered);
             }
         }
         while ex.run_ready(16) > 0 {}
@@ -347,7 +413,7 @@ proptest! {
     #[test]
     fn mixed_fast_and_slow_paths_reconcile(ops in proptest::collection::vec(0u8..4, 1..200)) {
         let mut ex = TestExecutor::new();
-        let gate: KeyedGate<u64, ()> = KeyedGate::new();
+        let gate: KeyedGate<u64, ()> = keyed_gate();
         let mut next_key = 0u64;
         let mut open = Vec::new();
         let counter = Rc::new(RefCell::new(0u64));
@@ -364,7 +430,7 @@ proptest! {
                 2 => {
                     let key = next_key;
                     next_key += 1;
-                    let waiter = gate.waiter(key);
+                    let waiter = keyed_wait(&gate, key);
                     let c = Rc::clone(&counter);
                     let r = ex.poll_immediate(async move { waiter.await; *c.borrow_mut() += 1; });
                     prop_assert!(matches!(r, PollImmediate::Suspended(_)));
@@ -619,7 +685,7 @@ fn the_spare_serves_no_task_an_id_names() {
 #[test]
 fn the_spare_lend_survives_every_other_borrow() {
     let mut ex = TestExecutor::new();
-    let gate: FabricGate<u64> = FabricGate::new();
+    let (gate, key) = fabric_gate::<u64>(1);
     let hits = Rc::new(Cell::new(0u64));
     let fast = |ex: &mut TestExecutor| {
         let hits = Rc::clone(&hits);
@@ -628,7 +694,7 @@ fn the_spare_lend_survives_every_other_borrow() {
     };
     fast(&mut ex);
     fast(&mut ex);
-    let waiter = gate.waiter(1);
+    let waiter = fabric_wait(Rc::clone(&gate), Rc::clone(&key));
     let sink = Rc::clone(&hits);
     let outcome = ex.poll_immediate(async move {
         let value = waiter.await;
@@ -654,7 +720,10 @@ fn the_spare_lend_survives_every_other_borrow() {
     drop(stolen.borrow_mut().take());
     assert_eq!(ex.run_ready(8), 1, "the Retired task's reclaim");
     fast(&mut ex);
-    assert!(gate.complete(1, 1_000_000));
+    assert_eq!(
+        FabricGate::complete(&gate, key.get(), 1_000_000, inf_foundation::time::Nanos(0)),
+        Delivery::Delivered
+    );
     fast(&mut ex);
     assert_eq!(ex.run_ready(8), 1, "the waiter completes");
     fast(&mut ex);
@@ -673,9 +742,9 @@ fn the_spare_lend_survives_every_other_borrow() {
 #[test]
 fn the_kept_lend_across_an_id_lookup_and_a_shared_borrow() {
     let mut ex = TestExecutor::new();
-    let gate: FabricGate<u64> = FabricGate::new();
+    let (gate, key) = fabric_gate::<u64>(1);
     let hits = Rc::new(Cell::new(0u64));
-    let waiter = gate.waiter(1);
+    let waiter = fabric_wait(Rc::clone(&gate), Rc::clone(&key));
     let outcome = ex.poll_immediate(async move {
         let _ = waiter.await;
     });
@@ -691,7 +760,10 @@ fn the_kept_lend_across_an_id_lookup_and_a_shared_borrow() {
         fast(&mut ex);
         assert_eq!(ex.class_tasks(ex.class()), 1, "the waiter; the spare is none");
     }
-    assert!(gate.complete(1, 1));
+    assert_eq!(
+        FabricGate::complete(&gate, key.get(), 1, inf_foundation::time::Nanos(0)),
+        Delivery::Delivered
+    );
     assert_eq!(ex.run_ready(8), 1);
     assert_eq!(hits.get(), 6);
     assert_eq!(ex.live_tasks(), 0);

@@ -1000,6 +1000,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         for _ in 0..orphans {
             fabric.note_orphan_reply();
         }
+        #[cfg(test)]
+        if self.reverse_replies {
+            self.staged_replies.reverse();
+            self.reversed_batch_max = self.reversed_batch_max.max(self.staged_replies.len());
+        }
         let mut had_replies = false;
         for (to, token, reply) in self.staged_replies.drain(..) {
             had_replies = true;
@@ -1064,7 +1069,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         // RESPOND, so the hop RTT overlaps local work instead of
         // following it (the request-path sibling of the M0-R1 "publish
         // replies NOW" finding; remote throughput is window/RTT-bound at
-        // REMOTE_WINDOW, so RTT saved converts directly). One extra
+        // a connection's gate units, so RTT saved converts directly). One extra
         // Release store + doorbell per destination per iteration; step 8
         // stays for late stagers.
         if self.early_fabric_flush {
@@ -1515,7 +1520,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         node.waker_foreign_ops.set(cx.executor.waker_foreign_ops());
         node.accept_errors.set(self.shared.accept_errors.get());
         node.timers_armed_max.set(u64::from(cx.timers().armed_max()));
-        node.fabric_rtt_p50_ns.set(self.shared.rtt_ns.borrow().percentile(50.0));
+        {
+            let gate = self.shared.gate.borrow();
+            node.fabric_rtt_p50_ns.set(gate.round_trips().percentile(50.0));
+            node.gate_full.set(gate.full());
+            node.gate_stale.set(gate.stale());
+        }
         {
             let ps = self.shared.pubsub.borrow();
             node.pubsub_channels.set(ps.live_owned_channel_count());

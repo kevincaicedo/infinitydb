@@ -1990,7 +1990,6 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             violations.push(format!("PARKED REFUSED: cell {i}, {refused} ops"));
         }
     }
-
     // The waker's wiring check (ADR-0003 A1.4): every cell's `waker_foreign_ops`, the gauge
     // INFO's `# Tripwires` renders, reads 0. The simulator runs every cell's loop on one thread,
     // so a waker used from another cell's step takes the owner lane and is not counted: a
@@ -2152,7 +2151,8 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
 
     // The cap census oracle (ADR-0163 D2): every cell's census after its
     // last iteration — the cap bound per row, the assembly rule and their
-    // liveness.
+    // liveness — and the gates' derived counts, read from the plane, not the
+    // stats flush's copies.
     let mut census = crate::census::CensusVerdict::default();
     for (index, (_, plane)) in cells.iter().enumerate() {
         let facts = crate::census::CellFacts {
@@ -2161,6 +2161,9 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             tiered_tables: plane.keyspace().tiered_tables(),
             turn_refused: plane.durable_stats().map(|stats| stats.turn_refused),
             maint_paced: nodes[index].tier_maint_task_waits.get(),
+            gate_full: plane.gate_full(),
+            gate_stale: plane.gate_stale(),
+            cold_gate_full: plane.cold_gate_full(),
         };
         census.judge(index, plane.cap_census(), facts);
     }

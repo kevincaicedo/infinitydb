@@ -93,7 +93,7 @@ CENSUS = (("disallowed-methods", "disallowed_methods", filesystem, "filesystem",
           ("disallowed-methods", "disallowed_methods", environment, "environment", 12),
           ("disallowed-types", "disallowed_types", filesystem, "filesystem", 5),
           ("disallowed-types", "disallowed_types", container, "container", 3),
-          ("await-holding-invalid-types", "await_holding_invalid_type", slot, "slot type", 9))
+          ("await-holding-invalid-types", "await_holding_invalid_type", slot, "slot type", 11))
 for key, lint, family, label, count in CENSUS:
     paths = [row["path"] for row in cfg.get(key, []) if family(row["path"])]
     if len(paths) != count or len(set(paths)) != len(paths):
@@ -168,10 +168,10 @@ for at, codes in sorted(seen.items()):
     if at not in plants and at not in controls:
         errors.append(f"{at}: unmarked diagnostic {sorted(codes)}")
 # nine decoder/enum, 41 stable APIs, two alias/UFCS bypasses, 11 containers,
-# nine slot types across an await, three discarded publishes, three whole
+# 11 slot types across an await, three discarded publishes, three whole
 # listings, eight std::env functions and two of their bypasses
-if len(plants) < 88:
-    errors.append(f"{len(plants)} plants; expected at least 88")
+if len(plants) < 90:
+    errors.append(f"{len(plants)} plants; expected at least 90")
 if messages == 0:
     errors.append("clippy produced no diagnostics; the probe did not run")
 
@@ -245,6 +245,6 @@ if errors:
 print(f"lint-scopes probe OK: {len(plants)} exact lint/path plants, "
       f"{len(controls)} clean controls; 36 stable filesystem methods, three whole listings, eight "
       f"std::env functions (four libc environment entries resolved-only), five filesystem types, "
-      f"three containers and nine slot types across an await covered{disclosed}")
+      f"three containers and 11 slot types across an await covered{disclosed}")
 print("lint-scopes unstable probe OK: 1/1 pinned-stable refusal (E0658 fs_set_times); "
       "all 37 filesystem method bans retained")

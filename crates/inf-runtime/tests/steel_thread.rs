@@ -34,8 +34,8 @@ use inf_log::{
     tier_frame_span,
 };
 use inf_runtime::{
-    BackendDriver, CompletionResult, CompletionToken, GateWait, IoGate, IoOp, PollImmediate, RawFd,
-    StableBytesMut, TokenClass, UringDriver, Wait,
+    BackendDriver, CompletionResult, CompletionToken, IoGate, IoOp, KeyedAdmission, KeyedWait,
+    PollImmediate, RawFd, StableBytesMut, TokenClass, UringDriver, Wait,
 };
 use inf_store::KeyHasher;
 use inf_store::{
@@ -64,7 +64,7 @@ const PAGE: usize = 1 << 12;
 /// exercises the exact second read.
 const POOL_BUF: usize = 16 * TIER_FRAME_BYTES;
 
-type Waiter = GateWait<CompletionToken, CompletionResult>;
+type Waiter = KeyedWait<CompletionToken, CompletionResult>;
 type Answer = Option<(Vec<u8>, u32, bool)>;
 
 struct Ctx {
@@ -151,7 +151,10 @@ fn plan_first_window(
                 buf: stable,
                 token,
             });
-            let waiter = ctx.gate.waiter(token);
+            let KeyedAdmission::Granted(permit) = ctx.gate.reserve(token) else {
+                panic!("the test mints each token once, into a gate of room");
+            };
+            let waiter = permit.register();
             Planned::Fetch(WindowPlan { buf, addr, frame_count, skip }, waiter)
         }
     }
@@ -216,7 +219,10 @@ fn resume_first_window(
                 buf: stable,
                 token,
             });
-            let waiter = ctx.gate.waiter(token);
+            let KeyedAdmission::Granted(permit) = ctx.gate.reserve(token) else {
+                panic!("the test mints each token once, into a gate of room");
+            };
+            let waiter = permit.register();
             Resumed::Oversized { boxed, waiter, addr, skip, len }
         }
     }
@@ -361,6 +367,12 @@ struct Corpus {
     values: std::collections::HashMap<Vec<u8>, Vec<u8>>,
 }
 
+/// The test's I/O gate: past the reads the test has in flight at once.
+const IO_GATE_HOLDERS: inf_foundation::bounded::Cap = inf_foundation::bounded::Cap::entries::<64>(
+    "io-gate-holders",
+    inf_foundation::bounded::CapFill::Serving,
+);
+
 /// Builds the table, seals + flushes + demotes everything, and returns
 /// the corpus — the §3.1 lifecycle up to "disk-only".
 fn build_demoted_corpus(
@@ -436,7 +448,7 @@ fn build_demoted_corpus(
         ks,
         pool: AlignedPool::new(4, POOL_BUF),
         driver: make_ring(64),
-        gate: IoGate::new(),
+        gate: IoGate::build(IO_GATE_HOLDERS, &census).expect("the steel thread's gate"),
         tier_fd: writer.raw_fd().expect("std fs has real fds"),
         tier_base: base.to_raw(),
         tier_frames,

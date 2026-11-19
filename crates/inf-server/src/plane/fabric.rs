@@ -85,25 +85,14 @@ fn handle_fabric_leaf<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 shared.credit_waiters.wake_one(from);
                 return;
             }
-            // Delivery-time hop RTT: inline-handled ops reply in send order
-            // per cell pair, so the front send-time entry is this reply's
-            // (recording at the pump's await would charge head-of-line
-            // parking to the fabric). Pump-deferred replies (`INF.PUB`,
-            // M1-S10 — the owner answers after its fan-out acks) interleave
-            // arbitrarily; their sends are never recorded, and the token
-            // match lets them pass without mispairing the queue.
-            {
-                let mut sent = shared.rtt_sent.borrow_mut();
-                let queue = &mut sent[usize::from(from.0)];
-                if queue.front().is_some_and(|&(sent_token, _)| sent_token == token.0) {
-                    let (_, t0) = queue.pop_front().expect("front exists");
-                    shared.rtt_ns.borrow_mut().record(now.saturating_sub(t0).0);
-                }
-            }
             // The drained reply already returned one data credit; wake one
             // sender blocked on that destination.
             shared.credit_waiters.wake_one(from);
-            if !shared.gate.complete(token.0, owned_outcome(shared, outcome)) {
+            let outcome = owned_outcome(shared, outcome);
+            // A recorded hop's round trip is taken here, at delivery, from
+            // the send time its holder kept: recording at the pump's await
+            // would charge head-of-line parking to the fabric.
+            if FabricGate::complete(&shared.gate, token.0, outcome, now) == Delivery::Orphan {
                 *orphans += 1;
             }
         }
@@ -647,12 +636,6 @@ pub(super) fn flush_apply_stage<O: PlaneObserver + 'static, F: SegmentFs + Clone
     }
     stage.clear();
     stage_bytes.clear();
-}
-
-/// One `MGET` position: rendered locally at dispatch, or one remote `GET`.
-pub(super) enum GatherPart {
-    Done(OwnedReply),
-    Wait(GateWait<u64, OwnedOutcome>),
 }
 
 /// The wire form of a staged reply (ADR-0190 D3): the tag is set from the

@@ -26,6 +26,9 @@ use super::scatter::{PROGRAM_REPLY_MALFORMED, read_scan_leg};
 use super::split::{OwnerSplit, split_by_owner};
 use super::*;
 
+/// A connection task's gate units.
+const GATE_UNITS: u32 = crate::limits::GATE_UNITS_PER_CONN_TASK;
+
 /// The client-side key every settled reply is written for (no connection
 /// is live: a publish stash lookup finds none).
 const KEY: ConnKey = ConnKey { slot: 0, generation: 0 };
@@ -210,10 +213,9 @@ fn reply_outcome_mset_refused_leg_is_not_ok() {
     let argv: &[&[u8]] = &[b"MSET", &remote, b"v"];
     let reply = cells.drive(
         async {
-            let mut inflight = 0;
-            let pending =
-                program_mset(shared, ORIGIN, Protocol::Resp2, 0, 0, argv, &mut inflight).await;
-            settle_reply(shared, KEY, pending, &mut inflight).await.into_bytes()
+            let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+            let pending = program_mset(shared, &units, ORIGIN, Protocol::Resp2, 0, 0, argv).await;
+            settle_reply(shared, KEY, pending).await.into_bytes()
         },
         |args| (args[0] == b"SET").then_some(Outcome::Err(ErrCode::OutOfMemory)),
     );
@@ -230,10 +232,9 @@ fn reply_outcome_mset_remote_error_leg_is_the_reply() {
     let argv: &[&[u8]] = &[b"MSET", &remote, b"v"];
     let reply = cells.drive(
         async {
-            let mut inflight = 0;
-            let pending =
-                program_mset(shared, ORIGIN, Protocol::Resp2, 0, 0, argv, &mut inflight).await;
-            settle_reply(shared, KEY, pending, &mut inflight).await.into_bytes()
+            let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+            let pending = program_mset(shared, &units, ORIGIN, Protocol::Resp2, 0, 0, argv).await;
+            settle_reply(shared, KEY, pending).await.into_bytes()
         },
         no_answer,
     );
@@ -251,18 +252,22 @@ fn reply_outcome_dbsize_drain_error_is_the_reply() {
     let shared = cells.origin();
     let reply = cells.drive(
         async {
-            let mut inflight = 1;
-            let waiter =
-                send_apply(shared, CellId(1), ApplyOrigin::Client, Protocol::Resp2, 0, argv)
-                    .await
-                    .expect("the leg is sent");
-            let counted = PendingReply::Counted {
-                waiters: vec![waiter],
-                acc: 0,
-                proto: Protocol::Resp2,
-                refusal: None,
-            };
-            settle_reply(shared, KEY, counted, &mut inflight).await.into_bytes()
+            let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+            let waiter = send_apply(
+                shared,
+                &units,
+                CellId(1),
+                ApplyOrigin::Client,
+                Protocol::Resp2,
+                0,
+                argv,
+            )
+            .await
+            .expect("the leg is sent");
+            let mut legs = CountedLegs::new(0, Protocol::Resp2);
+            legs.push(waiter);
+            let counted = PendingReply::Counted(legs);
+            settle_reply(shared, KEY, counted).await.into_bytes()
         },
         no_answer,
     );
@@ -333,10 +338,12 @@ fn tiered_command(cells: &Cells, argv: &[&[u8]]) -> OwnedReply {
     let meta = lookup(argv[0]).expect("a registered command");
     cells.drive(
         async {
-            let (mut pending, mut inflight) = (std::collections::VecDeque::new(), 0);
+            let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+            let mut pending = std::collections::VecDeque::new();
             let proto = Protocol::Resp2;
             let live = dispatch_ns(
                 shared,
+                &units,
                 KEY,
                 ORIGIN,
                 meta,
@@ -346,13 +353,12 @@ fn tiered_command(cells: &Cells, argv: &[&[u8]]) -> OwnedReply {
                 0,
                 TIERED,
                 &mut pending,
-                &mut inflight,
             )
             .await;
             assert!(live, "the connection stays");
             let front = pending.pop_front().expect("one reply slot");
             assert!(pending.is_empty(), "one command, one reply slot");
-            settle_reply(shared, KEY, front, &mut inflight).await
+            settle_reply(shared, KEY, front).await
         },
         no_answer,
     )
@@ -454,19 +460,19 @@ fn reply_outcome_config_set_invalid_is_the_reply() {
     let mut fanned = 0;
     let reply = cells.drive(
         async {
-            let mut inflight = 0;
+            let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
             let pending = dispatch_scatter(
                 shared,
+                &units,
                 CommandId::Config,
                 ORIGIN,
                 Protocol::Resp2,
                 0,
                 0,
                 argv,
-                &mut inflight,
             )
             .await;
-            settle_reply(shared, KEY, pending, &mut inflight).await.into_bytes()
+            settle_reply(shared, KEY, pending).await.into_bytes()
         },
         |args| {
             fanned += usize::from(args[0] == b"CONFIG");
@@ -490,7 +496,8 @@ fn reply_outcome_copy_refused_put_is_the_reply() {
     let argv: &[&[u8]] = &[b"COPY", &source, &target];
     let reply = cells.drive(
         async {
-            program_move(shared, ORIGIN, Protocol::Resp2, 0, 0, CommandId::Copy, argv)
+            let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+            program_move(shared, &units, ORIGIN, Protocol::Resp2, 0, 0, CommandId::Copy, argv)
                 .await
                 .into_bytes()
         },
@@ -521,7 +528,9 @@ fn reply_outcome_channels_error_leg_is_the_reply() {
 }
 
 async fn channels(cells: &Cells) -> Vec<u8> {
-    program_pubsub(cells.origin(), Protocol::Resp2, &[b"PUBSUB", b"CHANNELS"]).await.into_bytes()
+    let shared = cells.origin();
+    let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+    program_pubsub(shared, &units, Protocol::Resp2, &[b"PUBSUB", b"CHANNELS"]).await.into_bytes()
 }
 
 /// A `KEYS` peer leg that succeeded without an array header is a malformed
@@ -606,7 +615,9 @@ fn reply_outcome_scan_leg_reader_answers_each_outcome() {
 
 async fn keys(cells: &Cells) -> Vec<u8> {
     let argv: &[&[u8]] = &[b"KEYS", b"*"];
-    program_keys(cells.origin(), ORIGIN, Protocol::Resp2, 0, 0, ScatterScope::Db, argv)
+    let shared = cells.origin();
+    let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+    program_keys(shared, &units, ORIGIN, Protocol::Resp2, 0, 0, ScatterScope::Db, argv)
         .await
         .into_bytes()
 }
@@ -615,7 +626,9 @@ async fn keys(cells: &Cells) -> Vec<u8> {
 async fn scan_on_peer(cells: &Cells) -> Vec<u8> {
     let cursor = (1u64 << SCAN_CELL_SHIFT).to_string();
     let argv: &[&[u8]] = &[b"SCAN", cursor.as_bytes()];
-    program_scan(cells.origin(), ORIGIN, Protocol::Resp2, 0, 0, ScatterScope::Db, argv)
+    let shared = cells.origin();
+    let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+    program_scan(shared, &units, ORIGIN, Protocol::Resp2, 0, 0, ScatterScope::Db, argv)
         .await
         .into_bytes()
 }
@@ -631,10 +644,9 @@ fn reply_outcome_blob_error_leg_is_the_reply() {
     let argv: &[&[u8]] = &[b"MSET", &remote, b"v"];
     let reply = cells.drive(
         async {
-            let mut inflight = 0;
-            let pending =
-                program_mset(shared, ORIGIN, Protocol::Resp2, 0, 0, argv, &mut inflight).await;
-            settle_reply(shared, KEY, pending, &mut inflight).await.into_bytes()
+            let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+            let pending = program_mset(shared, &units, ORIGIN, Protocol::Resp2, 0, 0, argv).await;
+            settle_reply(shared, KEY, pending).await.into_bytes()
         },
         |args| (args[0] == b"SET").then_some(Outcome::ErrorReply(BLOB)),
     );
@@ -651,10 +663,9 @@ fn reply_outcome_dash_reply_tagged_success_is_a_success_leg() {
     let argv: &[&[u8]] = &[b"MSET", &remote, b"v"];
     let reply = cells.drive(
         async {
-            let mut inflight = 0;
-            let pending =
-                program_mset(shared, ORIGIN, Protocol::Resp2, 0, 0, argv, &mut inflight).await;
-            settle_reply(shared, KEY, pending, &mut inflight).await.into_bytes()
+            let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+            let pending = program_mset(shared, &units, ORIGIN, Protocol::Resp2, 0, 0, argv).await;
+            settle_reply(shared, KEY, pending).await.into_bytes()
         },
         |args| (args[0] == b"SET").then_some(Outcome::Bytes(b"-ERR x\r\n")),
     );
@@ -671,13 +682,20 @@ fn reply_outcome_empty_leg_is_refused() {
     let argv: &[&[u8]] = &[b"GET", &remote];
     let reply = cells.drive(
         async {
-            let mut inflight = 1;
-            let waiter =
-                send_apply(shared, CellId(1), ApplyOrigin::Client, Protocol::Resp2, 0, argv)
-                    .await
-                    .expect("the leg is sent");
+            let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+            let waiter = send_apply(
+                shared,
+                &units,
+                CellId(1),
+                ApplyOrigin::Client,
+                Protocol::Resp2,
+                0,
+                argv,
+            )
+            .await
+            .expect("the leg is sent");
             let remote = PendingReply::Remote { waiter, proto: Protocol::Resp2 };
-            settle_reply(shared, KEY, remote, &mut inflight).await.into_bytes()
+            settle_reply(shared, KEY, remote).await.into_bytes()
         },
         |args| (args[0] == b"GET").then_some(Outcome::Bytes(b"")),
     );
@@ -711,7 +729,10 @@ fn reply_outcome_msetnx_set_leg_error_is_the_reply() {
     let shared = cells.origin();
     let argv: &[&[u8]] = &[b"MSETNX", &remote, b"v"];
     let reply = cells.drive(
-        async { program_msetnx(shared, ORIGIN, Protocol::Resp2, 0, 0, argv).await.into_bytes() },
+        async {
+            let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+            program_msetnx(shared, &units, ORIGIN, Protocol::Resp2, 0, 0, argv).await.into_bytes()
+        },
         |args| (args[0] == b"SET").then_some(Outcome::ErrorReply(BLOB)),
     );
     assert_eq!(reply, BLOB);
@@ -727,7 +748,8 @@ fn reply_outcome_copy_read_leg_error_is_the_reply() {
     let argv: &[&[u8]] = &[b"COPY", &source, &target];
     let reply = cells.drive(
         async {
-            program_move(shared, ORIGIN, Protocol::Resp2, 0, 0, CommandId::Copy, argv)
+            let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+            program_move(shared, &units, ORIGIN, Protocol::Resp2, 0, 0, CommandId::Copy, argv)
                 .await
                 .into_bytes()
         },
@@ -747,7 +769,8 @@ fn reply_outcome_rename_take_leg_error_is_the_reply() {
     let argv: &[&[u8]] = &[b"RENAME", &source, &target];
     let reply = cells.drive(
         async {
-            program_move(shared, ORIGIN, Protocol::Resp2, 0, 0, CommandId::Rename, argv)
+            let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+            program_move(shared, &units, ORIGIN, Protocol::Resp2, 0, 0, CommandId::Rename, argv)
                 .await
                 .into_bytes()
         },
@@ -779,10 +802,10 @@ fn json_mget(
     };
     let reply = cells.drive(
         async {
-            let mut inflight = 0;
-            let pending = json_gather(shared, target, meta, argv, &mut inflight).await;
-            let reply = settle_reply(shared, KEY, pending, &mut inflight).await;
-            assert_eq!(inflight, 0, "every leg sent was awaited");
+            let units = shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
+            let pending = json_gather(shared, &units, target, meta, argv).await;
+            let reply = settle_reply(shared, KEY, pending).await;
+            assert_eq!(units.free(), units.count(), "every leg sent was awaited");
             reply
         },
         answer,
@@ -943,27 +966,46 @@ fn small_limit() -> inf_store::ReplyLimit {
 #[cfg(feature = "doc")]
 fn gathered_in(cells: &Cells, answers: &[LegAnswer], order: &[usize]) -> (OwnedReply, usize) {
     let shared = cells.origin();
-    let gate: inf_runtime::FabricGate<OwnedOutcome> = inf_runtime::FabricGate::new();
-    let tokens: Vec<u64> = (0..answers.len() as u64).map(|t| 0xFEED_0000 + t).collect();
-    let waiters = tokens.iter().map(|&t| gate.waiter(t)).collect();
+    const HOLDERS: Cap =
+        Cap::entries::<GATE_UNITS>("test-gate-holders", inf_foundation::bounded::CapFill::Serving);
+    let (census, _mark) = inf_foundation::bounded::CapCensus::new(CellId(0));
+    let gate = FabricGate::<OwnedOutcome>::build(0, GATE_UNITS, Some(HOLDERS), &census);
+    let gate = RefCell::new(gate.expect("a test gate"));
+    let units = gate.borrow().units(GATE_UNITS).expect("a task's units");
+    let mut keys = Vec::with_capacity(answers.len());
+    let mut waiters = Vec::with_capacity(answers.len());
+    for _ in answers {
+        let mut open = gate.borrow_mut();
+        let FabricAdmission::Granted(permit) = open.reserve(&units) else {
+            panic!("a leg has a unit and a holder")
+        };
+        keys.push(permit.key());
+        waiters.push(permit.register(&gate, None));
+    }
     let plan = remote_plan(answers.len());
     let gather = test_support::in_flight(shared, Protocol::Resp2, plan, small_limit(), waiters);
-    let mut inflight = answers.len();
     let reply = {
-        let mut finish = pin!(gather.finish(shared, &mut inflight));
+        let mut finish = pin!(gather.finish(shared));
         let mut cx = Context::from_waker(Waker::noop());
         let mut ready = None;
         for &leg in order {
             assert!(ready.is_none(), "the fold ended before every leg answered");
-            assert!(gate.complete(tokens[leg], answers[leg].outcome()), "a live waiter");
+            let delivery = FabricGate::complete(
+                &gate,
+                keys[leg],
+                answers[leg].outcome(),
+                inf_foundation::time::Nanos(0),
+            );
+            assert_eq!(delivery, Delivery::Delivered, "a live waiter");
             if let Poll::Ready(reply) = finish.as_mut().poll(&mut cx) {
                 ready = Some(reply);
             }
         }
         ready.expect("every leg answered: the fold is done")
     };
-    assert_eq!(inflight, 0, "every leg awaited");
-    (reply, gate.pending())
+    assert_eq!(units.free(), units.count(), "every leg awaited");
+    let live = gate.borrow().holders();
+    (reply, live)
 }
 
 /// The verdict does not depend on the order the replies arrive in. For
@@ -1043,4 +1085,85 @@ fn reply_outcome_json_mget_sum_over_the_account_is_refused() {
     assert_eq!(reply.bytes(), written_error("ERR reply too large"));
     assert!(reply.is_error());
     assert_eq!(shared.node.json_reply_refusals_cell.get() - before, 1, "one refusal, on this cell");
+}
+
+/// A stub fan's window: `out` legs out, each settle taking the oldest, and `stop` ending the
+/// fan at its next settle.
+struct StubWindow {
+    out: usize,
+    settles: usize,
+    stop: bool,
+}
+
+/// What ends a stub fan at a settle.
+struct StubStop;
+
+impl LegWindow for StubWindow {
+    type Stop = StubStop;
+
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        _shared: &Shared<O, F>,
+    ) -> Result<bool, StubStop> {
+        if self.stop {
+            return Err(StubStop);
+        }
+        if self.out == 0 {
+            return Ok(false);
+        }
+        self.out -= 1;
+        self.settles += 1;
+        Ok(true)
+    }
+}
+
+/// `send_windowed` over a stub window of `out` legs, its sends answering `script` in turn
+/// (`None` is `NoUnit`), polled once: nothing here suspends. Returns the answer, the sends
+/// run and the settles taken; a send past the script is a loop the window never ends.
+fn windowed(
+    shared: &Shared<NoopObserver, StdSegmentFs>,
+    out: usize,
+    stop: bool,
+    script: &[Option<u32>],
+) -> (Result<Result<u32, SendRefused>, StubStop>, usize, usize) {
+    let mut window = StubWindow { out, settles: 0, stop };
+    let mut sends = 0;
+    let answer = {
+        let fan = send_windowed(&mut window, shared, async |_| {
+            let answer = *script.get(sends).expect("a send past the script: the window looped");
+            sends += 1;
+            answer.ok_or(SendRefused::NoUnit)
+        });
+        let mut fan = pin!(fan);
+        let mut cx = Context::from_waker(Waker::noop());
+        let Poll::Ready(answer) = fan.as_mut().poll(&mut cx) else {
+            panic!("a stub window never suspends");
+        };
+        answer
+    };
+    (answer, sends, window.settles)
+}
+
+/// The windowed send's four exits (ADR-0177 D4), each with the sends it ran and the settles it
+/// took: a unit free sends at once; `NoUnit` with a leg out settles the oldest and sends again;
+/// `NoUnit` with no leg out is the refusal, answered after one send, never another turn of the
+/// loop; and a settle that ends the fan is the answer, with no send after it. A loop that
+/// re-sent with nothing out runs past its script and panics; one that dropped the refusal for
+/// a turn, or sent after a `Stop`, reads another shape.
+#[test]
+fn windowed_send_answers_each_of_its_four_exits() {
+    let cells = Cells::new();
+    let shared = cells.origin();
+    let (answer, sends, settles) = windowed(shared, 0, false, &[Some(7)]);
+    assert!(matches!(answer, Ok(Ok(7))), "sent at the first try");
+    assert_eq!((sends, settles), (1, 0), "sent at the first try");
+    let (answer, sends, settles) = windowed(shared, 1, false, &[None, Some(8)]);
+    assert!(matches!(answer, Ok(Ok(8))), "sent after one settle");
+    assert_eq!((sends, settles), (2, 1), "sent after one settle");
+    let (answer, sends, settles) = windowed(shared, 0, false, &[None]);
+    assert!(matches!(answer, Ok(Err(SendRefused::NoUnit))), "no unit, nothing out");
+    assert_eq!((sends, settles), (1, 0), "no unit, nothing out");
+    let (answer, sends, settles) = windowed(shared, 1, true, &[None]);
+    assert!(matches!(answer, Err(StubStop)), "a settle that stops the fan");
+    assert_eq!((sends, settles), (1, 0), "a settle that stops the fan");
 }

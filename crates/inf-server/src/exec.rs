@@ -99,10 +99,13 @@ pub enum ColdGauge {
     IdentityExhausted,
     /// The identity issuer's position: pairs spent or skipped.
     IdentityPairsUsed,
+    /// Requests the cold gate refused for no free route or holder,
+    /// cumulative: derived never while its cap is its product.
+    GateFull,
 }
 
 /// The number of [`ColdGauge`] slots.
-pub const COLD_GAUGES: usize = ColdGauge::IdentityPairsUsed as usize + 1;
+pub const COLD_GAUGES: usize = ColdGauge::GateFull as usize + 1;
 
 /// Default-initializable state surfaced through the command layer (M0-S19 + M1-S03):
 /// the frozen tripwire snapshot, the memory-attribution domains the store
@@ -242,6 +245,12 @@ pub struct NodeState {
     pub fabric_parked_bytes: Cell<u64>,
     pub fabric_parked_bytes_max: Cell<u64>,
     pub fabric_parked_refused: Cell<u64>,
+    /// The fabric gate's derived-never counters (ADR-0177 D4; cell scope,
+    /// `# Tripwires`), published at the stats flush: reserves that found
+    /// every holder taken (`gate_full`) and completions for no holder that
+    /// awaits one (`gate_stale`).
+    pub gate_full: Cell<u64>,
+    pub gate_stale: Cell<u64>,
     /// Publish fan legs this cell's owner pump could not stage on the
     /// credit general sends leave free, each then sent as a general op
     /// (ADR-0192 D3). Cell scope; 0 by the reserve's proof, so any other

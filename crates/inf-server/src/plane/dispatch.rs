@@ -1,56 +1,466 @@
 //! Command dispatch: the per-connection pump (pipeline order in, reply
-//! order out, [`REMOTE_WINDOW`] remote ops in flight), the local fast path,
+//! order out, a remote op in flight per gate unit of its task), the local
+//! fast path,
 //! and `dispatch_one` — the command-family switch every remote command
 //! enters through.
+
+use core::convert::Infallible;
 
 #[cfg(feature = "doc")]
 use super::json_gather::{GatherTarget, JsonGather, json_gather};
 use super::scatter::send_whole;
 use super::*;
 
-/// A reply slot awaiting its in-order turn on the wire.
-pub(super) enum PendingReply {
+/// A reply slot awaiting its in-order turn on the wire. Each remote leg it
+/// waits on holds one of its connection task's gate units (ADR-0177 D4).
+pub(super) enum PendingReply<'u> {
     /// Executed (locally or refused) at dispatch; the reply waits its turn.
     Done(OwnedReply),
     /// One remote `Apply` in flight; the owner's raw RESP reply parks in
     /// the gate if it lands before its turn.
-    Remote { waiter: GateWait<u64, OwnedOutcome>, proto: Protocol },
+    Remote { waiter: GateWait<'u, OwnedOutcome>, proto: Protocol },
     /// A tagged remote `PUBLISH` (ADR-0101 D4): the count reply, then the
     /// publisher's own frames stashed under `seq` by the tagged fan leg
     /// — Redis's reply-then-push order across a remote owner.
-    Publish { waiter: GateWait<u64, OwnedOutcome>, proto: Protocol, seq: u64 },
+    Publish { waiter: GateWait<'u, OwnedOutcome>, proto: Protocol, seq: u64 },
     /// Split DEL/UNLINK/EXISTS/TOUCH (and scattered DBSIZE): locally-counted
-    /// contributions in `acc`, remote per-key contributions in flight. A
-    /// leg that answered a typed error instead of a count, or a leg that
-    /// could not be sent (`refusal`), makes the reply that error — never
-    /// a partial sum (review of 2026-08-28, M4.5-S37 finding 2).
-    Counted {
-        waiters: Vec<GateWait<u64, OwnedOutcome>>,
-        acc: i64,
-        proto: Protocol,
-        refusal: Option<OwnedReply>,
-    },
+    /// contributions and the remote per-key ones. A leg that answered a
+    /// typed error instead of a count, or a leg that could not be sent,
+    /// makes the reply that error — never a partial sum.
+    Counted(CountedLegs<'u>),
     /// Split `MGET`: per-key replies reassemble into one array in argv
     /// order.
-    Gather { parts: Vec<GatherPart>, proto: Protocol },
+    Gather(GatherLegs<'u>),
     /// A cross-cell `JSON.MGET` (ADR-0173 D4): its legs in flight under one
     /// account of the whole reply, settled at the reply's turn.
     #[cfg(feature = "doc")]
-    JsonGather(Box<JsonGather>),
+    JsonGather(Box<JsonGather<'u>>),
     /// Fanned MSET / scattered FLUSH: all legs must come back `+OK` (the
     /// first error leg wins the reply otherwise). A leg that could not be
-    /// sent (`refusal`) makes the reply that refusal — never a silent
-    /// `+OK` over a dropped cell (review of 2026-08-30, H1 / F-L13-01);
-    /// already-sent waiters still drain so nothing orphans in flight.
-    AllOk {
-        waiters: Vec<GateWait<u64, OwnedOutcome>>,
-        proto: Protocol,
-        refusal: Option<OwnedReply>,
-    },
+    /// sent makes the reply that refusal — never a silent `+OK` over a
+    /// dropped cell; already-sent legs still settle so nothing orphans in
+    /// flight.
+    AllOk(AllOkLegs<'u>),
     /// `always` durable write (M2-S08): the reply bytes are staged but the
     /// slot resolves only once the fsync watermark covers the record's
     /// durable seq (§8.2 — ack after fsync; FIFO per connection holds).
     Durable { waiter: inf_runtime::WatermarkWait, reply: OwnedReply },
+}
+
+/// A fan's legs out, oldest first (ADR-0177 D4): each holds one of its
+/// task's units, so settling the oldest gives one back.
+pub(super) trait LegWindow {
+    /// What ends the fan at a settle, before its last leg is sent:
+    /// `Infallible` where every outcome waits for its reply's turn.
+    type Stop;
+
+    /// Settles the oldest leg out, its outcome kept or folded; `Ok(false)`
+    /// when no leg is out.
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        shared: &Shared<O, F>,
+    ) -> Result<bool, Self::Stop>;
+}
+
+/// The one windowed send (ADR-0177 D4): `send` runs, and while the task has
+/// every unit out the window's oldest leg settles and `send` runs again, so
+/// a fan wider than its task's units runs in windows and at most its units
+/// of legs are ever out. What is left is the send's own answer: a waiter,
+/// the codec's refusal, or `NoUnit` with no leg of the window out, derived
+/// never (a pump dispatches a command only while a unit is free, and a leg
+/// settled gives its unit back). Each caller answers a refusal by its own
+/// type; `Err` is a settle that ended the fan.
+pub(super) async fn send_windowed<W, T, O, F>(
+    window: &mut W,
+    shared: &Shared<O, F>,
+    mut send: impl AsyncFnMut(&mut W) -> Result<T, SendRefused>,
+) -> Result<Result<T, SendRefused>, W::Stop>
+where
+    W: LegWindow,
+    O: PlaneObserver + 'static,
+    F: SegmentFs + Clone + 'static,
+{
+    loop {
+        match send(window).await {
+            Err(SendRefused::NoUnit) => {
+                if !window.settle_oldest(shared).await? {
+                    return Ok(Err(SendRefused::NoUnit));
+                }
+            }
+            sent => return Ok(sent),
+        }
+    }
+}
+
+/// A fan's legs in flight, oldest first (ADR-0177 D4), whose outcomes
+/// nothing reads: settling one drops its outcome.
+pub(super) struct Legs<'u> {
+    waiters: Vec<GateWait<'u, OwnedOutcome>>,
+}
+
+impl<'u> Legs<'u> {
+    pub(super) fn new() -> Legs<'u> {
+        Legs { waiters: Vec::new() }
+    }
+
+    pub(super) fn push(&mut self, waiter: GateWait<'u, OwnedOutcome>) {
+        self.waiters.push(waiter);
+    }
+
+    /// The oldest leg's outcome, awaited; `None` when no leg is out.
+    pub(super) async fn oldest(&mut self) -> Option<OwnedOutcome> {
+        if self.waiters.is_empty() {
+            return None;
+        }
+        Some(self.waiters.remove(0).await)
+    }
+}
+
+impl LegWindow for Legs<'_> {
+    type Stop = Infallible;
+
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        _shared: &Shared<O, F>,
+    ) -> Result<bool, Infallible> {
+        Ok(self.oldest().await.is_some())
+    }
+}
+
+/// A program's legs whose outcomes it reads in leg order: the oldest leg
+/// out is settled first when the task needs its unit, its outcome kept for
+/// its turn (ADR-0177 D4).
+pub(super) struct OrderedLegs<'u> {
+    legs: Vec<OrderedLeg<'u>>,
+    /// Every leg before this one is settled or read.
+    settled: usize,
+    /// Every leg before this one is read.
+    read: usize,
+}
+
+enum OrderedLeg<'u> {
+    Out(GateWait<'u, OwnedOutcome>),
+    In(OwnedOutcome),
+    Read,
+}
+
+impl<'u> OrderedLegs<'u> {
+    pub(super) fn new() -> OrderedLegs<'u> {
+        OrderedLegs { legs: Vec::new(), settled: 0, read: 0 }
+    }
+
+    pub(super) fn push(&mut self, waiter: GateWait<'u, OwnedOutcome>) {
+        self.legs.push(OrderedLeg::Out(waiter));
+    }
+
+    /// The next leg's outcome in leg order; `None` past the last.
+    pub(super) async fn next_outcome(&mut self) -> Option<OwnedOutcome> {
+        let leg = self.legs.get_mut(self.read)?;
+        self.read += 1;
+        self.settled = self.settled.max(self.read);
+        match core::mem::replace(leg, OrderedLeg::Read) {
+            OrderedLeg::Out(waiter) => Some(waiter.await),
+            OrderedLeg::In(outcome) => Some(outcome),
+            OrderedLeg::Read => None,
+        }
+    }
+}
+
+impl LegWindow for OrderedLegs<'_> {
+    type Stop = Infallible;
+
+    /// Settles the oldest leg out, keeping its outcome for its turn.
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        _shared: &Shared<O, F>,
+    ) -> Result<bool, Infallible> {
+        while let Some(leg) = self.legs.get_mut(self.settled) {
+            self.settled += 1;
+            let OrderedLeg::Out(waiter) = leg else { continue };
+            *leg = OrderedLeg::In(waiter.await);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+/// A counted fan: the fold of the legs settled and the legs still out.
+pub(super) struct CountedLegs<'u> {
+    legs: Legs<'u>,
+    fold: CountedFold,
+    proto: Protocol,
+}
+
+impl<'u> CountedLegs<'u> {
+    /// A fan whose local contribution is `acc`.
+    pub(super) fn new(acc: i64, proto: Protocol) -> CountedLegs<'u> {
+        CountedLegs { legs: Legs::new(), fold: CountedFold::new(acc, None), proto }
+    }
+
+    pub(super) fn push(&mut self, waiter: GateWait<'u, OwnedOutcome>) {
+        self.legs.push(waiter);
+    }
+
+    /// Adds local contributions counted at dispatch.
+    pub(super) fn add(&mut self, local: i64) {
+        self.fold.add(local);
+    }
+
+    /// A leg that could not be sent: it is the reply, over any leg's error.
+    pub(super) fn refuse<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        shared: &Shared<O, F>,
+        refusal: OwnedReply,
+    ) {
+        if let Some(unused) = self.fold.refuse(refusal) {
+            shared.recycle_reply_buf(unused.into_bytes());
+        }
+    }
+
+    /// Sends one leg to `to`, the fan's oldest settled first while the task
+    /// has every unit out. A leg that cannot be sent is the reply: `false`,
+    /// and the fan sends no more.
+    #[allow(clippy::too_many_arguments)] // the send funnel's one context
+    pub(super) async fn send<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        shared: &'u Rc<Shared<O, F>>,
+        units: &'u GateUnits,
+        to: CellId,
+        origin: ApplyOrigin,
+        db: u16,
+        argv: &[&[u8]],
+    ) -> bool {
+        let proto = self.proto;
+        let Ok(sent) = send_windowed(self, shared, async |_| {
+            send_apply(shared, units, to, origin, proto, db, argv).await
+        })
+        .await;
+        match sent {
+            Ok(waiter) => {
+                self.push(waiter);
+                true
+            }
+            Err(refused) => {
+                let reply = refused.into_reply(shared, proto);
+                self.refuse(shared, reply);
+                false
+            }
+        }
+    }
+
+    /// Every leg settled, so nothing is orphaned in flight; the fold decides
+    /// the reply (a count, or the first error — a leg that is not a count
+    /// is an error, never a partial sum: ADR-0093 A3′).
+    async fn finish<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        mut self,
+        shared: &Shared<O, F>,
+    ) -> OwnedReply {
+        while let Ok(true) = self.settle_oldest(shared).await {}
+        match self.fold.finish() {
+            Err(error) => error,
+            Ok(total) => int_reply(shared, self.proto, total),
+        }
+    }
+}
+
+impl LegWindow for CountedLegs<'_> {
+    type Stop = Infallible;
+
+    /// Folds the oldest leg.
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        shared: &Shared<O, F>,
+    ) -> Result<bool, Infallible> {
+        let Some(outcome) = self.legs.oldest().await else { return Ok(false) };
+        if let Some(unused) = self.fold.leg(outcome, self.proto) {
+            shared.recycle_reply_buf(unused.into_bytes());
+        }
+        Ok(true)
+    }
+}
+
+/// An all-or-first-error fan: the first failure settled, and the legs out.
+pub(super) struct AllOkLegs<'u> {
+    legs: Legs<'u>,
+    failure: Option<OwnedReply>,
+    proto: Protocol,
+}
+
+impl<'u> AllOkLegs<'u> {
+    pub(super) fn new(proto: Protocol) -> AllOkLegs<'u> {
+        AllOkLegs { legs: Legs::new(), failure: None, proto }
+    }
+
+    pub(super) fn push(&mut self, waiter: GateWait<'u, OwnedOutcome>) {
+        self.legs.push(waiter);
+    }
+
+    /// A leg that could not be sent: the fan is known-incomplete, so this
+    /// refusal is the reply over any leg's error, and `+OK` would be a lie.
+    pub(super) fn refuse<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        shared: &Shared<O, F>,
+        refusal: OwnedReply,
+    ) {
+        if let Some(unused) = self.failure.replace(refusal) {
+            shared.recycle_reply_buf(unused.into_bytes());
+        }
+    }
+
+    /// Sends one leg to `to`, the fan's oldest settled first while the task
+    /// has every unit out. A leg that cannot be sent is the reply: `false`,
+    /// and the fan sends no more.
+    #[allow(clippy::too_many_arguments)] // the send funnel's one context
+    pub(super) async fn send<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        shared: &'u Rc<Shared<O, F>>,
+        units: &'u GateUnits,
+        to: CellId,
+        origin: ApplyOrigin,
+        db: u16,
+        argv: &[&[u8]],
+    ) -> bool {
+        let proto = self.proto;
+        let Ok(sent) = send_windowed(self, shared, async |_| {
+            send_apply(shared, units, to, origin, proto, db, argv).await
+        })
+        .await;
+        match sent {
+            Ok(waiter) => {
+                self.push(waiter);
+                true
+            }
+            Err(refused) => {
+                let reply = refused.into_reply(shared, proto);
+                self.refuse(shared, reply);
+                false
+            }
+        }
+    }
+
+    /// Every leg settled, so nothing is orphaned in flight; the reply is
+    /// the first failure or `+OK`.
+    async fn finish<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        mut self,
+        shared: &Shared<O, F>,
+    ) -> OwnedReply {
+        while let Ok(true) = self.settle_oldest(shared).await {}
+        match self.failure {
+            Some(error) => error,
+            None => simple_reply(shared, self.proto, "OK"),
+        }
+    }
+}
+
+impl LegWindow for AllOkLegs<'_> {
+    type Stop = Infallible;
+
+    /// Settles the oldest leg, keeping the first failure.
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        shared: &Shared<O, F>,
+    ) -> Result<bool, Infallible> {
+        let Some(outcome) = self.legs.oldest().await else { return Ok(false) };
+        // A leg failed by its outcome, never by its bytes: an error reply,
+        // or a fabric refusal (ADR-0190 D2).
+        let failed = match outcome {
+            OwnedOutcome::Reply(reply) if reply.is_error() => Some(reply),
+            OwnedOutcome::Reply(reply) => {
+                shared.recycle_reply_buf(reply.into_bytes());
+                None
+            }
+            refused @ OwnedOutcome::Err(_) => Some(render_outcome(shared, refused, self.proto)),
+            OwnedOutcome::Ok | OwnedOutcome::Int(_) | OwnedOutcome::Nil | OwnedOutcome::Bool(_) => {
+                None
+            }
+        };
+        match (self.failure.is_none(), failed) {
+            (true, failed) => self.failure = failed,
+            (false, Some(unused)) => shared.recycle_reply_buf(unused.into_bytes()),
+            (false, None) => {}
+        }
+        Ok(true)
+    }
+}
+
+/// One `MGET` position: a local reply, a remote leg, or a remote leg
+/// settled early into its element (`None`: nil).
+pub(super) enum GatherPart<'u> {
+    Done(OwnedReply),
+    Wait(GateWait<'u, OwnedOutcome>),
+    Settled(Option<OwnedReply>),
+}
+
+/// The `MGET` gather: every position in argv order, its oldest remote leg
+/// settled first when the task needs the unit.
+pub(super) struct GatherLegs<'u> {
+    parts: Vec<GatherPart<'u>>,
+    /// No position before this one waits.
+    next: usize,
+    proto: Protocol,
+}
+
+impl<'u> GatherLegs<'u> {
+    pub(super) fn new(proto: Protocol) -> GatherLegs<'u> {
+        GatherLegs { parts: Vec::new(), next: 0, proto }
+    }
+
+    pub(super) fn push(&mut self, part: GatherPart<'u>) {
+        self.parts.push(part);
+    }
+
+    /// Every position in argv order, each element pasted after the array
+    /// header.
+    async fn finish<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        mut self,
+        shared: &Shared<O, F>,
+    ) -> OwnedReply {
+        while let Ok(true) = self.settle_oldest(shared).await {}
+        let mut reply = OpenReply::new(shared.take_reply_buf());
+        RespWriter::new(reply.reply(), self.proto).array_header(self.parts.len());
+        for part in self.parts {
+            let element = match part {
+                GatherPart::Done(element) => Some(element),
+                GatherPart::Settled(element) => element,
+                GatherPart::Wait(_) => None,
+            };
+            let mut w = RespWriter::new(reply.reply(), self.proto);
+            match element {
+                Some(element) => {
+                    w.encoded(element.bytes());
+                    shared.recycle_reply_buf(element.into_bytes());
+                }
+                None => w.null(),
+            }
+        }
+        reply.finish()
+    }
+}
+
+impl LegWindow for GatherLegs<'_> {
+    type Stop = Infallible;
+
+    /// Settles the oldest remote position into its element.
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        _shared: &Shared<O, F>,
+    ) -> Result<bool, Infallible> {
+        while let Some(part) = self.parts.get_mut(self.next) {
+            self.next += 1;
+            let GatherPart::Wait(waiter) = part else { continue };
+            let element = match waiter.await {
+                OwnedOutcome::Reply(element) => Some(element),
+                OwnedOutcome::Ok
+                | OwnedOutcome::Int(_)
+                | OwnedOutcome::Nil
+                | OwnedOutcome::Bool(_)
+                | OwnedOutcome::Err(_) => None,
+            };
+            *part = GatherPart::Settled(element);
+            return Ok(true);
+        }
+        Ok(false)
+    }
 }
 
 /// What the pump found when it asked the connection for more work.
@@ -164,7 +574,7 @@ fn is_conn_state(owned: &OwnedCmd) -> bool {
 
 /// Outcome of the de-async dispatch fast path (ADR-0030 D4).
 enum FastDispatch {
-    /// Handled synchronously; `pending`/`inflight` updated.
+    /// Handled synchronously; `pending` updated.
     Handled,
     /// The connection is gone; the pump exits.
     ConnGone,
@@ -181,12 +591,12 @@ enum FastDispatch {
 /// arms exactly; every other shape falls back to it
 /// (`deasync_dispatch_matches_pump_semantics` pins the equivalence).
 #[allow(clippy::disallowed_types, reason = "container: A")]
-fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
+fn dispatch_one_fast<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &'u Rc<Shared<O, F>>,
+    units: &'u GateUnits,
     key: ConnKey,
     owned: &OwnedCmd,
-    pending: &mut VecDeque<PendingReply>,
-    inflight: &mut usize,
+    pending: &mut VecDeque<PendingReply<'u>>,
 ) -> FastDispatch {
     let argc = owned.argc();
     if argc > ARGV_INLINE {
@@ -296,9 +706,16 @@ fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
                 return FastDispatch::Fallback;
             }
             // Single-owner remote command: the hot arm.
-            return match try_send_apply(shared, first_owner, ApplyOrigin::Client, proto, db, argv) {
+            return match try_send_apply(
+                shared,
+                units,
+                first_owner,
+                ApplyOrigin::Client,
+                proto,
+                db,
+                argv,
+            ) {
                 SendNow::Sent(waiter) => {
-                    *inflight += 1;
                     pending.push_back(PendingReply::Remote { waiter, proto });
                     FastDispatch::Handled
                 }
@@ -326,13 +743,14 @@ fn dispatch_one_fast<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
 pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: Rc<Shared<O, F>>,
     key: ConnKey,
+    units: GateUnits,
 ) {
-    let Some(notes) = serve_conn(&shared, key).await else { return };
+    let Some(notes) = serve_conn(&shared, key, &units).await else { return };
     // Canary: the slot vacates before its deltas are acknowledged, so the
     // stop's barrier stops counting it with its deltas in flight.
     #[cfg(inf_canary_draining_vacates_before_acks)]
     let _ = shared.conns.borrow_mut().remove(key);
-    flush_sub_deltas(&shared, notes).await;
+    flush_sub_deltas(&shared, &units, notes).await;
     #[cfg(not(inf_canary_draining_vacates_before_acks))]
     let _ = shared.conns.borrow_mut().remove(key);
     // Canary: the pump keeps a clone of its own waker past its return, so
@@ -345,26 +763,26 @@ pub(super) async fn pump<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     .await;
 }
 
-/// The pump's serving loop: dispatch commands in pipeline order with up to
-/// [`REMOTE_WINDOW`] remote ops in flight, emit replies strictly in command
-/// order. Suspends on the front reply's gate, on fabric credits, and parked
-/// when the queue is empty with nothing pending; out-of-order completions
+/// The pump's serving loop: dispatch commands in pipeline order while one
+/// of the task's gate `units` is free (a command's first leg takes it;
+/// ADR-0177 D4), emit replies strictly in command order. Suspends on the
+/// front reply's gate, on fabric credits, and parked when the queue is
+/// empty with nothing pending; out-of-order completions
 /// park in the gate until their turn. Returns a draining slot's deltas once
 /// its queue is empty, or `None` when the slot is vacant.
 #[allow(clippy::disallowed_types, reason = "container: A")]
 async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     key: ConnKey,
+    units: &GateUnits,
 ) -> Option<SubNotes> {
     let shared = Rc::clone(shared);
-    let mut pending: VecDeque<PendingReply> = VecDeque::new();
-    // Remote ops sent and not yet awaited (Counted holds several).
-    let mut inflight: usize = 0;
+    let mut pending: VecDeque<PendingReply<'_>> = VecDeque::new();
     // A command held back by the conn-state barrier.
     let mut held: Option<OwnedCmd> = None;
     loop {
         // ---- dispatch: fill the window in pipeline order.
-        while pending.len() < PENDING_REPLIES_MAX && inflight < REMOTE_WINDOW {
+        while pending.len() < PENDING_REPLIES_MAX && units.free() > 0 {
             let cmd = match held.take() {
                 Some(cmd) => cmd,
                 None => match pop_or_quiesce(&shared, key, pending.is_empty()) {
@@ -396,7 +814,7 @@ async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             // constructing the `dispatch_one` future; rare shapes and
             // credit exhaustion fall back to the async path unchanged.
             let handled = if shared.deasync_dispatch.get() {
-                match dispatch_one_fast(&shared, key, &cmd, &mut pending, &mut inflight) {
+                match dispatch_one_fast(&shared, units, key, &cmd, &mut pending) {
                     FastDispatch::Handled => true,
                     FastDispatch::ConnGone => return None,
                     FastDispatch::Fallback => false,
@@ -404,7 +822,7 @@ async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             } else {
                 false
             };
-            if !handled && !dispatch_one(&shared, key, &cmd, &mut pending, &mut inflight).await {
+            if !handled && !dispatch_one(&shared, units, key, &cmd, &mut pending).await {
                 return None; // the slot is vacant
             }
             // The command's flat buffer recycles once dispatched (waiters
@@ -421,7 +839,7 @@ async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         };
         // A closing or draining slot drops the reply and the pump goes on;
         // only a vacant slot ends it.
-        let reply = settle_reply(&shared, key, front, &mut inflight).await;
+        let reply = settle_reply(&shared, key, front).await;
         let emitted = shared.with_conn(key, |conn| conn.emit(&reply)).unwrap_or(Emitted::Vacant);
         shared.recycle_reply_buf(reply.into_bytes());
         match emitted {
@@ -437,20 +855,13 @@ async fn serve_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
 pub(super) async fn settle_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     key: ConnKey,
-    front: PendingReply,
-    inflight: &mut usize,
+    front: PendingReply<'_>,
 ) -> OwnedReply {
     match front {
         PendingReply::Done(reply) => reply,
-        PendingReply::Remote { waiter, proto } => {
-            let outcome = waiter.await;
-            *inflight -= 1;
-            render_outcome(shared, outcome, proto)
-        }
+        PendingReply::Remote { waiter, proto } => render_outcome(shared, waiter.await, proto),
         PendingReply::Publish { waiter, proto, seq } => {
-            let outcome = waiter.await;
-            *inflight -= 1;
-            let reply = render_outcome(shared, outcome, proto);
+            let reply = render_outcome(shared, waiter.await, proto);
             // The owner replied only after this cell acked its fan
             // leg, so a self-frame stash for `seq` is either already
             // here or never existed (the publisher was not subscribed
@@ -464,114 +875,16 @@ pub(super) async fn settle_reply<O: PlaneObserver + 'static, F: SegmentFs + Clon
                 None => reply,
             }
         }
-        PendingReply::Counted { waiters, acc, proto, refusal } => {
-            // Every leg is awaited so nothing is orphaned in flight;
-            // the fold decides the reply (a count, or the first
-            // error — a leg that is not a count is an error, never
-            // a partial sum: ADR-0093 A3′).
-            let mut fold = CountedFold::new(acc, refusal);
-            for waiter in waiters {
-                if let Some(unused) = fold.leg(waiter.await, proto) {
-                    shared.recycle_reply_buf(unused.into_bytes());
-                }
-                *inflight -= 1;
-            }
-            match fold.finish() {
-                Err(error) => error,
-                Ok(total) => int_reply(shared, proto, total),
-            }
-        }
-        PendingReply::Gather { parts, proto } => {
-            settle_gather(shared, parts, proto, inflight).await
-        }
+        PendingReply::Counted(legs) => legs.finish(shared).await,
+        PendingReply::Gather(legs) => legs.finish(shared).await,
         #[cfg(feature = "doc")]
-        PendingReply::JsonGather(gather) => gather.finish(shared, inflight).await,
+        PendingReply::JsonGather(gather) => gather.finish(shared).await,
         PendingReply::Durable { waiter, reply } => {
             waiter.await;
             reply
         }
-        PendingReply::AllOk { waiters, proto, refusal } => {
-            settle_all_ok(shared, waiters, proto, refusal, inflight).await
-        }
+        PendingReply::AllOk(legs) => legs.finish(shared).await,
     }
-}
-
-/// The all-or-first-error fan: every leg is awaited, so nothing is
-/// orphaned in flight, and the reply is the first failure or `+OK`.
-async fn settle_all_ok<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
-    waiters: Vec<GateWait<u64, OwnedOutcome>>,
-    proto: Protocol,
-    refusal: Option<OwnedReply>,
-    inflight: &mut usize,
-) -> OwnedReply {
-    // A refusal (a leg never sent) outranks leg errors: the fan is
-    // known-incomplete, and `+OK` would be a lie.
-    let mut failure: Option<OwnedReply> = refusal;
-    for waiter in waiters {
-        let outcome = waiter.await;
-        *inflight -= 1;
-        // A leg failed by its outcome, never by its bytes: an error
-        // reply, or a fabric refusal (ADR-0190 D2).
-        let failed = match outcome {
-            OwnedOutcome::Reply(reply) if reply.is_error() => Some(reply),
-            OwnedOutcome::Reply(reply) => {
-                shared.recycle_reply_buf(reply.into_bytes());
-                None
-            }
-            refused @ OwnedOutcome::Err(_) => Some(render_outcome(shared, refused, proto)),
-            OwnedOutcome::Ok | OwnedOutcome::Int(_) | OwnedOutcome::Nil | OwnedOutcome::Bool(_) => {
-                None
-            }
-        };
-        match (failure.is_none(), failed) {
-            (true, failed) => failure = failed,
-            (false, Some(unused)) => shared.recycle_reply_buf(unused.into_bytes()),
-            (false, None) => {}
-        }
-    }
-    match failure {
-        Some(error) => error,
-        None => simple_reply(shared, proto, "OK"),
-    }
-}
-
-/// The `MGET` gather: every position in argv order, each element pasted
-/// after the array header.
-async fn settle_gather<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
-    parts: Vec<GatherPart>,
-    proto: Protocol,
-    inflight: &mut usize,
-) -> OwnedReply {
-    let mut reply = OpenReply::new(shared.take_reply_buf());
-    RespWriter::new(reply.reply(), proto).array_header(parts.len());
-    for part in parts {
-        let element = match part {
-            GatherPart::Done(element) => Some(element),
-            GatherPart::Wait(waiter) => {
-                let outcome = waiter.await;
-                *inflight -= 1;
-                match outcome {
-                    OwnedOutcome::Reply(element) => Some(element),
-                    OwnedOutcome::Ok
-                    | OwnedOutcome::Int(_)
-                    | OwnedOutcome::Nil
-                    | OwnedOutcome::Bool(_)
-                    | OwnedOutcome::Err(_) => None,
-                }
-            }
-        };
-        let mut w = RespWriter::new(reply.reply(), proto);
-        match element {
-            Some(element) => {
-                w.encoded(element.bytes());
-                shared.recycle_reply_buf(element.into_bytes());
-            }
-            None => w.null(),
-        }
-    }
-    reply.finish()
 }
 
 /// Keyspace-wide commands that must scatter across all cells on a
@@ -645,12 +958,12 @@ fn is_ns_ddl_sub(sub: Option<&[u8]>) -> bool {
 /// commands run as inline fabric programs (M1-S02). Returns `false` when
 /// the connection is gone.
 #[allow(clippy::disallowed_types, reason = "container: A")]
-async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
+async fn dispatch_one<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &'u Rc<Shared<O, F>>,
+    units: &'u GateUnits,
     key: ConnKey,
     owned: &OwnedCmd,
-    pending: &mut VecDeque<PendingReply>,
-    inflight: &mut usize,
+    pending: &mut VecDeque<PendingReply<'u>>,
 ) -> bool {
     // Argv views live on the stack for the common arity; wide commands
     // (MSET…) fall back to `slices()` (M2.5 Phase H allocator lever).
@@ -746,7 +1059,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
     let owner_of = |k: &[u8]| shared.router.cell_of(SlotRouter::slot_of(k));
     match meta {
         Some(meta) if well_formed && pubsub::is_plane_pubsub(meta.id) => {
-            return dispatch_pubsub(shared, key, meta.id, argv, proto, pending, inflight).await;
+            return dispatch_pubsub(shared, units, key, meta.id, argv, proto, pending).await;
         }
         // Namespace DDL (M2-S08, ADR-0015 D2/D3): each subcommand in its
         // program's order (`program_ns_ddl`, `program_ns_drop`) — on every
@@ -757,7 +1070,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 && meta.id == CommandId::InfNs
                 && is_ns_ddl_sub(argv.get(1).copied()) =>
         {
-            let reply = program_ns_ddl(shared, origin, proto, id, db, argv).await;
+            let reply = program_ns_ddl(shared, units, origin, proto, id, db, argv).await;
             pending.push_back(PendingReply::Done(reply));
         }
         // Checkpoint operator surface (M2-S20, ADR-0021 D6).
@@ -792,10 +1105,8 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                     && is_scatter(meta.id, argv.get(1).copied())) =>
         {
             let ns = conn_ns.expect("guarded");
-            return dispatch_ns(
-                shared, key, origin, meta, argv, proto, id, db, ns, pending, inflight,
-            )
-            .await;
+            return dispatch_ns(shared, units, key, origin, meta, argv, proto, id, db, ns, pending)
+                .await;
         }
         Some(meta)
             if well_formed
@@ -804,7 +1115,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 && !shared.route_local_only =>
         {
             pending.push_back(
-                dispatch_scatter(shared, meta.id, origin, proto, id, db, argv, inflight).await,
+                dispatch_scatter(shared, units, meta.id, origin, proto, id, db, argv).await,
             );
         }
         Some(meta)
@@ -819,45 +1130,34 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // typed Apply replies. Applies leave in argv order (per-key
             // order rides the destination ring FIFO).
             let name: &[u8] = argv[0];
+            let mut legs = CountedLegs::new(0, proto);
             let mut acc: i64 = 0;
-            let mut waiters = Vec::new();
             for k in &argv[1..] {
                 if shared.router.is_local(k, shared.cell) {
                     acc += shared.apply_counted(origin, name, k, db);
-                } else {
-                    match send_apply(
-                        shared,
-                        owner_of(k),
-                        ApplyOrigin::Client,
-                        proto,
-                        db,
-                        &[name, k],
-                    )
-                    .await
-                    {
-                        Ok(waiter) => {
-                            waiters.push(waiter);
-                            *inflight += 1;
-                        }
-                        Err(_) => debug_assert!(false, "2-arg apply exceeded ApplyArgs"),
-                    }
+                    continue;
+                }
+                let leg: [&[u8]; 2] = [name, k];
+                if !legs.send(shared, units, owner_of(k), ApplyOrigin::Client, db, &leg).await {
+                    break;
                 }
             }
-            pending.push_back(PendingReply::Counted { waiters, acc, proto, refusal: None });
+            legs.add(acc);
+            pending.push_back(PendingReply::Counted(legs));
         }
         Some(meta) if well_formed && meta.id == CommandId::Mget && has_remote_key(meta) => {
-            pending.push_back(gather_mget(shared, origin, proto, id, db, argv, inflight).await);
+            pending.push_back(gather_mget(shared, units, origin, proto, id, db, argv).await);
         }
         #[cfg(feature = "doc")]
         Some(meta) if well_formed && meta.id == CommandId::JsonMget && has_remote_key(meta) => {
             let target = GatherTarget { origin, proto, id, db, scope: ScatterScope::Db };
-            pending.push_back(json_gather(shared, target, meta, argv, inflight).await);
+            pending.push_back(json_gather(shared, units, target, meta, argv).await);
         }
         Some(meta) if well_formed && meta.id == CommandId::Mset && has_remote_key(meta) => {
-            pending.push_back(program_mset(shared, origin, proto, id, db, argv, inflight).await);
+            pending.push_back(program_mset(shared, units, origin, proto, id, db, argv).await);
         }
         Some(meta) if well_formed && meta.id == CommandId::Msetnx && has_remote_key(meta) => {
-            let reply = program_msetnx(shared, origin, proto, id, db, argv).await;
+            let reply = program_msetnx(shared, units, origin, proto, id, db, argv).await;
             pending.push_back(PendingReply::Done(reply));
         }
         Some(meta)
@@ -869,7 +1169,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // Two owners: the read(+delete)/write fabric program. Same-owner
             // pairs fall through to the whole-argv Apply below (atomic at
             // that cell).
-            let reply = program_move(shared, origin, proto, id, db, meta.id, argv).await;
+            let reply = program_move(shared, units, origin, proto, id, db, meta.id, argv).await;
             pending.push_back(PendingReply::Done(reply));
         }
         Some(meta) if well_formed && has_remote_key(meta) => {
@@ -877,8 +1177,7 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
             // executes and returns its raw RESP reply. The destination is
             // the first key's owner, computed in the routing pass above.
             let scope = ScatterScope::Db;
-            pending
-                .push_back(send_whole(shared, first_owner, proto, db, scope, argv, inflight).await);
+            pending.push_back(send_whole(shared, units, first_owner, proto, db, scope, argv).await);
         }
         _ => {
             return dispatch_mirror(
@@ -894,37 +1193,33 @@ async fn dispatch_one<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
 /// `KEYS`/`SCAN`/`RANDOMKEY` folds. Returns the reply slot to stage.
 #[allow(clippy::too_many_arguments, reason = "the dispatch context, not an API surface")]
 #[allow(clippy::wildcard_enum_match_arm, reason = "ADR-0143: column scatter")]
-pub(super) async fn dispatch_scatter<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
+pub(super) async fn dispatch_scatter<
+    'u,
+    O: PlaneObserver + 'static,
+    F: SegmentFs + Clone + 'static,
+>(
+    shared: &'u Rc<Shared<O, F>>,
+    units: &'u GateUnits,
     cmd: CommandId,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
     db: u16,
     argv: &[&[u8]],
-    inflight: &mut usize,
-) -> PendingReply {
+) -> PendingReply<'u> {
     match cmd {
         CommandId::Dbsize => {
-            let acc = shared.apply_dbsize(origin, db);
-            let mut waiters = Vec::new();
-            let mut refusal = None;
+            let mut legs = CountedLegs::new(shared.apply_dbsize(origin, db), proto);
             for cell in peer_cells(shared) {
                 // A leg that cannot be sent becomes the reply —
                 // never a partial sum (review of 2026-08-30, H1:
                 // `if let Ok` silently dropped the cell).
-                match send_apply(shared, cell, ApplyOrigin::Client, proto, db, &[b"DBSIZE"]).await {
-                    Ok(waiter) => {
-                        waiters.push(waiter);
-                        *inflight += 1;
-                    }
-                    Err(reply) => {
-                        refusal = Some(reply);
-                        break;
-                    }
+                let leg: [&[u8]; 1] = [b"DBSIZE"];
+                if !legs.send(shared, units, cell, ApplyOrigin::Client, db, &leg).await {
+                    break;
                 }
             }
-            PendingReply::Counted { waiters, acc, proto, refusal }
+            PendingReply::Counted(legs)
         }
         CommandId::Flushdb | CommandId::Flushall | CommandId::Config => {
             // Per-cell-state mutators (flush, CONFIG SET/RESETSTAT):
@@ -944,37 +1239,31 @@ pub(super) async fn dispatch_scatter<O: PlaneObserver + 'static, F: SegmentFs + 
                 // instead of being swallowed (H1 / F-L13-01: 8+
                 // pairs answered `+OK` while every peer leg was
                 // silently refused).
-                let legs = scatter_fan_legs(cmd, argv);
-                let mut waiters = Vec::new();
-                let mut refusal = None;
+                let fan = scatter_fan_legs(cmd, argv);
+                let mut legs = AllOkLegs::new(proto);
                 'fan: for cell in peer_cells(shared) {
-                    for leg in &legs {
-                        match send_apply(shared, cell, ApplyOrigin::Client, proto, db, leg).await {
-                            Ok(waiter) => {
-                                waiters.push(waiter);
-                                *inflight += 1;
-                            }
-                            Err(reply) => {
-                                refusal = Some(reply);
-                                break 'fan;
-                            }
+                    for leg in &fan {
+                        if !legs.send(shared, units, cell, ApplyOrigin::Client, db, leg).await {
+                            break 'fan;
                         }
                     }
                 }
-                PendingReply::AllOk { waiters, proto, refusal }
+                PendingReply::AllOk(legs)
             }
         }
         CommandId::Keys => {
-            let reply = program_keys(shared, origin, proto, id, db, ScatterScope::Db, argv).await;
+            let scope = ScatterScope::Db;
+            let reply = program_keys(shared, units, origin, proto, id, db, scope, argv).await;
             PendingReply::Done(reply)
         }
         CommandId::Scan => {
-            let reply = program_scan(shared, origin, proto, id, db, ScatterScope::Db, argv).await;
+            let scope = ScatterScope::Db;
+            let reply = program_scan(shared, units, origin, proto, id, db, scope, argv).await;
             PendingReply::Done(reply)
         }
         CommandId::Randomkey => {
-            let reply =
-                program_randomkey(shared, origin, proto, id, db, ScatterScope::Db, argv).await;
+            let scope = ScatterScope::Db;
+            let reply = program_randomkey(shared, units, origin, proto, id, db, scope, argv).await;
             PendingReply::Done(reply)
         }
         _ => unreachable!("is_scatter covers exactly the arms above"),
@@ -983,59 +1272,52 @@ pub(super) async fn dispatch_scatter<O: PlaneObserver + 'static, F: SegmentFs + 
 
 /// `MGET` with a remote key: every position resolves independently and
 /// the replies reassemble into one array in argv order.
-async fn gather_mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
+async fn gather_mget<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &'u Rc<Shared<O, F>>,
+    units: &'u GateUnits,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
     db: u16,
     argv: &[&[u8]],
-    inflight: &mut usize,
-) -> PendingReply {
+) -> PendingReply<'u> {
     // Gather: every position resolves independently, replies
     // reassemble into one array in argv order (the §6.2 "pipelined,
     // not serialized" shape; per-destination BatchOp coalescing is
     // the M1-S17 story).
-    let mut parts = Vec::with_capacity(argv.len() - 1);
+    let mut legs = GatherLegs::new(proto);
     for k in &argv[1..] {
+        let get: [&[u8]; 2] = [b"GET", k];
         if shared.router.is_local(k, shared.cell) {
             let mut reply = OpenReply::new(shared.take_reply_buf());
-            let get: [&[u8]; 2] = [b"GET", k];
             shared.execute_owned_into(origin, &get, proto, id, db, None, false, reply.reply());
-            parts.push(GatherPart::Done(reply.finish()));
-        } else {
-            match send_apply(
-                shared,
-                shared.router.cell_of(SlotRouter::slot_of(k)),
-                ApplyOrigin::Client,
-                proto,
-                db,
-                &[b"GET", k],
-            )
-            .await
-            {
-                Ok(waiter) => {
-                    parts.push(GatherPart::Wait(waiter));
-                    *inflight += 1;
-                }
-                Err(refusal) => parts.push(GatherPart::Done(refusal)),
-            }
+            legs.push(GatherPart::Done(reply.finish()));
+            continue;
         }
+        let to = shared.router.cell_of(SlotRouter::slot_of(k));
+        let Ok(sent) = send_windowed(&mut legs, shared, async |_| {
+            send_apply(shared, units, to, ApplyOrigin::Client, proto, db, &get).await
+        })
+        .await;
+        legs.push(match sent {
+            Ok(waiter) => GatherPart::Wait(waiter),
+            Err(refused) => GatherPart::Done(refused.into_reply(shared, proto)),
+        });
     }
-    PendingReply::Gather { parts, proto }
+    PendingReply::Gather(legs)
 }
 
 /// `MSET` with a remote key: local pairs first (an OOM reply preempts the
 /// fan), then one `SET` leg per remote pair under an all-OK fold.
-pub(super) async fn program_mset<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
+pub(super) async fn program_mset<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &'u Rc<Shared<O, F>>,
+    units: &'u GateUnits,
     origin: ExecOrigin,
     proto: Protocol,
     id: u64,
     db: u16,
     argv: &[&[u8]],
-    inflight: &mut usize,
-) -> PendingReply {
+) -> PendingReply<'u> {
     if argv.len().is_multiple_of(2) {
         PendingReply::Done(error_reply(
             shared,
@@ -1063,26 +1345,22 @@ pub(super) async fn program_mset<O: PlaneObserver + 'static, F: SegmentFs + Clon
         if let Some(error) = failure {
             PendingReply::Done(error)
         } else {
-            let mut waiters = Vec::new();
+            let mut legs = AllOkLegs::new(proto);
             let mut i = 1;
             while i < argv.len() {
-                if !shared.router.is_local(argv[i], shared.cell)
-                    && let Ok(waiter) = send_apply(
-                        shared,
-                        shared.router.cell_of(SlotRouter::slot_of(argv[i])),
-                        ApplyOrigin::Client,
-                        proto,
-                        db,
-                        &[b"SET", argv[i], argv[i + 1]],
-                    )
-                    .await
-                {
-                    waiters.push(waiter);
-                    *inflight += 1;
-                }
+                let pair: [&[u8]; 3] = [b"SET", argv[i], argv[i + 1]];
                 i += 2;
+                if shared.router.is_local(pair[1], shared.cell) {
+                    continue;
+                }
+                let to = shared.router.cell_of(SlotRouter::slot_of(pair[1]));
+                // A leg that cannot be sent is the reply, never a `+OK` over
+                // an unwritten pair; the fan sends no more.
+                if !legs.send(shared, units, to, ApplyOrigin::Client, db, &pair).await {
+                    break;
+                }
             }
-            PendingReply::AllOk { waiters, proto, refusal: None }
+            PendingReply::AllOk(legs)
         }
     }
 }

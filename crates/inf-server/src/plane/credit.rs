@@ -198,7 +198,7 @@ impl PlaneFabric {
     /// once, in the cell's `fabric_reserve_refused_cell`.
     pub(super) fn stage_fan_leg(
         &mut self,
-        legs: &mut FanLegs<'_>,
+        legs: &mut FanLegs<'_, '_>,
         to: CellId,
         op: &FanLegOp<'_>,
     ) -> Result<(), FanLegRefused> {
@@ -282,6 +282,20 @@ impl<'a> PointOp<'a> {
     pub(super) fn adopt_conn(token: FabricToken, fd: u32) -> PointOp<'static> {
         PointOp(Op::AdoptConn { token, fd })
     }
+
+    /// The op under `token`, the key of this attempt's holder: a send that
+    /// parked for a credit stamps its next key on the op it built once, so
+    /// its arguments are never built or copied again.
+    pub(super) fn stamp(&mut self, token: FabricToken) {
+        match &mut self.0 {
+            Op::Apply { token: at, .. }
+            | Op::ApplyNs { token: at, .. }
+            | Op::AdoptConn { token: at, .. } => *at = token,
+            Op::Read { .. } | Op::Write { .. } | Op::Batch { .. } | Op::Reply { .. } => {
+                debug_assert!(false, "a point op is an apply, an apply-ns or an adopt");
+            }
+        }
+    }
 }
 
 /// The argv of one publish fan leg, `INF.PUBFAN channel payload`, with the
@@ -351,24 +365,32 @@ pub(super) struct FanReserve {
 /// every leg's reply waiter in leg order, and the cell's count of refused
 /// legs.
 #[must_use = "a fan settles before the next one opens"]
-pub(super) struct FanLegs<'r> {
+pub(super) struct FanLegs<'r, 'u> {
     _reserve: &'r mut FanReserve,
     last: Option<CellId>,
-    waiters: Vec<GateWait<u64, OwnedOutcome>>,
+    waiters: Vec<GateWait<'u, OwnedOutcome>>,
     refused: &'r Cell<u64>,
 }
 
-impl<'r> FanLegs<'r> {
+impl<'r, 'u> FanLegs<'r, 'u> {
     /// Opens a fan on the cell's reserve; `refused` is the cell's
     /// `fabric_reserve_refused_cell`.
-    pub(super) fn open(reserve: &'r mut FanReserve, refused: &'r Cell<u64>) -> FanLegs<'r> {
+    pub(super) fn open(reserve: &'r mut FanReserve, refused: &'r Cell<u64>) -> FanLegs<'r, 'u> {
         FanLegs { _reserve: reserve, last: None, waiters: Vec::new(), refused }
     }
 
     /// A staged leg's reply waiter, or a refused leg's general one: either
     /// way the fan's settle awaits it.
-    pub(super) fn push(&mut self, waiter: GateWait<u64, OwnedOutcome>) {
+    pub(super) fn push(&mut self, waiter: GateWait<'u, OwnedOutcome>) {
         self.waiters.push(waiter);
+    }
+
+    /// The oldest leg's outcome, awaited; `None` when no leg is out.
+    pub(super) async fn oldest(&mut self) -> Option<OwnedOutcome> {
+        if self.waiters.is_empty() {
+            return None;
+        }
+        Some(self.waiters.remove(0).await)
     }
 
     /// Awaits every leg's reply and hands each outcome to `each`, in leg
@@ -434,7 +456,7 @@ mod tests {
     }
 
     /// A fan with no leg left to await settles on its first poll.
-    fn settle(legs: FanLegs<'_>) {
+    fn settle(legs: FanLegs<'_, '_>) {
         let mut settled = pin!(legs.settle(|_| {}));
         let poll = settled.as_mut().poll(&mut Context::from_waker(Waker::noop()));
         assert!(matches!(poll, Poll::Ready(())), "a fan with no waiter settles at once");

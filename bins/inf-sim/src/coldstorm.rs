@@ -1095,6 +1095,7 @@ pub fn run_cold_storm_scenario(scenario: &ColdStormScenario) -> ColdStormReport 
         cold: ColdReads::with_config(
             inf_alloc::AlignedPool::new(POOL_BUFFERS, POOL_FRAMES * TIER_FRAME_BYTES),
             inf_runtime::ColdReadConfig { qd_cap: QD_CAP, ..Default::default() },
+            &census,
         ),
         driver: SimDriver::with_disk(
             CellNet::new(0, scenario.seed ^ 0xD15C, Plant::None),

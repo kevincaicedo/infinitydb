@@ -72,14 +72,16 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use inf_alloc::{AlignedBufId, AlignedPool};
+use inf_foundation::bounded::CapCensus;
 use inf_foundation::limits::DRIVER_OP_BYTES_MAX;
 use inf_foundation::{BuildIntHasher, FileOffset, FileOffsetRefused, LogHistogram};
 
 use crate::budget::Issue;
 use crate::driver::{IoOp, RawFd, StableBytesMut};
-use crate::gate::{GateWait, KeyedGate};
+use crate::gate::{Delivery, GateHold, GateKey, KeyedAdmission, KeyedGate, KeyedWait};
 use crate::limits::{
     COLD_DELIVERIES_PER_TURN, COLD_IDENTITY_PAIRS_MAX, COLD_PREPARATION_WORK_PER_TURN,
+    cold_gate_holders,
 };
 use crate::token::{CompletionToken, MAX_SLOT, TokenClass};
 
@@ -145,24 +147,31 @@ impl ReadClass {
 /// completes the cold gate:
 ///
 /// ```compile_fail,E0308
-/// use inf_runtime::gate::KeyedGate;
+/// use inf_runtime::gate::{Delivery, KeyedGate};
 /// use inf_runtime::{ColdDone, DeviceId, LogicalId};
-/// fn deliver(gate: &KeyedGate<LogicalId, ColdDone>, device: DeviceId, done: ColdDone) -> bool {
-///     gate.complete(device, done)
+/// fn deliver(gate: &KeyedGate<LogicalId, ColdDone>, id: DeviceId, done: ColdDone) -> Delivery {
+///     gate.complete(id, done)
 /// }
 /// ```
 ///
 /// Its twin, the logical id, compiles:
 ///
 /// ```
-/// use inf_runtime::gate::KeyedGate;
+/// use inf_runtime::gate::{Delivery, KeyedGate};
 /// use inf_runtime::{ColdDone, LogicalId};
-/// fn deliver(gate: &KeyedGate<LogicalId, ColdDone>, logical: LogicalId, done: ColdDone) -> bool {
-///     gate.complete(logical, done)
+/// fn deliver(gate: &KeyedGate<LogicalId, ColdDone>, id: LogicalId, done: ColdDone) -> Delivery {
+///     gate.complete(id, done)
 /// }
 /// ```
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct LogicalId(CompletionToken);
+
+/// The cold gate routes a holder by the logical id's exact word (ADR-0151 D1).
+impl GateKey for LogicalId {
+    fn word(self) -> u64 {
+        self.0.as_u64()
+    }
+}
 
 /// A device read's identity (ADR-0181 R4): the odd word of its pair, the
 /// token its `TierRead` carries and its receipt returns. A read that serves
@@ -219,6 +228,13 @@ struct PairPermit {
     pair: u64,
 }
 
+impl PairPermit {
+    /// The logical id this pair mints: the gate reserves it before the mint.
+    fn logical(&self) -> LogicalId {
+        LogicalId(tier_read_token(2 * self.pair))
+    }
+}
+
 impl PairIssuer {
     /// The issuer at pair 0.
     #[must_use]
@@ -248,7 +264,7 @@ impl PairIssuer {
     fn mint(&mut self, permit: PairPermit) -> (LogicalId, DeviceId) {
         debug_assert_eq!(permit.pair, self.next_pair, "a permit is spent at the position it read");
         self.next_pair = permit.pair + 1;
-        let logical = LogicalId(tier_read_token(2 * permit.pair));
+        let logical = permit.logical();
         let device = DeviceId(tier_read_token(2 * permit.pair + 1));
         (logical, device)
     }
@@ -559,6 +575,10 @@ pub enum UnrepresentableRead {
 /// A queued read intent — plain data; the §3.3 pin is taken at enqueue.
 struct Intent {
     logical: LogicalId,
+    /// The gate's claim on this request's holder (ADR-0177 D4): the queue
+    /// asks through it whether the wait is live, and releases it when the
+    /// intent leaves the queue, issued or cancelled.
+    hold: GateHold,
     /// The pair's device id, the read's token when this intent seeds it.
     device: DeviceId,
     fd: RawFd,
@@ -816,7 +836,7 @@ pub struct ColdLeak {
 
 /// The future a suspended cold read parks on, keyed by its request's
 /// [`LogicalId`]; resolves to the custody-carrying [`ColdDone`].
-pub type ColdWait = GateWait<LogicalId, ColdDone>;
+pub type ColdWait = KeyedWait<LogicalId, ColdDone>;
 
 /// One cell's cold-read path state: pool, pins, queues, in-flight table,
 /// and the completion gate. Cheap-clone shared handle (cell-local `Rc`,
@@ -831,9 +851,12 @@ impl ColdReads {
     /// Takes ownership of the registered aligned pool (register it with
     /// the driver first — `BackendDriver::register_tier_pool`) under the
     /// default shaping config.
+    ///
+    /// # Panics
+    /// As [`with_config`](Self::with_config).
     #[must_use]
-    pub fn new(pool: AlignedPool) -> ColdReads {
-        ColdReads::with_config(pool, ColdReadConfig::default())
+    pub fn new(pool: AlignedPool, census: &Rc<CapCensus>) -> ColdReads {
+        ColdReads::with_config(pool, ColdReadConfig::default(), census)
     }
 
     /// [`new`](Self::new) with explicit shaping knobs (ADR-0055).
@@ -843,10 +866,17 @@ impl ColdReads {
     /// zero-limit config is a misconfiguration, not a throttle — and on a
     /// pool buffer wider than [`DRIVER_OP_BYTES_MAX`]: the buffer is the
     /// read-window maximum, and a device read's length is a `u32`
-    /// (ADR-0167 D1).
+    /// (ADR-0167 D1). A refused build of the gate's holders or routes on
+    /// `census` is the cell's fail-stop, as the pool's allocation is: the
+    /// gate is built at the cell's first tiered namespace, while it serves
+    /// (ADR-0177 D4).
     #[must_use]
     #[allow(clippy::disallowed_types, reason = "container: C")]
-    pub fn with_config(pool: AlignedPool, config: ColdReadConfig) -> ColdReads {
+    pub fn with_config(
+        pool: AlignedPool,
+        config: ColdReadConfig,
+        census: &Rc<CapCensus>,
+    ) -> ColdReads {
         assert!(config.qd_cap > 0, "qd_cap must admit at least one device read");
         assert!(config.overflow_cap > 0, "overflow_cap must queue at least one intent");
         assert!(config.grants_foreground > 0, "foreground grants must be nonzero");
@@ -856,6 +886,11 @@ impl ColdReads {
             "cold-read pool buffer exceeds a driver op's byte range"
         );
         let grants = [config.grants_foreground, config.grants_maintain];
+        let gate =
+            KeyedGate::build(cold_gate_holders(config.overflow_cap, pool.capacity()), census)
+                .unwrap_or_else(|refused| {
+                    panic!("the cold gate's holders were refused: {refused}")
+                });
         ColdReads {
             state: Rc::new(RefCell::new(ColdState {
                 pool,
@@ -889,7 +924,7 @@ impl ColdReads {
                 issuer: PairIssuer::new(),
                 identity_refusals: 0,
             })),
-            gate: KeyedGate::new(),
+            gate,
         }
     }
 
@@ -900,8 +935,13 @@ impl ColdReads {
     /// # Panics
     /// As [`with_config`](Self::with_config).
     #[must_use]
-    pub fn with_issuer(pool: AlignedPool, config: ColdReadConfig, issuer: PairIssuer) -> ColdReads {
-        let cold = ColdReads::with_config(pool, config);
+    pub fn with_issuer(
+        pool: AlignedPool,
+        config: ColdReadConfig,
+        issuer: PairIssuer,
+        census: &Rc<CapCensus>,
+    ) -> ColdReads {
+        let cold = ColdReads::with_config(pool, config, census);
         cold.state.borrow_mut().issuer = issuer;
         cold
     }
@@ -962,10 +1002,24 @@ impl ColdReads {
             state.counters.queue_full += 1;
             return Err(ColdRefused::QueueFull);
         }
+        // The route and holder before the intent is queued, the pin taken or
+        // the issuer advanced (ADR-0177 D4): a full gate refuses like a full
+        // queue and changes nothing else.
+        let gate = match self.gate.reserve(permit.logical()) {
+            KeyedAdmission::Granted(gate) => gate,
+            KeyedAdmission::Full => {
+                state.counters.queue_full += 1;
+                return Err(ColdRefused::QueueFull);
+            }
+            // The issuer mints each pair once below `COLD_IDENTITY_PAIRS_MAX`.
+            KeyedAdmission::Duplicate => unreachable!("a logical id minted twice"),
+        };
         let (logical, device) = state.issuer.mint(permit);
+        let (wait, hold) = gate.register_held();
         *state.pins.entry(file).or_insert(0) += 1;
         state.pending[class.index()].push_back(Intent {
             logical,
+            hold,
             device,
             fd,
             file,
@@ -977,8 +1031,7 @@ impl ColdReads {
         state.readiness = ColdReadiness::CpuPending;
         let depth = (state.pending[0].len() + state.pending[1].len()) as u32;
         state.counters.queue_depth_high_water = state.counters.queue_depth_high_water.max(depth);
-        drop(state);
-        Ok(self.gate.waiter(logical))
+        Ok(wait)
     }
 
     /// Admits queued intents to the device: merges (when enabled),
@@ -1080,10 +1133,11 @@ impl ColdReads {
         let ColdState { pending, pins, counters, issuer, .. } = state;
         for queue in pending.iter_mut() {
             while let Some(head) = queue.front() {
-                if gate.has_waiter(&head.logical) {
+                if gate.waiting(&head.hold) {
                     break;
                 }
                 let intent = queue.pop_front().expect("front observed");
+                gate.release(intent.hold);
                 ColdState::unpin(pins, intent.file);
                 counters.cancelled_queued += 1;
                 issuer.retire(intent.logical);
@@ -1134,7 +1188,7 @@ impl ColdReads {
             let ColdState { pending, pins, counters, merge_scratch, issuer, .. } = state;
             let queue = &mut pending[class];
             let seed = queue.pop_front().expect("picked class has a live head");
-            debug_assert!(gate.has_waiter(&seed.logical), "heads were purged");
+            debug_assert!(gate.waiting(&seed.hold), "heads were purged");
             // The read carries its seed's reserved device id (ADR-0181 R4).
             let device = seed.device;
             // Span ends come from `bytes_after`: at most `i64::MAX`, so the
@@ -1151,7 +1205,8 @@ impl ColdReads {
                 // original FIFO order.
                 for _ in 0..queue.len() {
                     let intent = queue.pop_front().expect("counted");
-                    if !gate.has_waiter(&intent.logical) {
+                    if !gate.waiting(&intent.hold) {
+                        gate.release(intent.hold);
                         ColdState::unpin(pins, intent.file);
                         counters.cancelled_queued += 1;
                         issuer.retire(intent.logical);
@@ -1183,13 +1238,18 @@ impl ColdReads {
             }
             device
         };
-        Self::issue(state, device, buf)
+        Self::issue(state, gate, device, buf)
     }
 
     /// Builds the merged window's device read under `device`, the seed's
     /// reserved id: each member's record written once from the union, the
     /// window Issued in the table, the device QD counted.
-    fn issue(state: &mut ColdState, device: DeviceId, buf: AlignedBufId) -> IoOp {
+    fn issue(
+        state: &mut ColdState,
+        gate: &KeyedGate<LogicalId, ColdDone>,
+        device: DeviceId,
+        buf: AlignedBufId,
+    ) -> IoOp {
         let buf_size = state.pool.buf_size();
         let ColdState { pool, inflight, counters, spare_waiters, merge_scratch, .. } = state;
         let (fd, file) = (merge_scratch[0].fd, merge_scratch[0].file);
@@ -1208,6 +1268,8 @@ impl ColdReads {
         let mut waiters = spare_waiters.pop().unwrap_or_default();
         debug_assert!(waiters.is_empty(), "spare lists come back drained");
         for intent in merge_scratch.drain(..) {
+            // The intent leaves the queue issued: its wait alone keeps the holder.
+            gate.release(intent.hold);
             waiters.push(Waiter {
                 logical: intent.logical,
                 skip: (intent.offset.bytes() - lo.bytes()) as u32,
@@ -1364,7 +1426,7 @@ impl ColdReads {
                     break;
                 }
             };
-            if self.gate.complete(step.logical, step.done) {
+            if self.gate.complete(step.logical, step.done) == Delivery::Delivered {
                 progress.delivered += 1;
                 let mut state = self.state.borrow_mut();
                 state.counters.delivered += 1;
@@ -1559,6 +1621,14 @@ impl ColdReads {
         self.state.borrow().identity_refusals
     }
 
+    /// `enqueue`s the gate refused for no free route or holder
+    /// (`cold_gate_full`, cell scope, cumulative): derived never while its
+    /// cap is its product (ADR-0177 D4).
+    #[must_use]
+    pub fn cold_gate_full(&self) -> u64 {
+        self.gate.full()
+    }
+
     /// The in-flight device-read cap (ADR-0055 D2) — the most intents one
     /// command should have queued before it suspends (`SCAN`'s chunk).
     #[must_use]
@@ -1715,11 +1785,18 @@ mod tests {
     const FRAME: u64 = inf_alloc::TIER_READ_ALIGN as u64;
 
     fn path(buffers: usize) -> ColdReads {
-        ColdReads::new(AlignedPool::new(buffers, BUF))
+        ColdReads::new(
+            AlignedPool::new(buffers, BUF),
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        )
     }
 
     fn shaped(buffers: usize, config: ColdReadConfig) -> ColdReads {
-        ColdReads::with_config(AlignedPool::new(buffers, BUF), config)
+        ColdReads::with_config(
+            AlignedPool::new(buffers, BUF),
+            config,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        )
     }
 
     /// Enqueue at t=0, foreground (the common shape in these tests).
@@ -2982,6 +3059,16 @@ mod tests {
         }
     }
 
+    /// The cold gate's holder slot: the keyed rows price its slab ops on the
+    /// holder legs' 64 B slot while it stays within 7 words more, 120 B;
+    /// past that its own legs are owed at its stride.
+    #[test]
+    fn the_cold_gates_holder_slot_fits_the_legs_it_is_priced_on() {
+        let slot = KeyedGate::<LogicalId, ColdDone>::HOLDER_SLOT_BYTES;
+        eprintln!("stride cold holder: {slot} B (bound 120 B)");
+        assert!(slot <= 120, "the cold gate's holder slot is {slot} B, above 120 B");
+    }
+
     /// The receipt-facing state a foreign receipt must leave as it was: the
     /// device QD, the ready list's ends and pending counts, the readiness,
     /// each window's phase, cursor, members and link, and each shared
@@ -3166,5 +3253,76 @@ mod tests {
         }
         drop(ops);
         assert_eq!(cold.reconcile(), Ok(()), "every value dropped: custody is back");
+    }
+
+    /// A cold host's whole draw on its gate at once: `reads` reads in flight
+    /// or delivered, each of `overflow_cap` members (one file a read), their
+    /// values unpolled, so every member's holder is held.
+    fn fill_reads(cold: &ColdReads, reads: usize, overflow_cap: usize) -> Vec<ColdWait> {
+        let mut members = Vec::with_capacity(reads * overflow_cap);
+        let mut ops = Vec::with_capacity(reads);
+        for read in 0..reads {
+            let fd = 1_000 + RawFd::try_from(read).expect("a small descriptor");
+            let file = TierFileId::new(10_000 + u32::try_from(read).expect("a small file"));
+            members.extend((0..overflow_cap).map(|_| ask(cold, fd, file, 0, 8)));
+            let issued = drain_ops(cold);
+            assert_eq!(issued.len(), 1, "read {read}: one window of {overflow_cap} members");
+            ops.extend(issued);
+        }
+        for op in ops {
+            let token = complete(op, 0x5A);
+            assert_eq!(deliver_all(cold, token, Ok(()), 1), overflow_cap as u32);
+        }
+        members
+    }
+
+    /// The cap's worst case at the default shape (ADR-0177 D4): `P` = 64 reads of
+    /// `overflow_cap` = 256 members delivered and unpolled, and both class
+    /// queues full, hold every one of the cap's 16,896 holders; the gate
+    /// refuses none. A cap one term short refuses here.
+    #[test]
+    fn the_cold_gates_worst_case_fills_its_cap_and_refuses_none() {
+        let (census, _mark) = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0));
+        let config = ColdReadConfig::default();
+        let (reads, overflow_cap) = (64, config.overflow_cap);
+        let cold = ColdReads::with_config(AlignedPool::new(reads, BUF), config, &census);
+        let mut held = fill_reads(&cold, reads, overflow_cap);
+        for (class, file) in [(ReadClass::Foreground, 20_000), (ReadClass::Maintain, 20_001)] {
+            let file = TierFileId::new(file);
+            for at in 0..overflow_cap as u64 {
+                let wait = cold.enqueue(7, file, at * 4 * FRAME, 8, class, 2);
+                held.push(wait.expect("both queues fill with no refusal"));
+            }
+        }
+        let row = census.row("cold-gate-holders").expect("the cold gate's census row");
+        assert_eq!(row.high_water, 16_896, "every holder of the cap held at once");
+        assert_eq!(cold.cold_gate_full(), 0, "cold_gate_full: the worst case refuses none");
+        assert_eq!(cold.counters().queue_full, 0);
+        drop(held);
+    }
+
+    /// At `COLD-READ-QD` 128's shape (`P` 128, `overflow_cap` 512) the product
+    /// passes the ceiling, so the cap is 65,536 and 128 reads of 512 members
+    /// fill it: the next request is refused `QueueFull` at the gate, counted in
+    /// `queue_full` and `cold_gate_full`, and leaves nothing else (ADR-0177 D4):
+    /// no intent queued, no pin, the issuer where it was.
+    #[test]
+    fn a_full_cold_gate_refuses_like_a_full_queue() {
+        let (census, _mark) = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0));
+        let config = ColdReadConfig { qd_cap: 128, overflow_cap: 512, ..ColdReadConfig::default() };
+        let cold = ColdReads::with_config(AlignedPool::new(128, BUF), config, &census);
+        let held = fill_reads(&cold, 128, 512);
+        let row = census.row("cold-gate-holders").expect("the cold gate's census row");
+        assert_eq!(row.high_water, 65_536, "engagement: the cap's every holder is held");
+        let file = TierFileId::new(30_000);
+        let before = footprint(&cold, file);
+        let refused = cold.enqueue(9, file, 0, 8, ReadClass::Foreground, 3);
+        assert!(matches!(refused, Err(ColdRefused::QueueFull)), "a full gate refuses");
+        let after = footprint(&cold, file);
+        let counted = ColdReadCounters { queue_full: before.0.queue_full + 1, ..before.0 };
+        assert_eq!(after.0, counted, "queue_full counts the refusal, nothing else moves");
+        assert_eq!((after.1, after.2, after.3), (before.1, before.2, before.3), "nothing queued");
+        assert_eq!(cold.cold_gate_full(), 1, "cold_gate_full counts the refusal");
+        drop(held);
     }
 }

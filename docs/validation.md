@@ -236,10 +236,20 @@ benchmark's files and every input its copy compiles from checked identical
 before either builds. A copy in the new build serves step 2's timing only,
 and its offset from the old build at the same source is reported beside it.
 A benchmark binary is not the server binary either: it can be built with
-other features and beside other code, so before a count is read the
-functions it measures are compared, instruction for instruction, with the
-same functions in the server binary built at the same revision, and a count
-read on code that differs is not the server's.
+other features and beside other code. So before a count is read, each
+function of the code under test that it measures, and that the server
+binary compiles from the same source at the same types, is compared,
+instruction for instruction, with that function in the server binary built
+at the same revision, or named in the result as not compared; a count read
+on code that differs is not the server's. A generic function that the
+benchmark builds at other types than the server has no counterpart there to
+compare. When every function of the code under test that the benchmark
+measures and a change moves is of that kind, the change's operations are
+compared instead by placement, what each one inlines and what it calls in
+each binary at that binary's own types, and the count is reported as
+resting on placement alone, since one function built at two types can
+differ inside its body; a generic function measured that neither comparison
+reaches is named in the result.
 
 Record which of these the conclusion rests on. A cross-binary timing result
 is context, not the verdict.

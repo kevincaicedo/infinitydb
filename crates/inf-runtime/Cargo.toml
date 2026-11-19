@@ -24,6 +24,12 @@ uring = ["dep:io-uring"]
 # prove they cost nothing; the iteration count stays, the cold turn's epoch
 # (ADR-0181 A1.3). Never enabled in shipping builds.
 no-tripwires = []
+# The fabric gate's test hooks (ADR-0194 A2's word at the field's edge): a
+# gate built with its holder slots at a chosen first generation, and its
+# count of takes past the key's generation field. Off in every shipping
+# build (scripts/check-shipping-features.sh); the simulator reaches it
+# through `inf-server/fault-points`, `just check` through the `gate` test.
+fault-points = ["inf-foundation/fault-points"]
 
 [dev-dependencies]
 # The timer set's last-generation tests reach the slab's test hook
@@ -120,3 +126,8 @@ required-features = ["uring"]
 name = "close_fd_reuse"
 path = "tests/close_fd_reuse.rs"
 required-features = ["uring"]
+
+# The fabric key past its generation field: needs the gate's first-generation hook.
+[[test]]
+name = "gate"
+required-features = ["fault-points"]

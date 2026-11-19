@@ -49,7 +49,7 @@ ReadWritePaths=/var/lib/infinitydb
 [Install]
 WantedBy=multi-user.target</pre>
 <ul class="dots">
-<li><strong><code>Restart=no</code> is a recommendation.</strong> The deliberate exits, a recovery refusal (exit 1), a durable fsync failure (exit 3) and a cell panic (exit 101), all mean the same thing: restarting will not help, and a loop hides the evidence. <a href="observability.html">Observability</a> explains each one.</li>
+<li><strong><code>Restart=no</code> is a recommendation.</strong> The deliberate exits, a recovery refusal (exit 1), a durable fsync failure (exit 3) and a cell panic (exit 101, or an abort by <code>SIGABRT</code>, status 134, when the panic is inside a cross-cell send), all mean the same thing: restarting will not help, and a loop hides the evidence. <a href="observability.html">Observability</a> explains each one.</li>
 <li><strong>A stop is graceful; a crash is still safe.</strong> On <code>SIGTERM</code> every cell stops admitting and drains, a durable cell publishes a stop checkpoint and its final sync, and the node exits 0: the next boot replays nothing. <code>--shutdown-timeout-ms</code> bounds the drain; when it expires the node exits 1 and names the phase. A second signal ends it at once.</li>
 </ul>
 

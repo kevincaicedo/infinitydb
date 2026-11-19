@@ -54,7 +54,7 @@ fn a_closed_subscriber_leaves_no_task_beside_its_slot() {
     }
     rig.rounds(8);
     assert_eq!(rig.closed(0).len(), SUBSCRIBERS, "engagement: every subscriber's close completed");
-    let held = rig.cells[0].plane.shared.gate.pending();
+    let held = rig.cells[0].plane.shared.gate.borrow().holders();
     assert!(held >= SUBSCRIBERS, "engagement: {held} deltas are unanswered, not {SUBSCRIBERS}");
     let live = rig.cells[0].reactor.executor().live_tasks();
     let occupied = rig.cells[0].plane.connections();
@@ -73,9 +73,6 @@ fn a_closed_subscriber_leaves_no_task_beside_its_slot() {
 /// fan); at HEAD the pump checks its window before the whole command and
 /// then sends a leg for every remote key.
 #[test]
-#[ignore = "a fan checks the connection's window of 32 remote legs once, before the command, \
-            then sends a leg and takes a gate holder per remote key; red until each leg takes \
-            one of the connection's 32 gate units and a sender with none settles its oldest leg"]
 fn a_remote_del_holds_at_most_its_window_of_gate_holders() {
     const KEYS: usize = 100;
     let mut rig = Rig::new(2);
@@ -86,12 +83,55 @@ fn a_remote_del_holds_at_most_its_window_of_gate_holders() {
     argv.extend(keys.iter().map(Vec::as_slice));
     rig.send(0, fd(0), &frame(&argv));
     rig.rounds(4);
-    let held = rig.cells[0].plane.shared.gate.pending();
+    let held = rig.cells[0].plane.shared.gate.borrow().holders();
     assert!(held >= 1, "engagement: the DEL sent no leg to the frozen owner");
+    let window = crate::limits::GATE_UNITS_PER_CONN_TASK as usize;
     assert!(
-        held <= REMOTE_WINDOW,
+        held <= window,
         "the gate holds {held} waiters for one connection's DEL of {KEYS} remote keys, past its \
-         window of {REMOTE_WINDOW}"
+         window of {window}"
     );
     assert!(rig.written(0, fd(0)).is_empty(), "no reply before the owner answers");
+}
+
+/// A node's fabric gate holds at most the key's index field, 2^24 holders (ADR-0177 D4): `H`
+/// at the field builds, one past it is `Layout`, before anything is built.
+#[test]
+fn the_gates_holders_stop_at_the_keys_index_field() {
+    let caps = crate::limits::plane_task_caps(1, 2).expect("one slot a cell");
+    let units = crate::limits::gate_units(&caps);
+    let credits = inf_runtime::limits::GATE_HOLDERS_MAX - units;
+    let at = crate::limits::gate_holders(&caps, 2, credits).expect("H = 2^24");
+    let at = at.expect("a gate at two cells");
+    assert_eq!(at.entries_max(), inf_runtime::limits::GATE_HOLDERS_MAX);
+    let past = crate::limits::gate_holders(&caps, 2, credits + 1);
+    assert!(matches!(past, Err(CapError::Layout)), "H = 2^24 + 1 is refused");
+}
+
+/// A node whose `H` passes the key's index field builds no plane: `PlaneBuildError::Gate`
+/// from the plane's build, before its executor allocates a slot. At two cells `C` = 2^19 + 1
+/// connection slots of 32 units pass 2^24 alone.
+#[test]
+fn a_node_whose_holders_pass_the_field_builds_no_plane() {
+    let cells = inf_foundation::CellCount::new(2).expect("two cells");
+    let capacity = crate::config::BootCapacity::new((1 << 20) + 2, cells).expect("C fits");
+    let config = crate::config::ConfigStore::default().with_boot_capacity(capacity);
+    let (node, admission) = NodeInfo::try_new(config).expect("fixture cache allocation");
+    let fabric = inf_fabric::Mesh::new(2, inf_fabric::MeshConfig::default());
+    let fabric = fabric.into_iter().nth(1).expect("cell 1");
+    let cfg = inf_store::StoreConfig::default();
+    let seed = KeyspaceSeed::Uncataloged { cfg, specs: Vec::new() };
+    let built: Result<(ServerPlane, _, _, _), _> = ServerPlane::new(
+        CellId(1),
+        2,
+        -1,
+        seed,
+        fabric,
+        Rc::new(node),
+        admission,
+        NoopObserver,
+        false,
+    );
+    let refused = built.err().expect("H past the field refuses the plane");
+    assert_eq!(refused, PlaneBuildError::Gate(CapError::Layout));
 }

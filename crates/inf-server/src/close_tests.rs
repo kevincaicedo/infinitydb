@@ -231,7 +231,7 @@ fn a_reset_connection_runs_its_queued_commands() {
     node.accept(0, CLIENT);
     node.accept(0, READER);
     node.freeze(1, true);
-    let held = node.keys_on(1, "held", REMOTE_WINDOW);
+    let held = node.keys_on(1, "held", crate::limits::GATE_UNITS_PER_CONN_TASK as usize);
     let key = node.key_on(0, "queued");
     let mut argv: Vec<&[u8]> = vec![b"DEL"];
     argv.extend(held.iter().map(Vec::as_slice));

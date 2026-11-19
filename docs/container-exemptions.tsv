@@ -16,11 +16,8 @@ crates/inf-runtime/src/cold.rs	fn ColdReads::with_config	5	C	2027-01-31
 crates/inf-runtime/src/cold.rs	fn ColdState::unpin	1	C	2027-01-31
 crates/inf-runtime/src/cold.rs	struct ColdState	4	C	2027-01-31
 crates/inf-runtime/src/cold.rs	use std::collections::{…}	2	C	2027-01-31
-crates/inf-runtime/src/gate.rs	fn KeyedGate::new	1	E	2026-12-31
 crates/inf-runtime/src/gate.rs	fn WaitList::new	1	E	2026-12-31
 crates/inf-runtime/src/gate.rs	fn wake_one_in	2	E	2026-12-31
-crates/inf-runtime/src/gate.rs	struct GateWait	1	E	2026-12-31
-crates/inf-runtime/src/gate.rs	struct KeyedGate	1	E	2026-12-31
 crates/inf-runtime/src/gate.rs	struct ListWait	2	E	2026-12-31
 crates/inf-runtime/src/gate.rs	struct WaitList	2	E	2026-12-31
 crates/inf-runtime/src/gate.rs	use std::collections::{…}	2	E	2026-12-31
@@ -36,9 +33,7 @@ crates/inf-runtime/src/uring.rs	fn UringDriver::new	6	D	2027-01-31
 crates/inf-runtime/src/uring.rs	struct UringDriver	6	D	2027-01-31
 crates/inf-runtime/src/uring.rs	use std::collections::{…}	2	D	2027-01-31
 crates/inf-server/src/plane.rs	fn ServerPlane::admit_accepted	1	A	2027-01-31
-crates/inf-server/src/plane.rs	fn ServerPlane::new	1	E	2026-12-31
 crates/inf-server/src/plane.rs	struct Conn	1	A	2027-01-31
-crates/inf-server/src/plane.rs	struct Shared	1	E	2026-12-31
 crates/inf-server/src/plane.rs	use std::collections::VecDeque	1	A	2027-01-31
 crates/inf-server/src/plane/dispatch.rs	fn dispatch_mirror	1	A	2027-01-31
 crates/inf-server/src/plane/dispatch.rs	fn dispatch_one	1	A	2027-01-31

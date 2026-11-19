@@ -852,7 +852,12 @@ fn a_ready_cold_window_keeps_the_loop_from_parking() {
     let per_turn = COLD_DELIVERIES_PER_TURN as usize;
     let members = 2 * per_turn + 2;
     let config = ColdReadConfig { qd_cap: 1, overflow_cap: members, ..ColdReadConfig::default() };
-    let cold = ColdReads::with_config(AlignedPool::new(1, 4 * inf_alloc::TIER_READ_ALIGN), config);
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+    let cold = ColdReads::with_config(
+        AlignedPool::new(1, 4 * inf_alloc::TIER_READ_ALIGN),
+        config,
+        &census,
+    );
     let file = TierFileId::new(9);
     let waits: Vec<_> = (0..members)
         .map(|_| cold.enqueue(-1, file, 0, 64, ReadClass::Foreground, 0).expect("the class's room"))
@@ -982,7 +987,12 @@ fn every_lend_of_an_iteration_shares_one_turn() {
     let members = 40usize;
     let config =
         ColdReadConfig { qd_cap: 2, overflow_cap: 2 * members, ..ColdReadConfig::default() };
-    let cold = ColdReads::with_config(AlignedPool::new(2, 4 * inf_alloc::TIER_READ_ALIGN), config);
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+    let cold = ColdReads::with_config(
+        AlignedPool::new(2, 4 * inf_alloc::TIER_READ_ALIGN),
+        config,
+        &census,
+    );
     let waits: Vec<_> = (0..2 * members)
         .map(|n| {
             let file = TierFileId::new(9 + u32::try_from(n / members).expect("two files"));

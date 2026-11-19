@@ -223,6 +223,11 @@ pub struct ConfigStore {
     /// it to push `hot-per-cell` keys (eviction pressure) without re-parsing
     /// the table each iteration (M1-E3).
     version: u64,
+    /// The first generation of the plane's fabric gate holders, so the
+    /// simulator's near-wrap leg reaches the key's generation field
+    /// (`fault-points` only).
+    #[cfg(feature = "fault-points")]
+    gate_first_generation: Option<u32>,
 }
 
 impl Default for ConfigStore {
@@ -320,6 +325,8 @@ impl Default for ConfigStore {
             entries,
             boot: BootCapacity::DEFAULT,
             version: 0,
+            #[cfg(feature = "fault-points")]
+            gate_first_generation: None,
             #[cfg(feature = "doc")]
             path_cache_capacity: inf_doc::limits::ProgramCacheCapacity::default(),
         }
@@ -345,6 +352,20 @@ impl ConfigStore {
     /// ADR-0177 D2). `cells` is the node's checked count, never 0.
     pub(crate) fn boot_share(&self, cells: u16) -> u32 {
         (self.boot.maxclients() / u32::from(cells.max(1))).max(1)
+    }
+
+    /// The plane's fabric gate built with every holder slot free at
+    /// `generation` (`fault-points` only): the near-wrap leg's gate.
+    #[cfg(feature = "fault-points")]
+    #[must_use]
+    pub fn with_gate_first_generation(mut self, generation: u32) -> Self {
+        self.gate_first_generation = Some(generation);
+        self
+    }
+
+    #[cfg(feature = "fault-points")]
+    pub(crate) fn gate_first_generation(&self) -> Option<u32> {
+        self.gate_first_generation
     }
 
     /// Assemble boot configuration with the node's boot capacity (ADR-0123

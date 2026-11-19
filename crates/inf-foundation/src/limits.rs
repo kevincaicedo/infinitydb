@@ -63,6 +63,22 @@ const _: () = assert!(CAP_CENSUS_ROWS_MAX <= 256, "a census row index fits a row
 /// built; a site that builds stores while serving derives its count.
 pub const CAP_CENSUS_SLABS_MAX: u16 = u16::MAX;
 
+/// Index bits of a fabric gate's key word (ADR-0177 D4: `tag:1 |
+/// generation:23 | index:24` in the fabric token's 48-bit sequence, the tag
+/// above both fields): a gate numbers at most 2²⁴ holders. Owner: the
+/// fabric gate, whose word adapter is built from its holder slab, and the
+/// mesh's token mint, which wraps below the tag. Crossing: a holder slab of
+/// more slots is refused `CapError::Layout` when the gate builds its
+/// adapter, at boot, before anything is served.
+pub const GATE_KEY_INDEX_BITS: u32 = 24;
+
+/// Generation bits of a fabric gate's key word (ADR-0177 D4): the low 23 bits
+/// of a holder's `u32` generation, which a reply's word is resolved by
+/// (ADR-0194 D6 with A2). Owner: the fabric gate. Crossing: none; the field
+/// wraps every 2²³ uses of a slot, and a reply aliasing a later occupant is
+/// a defect the holder slab's `WrapWithProof` proof rules out, never reuse.
+pub const GATE_KEY_GENERATION_BITS: u32 = 23;
+
 /// Bytes one backing allocation of a capped container requests: a deque's
 /// one allocation, a slab's or a map's chunk or directory (ADR-0151 D5).
 /// Owner: the capped types. Crossing: a shape whose allocation passes it is

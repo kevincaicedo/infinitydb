@@ -1153,10 +1153,10 @@ ordered_rows=(
   "inf_canary_conn_slot_frees_at_closed m0-capacity conn-tasks-unequal --close-leg close"
   # The `conn` class's slots are the cell's share (ADR-0177 D2) and its bytes E-store's F7 bill.
   # Planted, it is built over (1 + k) C slots, k from its stride: the idle node's resident
-  # memory a cell rises by k x C x s_conn, 2,500 x 3,048 B at 4 cells (k = 1), over F7's
+  # memory a cell rises by k x C x s_conn, 2,500 x 3,104 B at 4 cells (k = 1), over F7's
   # 256 KiB, which the plain node's three boots stay within. The bytes are that product at the
   # stride the plane's layout test prints; a stride that moves moves them with it.
-  "inf_canary_conn_slots_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 7620000 --control-bytes-cell 262144 --plant-row conn-tasks"
+  "inf_canary_conn_slots_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 7760000 --control-bytes-cell 262144 --plant-row conn-tasks"
   # A finished conn task's header is reclaimed once no waker names it, so a settled node holds no
   # Retired conn header (O1's leak clause). Planted, the pump keeps a clone of its own waker past
   # its return: the reset client's header stays Retired with every per-step clause green.
@@ -1211,6 +1211,24 @@ ordered_rows=(
   # A flushing slot is written no message published after its mark (ADR-0196 D4). Planted, the
   # delivery writes into it, and a message follows the subscriber's +OK.
   "inf_canary_flushing_takes_delivery m0-capacity push-after-quit --close-leg quit-subscriber"
+  # A fabric holder whose waiter drops waits, Orphaned, for its request's one completion, so no
+  # completion finds a later occupant (ADR-0177 D4). Planted, it frees at the drop. The crate test
+  # polls a wait to Waiting, drops it and counts the holders beside the key it kept. The scenario
+  # reaches the row from the wire: a fan of reads answers at its first failed leg and drops the
+  # rest, so a namespace KEYS whose first peer lacks the namespace drops the held peer's wait
+  # with its request out; planted, the late reply finds the slot at its next generation, and the
+  # report reads the stale completion.
+  "inf_canary_gate_frees_on_drop crate-test inf-runtime lib an_orphaned_holder_frees_at_its_late_completion orphan-freed-at-drop"
+  "inf_canary_gate_frees_on_drop m0-capacity gate-stale --close-leg orphan"
+  # The fabric gate's holders are resident from its build (ADR-0177 D8 with A1), billed by F7.
+  # Planted, the gate is built over 2 H: the idle node's resident memory a cell rises by H x
+  # s_h, 83,075 x 48 B at 4 cells, over F7's 256 KiB. The bytes are that product at the stride
+  # the plane's layout test prints; a stride that moves moves them with it.
+  "inf_canary_gate_holders_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 3987600 --control-bytes-cell 262144 --plant-row fabric-gate-holders"
+  # A fabric reserve takes one of its task's units, so a fan wider than 32 legs runs in windows
+  # and the share's fans stay within the gate's holders (ADR-0177 D4). Planted, it grants
+  # without a unit: each fan holds a holder a leg until its last is sent, and the gate fills.
+  "inf_canary_gate_units_unbounded m0-capacity gate-full --close-leg fan"
   # An `always` apply whose verdict is a reply drops its gated ticket, which releases its slot
   # (ADR-0177 D6), so its origin's next apply opens one. Planted, the drop releases nothing, the
   # error's slot stays at the origin's back, and the next write's open stops the cell.
@@ -1236,6 +1254,14 @@ ordered_rows=(
   # arm, where the escaped clone must keep the finished task Retired.
   "inf_canary_header_reused_with_wakers crate-test inf-runtime test:waker_threads a_retired_slot_is_never_reused_while_a_waker_names_its_header no stale clone activates the new occupant"
   "inf_canary_header_reused_with_wakers crate-test inf-runtime test:executor escaped_waker_clone_on_fast_path_is_harmless the escaped clone keeps the finished task Retired"
+  # A keyed wait dropped under its queue's hold keeps its slot until the hold is released
+  # (ADR-0177 D4), so the hold reads that slot and no later occupant. Planted, the drop frees the
+  # slot at once, and the gate holds one slot fewer than the model.
+  "inf_canary_keyed_hold_frees_on_drop crate-test inf-runtime lib the_keyed_gate_holds_what_its_model_holds slots-held"
+  # A dropped keyed wait takes its route and its stored waker in the same step (ADR-0177 D4).
+  # Planted, the drop leaves both: the hold reads it waiting, the routes fill, and a gate of 8
+  # answers full.
+  "inf_canary_keyed_route_kept_on_drop crate-test inf-runtime lib a_dropped_keyed_wait_leaves_no_route route-kept-on-drop"
   # MAINTAIN takes a compaction or shadow read only by spending a slot of its class's room, and
   # counts a namespace the room cannot serve (ADR-0177 D2), which no simulated run reaches: every
   # life's census reads the count 0. Planted, the room reads short at every pass, and the
@@ -1247,6 +1273,10 @@ ordered_rows=(
   # The mark of a slot whose receive is disarmed pushes one RecvArm (ADR-0196 A1.3). Planted, it
   # pushes none.
   "inf_canary_mark_keeps_disarmed crate-test inf-server lib mark_rearms_a_disarmed_receive no-rearm-at-mark"
+  # A named reservation dropped unpublished advances its slot's generation (ADR-0194 D1 with
+  # A2), so the handle it named names no later occupant. Planted, the drop keeps the
+  # generation, and the next named reservation of the slot names the same handle.
+  "inf_canary_named_drop_keeps_generation crate-test inf-foundation lib a_dropped_named_reservation_names_no_later_occupant id-reused"
   # The net's own invariant: no chunk of an fd is posted after its end of stream. Its close
   # legs' shared reap posts a closed client's last chunk and its EOF in one reap, data first;
   # planted, the EOF goes first and the chunk after it.
@@ -1317,6 +1347,13 @@ ordered_rows=(
   # a positive result. Planted, a zero result re-arms it too, and the half-closed socket posts
   # a second zero-length Recv.
   "inf_canary_uring_eof_rearms crate-test inf-runtime/uring test:driver_conformance eof_ends_the_receive recv-after-eof"
+  # A word resolves its slot by the generation bits it carries, the low bits of the occupant's
+  # (ADR-0194 D6 with A2). Planted, the whole generation is compared with the field, and from
+  # a slot's 2²³-th use its word reads Stale.
+  "inf_canary_word_resolve_unmasked crate-test inf-foundation lib a_word_resolves_its_slot_past_the_field_width key-stale-past-width"
+  # The same plant at the shipped topology: every cell's fabric holders start two uses short of
+  # the key's generation field, so a fan's word past it resolves stale and its reply is lost.
+  "inf_canary_word_resolve_unmasked m0-capacity fan-reply-lost --close-leg holder-near-wrap"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
   # A fixture's table is ordered whole.

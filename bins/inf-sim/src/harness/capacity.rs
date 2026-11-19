@@ -36,6 +36,8 @@ use crate::resp::reply_len;
 use crate::state::StateHash;
 
 mod gated;
+mod near_wrap;
+mod orphan;
 mod small_credit;
 
 /// The legs, each one row of `scripts/sim-smoke.sh` or one pinned red.
@@ -101,11 +103,20 @@ pub enum CloseLeg {
     /// An `always` `INCR` that errors, read under the held fsync, then a
     /// flat `always` `SET`, acked after the hold.
     GatedError,
+    /// Every cell's fabric holders built at the generation two short of the
+    /// key's 23-bit field, on a mesh of 8 credits: rounds of `MGET`s of 32
+    /// keys a peer owns, each a fan of 32 legs, carry every slot's word past
+    /// the field. Every reply is exact and in order.
+    HolderNearWrap,
+    /// A namespace `KEYS` on cell 0 whose first peer lacks the namespace,
+    /// its second held: the reply is the first peer's error, and the
+    /// dropped leg's holder waits, Orphaned, for its late reply.
+    Orphan,
 }
 
 impl CloseLeg {
     /// Every leg, in the order the help text lists them.
-    pub const ALL: [CloseLeg; 20] = [
+    pub const ALL: [CloseLeg; 22] = [
         CloseLeg::Tasks,
         CloseLeg::Fan,
         CloseLeg::Close,
@@ -126,6 +137,8 @@ impl CloseLeg {
         CloseLeg::GatedHold,
         CloseLeg::GatedCold,
         CloseLeg::GatedError,
+        CloseLeg::HolderNearWrap,
+        CloseLeg::Orphan,
     ];
 
     /// The legs red at this tree. Each runs in one ignored test of `reds`,
@@ -133,7 +146,7 @@ impl CloseLeg {
     /// green leg leaves this table for its `scripts/sim-smoke.sh` row, where
     /// it runs with its twin; `tests/lanes.rs` holds every leg to one of the
     /// two.
-    pub const PINNED_RED: &'static [CloseLeg] = &[CloseLeg::Fan];
+    pub const PINNED_RED: &'static [CloseLeg] = &[];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -158,6 +171,8 @@ impl CloseLeg {
             CloseLeg::GatedHold => "gated-hold",
             CloseLeg::GatedCold => "gated-cold",
             CloseLeg::GatedError => "gated-error",
+            CloseLeg::HolderNearWrap => "holder-near-wrap",
+            CloseLeg::Orphan => "orphan",
         }
     }
 
@@ -251,6 +266,8 @@ struct Rig {
     step_ns_max: u64,
     /// The cell whose iterations are skipped: its replies are held.
     held: Option<usize>,
+    /// Each cell's loop iterations the harness ran.
+    iterations: Vec<u64>,
     clients: Vec<Client>,
     steps: u64,
     trace: Vec<u8>,
@@ -275,29 +292,36 @@ impl Rig {
     /// The same, each cell's keyspace also holding `namespaces`, created
     /// uncataloged at boot.
     fn with_namespaces(seed: u64, maxclients: u32, step_ns_max: u64, namespaces: &[NsSpec]) -> Rig {
+        let each = [namespaces; CELLS as usize];
+        Rig::with_setup(seed, maxclients, step_ns_max, each, FROZEN_MESH, None)
+    }
+
+    /// The same with each cell's own `namespaces`, in cell order, on
+    /// `mesh`, each cell's fabric holders built free at `first_generation`
+    /// when one is named.
+    fn with_setup(
+        seed: u64,
+        maxclients: u32,
+        step_ns_max: u64,
+        namespaces: [&[NsSpec]; CELLS as usize],
+        mesh: inf_fabric::MeshConfig,
+        first_generation: Option<u32>,
+    ) -> Rig {
         let clock = Rc::new(VirtualClock::new(Nanos(1)));
         let mut cells = Vec::new();
         let mut nets = Vec::new();
         let mut nodes = Vec::new();
-        for (i, fabric) in Mesh::new(CELLS, FROZEN_MESH).into_iter().enumerate() {
+        for (i, fabric) in Mesh::new(CELLS, mesh).into_iter().enumerate() {
             let cell = u16::try_from(i).expect("a u16 cell");
             let net = CellNet::new(cell, seed, Plant::None);
-            // `maxclients` is the node's boot capacity, as `infinityd
-            // --maxclients` sets it (ADR-0123 A1).
-            let mut config = inf_server::ConfigStore::default();
-            if maxclients != 0 {
-                let cells = inf_foundation::CellCount::new(CELLS).expect("three cells");
-                let capacity = inf_server::BootCapacity::new(maxclients, cells)
-                    .expect("a leg's boot capacity");
-                config = config.with_boot_capacity(capacity);
-            }
+            let config = leg_config(maxclients, first_generation);
             let (node, admission) = NodeInfo::try_new(config).expect("fixture cache allocation");
             let node = Rc::new(node);
             node.rng_state.set(seed ^ (0xCA9A_0000 + i as u64));
             nodes.push(Rc::clone(&node));
             let seed_store = KeyspaceSeed::Uncataloged {
                 cfg: StoreConfig { hasher: node_hasher(seed), ..Default::default() },
-                specs: namespaces.to_vec(),
+                specs: namespaces[i].to_vec(),
             };
             let (plane, serve_mark, timer_set, executor) = Plane::new(
                 CellId(cell),
@@ -334,6 +358,7 @@ impl Rig {
             rng: SplitMix64::new(seed ^ 0xCA9A_C17E),
             step_ns_max,
             held: None,
+            iterations: vec![0; usize::from(CELLS)],
             clients: Vec::new(),
             steps: 0,
             trace: Vec::new(),
@@ -374,6 +399,7 @@ impl Rig {
             }
             let (cell_loop, plane) = &mut self.cells[index];
             cell_loop.run_iteration(plane).expect("sim iteration");
+            self.iterations[index] += 1;
         }
         if let Some(most) = self.tasks_most.as_mut() {
             for (cell, (cell_loop, _)) in self.cells.iter().enumerate() {
@@ -564,8 +590,9 @@ impl Rig {
     }
 
     /// The leg's report: every cell's cap census judged after its last
-    /// iteration (the cap bound, the assembly rule and their liveness), and
-    /// the state hash over the readings and every cell's keyspace.
+    /// iteration (the cap bound, the assembly rule, their liveness and the
+    /// gates' derived counts), and the state hash over the readings and
+    /// every cell's keyspace.
     fn report(mut self, leg: CloseLeg) -> CapacityReport {
         self.violations.extend(self.owners.take_violations());
         // No op refused at a full per-origin deque (ADR-0177 D6; derived
@@ -584,6 +611,9 @@ impl Rig {
                 tiered_tables: plane.keyspace().tiered_tables(),
                 turn_refused: plane.durable_stats().map(|stats| stats.turn_refused),
                 maint_paced: self.nodes[index].tier_maint_task_waits.get(),
+                gate_full: plane.gate_full(),
+                gate_stale: plane.gate_stale(),
+                cold_gate_full: plane.cold_gate_full(),
             };
             census.judge(index, plane.cap_census(), facts);
         }
@@ -638,6 +668,27 @@ fn names_on(owner: usize, stem: &str, count: usize) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// A leg node's configuration: `maxclients` its boot capacity, as `infinityd --maxclients`
+/// sets it (ADR-0123 A1), and the fabric holders' first generation when one is named.
+fn leg_config(maxclients: u32, first_generation: Option<u32>) -> inf_server::ConfigStore {
+    let mut config = inf_server::ConfigStore::default();
+    if maxclients != 0 {
+        let cells = inf_foundation::CellCount::new(CELLS).expect("three cells");
+        let capacity =
+            inf_server::BootCapacity::new(maxclients, cells).expect("a leg's boot capacity");
+        config = config.with_boot_capacity(capacity);
+    }
+    // The plane's gate hook is `inf-server`'s `fault-points`, which `dst` forwards; the
+    // simulator runs only with `dst`.
+    #[cfg(feature = "dst")]
+    if let Some(first) = first_generation {
+        config = config.with_gate_first_generation(first);
+    }
+    #[cfg(not(feature = "dst"))]
+    let _ = first_generation;
+    config
+}
+
 /// `count` names spread over every cell, after `stem`.
 fn names_anywhere(stem: &str, count: usize) -> Vec<Vec<u8>> {
     (0..count).map(|n| format!("{stem}:{n}").into_bytes()).collect()
@@ -675,6 +726,8 @@ pub fn run_capacity_scenario(scenario: &CapacityScenario) -> CapacityReport {
         CloseLeg::GatedHold => return gated::gated_hold_leg(seed),
         CloseLeg::GatedCold => return gated::gated_cold_leg(seed),
         CloseLeg::GatedError => return gated::gated_error_leg(seed),
+        CloseLeg::HolderNearWrap => near_wrap::holder_near_wrap_leg(seed),
+        CloseLeg::Orphan => orphan::orphan_leg(seed),
     };
     rig.report(leg)
 }
@@ -885,21 +938,28 @@ impl Rig {
     }
 }
 
-/// The share's clients on cell 0 each send a `DEL` of 100 keys cell 1 owns
-/// while cell 1 is held: the remote legs the cell holds (gate waiters and
-/// credit waits) stay within the share's windows of 32; at HEAD each sends a
-/// leg per key. Then every reply is the exact count.
+/// The share's clients on cell 0 each send a `DEL` of 1,023 keys cell 1 owns, each client its
+/// own keys, set first, while cell 1 is held: the remote legs the cell holds (gate waiters and
+/// credit waits) stay within the share's windows of 32, then every reply is the exact count. A
+/// fan with no window holds a holder for each leg until it has sent its last, so the share's
+/// fans pass the gate's holders (`gate-full`).
 fn fan_leg(seed: u64) -> Rig {
-    const KEYS: usize = 100;
+    const KEYS: usize = 1_023;
     let mut rig = Rig::new(seed, (SHARE * usize::from(CELLS)) as u32, 15_000);
     let fanners: Vec<usize> = (0..SHARE).map(|_| rig.admitted(X)).collect();
+    let writer = rig.admitted(Y);
+    let keys: Vec<Vec<Vec<u8>>> =
+        (0..SHARE).map(|n| names_on(Y, &format!("fan:{n}"), KEYS)).collect();
+    for names in &keys {
+        let owed = rig.clients[writer].replies.len() + names.len();
+        rig.send(writer, &sets(names));
+        rig.until("the fan keys' SETs", |rig| rig.clients[writer].replies.len() >= owed);
+    }
     rig.held = Some(Y);
-    let keys = names_on(Y, "fan", KEYS);
-    let mut argv: Vec<&[u8]> = vec![b"DEL"];
-    argv.extend(keys.iter().map(Vec::as_slice));
-    let del = encode(&argv);
-    for &id in &fanners {
-        rig.send(id, &del);
+    for (&id, names) in fanners.iter().zip(&keys) {
+        let mut argv: Vec<&[u8]> = vec![b"DEL"];
+        argv.extend(names.iter().map(Vec::as_slice));
+        rig.send(id, &encode(&argv));
     }
     rig.until("the fans' bytes taken", |rig| {
         fanners.iter().all(|&id| rig.nets[X].borrow().unread(rig.fd(id)) == Some(0))
@@ -919,8 +979,9 @@ fn fan_leg(seed: u64) -> Rig {
     rig.until("the fans' replies", |rig| {
         fanners.iter().all(|&id| rig.clients[id].replies.len() > 1)
     });
+    let count = format!(":{KEYS}\r\n").into_bytes();
     for &id in &fanners {
-        rig.judge_replies(id, 1, &[DEL_NONE.to_vec()], "a fan");
+        rig.judge_replies(id, 1, core::slice::from_ref(&count), "a fan");
     }
     rig.settle();
     if held == 0 {
@@ -1519,6 +1580,7 @@ mod reds {
     /// its test's ignore reason names; green, it fails too, since a green leg
     /// leaves `CloseLeg::PINNED_RED` for its smoke row: an ignore removed
     /// never runs a leg in this lane, unchecked by its twin.
+    #[allow(dead_code, reason = "no leg is pinned red at this tree; a red leg's test calls it")]
     fn pinned_red(leg: CloseLeg) {
         let name = leg.name();
         assert!(CloseLeg::PINNED_RED.contains(&leg), "--close-leg {name}: not a pinned red");
@@ -1529,12 +1591,5 @@ mod reds {
             "m0-capacity --close-leg {name} reads green: it leaves CloseLeg::PINNED_RED for its \
              scripts/sim-smoke.sh row"
         );
-    }
-
-    #[test]
-    #[ignore = "a fan sends a leg per remote key past the connection's window of 32; red until \
-                each leg takes one of the connection's gate units"]
-    fn the_fan_leg_holds_a_window_per_connection() {
-        pinned_red(CloseLeg::Fan);
     }
 }

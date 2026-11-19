@@ -35,7 +35,10 @@ cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 
 BANNED='collision-oracle|fault-points|test-support'
 # Resolver rows: `<package>:<its banned features>`.
-FENCED=('inf-foundation:collision-oracle|fault-points' 'inf-store:collision-oracle|test-support')
+# `inf-runtime` and `inf-server` forward `fault-points` (the fabric gate's
+# first-generation hook and wrap count): fenced the same way.
+FENCED=('inf-foundation:collision-oracle|fault-points' 'inf-store:collision-oracle|test-support'
+    'inf-runtime:fault-points' 'inf-server:fault-points')
 fail=0
 
 manifests=()

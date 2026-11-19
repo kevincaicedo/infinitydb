@@ -9,6 +9,9 @@ use inf_store::{Keyspace, StoreConfig};
 
 use super::*;
 
+/// A connection task's gate units.
+const GATE_UNITS: u32 = crate::limits::GATE_UNITS_PER_CONN_TASK;
+
 /// Snapshot framing must be complete before any destination write.
 #[test]
 fn malformed_snapshot_never_reaches_destination() {
@@ -324,8 +327,10 @@ impl Rig {
             _ => unreachable!("the move fixture accepts only move commands"),
         };
         let argv: &[&[u8]] = &[verb, &self.source, &self.target];
+        let units = self.planes[0].shared.gate.borrow().units(GATE_UNITS).expect("a task's units");
         let mut future = Box::pin(program_move(
             &self.planes[0].shared,
+            &units,
             ExecOrigin::Conn(0, 0),
             Protocol::Resp2,
             0,
@@ -368,8 +373,10 @@ impl Rig {
                     } else {
                         OwnedOutcome::Reply(reply)
                     };
-                    assert!(
-                        self.planes[usize::from(from.0)].shared.gate.complete(token.0, outcome)
+                    let gate = &self.planes[usize::from(from.0)].shared.gate;
+                    assert_eq!(
+                        FabricGate::complete(gate, token.0, outcome, Nanos(0)),
+                        Delivery::Delivered
                     );
                 }
             }

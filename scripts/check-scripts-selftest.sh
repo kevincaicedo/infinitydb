@@ -2491,6 +2491,30 @@ IFS= read -r -d '' body <<'EOF' || true
 [package]
 name = "fake"
 
+[dependencies]
+inf-runtime = { workspace = true, features = ["fault-points"] }
+EOF
+root=$(printf '%s' "$body" | manifest ship-runtime)
+expect red "shipping: a normal edge requests inf-runtime's fault-points forwarder" env INF_CHECK_ROOT="$root" $SHIP
+
+IFS= read -r -d '' body <<'EOF' || true
+[package]
+name = "fake"
+
+[features]
+default = ["near-wrap"]
+near-wrap = ["inf-server/fault-points"]
+
+[dependencies]
+inf-server = { workspace = true }
+EOF
+root=$(printf '%s' "$body" | manifest ship-server)
+expect red "shipping: a default reaches inf-server's fault-points forwarder" env INF_CHECK_ROOT="$root" $SHIP
+
+IFS= read -r -d '' body <<'EOF' || true
+[package]
+name = "fake"
+
 [dependencies.inf-foundation]
 workspace = true
 features = ["fault-points"]
@@ -2562,6 +2586,60 @@ inf-store = { workspace = true, features = ["test-support"] }
 EOF
 root=$(printf '%s' "$body" | manifest ship-test-support-dev)
 expect green "shipping: test-support declared, and requested on a dev edge only" env INF_CHECK_ROOT="$root" $SHIP
+
+# The resolver pass reads `cargo tree`, which no fixture root reaches: a stub
+# `cargo` on PATH answers each `-i <package>` with the package resolved and,
+# only when `-e` carries `features`, a planted feature enabled: on the
+# workspace's graph `<package>:<feature>` (SHIP_PLANT), on one shipping
+# package's own graph `<shipping package>/<package>:<feature>`
+# (SHIP_PLANT_ONE, read under `-p`). The manifests are the tree's own. One
+# red per fenced feature on the workspace's graph, so a misspelled `FENCED`
+# row matches nothing and reads OK no more, and one per shipping package on
+# its own graph, so its arm's pattern and package list go red when broken.
+mkdir -p "$work/ship-cargo"
+cat >"$work/ship-cargo/cargo" <<'STUB'
+#!/usr/bin/env bash
+package="" shipping="" edges="" workspace=0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -i) package=$2; shift ;;
+        -p) shipping=$2; shift ;;
+        -e) edges=$2; shift ;;
+        --workspace) workspace=1 ;;
+    esac
+    shift
+done
+echo "$package v0.0.0 (/fixture)"
+case ",$edges," in
+    *,features,*) ;;
+    *) exit 0 ;;
+esac
+if [ "$workspace" -eq 1 ] && [ "${SHIP_PLANT%%:*}" = "$package" ]; then
+    echo "├── $package feature \"${SHIP_PLANT#*:}\""
+fi
+one=${SHIP_PLANT_ONE#*/}
+if [ -n "$shipping" ] && [ "${SHIP_PLANT_ONE%%/*}" = "$shipping" ] \
+    && [ "${one%%:*}" = "$package" ]; then
+    echo "├── $package feature \"${one#*:}\""
+fi
+STUB
+chmod +x "$work/ship-cargo/cargo"
+expect green "shipping: the resolver pass reads a clean graph" \
+    env -u INF_CHECK_ROOT PATH="$work/ship-cargo:$PATH" SHIP_PLANT= SHIP_PLANT_ONE= $SHIP
+for plant in inf-foundation:collision-oracle inf-foundation:fault-points \
+    inf-store:collision-oracle inf-store:test-support inf-runtime:fault-points \
+    inf-server:fault-points; do
+    expect_red_because "shipping: the resolver pass reads $plant enabled" \
+        "enables a banned ${plant%%:*} feature" \
+        env -u INF_CHECK_ROOT PATH="$work/ship-cargo:$PATH" SHIP_PLANT="$plant" \
+        SHIP_PLANT_ONE= $SHIP
+done
+for shipping in infinityd inf; do
+    expect_red_because "shipping: $shipping's own graph resolves inf-server:fault-points" \
+        "$shipping alone resolves a banned inf-server feature" \
+        env -u INF_CHECK_ROOT PATH="$work/ship-cargo:$PATH" SHIP_PLANT= \
+        SHIP_PLANT_ONE="$shipping/inf-server:fault-points" $SHIP
+done
 }
 
 # ------------------------------------------------ planted-bug canary driver
@@ -6453,7 +6531,7 @@ root=$(ls_root ls-probe)
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-unconfigured"
 grep -v 'path = "inf_foundation::bounded::DequeSlot"' clippy.toml >"$work/probe-await-unconfigured/clippy.toml"
 expect_red_because "lint-scopes: a config without the slot type" \
-    "config needs 9 distinct slot type await-holding-invalid-types, found 8" ls_probe "$work/probe-await-unconfigured"
+    "config needs 11 distinct slot type await-holding-invalid-types, found 10" ls_probe "$work/probe-await-unconfigured"
 cp -R "$SCRIPT_DIR/lint-scope-probe" "$work/probe-await-unconfigured-answer"
 grep -v 'path = "inf_foundation::bounded::Reserved"' clippy.toml >"$work/probe-await-unconfigured-answer/clippy.toml"
 expect_red_because "lint-scopes: a config without the answer that carries the slot" \

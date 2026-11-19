@@ -41,9 +41,9 @@ use crate::limits::{
 };
 
 // The window is a share of the connection's: one gather's legs in flight
-// never fill it alone.
+// never fill its task's gate units alone.
 const _: () = assert!(
-    JSON_GATHER_LEGS_IN_FLIGHT_MAX as usize <= REMOTE_WINDOW,
+    JSON_GATHER_LEGS_IN_FLIGHT_MAX <= crate::limits::GATE_UNITS_PER_CONN_TASK,
     "a gather's window fits the connection's"
 );
 // A leg is a subset of the client's argv, so the codec's argument cap holds
@@ -65,24 +65,24 @@ pub(super) struct GatherTarget {
 }
 
 /// The waiters of a gather's remote legs in flight, oldest first.
-pub(super) type Flight = CappedDeque<GateWait<u64, OwnedOutcome>, Reserve>;
+pub(super) type Flight<'u> = CappedDeque<GateWait<'u, OwnedOutcome>, Reserve>;
 
 /// A `JSON.MGET` gather pending its turn in the pipeline.
-pub(super) struct JsonGather {
+pub(super) struct JsonGather<'u> {
     proto: Protocol,
-    phase: Phase,
+    phase: Phase<'u>,
 }
 
-enum Phase {
+enum Phase<'u> {
     /// Every leg settled so far was admitted.
-    Open(Open),
+    Open(Open<'u>),
     /// A verdict fell: the reply is decided, and the legs still in flight
     /// are awaited and dropped before it is emitted.
-    Draining { reply: OwnedReply, flight: Flight },
+    Draining { reply: OwnedReply, flight: Flight<'u> },
 }
 
 /// The gather while every leg settled so far was admitted.
-pub(super) struct Open {
+pub(super) struct Open<'u> {
     plan: GatherPlan,
     /// The reply, its `*N` header written: the refusal lines are written
     /// into it after a `clear()`, and the served reply reuses its buffer.
@@ -98,8 +98,25 @@ pub(super) struct Open {
     kept: Vec<JsonMgetLeg>,
     /// Legs settled so far: the next leg to settle is `legs()[settled]`.
     settled: usize,
-    flight: Flight,
+    flight: Flight<'u>,
     limit: ReplyLimit,
+}
+
+/// The open gather as a send's window: a settled leg's verdict ends it.
+struct OpenWindow<'a, 'u> {
+    open: &'a mut Open<'u>,
+    proto: Protocol,
+}
+
+impl LegWindow for OpenWindow<'_, '_> {
+    type Stop = End;
+
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        shared: &Shared<O, F>,
+    ) -> Result<bool, End> {
+        self.open.settle_oldest(shared, self.proto).await
+    }
 }
 
 /// A leg its reader accepted: the reply and where its elements begin. Only
@@ -122,20 +139,20 @@ enum End {
 
 /// `JSON.MGET` with a remote key, from either dispatch site: one owner gets
 /// the whole argv; two or more are a gather (ADR-0173 D4).
-pub(super) async fn json_gather<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
-    shared: &Rc<Shared<O, F>>,
+pub(super) async fn json_gather<'u, O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &'u Rc<Shared<O, F>>,
+    units: &'u GateUnits,
     target: GatherTarget,
     meta: &'static inf_wire::CommandMeta,
     argv: &[&[u8]],
-    inflight: &mut usize,
-) -> PendingReply {
+) -> PendingReply<'u> {
     let plan = match split_by_owner(&shared.router, shared.cell, meta, argv) {
         OwnerSplit::One(owner) if owner == shared.cell => {
             return PendingReply::Done(local_leg(shared, target, argv).await);
         }
         OwnerSplit::One(owner) => {
             let GatherTarget { proto, db, scope, .. } = target;
-            return send_whole(shared, owner, proto, db, scope, argv, inflight).await;
+            return send_whole(shared, units, owner, proto, db, scope, argv).await;
         }
         OwnerSplit::Many(plan) => plan,
     };
@@ -143,7 +160,7 @@ pub(super) async fn json_gather<O: PlaneObserver + 'static, F: SegmentFs + Clone
         Ok(open) => open,
         Err(failed) => return PendingReply::Done(failed),
     };
-    let gather = open.send_legs(shared, target, argv, inflight).await;
+    let gather = open.send_legs(shared, units, target, argv).await;
     match gather.phase {
         Phase::Draining { reply, flight } if flight.is_empty() => PendingReply::Done(reply),
         phase @ (Phase::Open(_) | Phase::Draining { .. }) => {
@@ -166,7 +183,7 @@ async fn local_leg<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     }
 }
 
-impl Open {
+impl<'u> Open<'u> {
     /// The account read once from the addressed store, the reply opened with
     /// its header, the FIFO built: a FIFO that cannot be built answers the
     /// cross-cell failure line, with no leg run or sent. A namespace's
@@ -176,7 +193,7 @@ impl Open {
         shared: &Shared<O, F>,
         target: GatherTarget,
         plan: GatherPlan,
-    ) -> Result<Open, OwnedReply> {
+    ) -> Result<Open<'u>, OwnedReply> {
         let limit = match target.scope {
             ScatterScope::Db => {
                 let mut store = shared.store.borrow_mut();
@@ -196,7 +213,7 @@ impl Open {
         proto: Protocol,
         plan: GatherPlan,
         limit: ReplyLimit,
-    ) -> Result<Open, OwnedReply> {
+    ) -> Result<Open<'u>, OwnedReply> {
         let Ok(flight) = Flight::new(JSON_GATHER_LEGS, &shared.census) else {
             return Err(error_reply(shared, proto, CROSS_CELL_EXECUTION_FAILED));
         };
@@ -223,11 +240,11 @@ impl Open {
     /// sends; legs already in flight drain at the reply's turn.
     async fn send_legs<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         mut self,
-        shared: &Rc<Shared<O, F>>,
+        shared: &'u Rc<Shared<O, F>>,
+        units: &'u GateUnits,
         target: GatherTarget,
         argv: &[&[u8]],
-        inflight: &mut usize,
-    ) -> JsonGather {
+    ) -> JsonGather<'u> {
         let proto = target.proto;
         let mut leg_argv: Vec<&[u8]> = Vec::with_capacity(argv.len());
         for index in 0..self.plan.legs().len() {
@@ -243,21 +260,30 @@ impl Open {
                 }
                 continue;
             }
-            if let Err(end) = self.pace(shared, proto, inflight).await {
+            if let Err(end) = self.pace(shared, proto).await {
                 return JsonGather::draining(proto, self.end(shared, proto, end));
             }
             let GatherTarget { db, scope, .. } = target;
-            let waiter = match scatter_send(shared, leg.owner, proto, db, scope, &leg_argv).await {
+            // With every unit of the task out, the oldest leg settles first
+            // (ADR-0177 D4): the gather's own window is the units' share.
+            let window = &mut OpenWindow { open: &mut self, proto };
+            let sent = send_windowed(window, shared, async |_| {
+                scatter_send(shared, units, leg.owner, proto, db, scope, &leg_argv).await
+            })
+            .await;
+            let sent = match sent {
+                Ok(sent) => sent,
+                Err(end) => return JsonGather::draining(proto, self.end(shared, proto, end)),
+            };
+            let waiter = match sent {
                 Ok(waiter) => waiter,
-                Err(refusal) => {
+                Err(refused) => {
+                    let refusal = refused.into_reply(shared, proto);
                     return JsonGather::draining(proto, self.end(shared, proto, End::Leg(refusal)));
                 }
             };
             match self.flight.reserve() {
-                Reserved::Slot(slot) => {
-                    slot.publish(waiter);
-                    *inflight += 1;
-                }
+                Reserved::Slot(slot) => slot.publish(waiter),
                 // The gather alone fills its FIFO and `pace` made room, so
                 // this is unreachable; the waiter drops, leaving the gate.
                 Reserved::Full => {
@@ -276,18 +302,29 @@ impl Open {
         &mut self,
         shared: &Shared<O, F>,
         proto: Protocol,
-        inflight: &mut usize,
     ) -> Result<(), End> {
         loop {
             match self.flight.reserve() {
                 Reserved::Slot(_) => return Ok(()),
                 Reserved::Full => {}
             }
-            let Some(oldest) = self.flight.pop_front() else { return Ok(()) };
-            let outcome = oldest.await;
-            *inflight -= 1;
-            self.settle(shared, proto, outcome)?;
+            if !self.settle_oldest(shared, proto).await? {
+                return Ok(());
+            }
         }
+    }
+
+    /// Awaits and settles the oldest leg in flight; `Ok(false)` when none is.
+    /// `Err` is the verdict a settled leg's outcome gave.
+    async fn settle_oldest<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        &mut self,
+        shared: &Shared<O, F>,
+        proto: Protocol,
+    ) -> Result<bool, End> {
+        let Some(oldest) = self.flight.pop_front() else { return Ok(false) };
+        let outcome = oldest.await;
+        self.settle(shared, proto, outcome)?;
+        Ok(true)
     }
 
     /// Settles the next leg in leg order from its outcome: the one place a
@@ -342,7 +379,7 @@ impl Open {
         shared: &Shared<O, F>,
         proto: Protocol,
         end: End,
-    ) -> (OwnedReply, Flight) {
+    ) -> (OwnedReply, Flight<'u>) {
         for leg in self.kept.drain(..) {
             shared.recycle_reply_buf(leg.reply.into_bytes());
         }
@@ -401,19 +438,17 @@ impl Open {
     }
 }
 
-impl JsonGather {
-    fn draining(proto: Protocol, (reply, flight): (OwnedReply, Flight)) -> JsonGather {
+impl<'u> JsonGather<'u> {
+    fn draining(proto: Protocol, (reply, flight): (OwnedReply, Flight<'u>)) -> JsonGather<'u> {
         JsonGather { proto, phase: Phase::Draining { reply, flight } }
     }
 
     /// The reply at its turn: the legs still in flight settled in leg order
     /// (or, after a verdict, drained), then the served array or the verdict.
-    /// Every leg sent is awaited once, so `inflight` is back to its value
-    /// before the gather.
+    /// Every leg sent is awaited once, so each gives its unit back.
     pub(super) async fn finish<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         self,
         shared: &Shared<O, F>,
-        inflight: &mut usize,
     ) -> OwnedReply {
         let proto = self.proto;
         let (reply, mut flight) = match self.phase {
@@ -422,7 +457,6 @@ impl JsonGather {
                     return open.assemble(shared, proto);
                 };
                 let outcome = next.await;
-                *inflight -= 1;
                 if let Err(end) = open.settle(shared, proto, outcome) {
                     break open.end(shared, proto, end);
                 }
@@ -433,7 +467,6 @@ impl JsonGather {
             if let OwnedOutcome::Reply(dropped) = waiter.await {
                 shared.recycle_reply_buf(dropped.into_bytes());
             }
-            *inflight -= 1;
         }
         debug_assert!(flight.is_empty(), "every leg sent was awaited");
         reply
@@ -536,6 +569,7 @@ pub(super) mod test_support {
     /// on `waiters`, in leg order: what `send_legs` leaves when no leg is
     /// local.
     pub(in crate::plane) fn in_flight<
+        'u,
         O: PlaneObserver + 'static,
         F: SegmentFs + Clone + 'static,
     >(
@@ -543,8 +577,8 @@ pub(super) mod test_support {
         proto: Protocol,
         plan: GatherPlan,
         limit: ReplyLimit,
-        waiters: Vec<GateWait<u64, OwnedOutcome>>,
-    ) -> JsonGather {
+        waiters: Vec<GateWait<'u, OwnedOutcome>>,
+    ) -> JsonGather<'u> {
         let mut open =
             Open::with_limit(shared, proto, plan, limit).expect("the row fits the census");
         for waiter in waiters {

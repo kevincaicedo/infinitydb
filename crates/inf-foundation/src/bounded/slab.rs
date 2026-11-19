@@ -51,10 +51,16 @@ pub trait Generation: sealed::Sealed + Copy + Eq + fmt::Debug {
     const FIRST: Self;
     /// The last generation; past it the policy decides.
     const LAST: Self;
+    /// The generation's width in bits: a word's generation field is at most
+    /// this wide (ADR-0194 D6).
+    const BITS: u32;
     /// The next generation, none past `LAST`.
     fn after(self) -> Option<Self>;
     /// The next generation, `LAST` wrapping to `FIRST`.
     fn after_wrapped(self) -> Self;
+    /// The generation zero-extended to a word, whose low bits a word's
+    /// generation field carries.
+    fn widened(self) -> u64;
 }
 
 macro_rules! generation {
@@ -62,6 +68,7 @@ macro_rules! generation {
         impl Generation for $width {
             const FIRST: Self = 0;
             const LAST: Self = <$width>::MAX;
+            const BITS: u32 = <$width>::BITS;
 
             #[inline]
             fn after(self) -> Option<Self> {
@@ -73,6 +80,11 @@ macro_rules! generation {
                 // ADR-0165 D1 `bits`: a generation's wrap is its policy.
                 self.wrapping_add(1)
             }
+
+            #[inline]
+            fn widened(self) -> u64 {
+                u64::from(self)
+            }
         }
     )*};
 }
@@ -81,6 +93,9 @@ generation!(u32, u64);
 /// What a slot's generation does at a `take` (ADR-0171 D2), a type
 /// parameter of the slab so the advance is static.
 pub trait GenerationPolicy: sealed::Sealed {
+    /// Whether the generation wraps at its last value: a word may then
+    /// carry fewer of its bits (ADR-0194 D6).
+    const WRAPS: bool;
     /// The generation the slot's next occupant takes, or `None`: the slot
     /// retires and the slab serves one slot fewer.
     fn advance<G: Generation>(generation: G) -> Option<G>;
@@ -92,6 +107,8 @@ pub trait GenerationPolicy: sealed::Sealed {
 pub struct Retire;
 
 impl GenerationPolicy for Retire {
+    const WRAPS: bool = false;
+
     #[inline]
     fn advance<G: Generation>(generation: G) -> Option<G> {
         generation.after()
@@ -104,6 +121,8 @@ impl GenerationPolicy for Retire {
 pub struct WrapWithProof;
 
 impl GenerationPolicy for WrapWithProof {
+    const WRAPS: bool = true;
+
     #[inline]
     fn advance<G: Generation>(generation: G) -> Option<G> {
         Some(generation.after_wrapped())
@@ -181,6 +200,19 @@ pub enum Released {
     Vacant,
 }
 
+/// The answer to `get_mut_by_word`: the occupant a word names, with its
+/// slot's whole handle, or why there is none. A word of another slab's
+/// adapter, or one whose generation field is not the low bits of the slot's
+/// occupant's generation (a free, retired or later-occupied slot), is
+/// `Stale`; a word naming no slot of this slab is `Vacant`.
+#[must_use]
+#[derive(Debug)]
+pub enum WordLookup<'a, T, G> {
+    Live(SlotId<G>, &'a mut T),
+    Stale,
+    Vacant,
+}
+
 /// What `vacated` left of a slot's transition for its off-path step.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Vacated {
@@ -205,25 +237,130 @@ pub enum SlabReserved<'a, T, G, P> {
 /// and cannot allocate or refuse; dropping it leaves the slot free with its
 /// generation. It borrows the slab, so it cannot cross an `await` or a
 /// reactor iteration: a resumed step reserves again.
+///
+/// It holds no value (ADR-0194 D1) and names its slab's row and counts by
+/// their one address: a step that holds a reservation across a call keeps
+/// each of its words through that call, so a pointer a fact would be a
+/// store and a load a fact.
 #[must_use = "a reservation publishes a value or is dropped; it carries none"]
 pub struct SlotReservation<'a, T, G, P> {
     slot: FreeSlot<'a, T, G>,
-    live: &'a mut u32,
-    high_water: &'a mut u32,
-    row: &'a CapRowHandle,
+    counts: &'a mut SlabCounts,
     instance: SlabInstance,
     policy: PhantomData<P>,
 }
 
-/// A live capped slab: its census row handle with the fill byte first, its
-/// live count and high water, then its store, 64 bytes in all, so a take's
-/// loads (the fill byte, the counts, the instance, the free head and the
-/// root) lie in one line when the slab starts on one.
+/// A reservation whose handle is known before its publish (ADR-0194 D1 with
+/// A2), on a `WrapWithProof` slab alone: `id()` answers the handle `publish`
+/// will return, every access by which is `Stale` until then. Dropped
+/// unpublished, on any path, unwinding included, the slot's generation
+/// advances by the policy and the slot stays free at the chain's head, so
+/// that handle names no later occupant. It borrows the slab, as the
+/// reservation it holds does, so it cannot cross an `await`.
+#[must_use = "a named reservation publishes a value or is dropped, advancing its generation"]
+pub struct NamedReservation<'a, T, G: Generation> {
+    id: SlotId<G>,
+    /// `Some` until `publish` takes it; the drop advances the generation of
+    /// what is left.
+    reservation: Option<SlotReservation<'a, T, G, WrapWithProof>>,
+}
+
+/// The adapter that carries one slab's handles in a word (ADR-0194 D6 with
+/// A2): the low `INDEX_BITS` hold the slot's index, the next
+/// `GENERATION_BITS` the low bits of its generation. It is built from the
+/// slab it serves, and a word is decoded only by that slab's
+/// `get_mut_by_word`, which compares the carried bits on the slot it walks
+/// to, so no handle is ever built from a truncated generation. On a
+/// `WrapWithProof` slab a narrower field aliases a later occupant only
+/// after `k × 2^GENERATION_BITS` uses of a slot, which the slab's proof
+/// makes a defect, never reuse.
+///
+/// The layout is the compiler's to check: the two fields fit one `u64`, the
+/// generation field fits the generation, and a `Retire` slab's word carries
+/// its whole generation (a retired slot's handle must never alias). A slab
+/// of more slots than the index field numbers is refused `Layout` when its
+/// adapter is built. A fabric key's layout, built and resolved:
+///
+/// ```
+/// # use inf_foundation::CellId;
+/// # use inf_foundation::bounded::{Built, Cap, CapCensus, CapFill, CappedSlab, SlabReserved};
+/// # use inf_foundation::bounded::{SlotWord, WordLookup, WrapWithProof};
+/// use inf_foundation::limits::{GATE_KEY_GENERATION_BITS, GATE_KEY_INDEX_BITS};
+/// # let (census, _serve_mark) = CapCensus::new(CellId(0));
+/// # let cap = Cap::entries::<4>("holders", CapFill::Serving);
+/// # let builder = CappedSlab::<u64, u32, WrapWithProof>::builder(cap, &census).expect("fits");
+/// # let Built::Live(mut slab) = builder.step() else { panic!("one chunk holds four") };
+/// type Key = SlotWord<u32, WrapWithProof, GATE_KEY_INDEX_BITS, GATE_KEY_GENERATION_BITS>;
+/// let key = Key::for_slab(&slab).expect("four slots number in 24 bits");
+/// let SlabReserved::Slot(slot) = slab.reserve() else { panic!("a free slot") };
+/// let id = slot.publish(7);
+/// let bits = key.encode(id).expect("this slab's handle");
+/// let found = slab.get_mut_by_word(&key, bits);
+/// assert!(matches!(found, WordLookup::Live(handle, value) if handle == id && *value == 7));
+/// ```
+///
+/// The index and generation fields of 33 and 32 bits pass one word:
+///
+/// ```compile_fail,E0080
+/// # use inf_foundation::CellId;
+/// # use inf_foundation::bounded::{Built, Cap, CapCensus, CapFill, CappedSlab};
+/// # use inf_foundation::bounded::{SlotWord, WrapWithProof};
+/// # let (census, _serve_mark) = CapCensus::new(CellId(0));
+/// # let cap = Cap::entries::<1>("word", CapFill::Serving);
+/// # let builder = CappedSlab::<u8, u32, WrapWithProof>::builder(cap, &census).expect("fits");
+/// # let Built::Live(slab) = builder.step() else { panic!("one chunk") };
+/// let _word = SlotWord::<u32, WrapWithProof, 33, 32>::for_slab(&slab);
+/// ```
+///
+/// A generation field of 33 bits passes a `u32` generation:
+///
+/// ```compile_fail,E0080
+/// # use inf_foundation::CellId;
+/// # use inf_foundation::bounded::{Built, Cap, CapCensus, CapFill, CappedSlab};
+/// # use inf_foundation::bounded::{SlotWord, WrapWithProof};
+/// # let (census, _serve_mark) = CapCensus::new(CellId(0));
+/// # let cap = Cap::entries::<1>("word", CapFill::Serving);
+/// # let builder = CappedSlab::<u8, u32, WrapWithProof>::builder(cap, &census).expect("fits");
+/// # let Built::Live(slab) = builder.step() else { panic!("one chunk") };
+/// let _word = SlotWord::<u32, WrapWithProof, 24, 33>::for_slab(&slab);
+/// ```
+///
+/// A `Retire` slab's word at 23 of its generation's 32 bits:
+///
+/// ```compile_fail,E0080
+/// # use inf_foundation::CellId;
+/// # use inf_foundation::bounded::{Built, Cap, CapCensus, CapFill, CappedSlab};
+/// # use inf_foundation::bounded::{Retire, SlotWord};
+/// # let (census, _serve_mark) = CapCensus::new(CellId(0));
+/// # let cap = Cap::entries::<1>("word", CapFill::Serving);
+/// # let builder = CappedSlab::<u8, u32, Retire>::builder(cap, &census).expect("fits");
+/// # let Built::Live(slab) = builder.step() else { panic!("one chunk") };
+/// let _word = SlotWord::<u32, Retire, 24, 23>::for_slab(&slab);
+/// ```
+pub struct SlotWord<G, P, const INDEX_BITS: u32, const GENERATION_BITS: u32> {
+    instance: SlabInstance,
+    /// The slab's slots: a word's index at or past it names no slot.
+    slots: u32,
+    layout: PhantomData<(G, P)>,
+}
+
+/// A slab's census row handle, the fill byte first, then its live count and
+/// its high water: what a publish and a take count and report by. One part
+/// of the slab, so a reservation borrows the three by one pointer beside
+/// its borrow of the store. 24 bytes.
 #[repr(C)]
-pub struct CappedSlab<T, G, P, const CHUNK_SLOTS: usize = MAP_CHUNK_SLOTS_MAX> {
+struct SlabCounts {
     row: CapRowHandle,
     live: u32,
     high_water: u32,
+}
+
+/// A live capped slab: its row and counts, then its store, 64 bytes in all,
+/// so a take's loads (the fill byte, the counts, the instance, the free head
+/// and the root) lie in one line when the slab starts on one.
+#[repr(C)]
+pub struct CappedSlab<T, G, P, const CHUNK_SLOTS: usize = MAP_CHUNK_SLOTS_MAX> {
+    counts: SlabCounts,
     store: SlotStore<T, G, CHUNK_SLOTS>,
     policy: PhantomData<P>,
 }
@@ -234,6 +371,11 @@ pub struct CappedSlab<T, G, P, const CHUNK_SLOTS: usize = MAP_CHUNK_SLOTS_MAX> {
 pub struct SlabBuilder<T, G, P, const CHUNK_SLOTS: usize = MAP_CHUNK_SLOTS_MAX> {
     row: CapRowHandle,
     store: SlotStore<T, G, CHUNK_SLOTS>,
+    /// The generation every slot a step builds is free at: `G::FIRST` but
+    /// under the test hook `first_generation`, which no shipping build
+    /// compiles, so a live slab's header is the same in every build.
+    #[cfg(any(test, feature = "fault-points"))]
+    first_generation: G,
     policy: PhantomData<P>,
 }
 
@@ -266,6 +408,38 @@ impl<T, G: Generation, P, const CHUNK_SLOTS: usize> CappedSlab<T, G, P, CHUNK_SL
     pub const SLOT_BYTES: usize = mem::size_of::<Slot<T, G>>();
 }
 
+/// The take transition (ADR-0194 D1's take row), written once and compiled as
+/// two bodies: `take`, which most takers call, and `take_inlined`, in a
+/// delivered poll's own frame. A macro and not a function: a `take` that
+/// only called `take_inlined` is folded by the compiler into each of its
+/// callers, and every taker then holds the whole body.
+macro_rules! take_transition {
+    ($slab:ident, $id:ident) => {{
+        let foreign = $slab.foreign(&$id);
+        let lent = named(
+            foreign,
+            // Inlined always: a body of its own where two steps of one slab
+            // take, the walk would be inline where one poll does, and a
+            // bench would not be placed as the server is (ADR-0205 A2.1).
+            #[inline(always)]
+            || $slab.store.slot_chain_mut($id.index).map(|(slot, chain)| Vacate(slot, chain)),
+            $id.generation,
+        );
+        match lent {
+            Named::Live((value, slot, chain)) => {
+                let left =
+                    Self::vacated(slot, chain, $id, &mut $slab.counts.live, &$slab.counts.row);
+                if left != Vacated::Written {
+                    $slab.vacated_off_path($id, left);
+                }
+                Taken::Value(value)
+            }
+            Named::Stale => Taken::Stale,
+            Named::Vacant => Taken::Vacant,
+        }
+    }};
+}
+
 impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     CappedSlab<T, G, P, CHUNK_SLOTS>
 {
@@ -285,20 +459,26 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
         }
         let row = census.register(cap)?;
         let store = SlotStore::new(cap.entries_max(), census)?;
-        Ok(SlabBuilder { row, store, policy: PhantomData })
+        Ok(SlabBuilder {
+            row,
+            store,
+            #[cfg(any(test, feature = "fault-points"))]
+            first_generation: G::FIRST,
+            policy: PhantomData,
+        })
     }
 
     /// Live occupants, at most `capacity_now`.
     #[must_use]
     #[inline]
     pub fn len(&self) -> u32 {
-        self.live
+        self.counts.live
     }
 
     #[must_use]
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.live == 0
+        self.counts.live == 0
     }
 
     /// The slots that can still serve: the cap, less the slots retired.
@@ -311,7 +491,7 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     /// slab's; an `Assembly` slab reports its every publish instead).
     #[must_use]
     pub fn high_water(&self) -> u32 {
-        self.high_water
+        self.counts.high_water
     }
 
     /// This slab's identity, stamped in every handle it mints.
@@ -335,24 +515,19 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
             };
         }
         let (instance, capacity) = (self.store.instance(), self.store.capacity_now());
-        let CappedSlab { row, live, high_water, store, .. } = self;
+        let CappedSlab { counts, store, .. } = self;
         match store.reserve() {
-            Some(slot) => SlabReserved::Slot(SlotReservation {
-                slot,
-                live,
-                high_water,
-                row,
-                instance,
-                policy: PhantomData,
-            }),
+            Some(slot) => {
+                SlabReserved::Slot(SlotReservation { slot, counts, instance, policy: PhantomData })
+            }
             // The chain holds `capacity_now - live` slots, so this arm is
             // never reached by a correct build.
             None => {
                 debug_assert!(
-                    *live >= capacity,
+                    counts.live >= capacity,
                     "the free chain is empty with live below capacity_now"
                 );
-                row.report_full();
+                counts.row.report_full();
                 SlabReserved::Full
             }
         }
@@ -378,31 +553,54 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
         }
     }
 
+    /// The occupant a word of `word` names, mutably, with its slot's whole
+    /// handle: the one decode of a word (ADR-0194 D6 with A2). An adapter of
+    /// another slab is `Stale` and nothing is walked; a word naming no slot
+    /// (a bit set above its two fields, which no encode sets, or an index at
+    /// or past the slab's slots) is `Vacant`; else one walk, `Live` when the
+    /// slot's occupant took a generation whose low bits are the word's
+    /// field, `Stale` for any other slot. Nothing is written.
+    #[inline]
+    pub fn get_mut_by_word<const INDEX_BITS: u32, const GENERATION_BITS: u32>(
+        &mut self,
+        word: &SlotWord<G, P, INDEX_BITS, GENERATION_BITS>,
+        bits: u64,
+    ) -> WordLookup<'_, T, G> {
+        let instance = self.store.instance();
+        if word.instance != instance {
+            return WordLookup::Stale;
+        }
+        let Some((index, field)) = word.fields(bits) else { return WordLookup::Vacant };
+        let mask = SlotWord::<G, P, INDEX_BITS, GENERATION_BITS>::GENERATION_MASK;
+        match named(false, || self.store.slot_mut(index), WordField { field, mask }) {
+            Named::Live((generation, value)) => {
+                WordLookup::Live(SlotId { index, generation, instance }, value)
+            }
+            Named::Stale => WordLookup::Stale,
+            Named::Vacant => WordLookup::Vacant,
+        }
+    }
+
     /// The occupant `id` names returns to its owner and the slot frees: its
     /// generation advances by the policy, or at the last it retires and the
     /// slab serves one slot fewer, reported to the row before any `Full` at
     /// the new count. An `Assembly` slab reports the removal (its fill byte,
     /// tested once). A stale or foreign handle changes nothing. `release`'s
-    /// body with the value moved out first.
+    /// body with the value moved out first. The one called body of the
+    /// transition: every taker calls it but a delivered poll.
     #[inline]
     pub fn take(&mut self, id: SlotId<G>) -> Taken<T> {
-        let foreign = self.foreign(&id);
-        let lent = named(
-            foreign,
-            || self.store.slot_chain_mut(id.index).map(|(slot, chain)| Vacate(slot, chain)),
-            id.generation,
-        );
-        match lent {
-            Named::Live((value, slot, chain)) => {
-                let left = Self::vacated(slot, chain, id, &mut self.live, &self.row);
-                if left != Vacated::Written {
-                    self.vacated_off_path(id, left);
-                }
-                Taken::Value(value)
-            }
-            Named::Stale => Taken::Stale,
-            Named::Vacant => Taken::Vacant,
-        }
+        take_transition!(self, id)
+    }
+
+    /// [`take`](Self::take) in its caller's frame (ADR-0194 D1's take row,
+    /// a second entry to it): for the poll that takes a delivered value and
+    /// reads it at once. Called, a take returns its occupant through memory
+    /// and the caller copies it out again; in the caller's frame it does not.
+    /// Each site pays the body's text, so no other taker enters here.
+    #[inline(always)]
+    pub fn take_inlined(&mut self, id: SlotId<G>) -> Taken<T> {
+        take_transition!(self, id)
     }
 
     /// `take` with nothing returned (ADR-0194 D1's second note): the same
@@ -435,7 +633,8 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
             );
             match lent {
                 Named::Live((slot, chain)) => {
-                    let left = Self::vacated(slot, chain, id, &mut self.live, &self.row);
+                    let left =
+                        Self::vacated(slot, chain, id, &mut self.counts.live, &self.counts.row);
                     if left != Vacated::Written {
                         self.vacated_off_path(id, left);
                     }
@@ -493,13 +692,13 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
         let capacity = self.store.capacity_now();
         #[cfg(inf_canary_cap_minus_one)]
         {
-            let serving = self.row.fill() == CapFill::Serving;
+            let serving = self.counts.row.fill() == CapFill::Serving;
             let short = capacity.checked_sub(1).unwrap_or_default();
-            self.live < if serving { short } else { capacity }
+            self.counts.live < if serving { short } else { capacity }
         }
         #[cfg(not(inf_canary_cap_minus_one))]
         {
-            self.live < capacity
+            self.counts.live < capacity
         }
     }
 
@@ -507,7 +706,7 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     #[cold]
     #[inline(never)]
     fn full(&mut self) -> SlabReserved<'_, T, G, P> {
-        self.row.report_full();
+        self.counts.row.report_full();
         SlabReserved::Full
     }
 
@@ -559,18 +758,18 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     fn vacated_off_path(&mut self, id: SlotId<G>, left: Vacated) {
         let mut left = left;
         if left == Vacated::Assembling {
-            self.row.report_removal(self.live);
+            self.counts.row.report_removal(self.counts.live);
             let found = self.store.slot_chain_mut(id.index);
             debug_assert!(found.is_some(), "a vacated slot is in its store");
             let Some((slot, chain)) = found else { return };
             left = Self::advanced(slot, chain, id);
         }
         if left == Vacated::Retiring {
-            let CappedSlab { row, store, .. } = self;
+            let CappedSlab { counts, store, .. } = self;
             let found = store.slot_chain_mut(id.index);
             debug_assert!(found.is_some(), "a vacated slot is in its store");
             let Some((slot, chain)) = found else { return };
-            Self::retired(slot, chain, row);
+            Self::retired(slot, chain, &counts.row);
         }
     }
 
@@ -601,18 +800,164 @@ impl<'a, T, G: Generation, P> SlotReservation<'a, T, G, P> {
     #[must_use = "the handle is the slot's one name"]
     #[inline(always)]
     pub fn publish_mut(self, value: T) -> (SlotId<G>, &'a mut T) {
-        let (index, generation, occupant) = self.slot.occupy_mut(value);
-        let live = live_published(*self.live);
-        *self.live = live;
+        let SlotReservation { slot, counts, instance, .. } = self;
+        let (index, generation, occupant) = slot.occupy_mut(value);
+        let live = live_published(counts.live);
+        counts.live = live;
         // An `Assembly` slab keeps its own high water at 0, so this one
         // compare reports its every publish and the row keeps its live count.
-        if live > *self.high_water {
-            if self.row.fill() == CapFill::Serving {
-                *self.high_water = live;
+        if live > counts.high_water {
+            if counts.row.fill() == CapFill::Serving {
+                counts.high_water = live;
             }
-            self.row.report_publish(live);
+            counts.row.report_publish(live);
         }
-        (SlotId { index, generation, instance: self.instance }, occupant)
+        (SlotId { index, generation, instance }, occupant)
+    }
+}
+
+impl<'a, T, G: Generation> SlotReservation<'a, T, G, WrapWithProof> {
+    /// This reservation with its handle known before its publish (ADR-0194
+    /// D1 with A2): the handle a request must carry before the value it
+    /// will name is published. Dropped unpublished, it advances the slot's
+    /// generation; an unnamed reservation's drop keeps it.
+    #[inline]
+    pub fn named(self) -> NamedReservation<'a, T, G> {
+        let id = SlotId {
+            index: self.slot.index(),
+            generation: self.slot.generation(),
+            instance: self.instance,
+        };
+        NamedReservation { id, reservation: Some(self) }
+    }
+
+    /// The slot left free at the chain's head at its next generation, the
+    /// policy's wrap included, so a handle read from this reservation names
+    /// no later occupant. One canary leaves the generation unchanged.
+    #[inline]
+    fn advanced_unpublished(self) {
+        #[cfg(inf_canary_named_drop_keeps_generation)]
+        {
+            drop(self);
+        }
+        #[cfg(not(inf_canary_named_drop_keeps_generation))]
+        {
+            let next = self.slot.generation().after_wrapped();
+            self.slot.free_at(next);
+        }
+    }
+}
+
+impl<T, G: Generation> NamedReservation<'_, T, G> {
+    /// The handle `publish` will return: the slot's index, the generation it
+    /// is free at, and the slab's identity. Every access by it is `Stale`
+    /// until the publish; after a drop, at every later occupant.
+    #[must_use]
+    #[inline]
+    pub fn id(&self) -> SlotId<G> {
+        self.id
+    }
+
+    /// The value takes the slot, and `id()` is returned. Cannot allocate or
+    /// refuse: the slot was free and the reservation held it.
+    #[inline]
+    pub fn publish(mut self, value: T) -> SlotId<G> {
+        let reservation = self.reservation.take();
+        let named = self.id;
+        // What is left has nothing to advance, so its drop would do nothing.
+        // Forgotten before any step that can unwind, it is named by no
+        // unwind path either: such a path would hand its address to the
+        // drop, and the reservation would live in its caller's memory.
+        core::mem::forget(self);
+        let Some(reservation) = reservation else {
+            unreachable!("a named reservation holds its slot until it publishes or drops")
+        };
+        let id = reservation.publish(value);
+        debug_assert_eq!(id, named, "a named reservation publishes the handle it named");
+        id
+    }
+}
+
+impl<T, G: Generation> Drop for NamedReservation<'_, T, G> {
+    /// Unpublished, the slot's generation advances: on every end but
+    /// `publish`, which took the reservation.
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            reservation.advanced_unpublished();
+        }
+    }
+}
+
+impl<G: Generation, P: GenerationPolicy, const INDEX_BITS: u32, const GENERATION_BITS: u32>
+    SlotWord<G, P, INDEX_BITS, GENERATION_BITS>
+{
+    /// The layout's rules, one assertion a clause, evaluated where a build
+    /// names them (`for_slab`), so a layout that breaks one fails to compile.
+    const FITS: () = {
+        assert!(
+            match INDEX_BITS.checked_add(GENERATION_BITS) {
+                Some(bits) => bits <= u64::BITS,
+                None => false,
+            },
+            "a word's index and generation fields fit one u64"
+        );
+        assert!(GENERATION_BITS <= G::BITS, "a word's generation field fits its generation");
+        assert!(
+            P::WRAPS || GENERATION_BITS == G::BITS,
+            "a Retire slab's word carries its whole generation"
+        );
+    };
+    const INDEX_MASK: u64 = low_bits_mask(INDEX_BITS);
+    const GENERATION_MASK: u64 = low_bits_mask(GENERATION_BITS);
+
+    /// The adapter of `slab`: `Layout` when the slab has more slots than the
+    /// index field numbers (`2^INDEX_BITS`), checked when it is built, at a
+    /// site's boot; every other layout fault is a compile error.
+    pub fn for_slab<T, const CHUNK_SLOTS: usize>(
+        slab: &CappedSlab<T, G, P, CHUNK_SLOTS>,
+    ) -> Result<Self, CapError> {
+        let () = Self::FITS;
+        let slots = slab.counts.row.entries_max();
+        // Every index below `slots` fits the field unless `slots > 2^INDEX_BITS`.
+        if 1u64.checked_shl(INDEX_BITS).is_some_and(|span| u64::from(slots) > span) {
+            return Err(CapError::Layout);
+        }
+        Ok(SlotWord { instance: slab.instance(), slots, layout: PhantomData })
+    }
+
+    /// The word of `id`: its index, and its generation's low
+    /// `GENERATION_BITS` above it; `None` for another slab's handle, which no
+    /// word of this adapter may carry.
+    #[must_use]
+    #[inline]
+    pub fn encode(&self, id: SlotId<G>) -> Option<u64> {
+        if id.instance != self.instance {
+            return None;
+        }
+        debug_assert!(id.index < self.slots, "a handle of this slab names one of its slots");
+        let generation = id.generation.widened() & Self::GENERATION_MASK;
+        Some(u64::from(id.index) | generation.checked_shl(INDEX_BITS).unwrap_or(0))
+    }
+
+    /// A word's slot index and generation field, or `None` when it names no
+    /// slot: a bit set above the two fields, or an index at or past the
+    /// slab's slots, so no walk passes the slab's bound.
+    #[inline]
+    fn fields(&self, bits: u64) -> Option<(u32, u64)> {
+        let carried = bits.checked_shr(INDEX_BITS).unwrap_or(0);
+        if carried.checked_shr(GENERATION_BITS).unwrap_or(0) != 0 {
+            return None;
+        }
+        let index = u32::try_from(bits & Self::INDEX_MASK).ok().filter(|i| *i < self.slots)?;
+        Some((index, carried & Self::GENERATION_MASK))
+    }
+}
+
+/// The mask of a word's low `bits` bits, all of them at 64 or more.
+const fn low_bits_mask(bits: u32) -> u64 {
+    match u64::MAX.checked_shl(bits) {
+        Some(high) => !high,
+        None => u64::MAX,
     }
 }
 
@@ -626,15 +971,38 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
         self.store.instance()
     }
 
+    /// A test hook: every slot a later step builds is free at `generation`,
+    /// so a test reaches a generation's high values, a word's field width
+    /// among them, without that many uses of a slot. Called before the
+    /// first step, every slot is.
+    #[cfg(any(test, feature = "fault-points"))]
+    #[must_use]
+    pub fn first_generation(mut self, generation: G) -> Self {
+        self.first_generation = generation;
+        self
+    }
+
+    /// The generation the slots a step builds are free at.
+    #[inline]
+    fn built_generation(&self) -> G {
+        #[cfg(any(test, feature = "fault-points"))]
+        {
+            self.first_generation
+        }
+        #[cfg(not(any(test, feature = "fault-points")))]
+        {
+            G::FIRST
+        }
+    }
+
     /// One build step: one chunk or one directory allocated. `Live` once
     /// the last chunk is built; a refused allocation retires what was built.
     pub fn step(mut self) -> Built<T, G, P, CHUNK_SLOTS> {
-        match self.store.build_step() {
+        let generation = self.built_generation();
+        match self.store.build_step_from(generation) {
             Ok(BuildStep::More) => Built::More(self),
             Ok(BuildStep::Done) => Built::Live(CappedSlab {
-                row: self.row,
-                live: 0,
-                high_water: 0,
+                counts: SlabCounts { row: self.row, live: 0, high_water: 0 },
                 store: self.store,
                 policy: PhantomData,
             }),
@@ -733,6 +1101,45 @@ impl<'s, T, G: Generation> SlotBorrow<G> for &'s mut Slot<T, G> {
     }
 }
 
+/// A word's generation field and the mask of its width: a slot answers it
+/// when its occupant's generation's low bits are the field (ADR-0194 D6
+/// with A2). One canary compares the whole generation with the field.
+#[derive(Clone, Copy)]
+struct WordField {
+    field: u64,
+    mask: u64,
+}
+
+impl WordField {
+    #[inline]
+    fn answers<G: Generation>(self, generation: G) -> bool {
+        #[cfg(inf_canary_word_resolve_unmasked)]
+        {
+            let _ = self.mask;
+            generation.widened() == self.field
+        }
+        #[cfg(not(inf_canary_word_resolve_unmasked))]
+        {
+            generation.widened() & self.mask == self.field
+        }
+    }
+}
+
+/// The occupant with its whole generation, for a word's walk.
+impl<'s, T, G: Generation> SlotBorrow<WordField> for &'s mut Slot<T, G> {
+    type Occupant = (G, &'s mut T);
+
+    #[inline]
+    fn occupant(self, at: WordField) -> Option<(G, &'s mut T)> {
+        match self {
+            Slot::Live { generation, value } if at.answers(*generation) => {
+                Some((*generation, value))
+            }
+            Slot::Live { .. } | Slot::Free { .. } | Slot::Closed => None,
+        }
+    }
+}
+
 /// A slot whose occupant at a generation moves out, leaving the slot
 /// `Closed` for `take` to free or retire, lent with its chain; any other
 /// slot is not written.
@@ -803,7 +1210,7 @@ mod tests {
     use super::*;
     use crate::bounded::{CensusPhase, ServeMark};
     use crate::ids::CellId;
-    use crate::limits::CAP_CENSUS_SLABS_MAX;
+    use crate::limits::{CAP_CENSUS_SLABS_MAX, GATE_KEY_GENERATION_BITS, GATE_KEY_INDEX_BITS};
     use crate::rng::{Entropy, SplitMix64};
 
     const CELL: CellId = CellId(7);
@@ -825,7 +1232,13 @@ mod tests {
         cap: Cap,
         census: &Rc<CapCensus>,
     ) -> (CappedSlab<T, G, P, C>, u32) {
-        let mut builder = CappedSlab::builder(cap, census).expect("registered");
+        stepped(CappedSlab::builder(cap, census).expect("registered"))
+    }
+
+    /// `builder` stepped to its live slab; the steps it took.
+    fn stepped<T, G: Generation, P: GenerationPolicy, const C: usize>(
+        mut builder: SlabBuilder<T, G, P, C>,
+    ) -> (CappedSlab<T, G, P, C>, u32) {
         let mut steps = 0;
         loop {
             steps += 1;
@@ -902,11 +1315,56 @@ mod tests {
     #[test]
     fn the_headers_fit_one_line() {
         assert_eq!(core::mem::size_of::<CapRowHandle>(), 16);
+        assert_eq!(core::mem::size_of::<SlabCounts>(), 24);
         assert_eq!(core::mem::size_of::<SlotStore<u64, u32>>(), 40);
         assert_eq!(core::mem::size_of::<CappedSlab<u64, u32, Retire>>(), 64);
         assert_eq!(core::mem::size_of::<CappedSlab<[u8; 200], u64, WrapWithProof>>(), 64);
         assert_eq!(core::mem::size_of::<SlotId<u32>>(), 12);
         assert_eq!(core::mem::size_of::<SlotId<u64>>(), 16);
+    }
+
+    /// `take_inlined` is `take`'s transition entered in the caller's frame
+    /// (ADR-0194 D1): by either entry the occupant returns, the slab holds
+    /// one fewer, the handle is stale, a second take of it changes nothing,
+    /// and the slot's next occupant is one generation on.
+    #[test]
+    fn take_inlined_is_takes_transition() {
+        type Twin = CappedSlab<u64, u32, WrapWithProof>;
+        type Entry = fn(&mut Twin, SlotId<u32>) -> Taken<u64>;
+        let entries: [(&str, Entry); 2] =
+            [("take", Twin::take), ("take_inlined", Twin::take_inlined)];
+        for (entry, take) in entries {
+            let (census, _mark) = census();
+            let cap = Cap::entries::<1>("twin", CapFill::Serving);
+            let (mut slab, _) = built::<u64, u32, WrapWithProof>(cap, &census);
+            let SlabReserved::Slot(slot) = slab.reserve() else { panic!("{entry}: a free slot") };
+            let id = slot.publish(7);
+            assert!(matches!(take(&mut slab, id), Taken::Value(7)), "{entry}: the occupant");
+            assert_eq!(slab.len(), 0, "{entry}: one fewer");
+            assert!(matches!(slab.get(id), Lookup::Stale), "{entry}: the handle is stale");
+            assert!(matches!(take(&mut slab, id), Taken::Stale), "{entry}: a second take");
+            assert_eq!(slab.len(), 0, "{entry}: a stale take changes nothing");
+            let SlabReserved::Slot(slot) = slab.reserve() else {
+                panic!("{entry}: the slot again")
+            };
+            let next = slot.publish(8);
+            assert_eq!(
+                (next.index, next.generation),
+                (id.index, id.generation + 1),
+                "{entry}: the slot's next occupant, one generation on"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reservation_names_its_slabs_row_and_counts_by_one_pointer() {
+        // The free slot with the head it moves (32 bytes at either
+        // generation's width), one pointer to the row and counts, and the
+        // instance: 48 bytes. A pointer each for the row, the live count
+        // and the high water makes it 64, each word of them kept through
+        // any call a step makes while it holds the reservation.
+        assert_eq!(core::mem::size_of::<SlotReservation<'_, u64, u32, WrapWithProof>>(), 48);
+        assert_eq!(core::mem::size_of::<SlotReservation<'_, [u8; 200], u64, Retire>>(), 48);
     }
 
     #[test]
@@ -1181,6 +1639,9 @@ mod tests {
         const ZERO: Self;
         const MAX: Self;
         fn successor(self) -> Option<Self>;
+        /// The generation as a `u128`, whose low bits the model reads by
+        /// remainders, not the slab's masks.
+        fn wide(self) -> u128;
     }
 
     macro_rules! model_generation {
@@ -1191,6 +1652,10 @@ mod tests {
 
                 fn successor(self) -> Option<Self> {
                     self.checked_add(1)
+                }
+
+                fn wide(self) -> u128 {
+                    u128::from(self)
                 }
             }
         )*};
@@ -1207,16 +1672,94 @@ mod tests {
         Wraps,
     }
 
-    trait ModelPolicy {
+    /// What the model expects of a policy, and its word and reservation
+    /// ops (ADR-0194 D6 and D1 with A2): a `WrapWithProof` slab's word
+    /// carries two generation bits, so a stale handle's word aliases a later
+    /// occupant within a run, and its reservations are named; a `Retire`
+    /// slab's word carries its whole generation (at a `u64`, beside an index
+    /// field of no bits: one slot), and its reservations drop unnamed.
+    trait ModelPolicy<G: Generation + ModelGeneration>: GenerationPolicy + Sized {
         const AT_LAST: AtLast;
+
+        fn word<T: ModelValue, const C: usize>(
+            slab: &mut CappedSlab<T, G, Self, C>,
+            model: &mut Model<G>,
+            handles: &[SlotId<G>],
+            rng: &mut SplitMix64,
+        );
+
+        fn reservation<T: ModelValue, const C: usize>(
+            slab: &mut CappedSlab<T, G, Self, C>,
+            model: &mut Model<G>,
+            handles: &mut Vec<SlotId<G>>,
+            value: u64,
+        );
     }
 
-    impl ModelPolicy for Retire {
+    impl ModelPolicy<u32> for Retire {
         const AT_LAST: AtLast = AtLast::Retires;
+
+        fn word<T: ModelValue, const C: usize>(
+            slab: &mut CappedSlab<T, u32, Self, C>,
+            model: &mut Model<u32>,
+            handles: &[SlotId<u32>],
+            rng: &mut SplitMix64,
+        ) {
+            model_word::<T, u32, Self, 32, 32, C>(slab, model, handles, rng);
+        }
+
+        fn reservation<T: ModelValue, const C: usize>(
+            slab: &mut CappedSlab<T, u32, Self, C>,
+            model: &mut Model<u32>,
+            _: &mut Vec<SlotId<u32>>,
+            _: u64,
+        ) {
+            model_unnamed_drop(slab, model);
+        }
     }
 
-    impl ModelPolicy for WrapWithProof {
+    impl ModelPolicy<u64> for Retire {
+        const AT_LAST: AtLast = AtLast::Retires;
+
+        fn word<T: ModelValue, const C: usize>(
+            slab: &mut CappedSlab<T, u64, Self, C>,
+            model: &mut Model<u64>,
+            handles: &[SlotId<u64>],
+            rng: &mut SplitMix64,
+        ) {
+            model_word::<T, u64, Self, 0, 64, C>(slab, model, handles, rng);
+        }
+
+        fn reservation<T: ModelValue, const C: usize>(
+            slab: &mut CappedSlab<T, u64, Self, C>,
+            model: &mut Model<u64>,
+            _: &mut Vec<SlotId<u64>>,
+            _: u64,
+        ) {
+            model_unnamed_drop(slab, model);
+        }
+    }
+
+    impl<G: Generation + ModelGeneration> ModelPolicy<G> for WrapWithProof {
         const AT_LAST: AtLast = AtLast::Wraps;
+
+        fn word<T: ModelValue, const C: usize>(
+            slab: &mut CappedSlab<T, G, Self, C>,
+            model: &mut Model<G>,
+            handles: &[SlotId<G>],
+            rng: &mut SplitMix64,
+        ) {
+            model_word::<T, G, Self, 16, 2, C>(slab, model, handles, rng);
+        }
+
+        fn reservation<T: ModelValue, const C: usize>(
+            slab: &mut CappedSlab<T, G, Self, C>,
+            model: &mut Model<G>,
+            handles: &mut Vec<SlotId<G>>,
+            value: u64,
+        ) {
+            model_named(slab, model, handles, value);
+        }
     }
 
     /// The five accesses that answer a handle against its slot.
@@ -1241,6 +1784,14 @@ mod tests {
         lent: u64,
         /// Live occupants freed by `release`.
         released: u64,
+        /// Word ops by answer: `Live`, `Stale`, `Vacant`, and the adapter
+        /// refused `Layout` (a slab whose slots pass its index field).
+        words: [u64; 4],
+        /// Words of a handle that resolved a later occupant at the same low
+        /// generation bits: the alias a narrow field allows.
+        aliased: u64,
+        /// Named reservations dropped, then published.
+        named: [u64; 2],
     }
 
     /// The model of one slab: its occupants by `(index, generation)`, by
@@ -1401,7 +1952,7 @@ mod tests {
         id: SlotId<G>,
     ) where
         G: Generation + ModelGeneration,
-        P: GenerationPolicy + ModelPolicy,
+        P: ModelPolicy<G>,
     {
         model.note(&id, Access::Take);
         match model.live.remove(&(id.index, id.generation)) {
@@ -1421,7 +1972,7 @@ mod tests {
         id: SlotId<G>,
     ) where
         G: Generation + ModelGeneration,
-        P: GenerationPolicy + ModelPolicy,
+        P: ModelPolicy<G>,
     {
         model.note(&id, Access::Release);
         match model.live.remove(&(id.index, id.generation)) {
@@ -1487,10 +2038,140 @@ mod tests {
         }
     }
 
+    /// A word op: an encoded handle's word (drawn as `pick` draws) or a
+    /// peer's (any `u64`, or one
+    /// whose index and field are drawn within and just past the slab),
+    /// decoded against the model's own reading of the layout, by remainders
+    /// of `u128`s: a bit above the two fields or an index at or past the
+    /// slots is `Vacant`; the slot's live occupant whose generation's low
+    /// bits are the field is `Live`, its whole handle answered, and written
+    /// through; any other is `Stale`. A slab whose slots pass the index
+    /// field refuses the adapter `Layout`.
+    fn model_word<T: ModelValue, G, P, const I: u32, const B: u32, const C: usize>(
+        slab: &mut CappedSlab<T, G, P, C>,
+        model: &mut Model<G>,
+        handles: &[SlotId<G>],
+        rng: &mut SplitMix64,
+    ) where
+        G: Generation + ModelGeneration,
+        P: GenerationPolicy,
+    {
+        let slots = model.next.len() as u128;
+        let word = match SlotWord::<G, P, I, B>::for_slab(slab) {
+            Ok(word) => word,
+            Err(refused) => {
+                assert_eq!(refused, CapError::Layout);
+                assert!(slots > 1 << I, "the adapter refused slots its index field numbers");
+                model.reach.words[3] += 1;
+                return;
+            }
+        };
+        assert!(slots <= 1 << I, "an adapter built past its index field");
+        let (bits, from) = match rng.next_below(4) {
+            0 | 1 => {
+                let id = handles[pick(rng, handles, model)];
+                (word.encode(id).expect("this slab's handle"), Some(id))
+            }
+            2 => (rng.next_u64(), None),
+            _ => {
+                let index = u128::from(rng.next_below(slots as u64 + 2)) % (1 << I);
+                let field = u128::from(rng.next_u64()) % (1 << B);
+                ((index + (field << I)) as u64, None)
+            }
+        };
+        let (index, carried) = (u128::from(bits) % (1 << I), u128::from(bits) >> I);
+        let expected = (carried >> B == 0 && index < slots).then(|| {
+            let index = index as u32;
+            let mut live = model.live.range((index, G::ZERO)..=(index, G::MAX));
+            let field = carried % (1 << B);
+            live.next().filter(|((_, generation), _)| generation.wide() % (1 << B) == field)
+        });
+        let expected = expected.map(|live| live.map(|(key, value)| (*key, *value)));
+        let instance = slab.instance();
+        match (slab.get_mut_by_word(&word, bits), expected) {
+            (WordLookup::Live(id, found), Some(Some(((index, generation), value)))) => {
+                assert_eq!((id.index, id.generation, id.instance), (index, generation, instance));
+                assert_eq!(found.value(), value, "{bits:#x}: the occupant the word names");
+                let written = value ^ 1 << 21;
+                *found = T::of(written);
+                model.live.insert((index, generation), written);
+                model.reach.words[0] += 1;
+                if from.is_some_and(|from| from.generation != generation) {
+                    model.reach.aliased += 1;
+                }
+            }
+            (WordLookup::Stale, Some(None)) => model.reach.words[1] += 1,
+            (WordLookup::Vacant, None) => model.reach.words[2] += 1,
+            (found, expected) => panic!("{bits:#x}: the word {found:?}, model {expected:?}"),
+        }
+    }
+
+    /// A named reservation: its `id()` is the slot's index and the model's
+    /// next generation for it, naming no occupant; published at odd values,
+    /// the publish returns it; else dropped, and the slot's next generation
+    /// advances, wrapping at the last. Its handle joins the run's, so every
+    /// later op reads it, at every later occupant.
+    fn model_named<T: ModelValue, G, const C: usize>(
+        slab: &mut CappedSlab<T, G, WrapWithProof, C>,
+        model: &mut Model<G>,
+        handles: &mut Vec<SlotId<G>>,
+        value: u64,
+    ) where
+        G: Generation + ModelGeneration,
+    {
+        let instance = slab.instance();
+        let named = match slab.reserve() {
+            SlabReserved::Slot(slot) => slot.named(),
+            SlabReserved::Full => {
+                assert_eq!(model.live.len() as u64, u64::from(model.capacity), "Full");
+                model.crossings += 1;
+                return;
+            }
+            SlabReserved::Exhausted => panic!("a wrapping slab answered Exhausted"),
+        };
+        let id = named.id();
+        assert_eq!(id.instance, instance);
+        let next = model.next_generation(id.index).expect("a wrapping slot never retires");
+        assert_eq!(id.generation, next, "a named reservation names the slot's next generation");
+        assert!(!model.live.contains_key(&(id.index, id.generation)), "it names no occupant");
+        if value & 1 == 1 {
+            assert_eq!(named.publish(T::of(value)), id, "the publish returns the named handle");
+            assert!(model.live.insert((id.index, id.generation), value).is_none());
+            model.high_water = model.high_water.max(model.live.len() as u32);
+            model.reach.named[1] += 1;
+        } else {
+            drop(named);
+            model.next[id.index as usize] = Some(id.generation.successor().unwrap_or(G::ZERO));
+            model.reach.named[0] += 1;
+        }
+        handles.push(id);
+    }
+
+    /// A reservation dropped unnamed: nothing changes, the slot's generation
+    /// kept (a `Retire` slab names none).
+    fn model_unnamed_drop<T: ModelValue, G, P, const C: usize>(
+        slab: &mut CappedSlab<T, G, P, C>,
+        model: &mut Model<G>,
+    ) where
+        G: Generation + ModelGeneration,
+        P: GenerationPolicy,
+    {
+        match slab.reserve() {
+            SlabReserved::Slot(slot) => drop(slot),
+            SlabReserved::Full => {
+                assert!(model.capacity > 0, "Full with no slot left");
+                assert_eq!(model.live.len() as u64, u64::from(model.capacity), "Full");
+                model.crossings += 1;
+            }
+            SlabReserved::Exhausted => assert_eq!(model.capacity, 0, "Exhausted with a slot left"),
+        }
+    }
+
     /// The model: a `BTreeMap<(index, generation), value>` per instance with
     /// the slots' next generations, the retired slots and the capacity left,
     /// sharing no code with the slab. Publishes, takes, releases, writes
-    /// through `get_mut` and the test hook's placements at the last
+    /// through `get_mut`, words decoded by `get_mut_by_word`, reservations
+    /// named or dropped, and the test hook's placements at the last
     /// generation are each checked against it, so a slot retires (`Retire`) or wraps
     /// (`WrapWithProof`) under random sequences; every handle the run minted
     /// is read back through `get` after every op, and the row's high water,
@@ -1499,7 +2180,7 @@ mod tests {
     fn model_run<G, P>(cap: Cap, seed: u64, ops: u32) -> Reach
     where
         G: Generation + ModelGeneration,
-        P: GenerationPolicy + ModelPolicy,
+        P: ModelPolicy<G>,
     {
         model_run_in::<u64, G, P, MAP_CHUNK_SLOTS_MAX>(cap, seed, ops)
     }
@@ -1509,7 +2190,7 @@ mod tests {
     where
         T: ModelValue,
         G: Generation + ModelGeneration,
-        P: GenerationPolicy + ModelPolicy,
+        P: ModelPolicy<G>,
     {
         let (census, _mark) = census();
         let (mut slab, _) = built_in::<T, G, P, C>(cap, &census);
@@ -1525,7 +2206,7 @@ mod tests {
         let mut rng = SplitMix64::new(seed);
         for op in 0..ops {
             let value = u64::from(op);
-            let kind = rng.next_below(16);
+            let kind = rng.next_below(18);
             if kind < 8 || handles.is_empty() {
                 model_publish(&mut slab, &mut model, &mut handles, value, false);
             } else {
@@ -1535,7 +2216,9 @@ mod tests {
                     11 | 12 => model_write(&mut slab, &mut model, handles[at], value),
                     13 => model_place_last(&mut slab, &mut model, &mut handles, at),
                     14 => model_publish(&mut slab, &mut model, &mut handles, value, true),
-                    _ => model_release(&mut slab, &mut model, handles[at]),
+                    15 => model_release(&mut slab, &mut model, handles[at]),
+                    16 => P::word(&mut slab, &mut model, &handles, &mut rng),
+                    _ => P::reservation(&mut slab, &mut model, &mut handles, value),
                 }
             }
             assert_eq!(slab.len() as usize, model.live.len());
@@ -1566,6 +2249,17 @@ mod tests {
         run
     }
 
+    /// `run`'s words and named reservations added to `totals`: the word
+    /// answers `Live`, `Stale`, `Vacant` and `Layout`, the aliased `Live`s,
+    /// the named drops and the named publishes.
+    fn worded(totals: &mut [u64; 7], run: Reach) -> Reach {
+        let reached = [run.words, [run.aliased, run.named[0], run.named[1], 0]].concat();
+        for (total, count) in totals.iter_mut().zip(reached) {
+            *total += count;
+        }
+        run
+    }
+
     fn add(sum: &mut [u64; 5], run: [u64; 5]) {
         for (total, count) in sum.iter_mut().zip(run) {
             *total += count;
@@ -1579,6 +2273,7 @@ mod tests {
     #[test]
     fn the_slab_equals_its_model_across_chunk_and_directory_edges() {
         let (mut retired, mut wrapped, mut lends) = ([0; 5], [0; 5], [0; 2]);
+        let (mut retire_words, mut wrap_words) = ([0; 7], [0; 7]);
         for (index, cap) in [
             Cap::entries::<1>("m-1", CapFill::Serving),
             Cap::entries::<2>("m-2", CapFill::Serving),
@@ -1591,14 +2286,15 @@ mod tests {
         .enumerate()
         {
             let seed = 0x51AB + 4 * index as u64;
-            add(&mut retired, lent(&mut lends, model_run::<u32, Retire>(cap, seed, 3_000)).retired);
-            add(
-                &mut retired,
-                lent(&mut lends, model_run::<u64, Retire>(cap, seed + 1, 3_000)).retired,
-            );
-            let wraps = lent(&mut lends, model_run::<u32, WrapWithProof>(cap, seed + 2, 3_000));
+            let retires = model_run::<u32, Retire>(cap, seed, 3_000);
+            add(&mut retired, worded(&mut retire_words, lent(&mut lends, retires)).retired);
+            let retires = model_run::<u64, Retire>(cap, seed + 1, 3_000);
+            add(&mut retired, worded(&mut retire_words, lent(&mut lends, retires)).retired);
+            let wraps = model_run::<u32, WrapWithProof>(cap, seed + 2, 3_000);
+            let wraps = worded(&mut wrap_words, lent(&mut lends, wraps));
             add(&mut wrapped, wraps.free_at_generation);
-            let wraps = lent(&mut lends, model_run::<u64, WrapWithProof>(cap, seed + 3, 3_000));
+            let wraps = model_run::<u64, WrapWithProof>(cap, seed + 3, 3_000);
+            let wraps = worded(&mut wrap_words, lent(&mut lends, wraps));
             add(&mut wrapped, wraps.free_at_generation);
         }
         // Get, GetMut, Take, Hook, Release.
@@ -1606,6 +2302,12 @@ mod tests {
         assert!(wrapped.iter().all(|count| *count > 0), "a wrapped slot unread: {wrapped:?}");
         assert!(lends[0] > 0, "no publish through publish_mut");
         assert!(lends[1] > 0, "no live occupant released");
+        // Live, Stale, Vacant and Layout words; aliased, named drops and
+        // publishes: a `Retire` word carries its whole generation and names
+        // none, and a `u64` one refuses every slab past one slot.
+        assert!(retire_words[..4].iter().all(|count| *count > 0), "{retire_words:?}");
+        assert!(wrap_words[..3].iter().chain(&wrap_words[4..]).all(|count| *count > 0));
+        assert_eq!(wrap_words[3], 0, "a 16-bit index field numbers every cap here");
     }
 
     /// The model at a wide slot (ADR-0194 A1): 2,992 B at a `u64` generation,
@@ -1616,6 +2318,7 @@ mod tests {
         type Payload = Wide<372>;
         assert_eq!(mem::size_of::<Slot<Payload, u64>>(), 2_992);
         let (mut retired, mut wrapped, mut lends) = ([0; 5], [0; 5], [0; 2]);
+        let (mut retire_words, mut wrap_words) = ([0; 7], [0; 7]);
         for (index, cap) in [
             Cap::entries::<1>("w-1", CapFill::Serving),
             Cap::entries::<2>("w-2", CapFill::Serving),
@@ -1628,13 +2331,10 @@ mod tests {
         .enumerate()
         {
             let seed = 0x3D1D + 2 * index as u64;
-            let retires =
-                lent(&mut lends, model_run_in::<Payload, u64, Retire, 16>(cap, seed, 3_000));
-            add(&mut retired, retires.retired);
-            let wraps = lent(
-                &mut lends,
-                model_run_in::<Payload, u64, WrapWithProof, 16>(cap, seed + 1, 3_000),
-            );
+            let retires = model_run_in::<Payload, u64, Retire, 16>(cap, seed, 3_000);
+            add(&mut retired, worded(&mut retire_words, lent(&mut lends, retires)).retired);
+            let wraps = model_run_in::<Payload, u64, WrapWithProof, 16>(cap, seed + 1, 3_000);
+            let wraps = worded(&mut wrap_words, lent(&mut lends, wraps));
             add(&mut wrapped, wraps.free_at_generation);
         }
         // Get, GetMut, Take, Hook, Release.
@@ -1642,6 +2342,13 @@ mod tests {
         assert!(wrapped.iter().all(|count| *count > 0), "a wrapped slot unread: {wrapped:?}");
         assert!(lends[0] > 0, "no publish through publish_mut");
         assert!(lends[1] > 0, "no live occupant released");
+        // A `u64` `Retire` word numbers one slot, whose hook retires it within
+        // a few ops: `Stale` there, `Layout` past it, never `Vacant` (no bit
+        // lies above its fields); its `Live` is the peer-word test's.
+        let retire_reached = [retire_words[1], retire_words[3]];
+        assert!(retire_reached.iter().all(|count| *count > 0), "{retire_words:?}");
+        assert_eq!(retire_words[2], 0, "a whole-word field leaves no bit above it");
+        assert!(wrap_words[..3].iter().chain(&wrap_words[4..]).all(|count| *count > 0));
     }
 
     /// Records its own address, where it is dropped.
@@ -1854,6 +2561,193 @@ mod tests {
         assert_eq!(slab.take(id), Taken::Value(1));
         assert!(matches!(slab.place_generation_last(&mut id), LookupMut::Stale));
         assert_eq!(id.generation, 0, "a stale handle is not re-stamped");
+    }
+
+    /// The fabric key's adapter: 24 index bits, the low 23 of a `u32`
+    /// generation (ADR-0177 D4).
+    type Key = SlotWord<u32, WrapWithProof, GATE_KEY_INDEX_BITS, GATE_KEY_GENERATION_BITS>;
+
+    /// The first generation past the key's field, whose field reads 0.
+    const PAST_FIELD: u32 = 1 << GATE_KEY_GENERATION_BITS;
+
+    /// A word resolves `id`'s occupant, `value`, answering its whole handle.
+    fn resolves(slab: &mut CappedSlab<u64, u32, WrapWithProof>, key: &Key, id: SlotId<u32>) {
+        let bits = key.encode(id).expect("this slab's handle");
+        match slab.get_mut_by_word(key, bits) {
+            WordLookup::Live(found, _) => assert_eq!(found, id, "the word's whole handle"),
+            other => panic!(
+                "key-stale-past-width: the word {bits:#x} of generation {:#x} is {other:?}",
+                id.generation
+            ),
+        }
+    }
+
+    /// A word that names no occupant now is `Stale`.
+    fn stale(slab: &mut CappedSlab<u64, u32, WrapWithProof>, key: &Key, id: SlotId<u32>) {
+        let bits = key.encode(id).expect("this slab's handle");
+        let found = slab.get_mut_by_word(key, bits);
+        assert!(matches!(found, WordLookup::Stale), "{bits:#x}: a past occupant's word {found:?}");
+    }
+
+    /// A word at the key's field edge (ADR-0194 D6 with A2): slots built
+    /// free at generation 2²³ − 1, one published and resolved by its word,
+    /// taken (its word now `Stale`), published again at 2²³, whose field
+    /// reads 0: that word resolves the occupant with its whole generation,
+    /// and the old word, field 2²³ − 1, is `Stale`. Compared on the whole
+    /// generation, the second word is `Stale` and its waiter never wakes.
+    #[test]
+    fn a_word_resolves_its_slot_past_the_field_width() {
+        let (census, _mark) = census();
+        let cap = Cap::entries::<2>("key-edge", CapFill::Serving);
+        let builder = CappedSlab::builder(cap, &census).expect("registered");
+        let (mut slab, _) =
+            stepped::<u64, u32, WrapWithProof, 64>(builder.first_generation(PAST_FIELD - 1));
+        let key = Key::for_slab(&slab).expect("two slots number in 24 bits");
+        let first = publish(&mut slab, 1).expect("room");
+        assert_eq!(first.generation, PAST_FIELD - 1);
+        resolves(&mut slab, &key, first);
+        assert_eq!(slab.take(first), Taken::Value(1));
+        stale(&mut slab, &key, first);
+        let second = publish(&mut slab, 2).expect("the slot freed");
+        assert_eq!((second.index, second.generation), (first.index, PAST_FIELD));
+        assert_eq!(key.encode(second), Some(u64::from(second.index)), "its field reads 0");
+        resolves(&mut slab, &key, second);
+        stale(&mut slab, &key, first);
+        assert!(matches!(slab.get(second), Lookup::Live(2)), "the word wrote nothing");
+    }
+
+    /// A word across the generation's last value: an occupant placed at
+    /// `u32::MAX` (field 2²³ − 1) resolves; taken, the slot wraps to 0; the
+    /// next occupant's word (field 0) resolves it, and the old word is
+    /// `Stale`.
+    #[test]
+    fn a_word_resolves_its_slot_across_the_last_generation() {
+        let (census, _mark) = census();
+        let cap = Cap::entries::<1>("key-last", CapFill::Serving);
+        let (mut slab, _) = built::<u64, u32, WrapWithProof>(cap, &census);
+        let key = Key::for_slab(&slab).expect("one slot numbers in 24 bits");
+        let mut last = publish(&mut slab, 1).expect("room");
+        assert!(matches!(slab.place_generation_last(&mut last), LookupMut::Live(1)));
+        assert_eq!(key.encode(last), Some(u64::from(PAST_FIELD - 1) << GATE_KEY_INDEX_BITS));
+        resolves(&mut slab, &key, last);
+        assert_eq!(slab.take(last), Taken::Value(1));
+        let wrapped = publish(&mut slab, 2).expect("the slot wrapped");
+        assert_eq!(wrapped.generation, 0);
+        resolves(&mut slab, &key, wrapped);
+        stale(&mut slab, &key, last);
+    }
+
+    /// A peer's word (ADR-0194 D6 with A2): any `u64` answers `Live`,
+    /// `Stale` or `Vacant` against the oracle, which reads the layout by
+    /// remainders, and writes nothing; an index at or past the slab's slots,
+    /// or a bit above the two fields, is `Vacant`; another slab's adapter is
+    /// `Stale`; another slab's handle encodes to `None`; a slab past the
+    /// index field's span refuses its adapter `Layout`.
+    #[test]
+    fn a_peer_word_answers_by_its_bits_and_writes_nothing() {
+        let (census, _mark) = census();
+        let cap = Cap::entries::<5>("peer", CapFill::Serving);
+        let (mut slab, _) = built::<u64, u32, WrapWithProof>(cap, &census);
+        let (mut other, _) = built::<u64, u32, WrapWithProof>(cap, &census);
+        let key = Key::for_slab(&slab).expect("five slots number in 24 bits");
+        let theirs_key = Key::for_slab(&other).expect("five slots number in 24 bits");
+        let ids: Vec<_> = (0..4).map(|value| publish(&mut slab, value).expect("room")).collect();
+        let theirs = publish(&mut other, 9).expect("room");
+        let mut rng = SplitMix64::new(0x0B17);
+        for draw in 0..20_000u32 {
+            let bits = match draw % 3 {
+                0 => rng.next_u64(),
+                1 => rng.next_u64() % (1 << 47),
+                _ => rng.next_below(7) + (rng.next_below(2) << GATE_KEY_INDEX_BITS),
+            };
+            let (index, carried) = (bits % (1 << 24), bits >> 24);
+            let expected = (carried >> 23 == 0 && index < 5).then(|| {
+                let field = |id: &&SlotId<u32>| u64::from(id.generation) % (1 << 23) == carried;
+                ids.iter().find(|id| u64::from(id.index) == index).filter(field)
+            });
+            match (slab.get_mut_by_word(&key, bits), expected) {
+                (WordLookup::Live(found, value), Some(Some(id))) => {
+                    assert_eq!(found, *id);
+                    assert_eq!(*value, u64::from(id.index));
+                }
+                (WordLookup::Stale, Some(None)) | (WordLookup::Vacant, None) => {}
+                (found, expected) => panic!("{bits:#x}: the word {found:?}, oracle {expected:?}"),
+            }
+        }
+        for (index, id) in (0..).zip(&ids) {
+            assert!(matches!(slab.get(*id), Lookup::Live(value) if *value == index));
+        }
+        assert_eq!(slab.len(), 4, "no word wrote the slab");
+        let past = [5, (1 << 24) - 1, (1 << 47) | 1, u64::MAX];
+        for bits in past {
+            assert!(matches!(slab.get_mut_by_word(&key, bits), WordLookup::Vacant), "{bits:#x}");
+        }
+        let mine = key.encode(ids[1]).expect("this slab's handle");
+        assert!(matches!(slab.get_mut_by_word(&theirs_key, mine), WordLookup::Stale));
+        assert_eq!(key.encode(theirs), None, "another slab's handle");
+        type Narrow = SlotWord<u32, WrapWithProof, 2, 23>;
+        assert_eq!(Narrow::for_slab(&slab).map(|_| ()).err(), Some(CapError::Layout));
+        let four = Cap::entries::<4>("four", CapFill::Serving);
+        assert!(Narrow::for_slab(&built::<u64, u32, WrapWithProof>(four, &census).0).is_ok());
+        // A `Retire` word carries the whole `u64`: one slot, every bit its
+        // generation's, so its occupant resolves and, retired, is `Stale`.
+        type Whole = SlotWord<u64, Retire, 0, 64>;
+        let one = Cap::entries::<1>("one", CapFill::Serving);
+        let mut single = built::<u64, u64, Retire>(one, &census).0;
+        let whole = Whole::for_slab(&single).expect("one slot numbers in no bits");
+        let mut last = publish(&mut single, 3).expect("room");
+        assert!(matches!(single.place_generation_last(&mut last), LookupMut::Live(3)));
+        assert_eq!(whole.encode(last), Some(u64::MAX), "the word is the generation");
+        let found = single.get_mut_by_word(&whole, u64::MAX);
+        assert!(matches!(found, WordLookup::Live(id, 3) if id == last), "{found:?}");
+        assert_eq!(single.take(last), Taken::Value(3));
+        assert!(matches!(single.get_mut_by_word(&whole, u64::MAX), WordLookup::Stale));
+        let two = Cap::entries::<2>("two", CapFill::Serving);
+        let refused = Whole::for_slab(&built::<u64, u64, Retire>(two, &census).0);
+        assert_eq!(refused.map(|_| ()).err(), Some(CapError::Layout));
+    }
+
+    /// A named reservation (ADR-0194 D1 with A2): its `id()` is `Stale`
+    /// until its publish; dropped unpublished, the next named reservation of
+    /// that slot names the next generation, so the first word is `Stale` at
+    /// the new occupant; at the last generation the drop wraps; and the
+    /// drop's advance runs on an unwind. Kept, the dropped handle is reissued.
+    #[test]
+    fn a_dropped_named_reservation_names_no_later_occupant() {
+        let (census, _mark) = census();
+        let cap = Cap::entries::<1>("named", CapFill::Serving);
+        let builder = CappedSlab::builder(cap, &census).expect("registered");
+        let (mut slab, _) =
+            stepped::<u64, u32, WrapWithProof, 64>(builder.first_generation(u32::MAX - 1));
+        let key = Key::for_slab(&slab).expect("one slot numbers in 24 bits");
+        let mut dropped = Vec::new();
+        for expected in [u32::MAX - 1, u32::MAX, 0] {
+            let SlabReserved::Slot(slot) = slab.reserve() else { panic!("a free slot") };
+            let named = slot.named();
+            let id = named.id();
+            assert_eq!(id.generation, expected, "id-reused: {id:?} after {dropped:?}");
+            drop(named);
+            assert!(matches!(slab.get(id), Lookup::Stale), "an unpublished handle");
+            dropped.push(id);
+        }
+        let unwound = catch_unwind(AssertUnwindSafe(|| {
+            let SlabReserved::Slot(slot) = slab.reserve() else { panic!("a free slot") };
+            let named = slot.named();
+            assert_eq!(named.id().generation, 1, "id-reused: the drops advanced to 1");
+            panic!("unwinding with {:?} held", named.id());
+        }));
+        assert!(unwound.is_err(), "the closure unwound");
+        let SlabReserved::Slot(slot) = slab.reserve() else { panic!("a free slot") };
+        let named = slot.named();
+        let id = named.id();
+        assert_eq!(id.generation, 2, "id-reused: the unwind's drop advanced past 1");
+        assert_eq!(named.publish(7), id, "the publish returns the named handle");
+        assert_eq!(slab.len(), 1);
+        for past in dropped {
+            stale(&mut slab, &key, past);
+            assert!(matches!(slab.get(past), Lookup::Stale), "{past:?}");
+        }
+        resolves(&mut slab, &key, id);
     }
 
     // The fill byte's removal leg: an `Assembly` slab filled to its cap and

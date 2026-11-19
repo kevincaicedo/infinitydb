@@ -17,13 +17,16 @@
 //! fast step are `support/fast.rs`'s; this one binary is timed, counted (`perf stat`, instructions
 //! per near call) and listed (`perf record`), so every reading of a shape reads one loop.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::hint::black_box;
 use std::rc::Rc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use inf_foundation::CellId;
+use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_runtime::{
-    CellExecutor, FabricGate, GateWait, PollImmediate, TaskAdmission, TaskClass, TaskFactory,
+    CellExecutor, FabricAdmission, FabricGate, GateUnits, GateWait, PollImmediate, TaskAdmission,
+    TaskClass, TaskFactory,
 };
 
 #[path = "support/fast.rs"]
@@ -40,7 +43,7 @@ fn executor_of<Args, Fac: TaskFactory<Args>>(factory: &Fac) -> (CellExecutor, Ta
 }
 
 /// The slow path's task: it awaits its gate's value and keeps it.
-async fn waiter_task(waiter: GateWait<u64, u64>, sink: Rc<Cell<u64>>) {
+async fn waiter_task(waiter: GateWait<'static, u64>, sink: Rc<Cell<u64>>) {
     sink.set(waiter.await);
 }
 
@@ -114,20 +117,29 @@ fn bench_suspend_resume(c: &mut Criterion) {
     let mut group = c.benchmark_group("executor_slow_path");
 
     let (mut ex, class) = executor_of(&waiter_task);
-    let gate: FabricGate<u64> = FabricGate::new();
+    // A task's wait borrows its gate and units, so the bench's live for the
+    // run: the spawned future is `'static`.
+    let gate: &'static RefCell<FabricGate<u64>> =
+        Box::leak(Box::new(RefCell::new(one_holder_gate())));
+    let units: &'static GateUnits = Box::leak(Box::new(gate.borrow().units(1).expect("a unit")));
     let sink = Rc::new(Cell::new(0u64));
-    let mut token = 0u64;
     group.bench_function("suspend_complete_resume", |b| {
         b.iter(|| {
-            token += 1;
-            let waiter = gate.waiter(token);
+            let (token, waiter) = {
+                let mut open = gate.borrow_mut();
+                let FabricAdmission::Granted(permit) = open.reserve(units) else {
+                    panic!("the bench's one wait is done");
+                };
+                let token = permit.key();
+                (token, permit.register(gate, None))
+            };
             let sink = Rc::clone(&sink);
             let TaskAdmission::Granted(permit) = ex.reserve(class) else {
                 panic!("the bench's class has room");
             };
             let outcome = permit.poll_immediate(|| waiter_task(waiter, sink));
             assert!(matches!(outcome, PollImmediate::Suspended(_)));
-            gate.complete(token, token);
+            FabricGate::complete(gate, token, token, inf_foundation::time::Nanos(0));
             ex.run_ready(1);
         });
     });
@@ -138,3 +150,10 @@ fn bench_suspend_resume(c: &mut Criterion) {
 
 criterion_group!(benches, bench_fast_path, bench_suspend_resume);
 criterion_main!(benches);
+
+/// A gate of one unit over one holder, on a census of its own.
+fn one_holder_gate() -> FabricGate<u64> {
+    const HOLDERS: Cap = Cap::entries::<1>("bench-gate-holders", CapFill::Serving);
+    let (census, _mark) = CapCensus::new(CellId(0));
+    FabricGate::build(0, 1, Some(HOLDERS), &census).expect("the bench's gate")
+}

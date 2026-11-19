@@ -489,6 +489,10 @@ fn tripwires_section(
     push(text, &format!("fabric_parked_bytes:{}", node.fabric_parked_bytes.get()));
     push(text, &format!("fabric_parked_bytes_max:{}", node.fabric_parked_bytes_max.get()));
     push(text, &format!("fabric_parked_refused:{}", node.fabric_parked_refused.get()));
+    // The fabric gate's reserves on a full gate and completions for no
+    // waiting holder, each derived never (ADR-0177 D4; cell scope).
+    push(text, &format!("gate_full:{}", node.gate_full.get()));
+    push(text, &format!("gate_stale:{}", node.gate_stale.get()));
     push(text, &format!("pubsub_delivered:{}", node.pubsub_delivered.get()));
     push(text, &format!("pubsub_state_bytes:{}", node.pubsub_state_bytes.get()));
     push(text, &format!("{}:{}", tw::WIRE_BUFFERS_BYTES, node.wire_buffers_bytes.get()));
@@ -925,6 +929,7 @@ fn tiering_read_lines(ks: &Keyspace, node: &NodeInfo, text: &mut String) {
     push(text, &format!("cold_link_stale:{}", cold_gauge(C::LinksStale)));
     push(text, &format!("cold_identity_exhausted:{}", cold_gauge(C::IdentityExhausted)));
     push(text, &format!("cold_identity_pairs_used:{}", cold_gauge(C::IdentityPairsUsed)));
+    push(text, &format!("cold_gate_full:{}", cold_gauge(C::GateFull)));
     push(text, &format!("tiering_tail_allocs:{}", tiering.tail_allocs));
     push(text, &format!("tiering_seal_holes:{}", tiering.seal_holes));
     push(text, &format!("tiering_seal_hole_bytes:{}", tiering.seal_hole_bytes));

@@ -88,10 +88,14 @@ pub enum SlabLevels {
 }
 
 /// The rate legs' loop: `ops` steps over the keys `2 · (op & mask)`, with
-/// `NOPS` planted per op. Every rate leg and the harness run it, so the
-/// harness reads the loop's own share of each.
+/// `NOPS` planted per op. Every rate leg, every wait leg and the harness
+/// run it, so the harness reads the loop's own share of each.
 #[inline(always)]
-fn rate_loop<const NOPS: u8>(ops: u64, mask: u64, mut step: impl FnMut(u64) -> u64) -> u64 {
+pub(super) fn rate_loop<const NOPS: u8>(
+    ops: u64,
+    mask: u64,
+    mut step: impl FnMut(u64) -> u64,
+) -> u64 {
     let mut accumulator = 0u64;
     for op in 0..ops {
         plant::<NOPS>();
@@ -101,7 +105,7 @@ fn rate_loop<const NOPS: u8>(ops: u64, mask: u64, mut step: impl FnMut(u64) -> u
 }
 
 /// The keys the depth-14 legs walk: the harness walks the same.
-const MASK_14: u64 = (1 << 14) - 1;
+pub(super) const MASK_14: u64 = (1 << 14) - 1;
 
 /// Drives `ops` steps of `leg` with `NOPS` planted per op, then checks what
 /// they did.
@@ -271,8 +275,8 @@ fn step_slab_cycle(slab: &mut IntentSlab, key: u64) -> u64 {
 }
 
 #[inline(never)]
-fn step_slab_get(slab: &mut IntentSlab, id: SlotId<u32>) -> u64 {
-    match slab.get(id) {
+fn step_slab_get(slab: &mut IntentSlab, id: &SlotId<u32>) -> u64 {
+    match slab.get(*id) {
         Lookup::Live(value) => value[14] + 1,
         Lookup::Stale | Lookup::Vacant => panic!("a live occupant"),
     }
@@ -286,7 +290,7 @@ fn drive_slab<const NOPS: u8>(cycle: bool, ops: u64) -> u64 {
     let accumulator = if cycle {
         rate_loop::<NOPS>(ops, MASK_14, |key| step_slab_cycle(slab, key))
     } else {
-        rate_loop::<NOPS>(ops, MASK_14, |_| step_slab_get(slab, first))
+        rate_loop::<NOPS>(ops, MASK_14, |_| step_slab_get(slab, &first))
     };
     // Engagement, after the counted loop: every op reached its slot and the
     // slab holds its occupants alone.
@@ -304,7 +308,7 @@ const RETIRE_256: Cap = Cap::entries::<256>("bench-retire-256", CapFill::Serving
 const RETIRE_16448: Cap = Cap::entries::<16_448>("bench-retire-16448", CapFill::Serving);
 
 /// The slots one directory level covers: its children's chunks.
-const ONE_LEVEL_SLOTS: usize = MAP_CHUNK_SLOTS_MAX * MAP_DIRECTORY_CHILDREN_MAX;
+pub(super) const ONE_LEVEL_SLOTS: usize = MAP_CHUNK_SLOTS_MAX * MAP_DIRECTORY_CHILDREN_MAX;
 // The one-level legs' slab is one directory over its chunks and the `-2`
 // legs' slab two, so each op of a `-2` leg walks one link more than its
 // twin's: a smaller cap does not compile.
@@ -346,16 +350,16 @@ fn step_slab_cycle_retire(slab: &mut RetireSlab, key: u64) -> u64 {
 }
 
 #[inline(never)]
-fn step_slab_get_retire(slab: &mut RetireSlab, id: SlotId<u64>) -> u64 {
-    match slab.get(id) {
+fn step_slab_get_retire(slab: &mut RetireSlab, id: &SlotId<u64>) -> u64 {
+    match slab.get(*id) {
         Lookup::Live(value) => value[14] + 1,
         Lookup::Stale | Lookup::Vacant => panic!("a live occupant"),
     }
 }
 
 #[inline(never)]
-fn step_slab_get_mut(slab: &mut RetireSlab, id: SlotId<u64>) -> u64 {
-    match slab.get_mut(id) {
+fn step_slab_get_mut(slab: &mut RetireSlab, id: &SlotId<u64>) -> u64 {
+    match slab.get_mut(*id) {
         LookupMut::Live(value) => value[14] + 1,
         LookupMut::Stale | LookupMut::Vacant => panic!("a live occupant"),
     }
@@ -371,8 +375,8 @@ fn drive_retire_slab<const NOPS: u8>(op: RetireOp, levels: SlabLevels, ops: u64)
     let (mut slab, first, _census) = retire_slab(cap);
     let slab = black_box(&mut slab);
     let accumulator = match op {
-        RetireOp::Get => rate_loop::<NOPS>(ops, MASK_14, |_| step_slab_get_retire(slab, first)),
-        RetireOp::GetMut => rate_loop::<NOPS>(ops, MASK_14, |_| step_slab_get_mut(slab, first)),
+        RetireOp::Get => rate_loop::<NOPS>(ops, MASK_14, |_| step_slab_get_retire(slab, &first)),
+        RetireOp::GetMut => rate_loop::<NOPS>(ops, MASK_14, |_| step_slab_get_mut(slab, &first)),
         RetireOp::Cycle => rate_loop::<NOPS>(ops, MASK_14, |key| step_slab_cycle_retire(slab, key)),
     };
     // Engagement, after the counted loop: every op reached its slot and the

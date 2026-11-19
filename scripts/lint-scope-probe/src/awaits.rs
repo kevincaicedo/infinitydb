@@ -6,12 +6,13 @@
 //! live across the await, so the slot and the answer that carries it are two
 //! entries with a plant each; a wrapper of the caller's own (an `Option`, a
 //! tuple or a struct holding a slot) is not matched and stays review's. A
-//! slab's lookups borrow its occupant for one step, and a map's admission
-//! answer, its vacant slot and its present entry borrow the map, so they are
-//! listed too. Compile only; nothing here runs.
+//! slab's lookups, by handle or by word, borrow its occupant for one step, a
+//! named reservation borrows the slab as its reservation does, and a map's
+//! admission answer, its vacant slot and its present entry borrow the map, so
+//! they are listed too. Compile only; nothing here runs.
 use inf_foundation::bounded::{
     Admission, CappedDeque, CappedMap, CappedSlab, Lookup, LookupMut, Reserve, Reserved, Retire,
-    SlabReserved, SlotId,
+    SlabReserved, SlotId, SlotWord, WordLookup, WrapWithProof,
 };
 
 async fn yield_once() {}
@@ -124,6 +125,59 @@ fn write(found: LookupMut<'_, u8>) {
     match found {
         LookupMut::Live(value) => *value = 1,
         LookupMut::Stale | LookupMut::Vacant => {}
+    }
+}
+
+// A named reservation, held across the await before its publish, and a word's
+// lookup, each a borrow of the slab for one step.
+
+pub async fn named_reservation_across_await(slab: &mut CappedSlab<u8, u32, WrapWithProof>) {
+    match slab.reserve() {
+        SlabReserved::Slot(slot) => {
+            let named = slot.named(); // PLANT clippy::await_holding_invalid_type inf_foundation::bounded::NamedReservation
+            settle().await;
+            let _id = named.publish(6);
+        }
+        SlabReserved::Full | SlabReserved::Exhausted => {}
+    }
+}
+
+pub async fn named_reservation_published_before_await(
+    slab: &mut CappedSlab<u8, u32, WrapWithProof>,
+) {
+    match slab.reserve() {
+        SlabReserved::Slot(slot) => {
+            let _id = slot.named().publish(6); // CONTROL
+        }
+        SlabReserved::Full | SlabReserved::Exhausted => {}
+    }
+    settle().await; // CONTROL
+}
+
+pub async fn word_lookup_across_await(
+    slab: &mut CappedSlab<u8, u32, WrapWithProof>,
+    word: &SlotWord<u32, WrapWithProof, 24, 23>,
+    bits: u64,
+) {
+    let found = slab.get_mut_by_word(word, bits); // PLANT clippy::await_holding_invalid_type inf_foundation::bounded::WordLookup
+    settle().await;
+    resolve(found);
+}
+
+pub async fn word_lookup_resolved_before_await(
+    slab: &mut CappedSlab<u8, u32, WrapWithProof>,
+    word: &SlotWord<u32, WrapWithProof, 24, 23>,
+    bits: u64,
+) {
+    let found = slab.get_mut_by_word(word, bits); // CONTROL
+    resolve(found); // CONTROL
+    settle().await; // CONTROL
+}
+
+fn resolve(found: WordLookup<'_, u8, u32>) {
+    match found {
+        WordLookup::Live(_, value) => *value = 1,
+        WordLookup::Stale | WordLookup::Vacant => {}
     }
 }
 

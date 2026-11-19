@@ -8,7 +8,7 @@ use inf_foundation::bounded::{AssemblyFull, Cap, CapError};
 use inf_runtime::{CellExecutor, ExecutorLayout, TaskAdmission, TaskClass, TaskId, TaskPermit};
 
 use super::*;
-use crate::limits::{PeerTaskCaps, PlaneTaskCaps};
+use crate::limits::{GATE_UNITS_PER_CONN_TASK, PeerTaskCaps, PlaneTaskCaps};
 
 /// The six classes' handles and their caps, one field of `Shared`.
 pub(super) struct PlaneTasks {
@@ -120,17 +120,19 @@ fn granted<Fut>(admission: TaskAdmission<'_, Fut>) -> Option<TaskPermit<'_, Fut>
 
 /// Admits a connection and makes its pump in one step (ADR-0123 A1, ADR-0177 D2): the `conn`
 /// permit first, so a full class refuses the accept before anything is installed; then the
-/// slot, whose key the pump serves; the pump's first poll finds no command and parks. `None`
-/// when the class or the slab is full: nothing was installed or made.
+/// task's gate units (ADR-0177 D4), which leave and return with it; then the slot, whose key
+/// the pump serves; the pump's first poll finds no command and parks. `None` when the class,
+/// the gate's units or the slab is full: nothing was installed or made.
 pub(super) fn admit_conn<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     executor: &mut CellExecutor,
     shared: &Rc<Shared<O, F>>,
     conn: impl FnOnce(TaskId) -> Conn,
 ) -> Option<ConnKey> {
     let permit = granted(executor.reserve(shared.tasks.conn.0))?;
+    let units = shared.gate.borrow().units(GATE_UNITS_PER_CONN_TASK)?;
     shared.conns.borrow_mut().insert_with(|key| {
         let pump_shared = Rc::clone(shared);
-        conn(permit.spawn_local(move || pump(pump_shared, key)))
+        conn(permit.spawn_local(move || pump(pump_shared, key, units)))
     })
 }
 
@@ -158,10 +160,20 @@ pub(super) fn start_peer_pumps<O: PlaneObserver + 'static, F: SegmentFs + Clone 
         let (pump_shared, own) = (Rc::clone(shared), shared.cell.0);
         ns_apply.push(permit.spawn_local(move || ns_apply_pump(pump_shared, own)));
     }
-    let owner_pub = start_one(executor, peers.owner_pub, || owner_pub_pump(Rc::clone(shared)))?;
+    // The owner pump's units: one leg toward each peer (ADR-0177 D2).
+    let owner_units = || {
+        let units = shared.gate.borrow().units(u32::from(shared.cells) - 1);
+        units.ok_or(AssemblyFull::new(peers.owner_pub.1))
+    };
+    let units = owner_units()?;
+    let owner_pub =
+        start_one(executor, peers.owner_pub, || owner_pub_pump(Rc::clone(shared), units))?;
     // Canary: plane start makes a second `owner-pub` pump.
     #[cfg(inf_canary_owner_pub_pump_extra)]
-    start_one(executor, peers.owner_pub, || owner_pub_pump(Rc::clone(shared)))?;
+    {
+        let units = owner_units()?;
+        start_one(executor, peers.owner_pub, || owner_pub_pump(Rc::clone(shared), units))?;
+    }
     let gated = start_one(executor, peers.gated, || gated_pump(Rc::clone(shared)))?;
     // Canary: plane start makes a second `gated` pump.
     #[cfg(inf_canary_gated_pump_extra)]
@@ -256,6 +268,115 @@ mod tests {
                 caps.conn.entries_max(),
                 executor.header_array_bytes()
             );
+            let holders = crate::limits::gate_holders(&caps, cells, 1_024)
+                .expect("the default gate")
+                .map_or(0, |holders| holders.entries_max());
+            println!(
+                "every_class_registers_at_its_chunk: {cells} cells: H {holders}, holder {} B",
+                FabricGate::<OwnedOutcome>::HOLDER_SLOT_BYTES
+            );
         }
+    }
+
+    /// The chunks and directories a slab of `cap` slots in chunks of `chunk` builds: ⌈cap ÷ c⌉
+    /// chunks and, per directory level above them, ⌈chunks ÷ 256^k⌉ directories, none for one
+    /// chunk (ADR-0194 A1).
+    #[cfg(feature = "doc")]
+    fn chunks_and_directories(cap: u32, chunk: usize) -> (u64, u64) {
+        let chunks = u64::from(cap).div_ceil(chunk as u64);
+        let (mut directories, mut level) = (0, chunks);
+        while level > 1 {
+            level = level.div_ceil(inf_foundation::limits::MAP_DIRECTORY_CHILDREN_MAX as u64);
+            directories += level;
+        }
+        (chunks, directories)
+    }
+
+    /// One slab's resident bill at the build: every slot of each chunk and each 2 KiB
+    /// directory written (ADR-0177 D8 with A1.1).
+    #[cfg(feature = "doc")]
+    fn slab_bill(cap: u32, stride: usize, chunk: usize) -> u64 {
+        let (chunks, directories) = chunks_and_directories(cap, chunk);
+        chunks * chunk as u64 * stride as u64 + directories * 2_048
+    }
+
+    /// The `--plant-bytes-cell` value of `cfg`'s row in the canary table.
+    #[cfg(feature = "doc")]
+    fn plant_bytes(table: &str, cfg: &str) -> u64 {
+        let row = table
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("\"{cfg} ")))
+            .unwrap_or_else(|| panic!("no canary row for {cfg}"));
+        let mut words = row.split_whitespace();
+        words.find(|word| *word == "--plant-bytes-cell");
+        words.next().and_then(|bytes| bytes.parse().ok()).expect("a plant's bytes")
+    }
+
+    /// `empty_idle_rss`'s bill at 4 cells and the default `maxclients`, recomputed from the
+    /// strides the build reads (ADR-0177 D8 with A1): the fixed terms, each task class's
+    /// slab and the fabric gate's holders. The gate row's threshold and both `binary` canaries'
+    /// planted bytes (`conn` slots and gate holders doubled) are these strides' products, so a
+    /// stride that moves turns this red until the three move with it. The bill is the shipped
+    /// node's, built with its default features: a slim build's strides are its own.
+    #[test]
+    #[cfg(feature = "doc")]
+    fn the_idle_bill_and_its_plants_follow_the_strides() {
+        const CELLS: u16 = 4;
+        const MIB: f64 = 1_048_576.0;
+        let config = ConfigStore::default();
+        let caps = crate::limits::plane_task_caps(config.boot_share(CELLS), CELLS)
+            .expect("the default caps");
+        let peers = caps.peers.as_ref().expect("a cell with peers");
+        let classes = [
+            (caps.conn, ExecutorLayout::slot_shape(&pump::<O, F>)),
+            (peers.ns_apply, ExecutorLayout::slot_shape(&ns_apply_pump::<O, F>)),
+            (peers.owner_pub, ExecutorLayout::slot_shape(&owner_pub_pump::<O, F>)),
+            (peers.gated, ExecutorLayout::slot_shape(&gated_pump::<O, F>)),
+            (caps.compact, ExecutorLayout::slot_shape(&compact_pump::<O, F>)),
+            (caps.shadow, ExecutorLayout::slot_shape(&shadow_pump::<O, F>)),
+        ];
+        let tasks: u64 = classes
+            .iter()
+            .map(|(cap, (stride, chunk))| slab_bill(cap.entries_max(), *stride, *chunk))
+            .sum();
+        let holders = crate::limits::gate_holders(&caps, CELLS, 1_024)
+            .expect("the default gate")
+            .expect("a gate at 4 cells")
+            .entries_max();
+        let holder_bytes = FabricGate::<OwnedOutcome>::HOLDER_SLOT_BYTES;
+        let holder_chunk =
+            inf_foundation::limits::chunk_slots_for(holder_bytes).expect("a holder's chunk");
+        let gate = slab_bill(holders, holder_bytes, holder_chunk);
+        // Pinned receive pools 64 MiB, mesh ring slots 3 MiB, SQ and CQ 1.5 MiB, the per-cell
+        // remainder 16 MiB and the per-node remainder 16 MiB: the row's fixed terms.
+        let fixed = 100.5 * MIB;
+        let bill = (fixed + (u64::from(CELLS) * (tasks + gate)) as f64) / MIB;
+        let threshold = (bill * 100.0).ceil() / 100.0;
+        println!(
+            "the_idle_bill_and_its_plants_follow_the_strides: tasks {tasks} B, gate {gate} B a \
+             cell, bill {bill:.3} MiB, threshold {threshold:.2}"
+        );
+        let gates = include_str!("../../../../docs/milestones/m1-gates.toml");
+        let row = gates.split("[[gate]]").find(|row| row.contains("id = \"empty_idle_rss\""));
+        let written: f64 = row
+            .and_then(|row| row.lines().find_map(|line| line.strip_prefix("threshold = ")))
+            .and_then(|value| value.trim().parse().ok())
+            .expect("empty_idle_rss's threshold");
+        assert!(
+            (written - threshold).abs() < 1e-9,
+            "empty_idle_rss's threshold {written} is not the bill's {threshold} at these strides"
+        );
+        let sum = format!("Σ {bill:.3} MiB");
+        assert!(gates.contains(&sum), "the bill's comment does not read `{sum}` at these strides");
+        let canaries = include_str!("../../../../scripts/sim-canaries.sh");
+        let conn_stride = ExecutorLayout::slot_shape(&pump::<O, F>).0 as u64;
+        let conn_plant = u64::from(caps.conn.entries_max()) * conn_stride;
+        assert_eq!(
+            plant_bytes(canaries, "inf_canary_conn_slots_doubled"),
+            conn_plant,
+            "C x s_conn"
+        );
+        let gate_plant = u64::from(holders) * holder_bytes as u64;
+        assert_eq!(plant_bytes(canaries, "inf_canary_gate_holders_doubled"), gate_plant, "H x s_h");
     }
 }

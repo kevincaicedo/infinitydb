@@ -69,7 +69,11 @@ pub use executor::{
     CellExecutor, ExecutorInitError, ExecutorLayout, Park, PollImmediate, TaskAdmission, TaskClass,
     TaskFactory, TaskId, TaskPermit, Woken, park,
 };
-pub use gate::{FabricGate, GateWait, IoGate, WaitList, WatermarkGate, WatermarkWait};
+pub use gate::{
+    Cleanup, Delivery, DropValue, FabricAdmission, FabricGate, GateHold, GateKey, GatePermit,
+    GateUnits, GateWait, IoGate, KeyedAdmission, KeyedGate, KeyedPermit, KeyedWait, WaitList,
+    WatermarkGate, WatermarkWait,
+};
 pub use reactor::{
     CellLoop, CellPlane, IterStats, LoopConfig, LoopCx, ParkCeiling, ParkCeilingTooLong,
 };

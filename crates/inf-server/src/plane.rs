@@ -9,8 +9,8 @@
 //! - **Local commands** (every key owned by this cell, or no keys) execute
 //!   synchronously inside PARSE+EXECUTE — the L6 fast path pays nothing.
 //! - **Remote commands** run on a per-connection *pump* future. The pump
-//!   dispatches commands in pipeline order with up to [`REMOTE_WINDOW`]
-//!   remote ops in flight at once (the M0-E8 cross-cell remediation:
+//!   dispatches commands in pipeline order with one remote op in flight per
+//!   unit of its task's gate units at once (the M0-E8 cross-cell remediation:
 //!   one-hop-at-a-time execution was the 85% penalty), then emits replies
 //!   strictly in command order — out-of-order completions park in the
 //!   [`FabricGate`] until their turn. Sends always leave from the single
@@ -45,19 +45,20 @@ use inf_fabric::{
     ApplyArgs, CellFabric, ErrCode, FabricToken, MAX_APPLY_ARGS, MAX_INLINE_APPLY_ARGS, Op,
     Outcome, SendError,
 };
+use inf_foundation::CellId;
 use inf_foundation::bounded::{
     Cap, CapCensus, CapError, CappedDeque, Reserve, Reserved, ServeMark,
 };
 use inf_foundation::time::Nanos;
-use inf_foundation::{CellId, LogHistogram};
 #[cfg(feature = "doc")]
 use inf_log::DocLineage;
 use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{FsyncClass, MutationEffect, SegmentRotor};
 use inf_runtime::{CellExecutor, ExecutorLayout, GroupClass, TaskId, park};
 use inf_runtime::{
-    CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait, IoClass, IoOp,
-    Issue, LoopCx, OwnerPhase, RawFd, TimerNotice, TimerOutcome, TimerSet, TokenClass, WaitList,
+    CellPlane, Completion, CompletionResult, CompletionToken, Delivery, FabricAdmission,
+    FabricGate, GatePermit, GateUnits, GateWait, IoClass, IoOp, Issue, LoopCx, OwnerPhase, RawFd,
+    TimerNotice, TimerOutcome, TimerSet, TokenClass, WaitList,
 };
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
@@ -103,17 +104,19 @@ use conn::{
 };
 use credit::{FanLegs, FanReserve, PlaneFabric, PointOp, PubFanArgv};
 pub use credit::{MeshConfigRefused, checked_mesh_config};
-use dispatch::{PendingReply, close_after_reply, is_scatter, pump, render_outcome};
+use dispatch::{
+    CountedLegs, LegWindow, Legs, OrderedLegs, PendingReply, close_after_reply, is_scatter, pump,
+    render_outcome, send_windowed,
+};
 use fabric::{
-    GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, handle_fabric_op,
-    parse_stageable, stage_argv_block, stage_argv_block_argv, stage_or_handle, staged_outcome,
-    wire_reply,
+    StagedApply, flush_apply_stage, flush_parse_stage, handle_fabric_op, parse_stageable,
+    stage_argv_block, stage_argv_block_argv, stage_or_handle, staged_outcome, wire_reply,
 };
 #[cfg(feature = "doc")]
 pub use json_gather::parse_json_mget_leg;
 use ns_ddl::{
-    SendNow, dispatch_ns, program_ckpt, program_ns_ddl, send_apply, send_apply_ns, send_fan_leg,
-    try_send_apply,
+    SendNow, SendRefused, Sent, dispatch_ns, program_ckpt, program_ns_ddl, send_apply,
+    send_apply_ns, send_fan_leg, try_send_apply,
 };
 use publish::{
     SubNotes, dispatch_pubsub, enforce_output_cap, flush_sub_deltas, handle_pubsub_apply,
@@ -398,7 +401,6 @@ pub(super) struct ConnKey {
     generation: u32,
 }
 
-#[allow(clippy::disallowed_types, reason = "container: E")]
 pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     cell: CellId,
     cells: u16,
@@ -415,18 +417,15 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     store: RefCell<Keyspace>,
     fabric: RefCell<PlaneFabric>,
     conns: RefCell<ConnSlab>,
-    gate: FabricGate<OwnedOutcome>,
+    /// The fabric gate (ADR-0177 D4): it mints every request's key and
+    /// holds its waiter; each send borrows it for one synchronous step, and
+    /// each reply's waiter for its life.
+    gate: RefCell<FabricGate<OwnedOutcome>>,
     credit_waiters: WaitList<CellId>,
     observer: RefCell<O>,
     node: Rc<NodeInfo>,
     /// Loop-granularity clock for futures (set each step from `cx.now`).
     now: Cell<Nanos>,
-    /// Fabric token round-trip latency, nanoseconds (hop RTT gate).
-    rtt_ns: RefCell<LogHistogram>,
-    /// Per-destination `(token, send time)` FIFO: replies return in send
-    /// order per cell pair, so RTT is recorded at *delivery* (FABRIC-IN),
-    /// not when the windowed pump finally awaits the parked value.
-    rtt_sent: RefCell<Vec<VecDeque<(u64, Nanos)>>>,
     /// Recycled reply buffers (gate values, pump-local replies) — the
     /// remote path's per-op heap traffic was a top M0-R1 cost. Bounded by
     /// [`REPLY_POOL_MAX`]/[`REPLY_POOL_BUF_CAP`].
@@ -604,16 +603,12 @@ const PENDING_HIGH_WATER: usize = 1024;
 const PENDING_LOW_WATER: usize = 64;
 /// Max fabric ops drained per FABRIC-IN step (bounded drain).
 const FABRIC_DRAIN_MAX: usize = 1024;
-/// Remote ops one connection may have in flight at once. Replies that land
-/// out of order park in the `FabricGate` (≤ one value each) until emitted,
-/// so this also bounds parked-reply memory per connection.
-const REMOTE_WINDOW: usize = 32;
 /// Replies (of any kind) awaiting in-order emission per connection; locals
 /// executed eagerly behind a slow remote stage their bytes here.
 const PENDING_REPLIES_MAX: usize = 256;
 /// Reply-pool bounds: buffers kept per cell, and the largest buffer worth
 /// keeping (anything bigger is freed, so one giant value can't pin memory).
-/// Sized to the parked-reply working set — up to `conns × REMOTE_WINDOW`
+/// Sized to the parked-reply working set — up to `conns × GATE_UNITS_PER_CONN_TASK`
 /// `Bytes` gate values hold pool buffers at once on the natural-routing
 /// leg; at 256 the pool exhausted and the overflow paid malloc/free per
 /// reply (M2.5 Phase H allocator lever). Worst-case retention is
@@ -760,6 +755,13 @@ pub struct ServerPlane<
     /// Reusable FABRIC-IN scratch: replies staged while the fabric is
     /// borrowed by `drain`, sent the moment it ends.
     staged_replies: Vec<(CellId, FabricToken, StagedReply)>,
+    /// A test node's reply order: each drain's replies newest first, so an
+    /// origin's fan reads its legs' replies out of send order; and the
+    /// largest drain so reversed, the hook's engagement.
+    #[cfg(test)]
+    reverse_replies: bool,
+    #[cfg(test)]
+    reversed_batch_max: usize,
     /// Doorbell-wakeup park board (M0-R1): this cell sets `[cell]` in the
     /// park handshake; peers read it at flush. Single-writer per slot — the
     /// same blessed class as the fabric doorbells, NOT shared mutable
@@ -937,6 +939,27 @@ pub enum PlaneBuildError {
     /// A plane-start pump found its class full at assembly: the class's
     /// cap is short of the plane's own demand.
     Assembly(inf_foundation::bounded::AssemblyFull),
+    /// The fabric gate's holders were refused (ADR-0177 D4): `H` past its
+    /// ceiling, or the allocator.
+    Gate(inf_foundation::bounded::CapError),
+}
+
+/// The plane's fabric gate (ADR-0177 D4); under `fault-points` with its
+/// holder slots at the first generation `config` names.
+fn build_gate(
+    config: &crate::config::ConfigStore,
+    origin: u16,
+    units: u32,
+    holders: Option<inf_foundation::bounded::Cap>,
+    census: &Rc<CapCensus>,
+) -> Result<FabricGate<OwnedOutcome>, inf_foundation::bounded::CapError> {
+    #[cfg(feature = "fault-points")]
+    if let Some(first) = config.gate_first_generation() {
+        return FabricGate::build_at_generation(origin, units, holders, census, first);
+    }
+    #[cfg(not(feature = "fault-points"))]
+    let _ = config;
+    FabricGate::build(origin, units, holders, census)
 }
 
 impl core::fmt::Display for PlaneBuildError {
@@ -950,6 +973,7 @@ impl core::fmt::Display for PlaneBuildError {
             PlaneBuildError::Tasks(refused) => write!(f, "the plane's task classes: {refused}"),
             PlaneBuildError::Executor(refused) => write!(f, "{refused}"),
             PlaneBuildError::Assembly(refused) => write!(f, "{refused}"),
+            PlaneBuildError::Gate(refused) => write!(f, "the fabric gate: {refused}"),
         }
     }
 }
@@ -977,7 +1001,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// and a mesh past `FABRIC_CREDITS_PER_PEER_MAX` that no mesh check
     /// passed.
     #[allow(clippy::too_many_arguments)] // construction-time wiring, not an API surface
-    #[allow(clippy::disallowed_types, reason = "container: E")]
     pub fn new(
         cell: CellId,
         cells: u16,
@@ -992,6 +1015,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let (census, serve_mark) = CapCensus::new(cell);
         let share = node.config.borrow().boot_share(cells);
         let caps = crate::limits::plane_task_caps(share, cells).map_err(PlaneBuildError::Tasks)?;
+        // `H` is checked against the key's index field before anything is built.
+        let holders = crate::limits::gate_holders(&caps, cells, fabric.data_credits())
+            .map_err(PlaneBuildError::Gate)?;
         let mut layout = ExecutorLayout::new(&census);
         let tasks =
             PlaneTasks::register::<O, F>(&mut layout, &caps).map_err(PlaneBuildError::Tasks)?;
@@ -1000,6 +1026,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let (timer_set, timers) = ServerTimers::build(&census).map_err(PlaneBuildError::Timers)?;
         let parked = ParkedDeques::build(cell, cells, fabric.data_credits(), &census)
             .map_err(PlaneBuildError::Parked)?;
+        let units = crate::limits::gate_units(&caps);
+        let gate = build_gate(&node.config.borrow(), cell.0, units, holders, &census)
+            .map_err(PlaneBuildError::Gate)?;
         node.cell.set(cell.0);
         node.cells.set(cells);
         node.cap_census.replace(Some(Rc::clone(&census)));
@@ -1018,13 +1047,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 store: RefCell::new(store),
                 fabric: RefCell::new(fabric),
                 conns: RefCell::new(ConnSlab::default()),
-                gate: FabricGate::new(),
+                gate: RefCell::new(gate),
                 credit_waiters: WaitList::new(),
                 observer: RefCell::new(observer),
                 node,
                 now: Cell::new(Nanos(0)),
-                rtt_ns: RefCell::new(LogHistogram::new()),
-                rtt_sent: RefCell::new(vec![VecDeque::new(); usize::from(cells)]),
                 reply_pool: RefCell::new(Vec::new()),
                 cmd_pool: RefCell::new(Vec::new()),
                 reply_pool_bytes: Cell::new(0),
@@ -1083,6 +1110,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             parse_stage: Vec::new(),
             parse_stage_bytes: Vec::new(),
             staged_replies: Vec::new(),
+            #[cfg(test)]
+            reverse_replies: false,
+            #[cfg(test)]
+            reversed_batch_max: 0,
             park_flags: None,
             expiry_lag: 0,
             // MAX forces one push on the first MAINTAIN (boot-time config).
@@ -1626,6 +1657,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 (ColdGauge::LinksStale, counters.links_stale),
                 (ColdGauge::IdentityExhausted, cold.identity_refusals()),
                 (ColdGauge::IdentityPairsUsed, cold.identity_pairs_used()),
+                (ColdGauge::GateFull, cold.cold_gate_full()),
             ] {
                 gauges[slot as usize] = value;
             }
@@ -2052,6 +2084,34 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.shared.conns.borrow().live
     }
 
+    /// Takes of fabric holders past the key's generation field: the
+    /// near-wrap leg's engagement (`fault-points` only).
+    #[cfg(feature = "fault-points")]
+    pub fn gate_wrapped_takes(&self) -> u64 {
+        self.shared.gate.borrow().wrapped_takes()
+    }
+
+    /// The fabric gate's reserves that found every holder taken
+    /// (`gate_full`): derived never (ADR-0177 D4, E7).
+    pub fn gate_full(&self) -> u64 {
+        self.shared.gate.borrow().full()
+    }
+
+    /// The cold gate's requests refused for no free route or holder
+    /// (`cold_gate_full`): derived never while its cap is its product
+    /// (ADR-0177 D4); 0 on a cell with no cold engine. Not the fabric gate's
+    /// `gate_full`.
+    pub fn cold_gate_full(&self) -> u64 {
+        let tier = self.shared.tier.borrow();
+        tier.as_ref().and_then(|tier| tier.cold.as_ref()).map_or(0, |cold| cold.cold_gate_full())
+    }
+
+    /// The fabric gate's completions for no holder that awaits one
+    /// (`gate_stale`): derived never (ADR-0177 D4, E8).
+    pub fn gate_stale(&self) -> u64 {
+        self.shared.gate.borrow().stale()
+    }
+
     /// O1's two owners (ADR-0177 D2): the `conn` tasks `executor`, this
     /// cell's, holds and how many of them are Retired, and the occupied
     /// connection slots, with the class's slots `C` that bound both. A
@@ -2065,7 +2125,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// Outstanding async work: pending fabric replies + credit waiters.
     /// Quiescence (sim) means zero.
     pub fn suspended(&self) -> usize {
-        self.shared.gate.pending() + self.shared.credit_waiters.waiting()
+        self.shared.gate.borrow().holders() + self.shared.credit_waiters.waiting()
     }
 
     /// This cell's fabric counters (the DST's drain-fairness oracle,
@@ -2335,3 +2395,7 @@ mod wire_rig;
 #[cfg(test)]
 #[path = "capacity_tests.rs"]
 mod capacity_tests;
+
+#[cfg(test)]
+#[path = "window_tests.rs"]
+mod window_tests;
