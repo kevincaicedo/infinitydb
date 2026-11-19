@@ -507,14 +507,34 @@ pub(crate) const fn plane_task_caps(
     Ok(PlaneTaskCaps { conn, peers, compact: COMPACT_TASKS, shadow: SHADOW_TASKS })
 }
 
+/// Every task class's ceiling, as one cell of the most cells and the largest share holds them:
+/// the caps [`WAIT_NODES_MAX`] sums.
+const TASK_CEILINGS: PlaneTaskCaps = PlaneTaskCaps {
+    conn: CONN_TASKS,
+    peers: Some(PeerTaskCaps {
+        ns_apply: NS_APPLY_TASKS,
+        owner_pub: OWNER_PUB_TASKS,
+        gated: GATED_TASKS,
+    }),
+    compact: COMPACT_TASKS,
+    shadow: SHADOW_TASKS,
+};
+
+/// The task slots of a cell of `caps`: every class's cap, each named, so a class the struct
+/// gains is a compile error here and in [`TASK_CEILINGS`] until it is counted. Each cap is at
+/// most its ceiling, so the sum is at most [`WAIT_NODES_MAX`]'s, which the compiler evaluates.
+const fn task_slots(caps: &PlaneTaskCaps) -> u32 {
+    let PlaneTaskCaps { conn, peers, compact, shadow } = caps;
+    let mut slots = conn.entries_max() + compact.entries_max() + shadow.entries_max();
+    if let Some(PeerTaskCaps { ns_apply, owner_pub, gated }) = peers {
+        slots += ns_apply.entries_max() + owner_pub.entries_max() + gated.entries_max();
+    }
+    slots
+}
+
 /// Wait nodes one cell holds at most (ADR-0177 D5): one for each live task's one parked wait, so
-/// the sum of the task classes' ceilings. Unit: nodes per cell.
-pub const WAIT_NODES_MAX: u32 = CONN_TASKS.entries_max()
-    + NS_APPLY_TASKS.entries_max()
-    + OWNER_PUB_TASKS.entries_max()
-    + GATED_TASKS.entries_max()
-    + COMPACT_TASKS.entries_max()
-    + SHADOW_TASKS.entries_max();
+/// the task slots of every class at its ceiling. Unit: nodes per cell.
+pub const WAIT_NODES_MAX: u32 = task_slots(&TASK_CEILINGS);
 
 /// The cell's pool of wait nodes (ADR-0177 D5): `T`, one node for each task slot of the cell's
 /// classes, which every wait list of the cell takes. The ceiling of the derived cap
@@ -523,21 +543,34 @@ pub const WAIT_NODES_MAX: u32 = CONN_TASKS.entries_max()
 /// a task holds at most one parked wait.
 pub const WAIT_NODES: Cap = Cap::entries::<WAIT_NODES_MAX>("wait-nodes", CapFill::Serving);
 
-/// The pool of a cell of `caps` (ADR-0177 D5): the sum of its classes' caps, each at most its
-/// ceiling, so the sum is at most [`WAIT_NODES_MAX`] and cannot overflow.
+/// The pool of a cell of `caps` (ADR-0177 D5): its task slots, `T`.
 ///
 /// # Errors
-/// `CapError::Layout` when the sum passes [`WAIT_NODES_MAX`]; derived never.
+/// `CapError::Layout` when `T` passes [`WAIT_NODES_MAX`]; derived never.
 pub(crate) const fn wait_nodes(caps: &PlaneTaskCaps) -> Result<Cap, CapError> {
-    let mut nodes =
-        caps.conn.entries_max() + caps.compact.entries_max() + caps.shadow.entries_max();
-    if let Some(peers) = &caps.peers {
-        nodes += peers.ns_apply.entries_max()
-            + peers.owner_pub.entries_max()
-            + peers.gated.entries_max();
-    }
+    let nodes = task_slots(caps);
+    // Canary: the pool is built over (1 + k) T nodes, k the fewest whose nodes' bytes
+    // pass ten of F7's 256 KiB controls a cell, so the idle node's resident rise is one the
+    // resident tool gives a verdict on.
+    #[cfg(inf_canary_wait_nodes_oversized)]
+    let nodes = nodes * (1 + wait_nodes_oversized_k(nodes));
     Cap::derived(&WAIT_NODES, nodes)
 }
+
+/// The oversized-pool canary's `k` at `nodes` (F7's control, 256 KiB a cell, ten times
+/// over): the fewest counts of `nodes` whose node bytes pass 2,621,440 B, at the stride the
+/// build reads.
+#[cfg(any(all(test, feature = "doc"), inf_canary_wait_nodes_oversized))]
+pub(crate) const fn wait_nodes_oversized_k(nodes: u32) -> u32 {
+    let stride = inf_runtime::WaitNodes::NODE_SLOT_BYTES as u64;
+    let per_count = nodes as u64 * stride;
+    (WAIT_NODES_PLANT_FLOOR_BYTES / per_count + 1) as u32
+}
+
+/// The bytes a cell the oversized-pool canary must pass: ten of F7's 256 KiB controls, the
+/// least resident rise the idle-resident tool separates from its control.
+#[cfg(any(all(test, feature = "doc"), inf_canary_wait_nodes_oversized))]
+pub(crate) const WAIT_NODES_PLANT_FLOOR_BYTES: u64 = 10 * 262_144;
 
 /// Keys one cell's credit wait list holds (ADR-0177 D5): one per peer, `cells − 1`, each held
 /// from the list's build, before the cell serves; a cell of a node of one cell holds none and

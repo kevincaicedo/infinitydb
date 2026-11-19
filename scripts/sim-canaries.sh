@@ -1350,6 +1350,12 @@ ordered_rows=(
   # a positive result. Planted, a zero result re-arms it too, and the half-closed socket posts
   # a second zero-length Recv.
   "inf_canary_uring_eof_rearms crate-test inf-runtime/uring test:driver_conformance eof_ends_the_receive recv-after-eof"
+  # The cell's wait nodes are resident from the pool's build (ADR-0177 D5, D8 with A1), inside
+  # the gate row's per-cell remainder. Planted, the pool is built over (1 + k) T nodes, k the
+  # fewest counts of T whose node bytes pass ten of F7's 256 KiB controls: the idle node's
+  # resident memory a cell rises by k x T x s_node, 17 x 2,825 x 56 B at 4 cells. The bytes are
+  # that product at the stride the bill's test reads; a stride that moves moves them with it.
+  "inf_canary_wait_nodes_oversized binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 2689400 --control-bytes-cell 262144 --plant-row wait-nodes"
   # A word resolves its slot by the generation bits it carries, the low bits of the occupant's
   # (ADR-0194 D6 with A2). Planted, the whole generation is compared with the field, and from
   # a slot's 2²³-th use its word reads Stale.

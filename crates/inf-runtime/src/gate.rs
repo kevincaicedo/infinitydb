@@ -391,7 +391,7 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
             None => None,
             Some(cap) => {
                 debug_assert!(cap.entries_max() >= units_max, "H counts every unit");
-                let slab = build_holders(configure(CappedSlab::builder(cap, census)?))?;
+                let slab = build_slab(configure(CappedSlab::builder(cap, census)?))?;
                 let word = GateWord::for_slab(&slab)?;
                 Some(FabricHolders {
                     slab,
@@ -564,11 +564,11 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
     }
 }
 
-/// Steps a holder slab's build to its end; a refused build retires its
-/// prefix by steps before it answers.
-fn build_holders<V>(
-    mut builder: SlabBuilder<Holder<V>, u32, WrapWithProof>,
-) -> Result<HolderSlab<V>, CapError> {
+/// Steps a slab's build to its end; a refused build retires its prefix by
+/// steps before it answers.
+fn build_slab<T>(
+    mut builder: SlabBuilder<T, u32, WrapWithProof>,
+) -> Result<CappedSlab<T, u32, WrapWithProof>, CapError> {
     loop {
         builder = match builder.step() {
             Built::More(next) => next,
@@ -857,7 +857,7 @@ impl<K: GateKey, V, C: Cleanup<V>> KeyedGate<K, V, C> {
     /// `CapError` from either build or the census; a refused route build
     /// retires the built holders by steps first.
     pub fn build(cap: Cap, census: &Rc<CapCensus>) -> Result<KeyedGate<K, V, C>, CapError> {
-        let holders = build_holders(CappedSlab::builder(cap, census)?)?;
+        let holders = build_slab(CappedSlab::builder(cap, census)?)?;
         let routes = match CappedMap::builder(cap, census).and_then(build_routes) {
             Ok(routes) => routes,
             Err(refused) => {
@@ -1174,33 +1174,73 @@ pub type IoGate = KeyedGate<CompletionToken, CompletionResult>;
 
 // ---- WaitNodes ----------------------------------------------------------------
 
-/// The cell's wait nodes (ADR-0177 D5): one pool a cell, of `T` nodes, one
-/// for each live task's one parked wait. Every [`WaitList`] of the cell takes
-/// it at its constructor; a clone is a handle on the same pool. Its storage
-/// is not built: each list queues its waits in its own table, so the pool
-/// holds no node and answers 0 to [`len`](Self::len) and
-/// [`full`](Self::full).
-#[derive(Clone, Debug)]
+/// A wait node's handle: its slot in the pool's slab.
+type NodeId = SlotId<u32>;
+
+/// The pool's slab (ADR-0177 D5, D7): a `u32` generation that wraps.
+type NodeSlab = CappedSlab<WaitNode, u32, WrapWithProof>;
+
+/// A queued node's state: on its list, or taken off it by a wake its wait
+/// has not read yet.
+#[expect(dead_code, reason = "no wait takes a node: the lists queue alone")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NodeState {
+    Queued,
+    Woken,
+}
+
+/// A parked wait (ADR-0177 D5): its task's waker, its place on its one list
+/// and its state. 48 B, a 56 B slot.
+#[expect(dead_code, reason = "no wait takes a node: the lists queue alone")]
+struct WaitNode {
+    waker: Option<Waker>,
+    prev: Option<NodeId>,
+    next: Option<NodeId>,
+    state: NodeState,
+}
+
+const _: () = assert!(size_of::<WaitNode>() == 48, "a wait node is 48 B");
+
+/// What a pool's handles share: the slab and its counter.
+struct Pool {
+    nodes: RefCell<NodeSlab>,
+    /// First polls that found no node or no key (`wait_nodes_full`, cell
+    /// scope): derived never, a task holding at most one parked wait.
+    full: Cell<u64>,
+}
+
+/// The cell's wait nodes (ADR-0177 D5): one pool a cell, a capped slab of
+/// `T` nodes, one for each live task's one parked wait, on the cell's census
+/// under its cap's row and resident whole from its build. Every
+/// [`WaitList`] of the cell takes it at its constructor; a clone is a handle
+/// on the same pool. No wait takes a node yet: each list queues its waits in
+/// its own table.
+#[derive(Clone)]
 pub struct WaitNodes {
-    _private: (),
+    pool: Rc<Pool>,
 }
 
 impl WaitNodes {
-    /// The pool of `cap` nodes on the cell's `census`, built whole before the
-    /// cell serves.
+    /// A node's slot bytes: the stride the idle bill counts the pool at, in
+    /// its chunks (ADR-0177 D8 with A1).
+    pub const NODE_SLOT_BYTES: usize = NodeSlab::SLOT_BYTES;
+
+    /// The pool of `cap` nodes on the cell's `census`, its row registered and
+    /// its slab built whole by steps before the cell serves.
     ///
     /// # Errors
-    /// `CapError` from the pool's build; nothing is served.
+    /// `CapError` from the slab's build or its census row; a refused build
+    /// retires its prefix first. Nothing is served.
     pub fn build(cap: Cap, census: &Rc<CapCensus>) -> Result<WaitNodes, CapError> {
-        // The storage that reads them is not built: taken and dropped.
-        let _ = (cap, census);
-        Ok(WaitNodes { _private: () })
+        let nodes = build_slab(NodeSlab::builder(cap, census)?)?;
+        let pool = Pool { nodes: RefCell::new(nodes), full: Cell::new(0) };
+        Ok(WaitNodes { pool: Rc::new(pool) })
     }
 
     /// Nodes held by parked waits now (cell scope).
     #[must_use]
     pub fn len(&self) -> u32 {
-        0
+        self.pool.nodes.borrow().len()
     }
 
     /// Whether no parked wait holds a node.
@@ -1213,7 +1253,13 @@ impl WaitNodes {
     /// scope).
     #[must_use]
     pub fn full(&self) -> u64 {
-        0
+        self.pool.full.get()
+    }
+}
+
+impl core::fmt::Debug for WaitNodes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "WaitNodes {{ len: {}, full: {} }}", self.len(), self.full())
     }
 }
 
@@ -2385,5 +2431,59 @@ mod tests {
         assert_eq!(list.waiting(), 0, "no dropped wait is a live waiter");
         let entries: usize = list.queues.borrow().values().map(|queue| queue.len()).sum();
         assert_eq!(entries, 0, "{entries} entries stay queued after {WAITS} waits were dropped");
+    }
+
+    /// The pool is one capped slab of its cap's nodes, its row on the census
+    /// and every slot built before anything serves, and it holds nodes as a
+    /// model of its live handles does: a seeded run of takes and releases,
+    /// a take answered by a free slot below the cap and refused at it, a
+    /// release by any live handle, and the pool's `len` the model's count
+    /// after every step. Oracle: the model's own vector; the census row
+    /// reads the cap's crossings and its high water.
+    #[test]
+    fn the_pool_holds_its_nodes_as_its_model_does() {
+        const NODES: u32 = 100;
+        const POOL: Cap = Cap::entries::<NODES>("test-pool-model", CapFill::Serving);
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
+        let pool = WaitNodes::build(POOL, &census).expect("the test pool");
+        let row = census.row("test-pool-model").expect("the pool's census row");
+        assert_eq!((row.entries_max, row.capacity_now), (NODES, NODES), "built whole");
+        assert_eq!((pool.len(), pool.full()), (0, 0), "a new pool holds no node");
+        let mut live: Vec<NodeId> = Vec::new();
+        let mut rng = inf_foundation::rng::SplitMix64::new(0x706F_6F6C_0000_00E4);
+        let mut refused = 0u32;
+        for _ in 0..10_000 {
+            let mut nodes = pool.pool.nodes.borrow_mut();
+            // Two takes for each release, so the run reaches the cap.
+            if !rng.next_u64().is_multiple_of(3) {
+                match nodes.reserve() {
+                    SlabReserved::Slot(slot) => {
+                        let node = WaitNode {
+                            waker: None,
+                            prev: None,
+                            next: None,
+                            state: NodeState::Queued,
+                        };
+                        live.push(slot.publish(node));
+                    }
+                    SlabReserved::Full => {
+                        assert_eq!(live.len(), NODES as usize, "refused only at the cap");
+                        refused += 1;
+                    }
+                    SlabReserved::Exhausted => panic!("a wrapping slab never retires a slot"),
+                }
+            } else if !live.is_empty() {
+                let at = usize::try_from(rng.next_u64() % live.len() as u64).expect("an index");
+                let id = live.swap_remove(at);
+                assert_eq!(nodes.release(id), inf_foundation::bounded::Released::Dropped);
+            }
+            drop(nodes);
+            assert_eq!(pool.len() as usize, live.len(), "the pool's len is the model's count");
+        }
+        assert!(refused > 0, "engagement: the run reached the cap");
+        let row = census.row("test-pool-model").expect("the pool's census row");
+        assert_eq!(row.high_water, NODES, "the high water is the cap");
+        assert_eq!(row.crossings, u64::from(refused), "each refusal is one crossing");
+        assert_eq!(pool.full(), 0, "no first poll ran, so none starved");
     }
 }

@@ -301,6 +301,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_unsliced_drop)',
     'cfg(inf_canary_uring_cqe_order_reversed)',
     'cfg(inf_canary_uring_eof_rearms)',
+    'cfg(inf_canary_wait_nodes_oversized)',
     'cfg(inf_canary_wake_clear_before_link)',
     'cfg(inf_canary_wake_clear_relaxed)',
     'cfg(inf_canary_wake_close_relaxed)',
