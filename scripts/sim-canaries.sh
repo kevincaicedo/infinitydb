@@ -113,12 +113,13 @@
 # order, its output then in the lane's. A planted simulator is built ahead
 # only once the plain one is built. A cfg runs alone when it holds a binary
 # row, or a crate-test or Loom row whose test `.config/nextest.toml` runs
-# alone (an override with `threads-required = "num-test-threads"`, read from
-# that file): it is never built ahead, and before its rows every build ahead
-# ends and none starts until they are judged, as the node's resident memory,
-# a test's time bound or a rate it reads would move with a build beside it.
+# alone (an override with `threads-required = "num-test-threads"`, as the
+# config's own gate parses it): it is never built ahead, and before its rows
+# every build ahead ends and none starts until they are judged, as the node's
+# resident memory, a test's time bound or a rate it reads would move with a
+# build beside it.
 # At most K planted directories live at once. A run a signal stops sends
-# each build ahead's process group SIGTERM, then SIGKILL after 10 s, and waits
+# each build ahead's process group SIGTERM, then SIGKILL after 3 s, and waits
 # until every group is gone before their directories go.
 # The lane's compiles share J jobs: CARGO_BUILD_JOBS as cargo reads it (a
 # count, `default`, or a negative count taken from the host's processors),
@@ -183,13 +184,19 @@ case "$table_only" in
     exit 1
     ;;
 esac
-# K, the cfgs' planted builds at once, is bounded by memory: the lane runs on
-# the dev box in a scope of 12 GiB, page cache included and no swap, and a run
-# past it is killed whole. Four planted test builds at once peaked at 6.0 GiB
-# there, four simulators at 5.4 GiB and six at 7.5 GiB, each cargo on 10 jobs
-# of its own (the pool holds them lower), and a simulation beside them takes
-# up to 3.5 GiB: four builds and a run stay under 10 GiB, and a fifth build
-# would leave the run less than it takes.
+# K, the cfgs' planted builds at once, is bounded by anonymous memory. The
+# lane runs on the dev box in a scope whose memory.max is 12 GiB, with no
+# swap: page cache counts toward the cap and fills it, the kernel reclaims
+# that cache there, and only memory it cannot reclaim, anonymous memory above
+# all, kills the run whole past the cap. Four planted test builds at once
+# peaked at 6.0 GiB there, four simulators at 5.4 GiB and six at 7.5 GiB, each
+# cargo on 10 jobs of its own (the pool holds them lower), and a simulation
+# beside them at 3.5 GiB. Those peaks count page cache too, so they bound the
+# anonymous memory from above: four builds and a run take at most about
+# 9.5 GiB of the 12, and a fifth build would leave the run less than it
+# takes. The box's heavy-run wrapper (box-heavy.sh) records each run's
+# anonymous peak (memory.stat's anon, sampled each second), its memory.events
+# and its memory stall: the instrument for this bound.
 readonly builds_max=4
 builds=${INF_CANARY_BUILDS:-4}
 case "$builds" in
@@ -1616,38 +1623,52 @@ esac
 ahead_pid=() ahead_began=() ahead_status=() ahead_waited=()
 # ahead_stop: every build ahead not yet waited for ends. Its process group
 # (cargo, and every compiler and linker it started) is sent SIGTERM, then
-# SIGKILL once 10 s pass, and the stop returns once every group is gone, its
-# tick a 1 s read of a FIFO nobody writes; past 20 s it names the groups left.
-# A job started but not yet recorded when a signal came is in `jobs -p`.
+# SIGKILL once 3 s pass, and the stop polls each group until no process of it
+# is left but a zombie, its tick a 1 s read of the `tick` FIFO nobody writes
+# (made with the pool; a tick that is no FIFO would read at once, so the stop
+# then sends SIGKILL at once); past 10 s it names the groups left. A zombie
+# holds no file, and the lane reaps its own jobs only when it waits, so the
+# poll reads the process table (`ps`), and a group it cannot read is alive
+# while `kill -0` reaches it. Only then is each job waited for, so a leader
+# that ignores SIGTERM never holds the poll. A job started but not yet
+# recorded when a signal came is in `jobs -p`.
 ahead_stop() {
-  local j pid groups='' alive tick=0
+  local j pid groups=' ' alive tick=0 kill_at=3 table
   for j in ${ahead_pid[@]+"${!ahead_pid[@]}"}; do
     [ -z "${ahead_status[$j]:-}" ] || continue
-    groups="$groups ${ahead_pid[$j]}"
     ahead_status[$j]=stopped
+    groups="$groups${ahead_pid[$j]} "
   done
-  groups="$groups $(jobs -p 2>/dev/null | tr '\n' ' ')"
+  for pid in $(jobs -p 2>/dev/null); do
+    case "$groups" in *" $pid "*) ;; *) groups="$groups$pid " ;; esac
+  done
   [ -n "${groups// /}" ] || return 0
   for pid in $groups; do kill -TERM -- "-$pid" 2>/dev/null || true; done
-  for pid in $groups; do wait "$pid" 2>/dev/null || true; done
-  mkfifo "$work/tick" 2>/dev/null || true
-  exec 4<>"$work/tick"
+  if [ -p "$work/tick" ]; then exec 4<>"$work/tick"; else kill_at=0; fi
   while :; do
     alive=''
+    table=$(ps -A -o pgid= -o stat= 2>/dev/null) || table=''
     for pid in $groups; do
-      if kill -0 -- "-$pid" 2>/dev/null; then alive="$alive $pid"; fi
+      if [ -n "$table" ]; then
+        printf '%s\n' "$table" | LC_ALL=C awk -v g="$pid" '$1 == g && $2 !~ /^Z/ { live = 1 }
+          END { exit !live }' || continue
+      else
+        kill -0 -- "-$pid" 2>/dev/null || continue
+      fi
+      alive="$alive $pid"
     done
     [ -n "$alive" ] || break
-    if [ "$tick" -eq 10 ]; then
+    if [ "$tick" -eq "$kill_at" ]; then
       for pid in $alive; do kill -KILL -- "-$pid" 2>/dev/null || true; done
-    elif [ "$tick" -ge 20 ]; then
-      echo "   red: the process groups of builds ahead$alive outlived SIGKILL by 10 s"
+    elif [ "$tick" -ge 10 ] || [ "$kill_at" -eq 0 ]; then
+      echo "   red: the process groups of builds ahead$alive outlived SIGKILL"
       break
     fi
-    read -r -t 1 -u 4 _ || true
+    if [ "$kill_at" -gt 0 ]; then read -r -t 1 -u 4 _ || true; fi
     tick=$((tick + 1))
   done
-  exec 4>&-
+  if [ "$kill_at" -gt 0 ]; then exec 4>&-; fi
+  for pid in $groups; do wait "$pid" 2>/dev/null || true; done
 }
 # On any exit every build ahead ends first, its whole process group; then the
 # work directory goes, and so do the planted directory of the cfg whose rows
@@ -1667,12 +1688,13 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 log=$work/planted.log
 control=$work/control.log
-# The job pool at K > 1: J - K one-byte tokens in a FIFO the lane holds open
-# both ways, so a token given back never blocks and a take never reads an end
-# of file; a cargo that inherits a pool ignores its own job bound. J - K is
-# under 1,000 bytes, which any system's pipe buffer holds.
+# The job pool at K > 1, and the stop's tick (ahead_stop): J - K one-byte
+# tokens in a FIFO the lane holds open both ways, so a token given back never
+# blocks and a take never reads an end of file; a cargo that inherits a pool
+# ignores its own job bound. J - K is under 1,000 bytes, which any system's
+# pipe buffer holds.
 if [ "$builds" -gt 1 ]; then
-  mkfifo "$work/pool" || { echo "sim-canaries: mkfifo failed"; exit 2; }
+  mkfifo "$work/pool" "$work/tick" || { echo "sim-canaries: mkfifo failed"; exit 2; }
   exec 3<>"$work/pool"
   token=$builds
   while [ "$token" -lt "$build_jobs" ]; do
@@ -2225,53 +2247,32 @@ for row_cfg in "${cfg_order[@]}"; do
   done
 done
 rows=("${grouped[@]}")
-# The tests the nextest config runs alone, read at K > 1, where they schedule:
-# each override of `.config/nextest.toml` with `threads-required =
-# "num-test-threads"` gives its filter's binary (`<package>` a library's
-# tests, `<package>::<target>` an integration test's, `*<package>` every
-# binary of the package, from `package(<package>)`) in alone_binary and its
-# test (empty for every test) in alone_test, at one index. A filter outside
-# the shapes the config's gate admits (scripts/check-nextest-config.sh:
-# `binary_id(<package>)`, `binary_id(<package>::<target>)`,
-# `binary_id(<package>::bin/<name>)` or `package(<package>)`, each with an
-# optional `& test(=<name>)`) is a scope error, so no new shape drops a test
-# from the rule; so is a missing config.
+# The tests the nextest config runs alone, read at K > 1, where they schedule,
+# from the config's own gate (`check-nextest-config.sh --print-alone`), which
+# parses `.config/nextest.toml` as TOML and holds the one copy of the filter
+# forms: each override with `threads-required = "num-test-threads"` gives its
+# filter's binary (`<package>` a library's tests, `<package>::<target>` an
+# integration test's, `*<package>` every binary of the package, from
+# `package(<package>)`) in alone_binary and its test (empty for every test)
+# in alone_test, at one index. A missing or unreadable config, or a run-alone
+# filter in none of the forms, is the gate's scope error and the lane's.
 alone_binary=() alone_test=()
-alone_shape='^(binary_id\(([A-Za-z0-9_-]+)(::(bin/)?([A-Za-z0-9_-]+))?\)'
-alone_shape+='|package\(([A-Za-z0-9_-]+)\))( & test\(=([A-Za-z0-9_:]+)\))?$'
 if [ "$builds" -gt 1 ]; then
-  [ -f .config/nextest.toml ] || {
-    echo "sim-canaries: SCOPE ERROR — at INF_CANARY_BUILDS $builds the tests .config/nextest.toml" \
-      "runs alone schedule the lane, and it is missing"
+  alone_rows=$(scripts/check-nextest-config.sh --print-alone 2>&1) || {
+    echo "sim-canaries: SCOPE ERROR — at INF_CANARY_BUILDS $builds the tests the nextest config" \
+      "runs alone schedule the lane, and its gate cannot name them:"
+    printf '%s\n' "$alone_rows" | sed -n '1,5p'
     exit 1
   }
-  while IFS= read -r filter; do
-    [[ "$filter" =~ $alone_shape ]] || {
-      echo "sim-canaries: SCOPE ERROR — a run-alone filter of .config/nextest.toml this lane" \
-        "cannot read: $filter"
-      exit 1
-    }
-    if [ -n "${BASH_REMATCH[6]}" ]; then
-      alone_binary+=("*${BASH_REMATCH[6]}")
-    elif [ -n "${BASH_REMATCH[4]}" ]; then
-      alone_binary+=("${BASH_REMATCH[2]}::bin/${BASH_REMATCH[5]}")
+  while IFS='|' read -r alone_id alone_package alone_name; do
+    [ -n "$alone_id$alone_package" ] || continue
+    if [ -n "$alone_package" ]; then
+      alone_binary+=("*$alone_package")
     else
-      alone_binary+=("${BASH_REMATCH[2]}${BASH_REMATCH[3]}")
+      alone_binary+=("$alone_id")
     fi
-    alone_test+=("${BASH_REMATCH[8]}")
-  done < <(awk '
-    function flush() { if (block && alone) print filter; block = 0; alone = 0; filter = "" }
-    /^\[\[profile\.default\.overrides\]\]/ { flush(); block = 1; next }
-    /^\[/ { flush(); next }
-    block && /^filter[ \t]*=/ {
-      filter = $0
-      sub(/^filter[ \t]*=[ \t]*/, "", filter)
-      quote = substr(filter, 1, 1)
-      filter = substr(filter, 2)
-      sub(quote ".*$", "", filter)
-    }
-    block && /^threads-required[ \t]*=[ \t]*"num-test-threads"/ { alone = 1 }
-    END { flush() }' .config/nextest.toml)
+    alone_test+=("$alone_name")
+  done <<<"$alone_rows"
 fi
 
 # runs_alone <row words…>: zero when the row is a crate-test or Loom row whose

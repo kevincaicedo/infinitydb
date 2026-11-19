@@ -80,10 +80,17 @@
 # metadata`, no test binary, no .rs file, a `mod` that resolves to no file,
 # no workflow, no cargo-nextest install in any workflow. INF_CHECK_ROOT names another checkout (the self-test's
 # fixtures).
+#
+# `--print-alone` prints the run-alone overrides' filters as this gate parses
+# them, one a line, `<binary id>|<package>|<test>` (the binary id empty for a
+# `package(…)` filter, the package empty for a `binary_id(…)` one, the test
+# empty when the filter names none), and judges nothing else: the canary lane
+# schedules by them. A run-alone filter in none of the forms is a scope error
+# there, as a missing or unreadable config is.
 set -euo pipefail
 cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
 
-exec python3 -I - <<'PY'
+exec python3 -I - "$@" <<'PY'
 import json
 import os
 import re
@@ -173,6 +180,19 @@ overrides = default.get("overrides", [])
 if not isinstance(overrides, list):
     red(f"{CONFIG}: `overrides` is not an array of tables")
     overrides = []
+
+if sys.argv[1:] == ["--print-alone"]:
+    for index, entry in enumerate(overrides):
+        if not isinstance(entry, dict) or entry.get("threads-required") != ALL_THREADS:
+            continue
+        match = FILTER.match(str(entry.get("filter", "")))
+        if not match:
+            scope_error(f"{CONFIG}: run-alone override {index + 1}'s filter "
+                        f"{entry.get('filter')!r} is in none of the forms")
+        print(f"{match['binary'] or ''}|{match['package'] or ''}|{match['test'] or ''}")
+    sys.exit(0)
+if sys.argv[1:]:
+    scope_error(f"usage: check-nextest-config.sh [--print-alone], not {' '.join(sys.argv[1:])}")
 
 # ---- the workspace's test binaries ------------------------------------------
 try:

@@ -3396,16 +3396,15 @@ expect_red_because "canaries: a named inf-bench beside a cargo answering as carg
 }
 
 # ------------------------------- planted-bug canary driver: builds at once
-group_sim_canaries_builds() {
-# INF_CANARY_BUILDS=K > 1: while a cfg's rows are judged, the next K - 1 cfgs
-# build ahead, each a background job, and every row is still judged on its
-# own cfg's build, in the table's order. The driver runs each group at
-# CARGO_BUILD_JOBS=1, where K is 1, so every case names both. A case runs a
-# copy of the lane in a fixture checkout with a root and a nextest config of
-# its own, over its rows file. The stub cargo makes a cfg's planted build of
-# a command (`build`, a simulator or a node, or `test`) by creating
-# `built-<command>` in its directory (cold while that is absent) and writes
-# events: `begin <cfg> <pid> <planted directories alive> <command>` and
+# The canary lane at INF_CANARY_BUILDS=K > 1: while a cfg's rows are judged,
+# the next K - 1 cfgs build ahead, each a background job, and every row is
+# still judged on its own cfg's build, in the table's order. The driver runs
+# each group at CARGO_BUILD_JOBS=1, where K is 1, so every case names both.
+# A case runs a copy of the lane in a fixture checkout with a root and a
+# nextest config of its own, over its rows file. The stub cargo makes a cfg's
+# planted build of a command (`build`, a simulator or a node, or `test`) by
+# creating `built-<command>` in its directory (cold while that is absent) and
+# writes events: `begin <cfg> <pid> <planted directories alive> <command>` and
 # `built <cfg> <command>` around a cold build, `run <cfg> <builds begun>
 # <builds ended>` for a planted test run and `run <cfg>` for a simulator's.
 # Its cold build of a cfg ending `_hold` writes the cfg to the `began` FIFO,
@@ -3413,23 +3412,27 @@ group_sim_canaries_builds() {
 # FIFO, each read bounded at 30 s as a hang bound, and writes `held <cfg>
 # <planted directories alive>`; `_lingers` holds too and leaves a child that
 # outlives a SIGTERM by 1 s, then makes a directory in the cfg's and writes
-# `lingered`. A cfg ending `_frees` writes one line to `hold` once its cold
-# build ends; `_waits` starts its planted test run once a `_hold` build began
-# (at most 30 s), and `_stop` then sends the lane SIGTERM; `_broken` fails
-# each planted build, `_flaky` its first; `_toothless` runs green. A held or
-# lingering build a signal stops writes `stopped <cfg>`. The lane's output
+# `lingered`; `_deaf` holds and leaves a child that ignores SIGTERM and
+# writes `deaf <cfg> <pid>`. A cfg ending `_frees` writes one line to `hold`
+# once its cold build ends; `_waits` starts its planted test run once
+# `began-count` held builds began (default 1, at most 30 s each), and `_stop`
+# then sends the lane SIGTERM, `_interrupt` SIGINT; `_broken` fails each
+# planted build, `_flaky`
+# its first; `_toothless` runs green. A held build a signal stops writes
+# `stopped <cfg>`. Each stub cargo, simulator and instrument writes whether
+# it holds descriptor 3 (`fd3 open|closed`). The lane's output
 # passes through a watcher that writes a line to `hold` when a line of it
 # matches the pattern in `release-on`, so a hold ends once the lane printed
 # what the case waits for. A planted run names its cfg (`from-<cfg>`), so a
 # catch shows whose build it read.
-export INF_CANARY_HOST=Linux
 builds_lane() { # <name> <row>…: a fixture checkout with the lane, its rows, a nextest config and the stub cargo
     local dir
     [ -n "$1" ] && [ -n "$work" ] || { echo "builds_lane: empty name or work dir" >&2; exit 2; }
     dir="$work/$1"
     shift
     mkdir -p "$dir/scripts" "$dir/.config"
-    cp "$SCRIPT_DIR/sim-canaries.sh" "$SCRIPT_DIR/target-root.sh" "$dir/scripts/"
+    cp "$SCRIPT_DIR/sim-canaries.sh" "$SCRIPT_DIR/target-root.sh" "$SCRIPT_DIR/check-nextest-config.sh" \
+        "$dir/scripts/"
     printf '%s\n' "$@" >"$dir/rows"
     printf '%s\n' '[profile.default]' 'leak-timeout = { period = "100ms", result = "fail" }' \
         >"$dir/.config/nextest.toml"
@@ -3475,7 +3478,12 @@ print("pool", len(held))' "$fifo" >>"$here/events"
     build)
         [ ! -e "$here/plain-broken" ] || { echo "error: could not compile inf-sim"; exit 101; }
         mkdir -p "$target/release"
-        printf '#!/usr/bin/env bash\necho "inf-sim: fake-scenario: green"\n' >"$target/release/inf-sim"
+        {
+            echo '#!/usr/bin/env bash'
+            echo 'fd3=closed; if (exec 4>&3) 2>/dev/null; then fd3=open; fi'
+            echo "echo \"fd3 \$fd3\" >>'$here/events'"
+            echo 'echo "inf-sim: fake-scenario: green"'
+        } >"$target/release/inf-sim"
         chmod +x "$target/release/inf-sim"
         ;;
     test) echo "test $name ... ok" ;;
@@ -3486,10 +3494,8 @@ mkdir -p "$target/release"
 if [ ! -e "$target/built-$1" ]; then
     echo "begin $cfg $$ $(cd "${target%/*}" && ls -d canary-* | wc -l) $1" >>"$here/events"
     case $cfg in
-    *_hold | *_lingers)
-        trap 'echo "stopped $cfg" >>"$here/events"; exit 143' TERM
+    *_hold | *_lingers | *_deaf)
         exec 8<>"$here/began" 9<>"$here/hold"
-        echo "$cfg" >&8
         case $cfg in
         *_lingers)
             (
@@ -3498,7 +3504,20 @@ if [ ! -e "$target/built-$1" ]; then
                 read -r -t 30 -u 6 _ || true
             ) &
             ;;
+        *_deaf)
+            # The child ignores SIGTERM from its start, as it inherits the
+            # ignored signal: only a SIGKILL ends it before its 30 s.
+            trap '' TERM
+            (
+                exec 6<>"$here/linger"
+                echo "deaf $cfg $BASHPID" >>"$here/events"
+                read -r -t 30 -u 6 _ || true
+                echo "deaf-ended $cfg" >>"$here/events"
+            ) &
+            ;;
         esac
+        trap 'echo "stopped $cfg" >>"$here/events"; exit 143' TERM
+        echo "$cfg" >&8
         count=1
         [ ! -f "$here/hold-count" ] || count=$(cat "$here/hold-count")
         while [ "$count" -gt 0 ] && read -r -t 30 -u 9 _; do count=$((count - 1)); done
@@ -3516,7 +3535,12 @@ if [ ! -e "$target/built-$1" ]; then
     : >"$target/built-$1"
     code=1
     case $cfg in *_toothless) code=0 ;; esac
-    printf '#!/usr/bin/env bash\necho "run %s" >>"%s/events"\n' "$cfg" "$here" >"$target/release/inf-sim"
+    {
+        echo '#!/usr/bin/env bash'
+        echo 'fd3=closed; if (exec 4>&3) 2>/dev/null; then fd3=open; fi'
+        echo "echo \"fd3 \$fd3\" >>'$here/events'"
+        echo "echo 'run $cfg' >>'$here/events'"
+    } >"$target/release/inf-sim"
     [ "$code" -eq 0 ] || printf '%s\n' "echo \"inf-sim: ORACLE VIOLATION: TOKEN VIOLATION seed 0x1 cell 0: from-$cfg\"" >>"$target/release/inf-sim"
     echo "exit $code" >>"$target/release/inf-sim"
     chmod +x "$target/release/inf-sim"
@@ -3530,14 +3554,17 @@ if [ ! -e "$target/built-$1" ]; then
 fi
 if [ "$1" = test ] && [ "$norun" = no ]; then
     case $cfg in
-    *_waits | *_stop)
+    *_waits | *_stop | *_interrupt)
         exec 8<>"$here/began"
-        read -r -t 30 -u 8 _ || true
+        count=1
+        [ ! -f "$here/began-count" ] || count=$(cat "$here/began-count")
+        while [ "$count" -gt 0 ] && read -r -t 30 -u 8 _; do count=$((count - 1)); done
         ;;
     esac
     echo "run $cfg $(grep -c '^begin' "$here/events") $(grep -c '^built' "$here/events")" >>"$here/events"
     case $cfg in
     *_stop) kill -TERM "$PPID" ;;
+    *_interrupt) kill -INT "$PPID" ;;
     *_toothless) echo "test $name ... ok"; exit 0 ;;
     esac
     echo "panicked: from-$cfg"
@@ -3577,6 +3604,9 @@ builds_caught() { # <log>: the cfgs the catches name, in the log's order
 test_row() { # <cfg>: a crate-test row whose witness names its cfg
     echo "$1 crate-test fake test:suite the_row from-$1"
 }
+
+group_sim_canaries_builds() {
+export INF_CANARY_HOST=Linux
 # Rows judged in order: at K = 4, `_hold` is built ahead and ends only after
 # the two cfgs behind it are built, and each row still reads its own cfg's
 # build, in the table's order, once that build ended. The scenario cfg in
@@ -3606,6 +3636,8 @@ expect green "builds: no planted directory is left under the root" test -z "$(ls
 expect green "builds: each row's elapsed seconds follow its verdict" \
     test "$(grep -c '^== canary inf_canary_[a-e][a-z_]* [a-z-]* [a-z_-]*: elapsed [0-9]*\.[0-9] s$' "$dir/run.log")" -eq 5
 expect green "builds: the lane names K, J and the pool" grep -qx "builds: 4 cfgs' planted builds at once, on 5 jobs (a pool of 1 tokens)" "$dir/run.log"
+expect green "builds: no simulator, plain or planted, nor cargo the lane runs holds the pool's descriptor" \
+    test "$(grep '^fd3 ' "$dir/events" | sort -u)" = "fd3 closed"
 # The window holds K cfgs: at K = 3 the first cfg holds its own build until
 # the two cfgs behind it are built, five more wait behind them, and the held
 # build counts the planted directories alive: K, never K + 1.
@@ -3673,6 +3705,8 @@ echo '== canary inf_canary_b_bin: its rows run alone*' >"$dir/release-on"
 {
     echo '#!/usr/bin/env bash'
     echo "here='$dir'"
+    echo 'fd3=closed; if (exec 4>&3) 2>/dev/null; then fd3=open; fi'
+    echo 'echo "fd3 $fd3" >>"$here/events"'
     echo 'case " $* " in *" --preflight "*) echo "host: Linux stub"; exit 0 ;; esac'
     echo 'echo "bench $(grep -c "^begin" "$here/events") $(grep -c "^built" "$here/events")" >>"$here/events"'
     echo 'echo "T-OVER: reading 3200000 B a cell"'
@@ -3688,6 +3722,8 @@ expect green "builds: the held build ahead began before the first cfg's planted 
     awk '$1 == "begin" && $2 == "inf_canary_c_hold" { held = NR } $1 == "run" && $2 == "inf_canary_a_waits" { a = NR } END { exit !(held && a && held < a) }' "$dir/events"
 expect green "builds: no build begins between the binary cfg's drain and its instrument" \
     awk '$1 == "bench" { exit found } $1 == "begin" && ($2 == "inf_canary_d" || $2 == "inf_canary_e") { found = 1 } END { exit found }' "$dir/events"
+expect green "builds: neither the instrument nor its preflight holds the pool's descriptor" \
+    test "$(grep '^fd3 ' "$dir/events" | sort -u)" = "fd3 closed"
 dir=$(builds_lane builds-alone "$(test_row inf_canary_a_waits)" \
     "inf_canary_b_alone crate-test fake test:suite the_alone_row from-inf_canary_b_alone" \
     "$(test_row inf_canary_c_hold)" "$(test_row inf_canary_d)" "$(test_row inf_canary_e)")
@@ -3704,29 +3740,37 @@ expect green "builds: the held build ahead began before the run-alone cfg was re
 expect green "builds: no build begins between the run-alone cfg's drain and its run" \
     awk '$1 == "run" && $2 == "inf_canary_b_alone" { exit found } $1 == "begin" && ($2 == "inf_canary_d" || $2 == "inf_canary_e") { found = 1 } END { exit found }' "$dir/events"
 expect red "builds: the run-alone test's cfg is never built ahead" grep -q '^== canary inf_canary_b_alone: built ahead' "$dir/run.log"
-# The run-alone set is the nextest config's: at K > 1 a missing config, or a
-# run-alone filter of a shape the lane cannot read, is a scope failure.
+# The set is the nextest config's as TOML reads it, whatever its spelling:
+# the same override under a header with spaces inside its brackets.
+dir=$(builds_lane builds-alone-spaced "$(test_row inf_canary_a)" \
+    "inf_canary_b_alone crate-test fake test:suite the_alone_row from-inf_canary_b_alone" "$(test_row inf_canary_c)")
+printf '%s\n' '[[ profile.default.overrides ]]' "filter = 'binary_id(fake::suite) & test(=the_alone_row)'" \
+    'threads-required = "num-test-threads"' 'priority = 100' >>"$dir/.config/nextest.toml"
+expect_output "builds: a run-alone override under a spaced header: the three cfgs are caught" "sim-canaries: 3 canaries caught" builds_run "$dir" 3 4
+cp "$work/log" "$dir/run.log"
+expect green "builds: a run-alone override under a spaced header runs its cfg alone" grep -qx '== canary inf_canary_b_alone: its rows run alone (a test .config/nextest.toml runs alone): every build ahead ends, and none starts until they are judged' "$dir/run.log"
+# A cfg stays alone when a plain row follows its run-alone row, and a
+# `package(<p>) & test(=<path>)` filter names the test by its path's last part.
+dir=$(builds_lane builds-alone-package "$(test_row inf_canary_a_waits)" \
+    "inf_canary_b_alone crate-test fake test:suite the_alone_row from-inf_canary_b_alone" "$(test_row inf_canary_b_alone)" \
+    "$(test_row inf_canary_c_hold)" "$(test_row inf_canary_d)" "$(test_row inf_canary_e)")
+printf '%s\n' '[[profile.default.overrides]]' "filter = 'package(fake) & test(=mod::the_alone_row)'" \
+    'threads-required = "num-test-threads"' 'priority = 100' >>"$dir/.config/nextest.toml"
+echo '== canary inf_canary_b_alone: its rows run alone*' >"$dir/release-on"
+expect_output "builds: a cfg of a run-alone row and a plain one, named by package and path: six caught" "sim-canaries: 6 canaries caught" builds_run "$dir" 3 4
+cp "$work/log" "$dir/run.log"
+expect green "builds: the cfg whose run-alone row precedes a plain one runs alone" grep -qx '== canary inf_canary_b_alone: its rows run alone (a test .config/nextest.toml runs alone): every build ahead ends, and none starts until they are judged' "$dir/run.log"
+expect red "builds: the cfg whose run-alone row precedes a plain one is never built ahead" grep -q '^== canary inf_canary_b_alone: built ahead' "$dir/run.log"
+expect green "builds: both rows of that cfg ran with every build begun also ended" \
+    awk '$1 == "run" && $2 == "inf_canary_b_alone" { n++; if ($3 != $4) bad = 1 } END { exit bad || n != 2 }' "$dir/events"
+# The run-alone set is the nextest config's, read by its gate: at K > 1 a
+# missing config, or a run-alone filter in none of the gate's forms, is a
+# scope failure.
 rm -f -- "${dir:?}/.config/nextest.toml"
-expect_red_because "builds: at K > 1 a missing nextest config is a scope failure" "the tests .config/nextest.toml runs alone schedule the lane, and it is missing" builds_run "$dir" 3 4
+expect_red_because "builds: at K > 1 a missing nextest config is a scope failure" "nextest-config SCOPE ERROR: .config/nextest.toml is missing" builds_run "$dir" 3 4
 printf '%s\n' '[[profile.default.overrides]]' "filter = 'test(=the_alone_row)'" 'threads-required = "num-test-threads"' \
     'priority = 100' >"$dir/.config/nextest.toml"
-expect_red_because "builds: a run-alone filter of another shape is a scope failure" "a run-alone filter of .config/nextest.toml this lane cannot read: test(=the_alone_row)" builds_run "$dir" 3 4
-# A run a signal stops ends its builds ahead, each whole process group, then
-# removes every planted directory: the held build is stopped mid-build and
-# never ends, and its child, which outlives the SIGTERM by 1 s and then
-# makes a directory in the cfg's, is gone before that directory goes. The
-# case reads the child's `lingered` line (at most 5 s) before it looks.
-dir=$(builds_lane builds-stop "$(test_row inf_canary_a_stop)" "$(test_row inf_canary_b_lingers)" "$(test_row inf_canary_c)")
-exec 6<>"$dir/lingered"
-expect red "builds: a lane copy stopped by SIGTERM at K = 3 is red" builds_run "$dir" 3 4
-cp "$work/log" "$dir/run.log"
-expect green "builds: the lingering child of the stopped build ended" read -r -t 5 -u 6 _
-exec 6>&-
-expect red "builds: the stopped lane gave no verdict" grep -q "^sim-canaries:" "$dir/run.log"
-expect green "builds: the held build ahead had begun when the signal came (the case's premise)" grep -q '^begin inf_canary_b_lingers ' "$dir/events"
-expect green "builds: the held build ahead was stopped by the signal" grep -qx 'stopped inf_canary_b_lingers' "$dir/events"
-expect red "builds: the held build ahead never ended" grep -q '^built inf_canary_b_lingers ' "$dir/events"
-expect green "builds: no planted directory is left after the stop, the lingering child's included" test -z "$(ls -d "$dir"/target/canary-* 2>/dev/null)"
+expect_red_because "builds: a run-alone filter of another shape is a scope failure" "run-alone override 1's filter 'test(=the_alone_row)' is in none of the forms" builds_run "$dir" 3 4
 # K's knobs and the pool: K is 1 to 4 and at most J, J as cargo reads
 # CARGO_BUILD_JOBS; the pool holds J - K tokens and no command the lane runs
 # holds its descriptor; an inherited pool is refused at K > 1; controls alone
@@ -3754,6 +3798,48 @@ expect green "builds: no command the lane runs holds the pool's descriptor" test
 : >"$dir/events"
 expect_output "builds: controls alone at K = 3 read three controls" "controls only: 3 rows' controls green" builds_run "$dir" 3 7 INF_CANARY_CONTROLS_ONLY=1
 expect green "builds: controls alone build nothing ahead and name no pool" test "$(grep -v '^fd3 ' "$dir/events" | sort -u)" = "pool none"
+}
+
+# ------------------------- planted-bug canary driver: builds at once, stops
+group_sim_canaries_builds_stop() {
+export INF_CANARY_HOST=Linux
+# A run a signal stops ends its builds ahead, each whole process group, then
+# removes every planted directory: the held build is stopped mid-build and
+# never ends, and its child, which outlives the SIGTERM by 1 s and then
+# makes a directory in the cfg's, is gone before that directory goes. The
+# case reads the child's `lingered` line (at most 5 s) before it looks.
+dir=$(builds_lane builds-stop "$(test_row inf_canary_a_stop)" "$(test_row inf_canary_b_lingers)" "$(test_row inf_canary_c)")
+exec 6<>"$dir/lingered"
+expect red "builds: a lane copy stopped by SIGTERM at K = 3 is red" builds_run "$dir" 3 4
+cp "$work/log" "$dir/run.log"
+expect green "builds: the lingering child of the stopped build ended" read -r -t 5 -u 6 _
+exec 6>&-
+expect red "builds: the stopped lane gave no verdict" grep -q "^sim-canaries:" "$dir/run.log"
+expect green "builds: the held build ahead had begun when the signal came (the case's premise)" grep -q '^begin inf_canary_b_lingers ' "$dir/events"
+expect green "builds: the held build ahead was stopped by the signal" grep -qx 'stopped inf_canary_b_lingers' "$dir/events"
+expect red "builds: the held build ahead never ended" grep -q '^built inf_canary_b_lingers ' "$dir/events"
+expect green "builds: no planted directory is left after the stop, the lingering child's included" test -z "$(ls -d "$dir"/target/canary-* 2>/dev/null)"
+# A build ahead whose child ignores SIGTERM: the stop sends its group SIGKILL
+# once its bound passes, and waits until the group is gone before the
+# directory goes.
+dir=$(builds_lane builds-stop-deaf "$(test_row inf_canary_a_stop)" "$(test_row inf_canary_b_deaf)" "$(test_row inf_canary_c)")
+expect red "builds: a lane copy stopped beside a build whose child ignores SIGTERM is red" builds_run "$dir" 3 4
+cp "$work/log" "$dir/run.log"
+deaf=$(awk '$1 == "deaf" { print $3 }' "$dir/events")
+expect green "builds: the child that ignores SIGTERM had begun when the signal came (the case's premise)" test -n "$deaf"
+expect red "builds: the stop's SIGKILL ended the child that ignores SIGTERM" kill -0 "${deaf:-0}"
+expect red "builds: the child that ignores SIGTERM never reached its own end" grep -q '^deaf-ended ' "$dir/events"
+expect green "builds: no planted directory is left after a stop that took SIGKILL" test -z "$(ls -d "$dir"/target/canary-* 2>/dev/null)"
+# A lane started with SIGTERM ignored passes the ignored signal to its builds
+# ahead: a stop (here by SIGINT) polls their groups before it waits for any
+# job, so its SIGKILL comes on time, and the held build never ends.
+builds_run_term_ignored() { (trap '' TERM; builds_run "$@"); }
+dir=$(builds_lane builds-stop-ignored "$(test_row inf_canary_a_interrupt)" "$(test_row inf_canary_b_hold)" "$(test_row inf_canary_c)")
+expect red "builds: a lane copy started with SIGTERM ignored and stopped by SIGINT is red" builds_run_term_ignored "$dir" 3 4
+cp "$work/log" "$dir/run.log"
+expect green "builds: the held build ahead had begun when SIGINT came (the case's premise)" grep -q '^begin inf_canary_b_hold ' "$dir/events"
+expect red "builds: the held build ahead, deaf to SIGTERM, never ended" grep -q '^built inf_canary_b_hold ' "$dir/events"
+expect green "builds: no planted directory is left after that stop" test -z "$(ls -d "$dir"/target/canary-* 2>/dev/null)"
 }
 
 # ------------------------------- planted-bug canary driver: long logs, readers
