@@ -914,7 +914,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         // most `2 * ceil(N / 64)` unparked turns per own publication. The
         // two O(1) tests go first; the waitlist test stops at its first
         // live waiter.
-        if self.ckpt_observation_owed() && self.shared.ckpt_waiters.any_waiting() {
+        if self.ckpt_observation_owed() && !self.shared.ckpt_waiters.is_idle() {
             return true;
         }
         // A parked loop never holds ready cold work (ADR-0181 R2, R6):

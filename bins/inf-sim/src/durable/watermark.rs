@@ -32,7 +32,7 @@ fn any_file(_: &Path) -> bool {
 /// One connection sends 31 `always` writes at one step, delivered whole,
 /// while the device holds every barrier: the pump stages all 31 in one pass,
 /// and the cell then parks exactly one watermark wait for them, its front's.
-/// Once the hold lifts, all 31 are acknowledged in pipeline order and no
+/// Once the hold lifts, all 31 are acknowledged and no
 /// wait is left parked: no entry is stranded behind the front. Engagement,
 /// each else its `VACUOUS` line: the device held a frame barrier
 /// (`frame-barrier-unheld`), all 31 were appended (`writes-unstaged`), and no
@@ -87,7 +87,7 @@ fn a_task_waits_on_the_watermark_once_for_its_staged_writes() {
     for _ in 0..STEPS_MAX {
         quiet.step();
         while let Some(reply) = writer.recv(&mut quiet.node) {
-            assert_eq!(reply.as_slice(), b"+OK\r\n", "write {acked}'s ack, in pipeline order");
+            assert_eq!(reply.as_slice(), b"+OK\r\n", "write {acked}'s ack");
             acked += 1;
         }
         if acked == WRITES {

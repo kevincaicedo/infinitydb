@@ -1337,82 +1337,94 @@ fn rewake(pool: &Pool, id: NodeId, cx: &Context<'_>) {
     drop(stale);
 }
 
-/// One key's FIFO: its two ends and its queued waits, each a cell, so a list
-/// reads and moves them with no borrow of the pool.
-#[derive(Default, Debug)]
-pub struct Ends {
-    head: Cell<Option<NodeId>>,
-    tail: Cell<Option<NodeId>>,
-    queued: Cell<u32>,
+/// A list's storage, sealed: its items are `pub`, so `ListKey` names them, in a module no
+/// caller can name, so the list's ends stay out of the crate's API.
+mod lists {
+    use core::cell::Cell;
+
+    use inf_foundation::bounded::{CappedMap, ExactKey};
+
+    use super::NodeId;
+
+    /// One key's FIFO: its two ends and its queued waits, each a cell, so a list
+    /// reads and moves them with no borrow of the pool.
+    #[derive(Default, Debug)]
+    pub struct Ends {
+        pub(super) head: Cell<Option<NodeId>>,
+        pub(super) tail: Cell<Option<NodeId>>,
+        pub(super) queued: Cell<u32>,
+    }
+
+    /// A list's ends by key, and its count of queued waits.
+    pub trait Queues<K> {
+        /// The key's ends; `None` for a key the list does not hold.
+        fn ends(&self, key: K) -> Option<&Ends>;
+        /// Waits queued on the list, on every key: one load, with no borrow.
+        fn queued(&self) -> u32;
+        /// A wait joined `ends`' tail.
+        fn joined(&self, ends: &Ends);
+        /// A wait left `ends`: woken, or unlinked at its drop.
+        fn left(&self, ends: &Ends);
+    }
+
+    /// The unit key's list keeps its one pair of ends in its own state, with no
+    /// map: its ends' count is the list's count, one fact.
+    impl Queues<()> for Ends {
+        #[inline]
+        fn ends(&self, (): ()) -> Option<&Ends> {
+            Some(self)
+        }
+
+        #[inline]
+        fn queued(&self) -> u32 {
+            self.queued.get()
+        }
+
+        #[inline]
+        fn joined(&self, ends: &Ends) {
+            ends.queued.set(ends.queued.get() + 1);
+        }
+
+        #[inline]
+        fn left(&self, ends: &Ends) {
+            ends.queued.set(ends.queued.get() - 1);
+        }
+    }
+
+    /// A keyed list's ends: every key admitted before the cell serves, so a
+    /// lookup is a shared read and the map takes no borrow of its own; `None`
+    /// holds no key.
+    pub struct KeyedEnds<K: ExactKey> {
+        pub(super) queued: Cell<u32>,
+        pub(super) by_key: Option<CappedMap<K, Ends>>,
+    }
+
+    impl<K: ExactKey> Queues<K> for KeyedEnds<K> {
+        #[inline]
+        fn ends(&self, key: K) -> Option<&Ends> {
+            self.by_key.as_ref()?.get(key)
+        }
+
+        #[inline]
+        fn queued(&self) -> u32 {
+            self.queued.get()
+        }
+
+        #[inline]
+        fn joined(&self, ends: &Ends) {
+            ends.queued.set(ends.queued.get() + 1);
+            self.queued.set(self.queued.get() + 1);
+        }
+
+        #[inline]
+        fn left(&self, ends: &Ends) {
+            ends.queued.set(ends.queued.get() - 1);
+            self.queued.set(self.queued.get() - 1);
+        }
+    }
 }
 
-/// A list's ends by key, and its count of queued waits.
-pub trait Queues<K> {
-    /// The key's ends; `None` for a key the list does not hold.
-    fn ends(&self, key: K) -> Option<&Ends>;
-    /// Waits queued on the list, on every key: one load, with no borrow.
-    fn queued(&self) -> u32;
-    /// A wait joined `ends`' tail.
-    fn joined(&self, ends: &Ends);
-    /// A wait left `ends`: woken, or unlinked at its drop.
-    fn left(&self, ends: &Ends);
-}
-
-/// The unit key's list keeps its one pair of ends in its own state, with no
-/// map: its ends' count is the list's count, one fact.
-impl Queues<()> for Ends {
-    #[inline]
-    fn ends(&self, (): ()) -> Option<&Ends> {
-        Some(self)
-    }
-
-    #[inline]
-    fn queued(&self) -> u32 {
-        self.queued.get()
-    }
-
-    #[inline]
-    fn joined(&self, ends: &Ends) {
-        ends.queued.set(ends.queued.get() + 1);
-    }
-
-    #[inline]
-    fn left(&self, ends: &Ends) {
-        ends.queued.set(ends.queued.get() - 1);
-    }
-}
-
-/// A keyed list's ends: every key admitted before the cell serves, so a
-/// lookup is a shared read and the map takes no borrow of its own; `None`
-/// holds no key.
-pub struct KeyedEnds<K: ExactKey> {
-    queued: Cell<u32>,
-    by_key: Option<CappedMap<K, Ends>>,
-}
-
-impl<K: ExactKey> Queues<K> for KeyedEnds<K> {
-    #[inline]
-    fn ends(&self, key: K) -> Option<&Ends> {
-        self.by_key.as_ref()?.get(key)
-    }
-
-    #[inline]
-    fn queued(&self) -> u32 {
-        self.queued.get()
-    }
-
-    #[inline]
-    fn joined(&self, ends: &Ends) {
-        ends.queued.set(ends.queued.get() + 1);
-        self.queued.set(self.queued.get() + 1);
-    }
-
-    #[inline]
-    fn left(&self, ends: &Ends) {
-        ends.queued.set(ends.queued.get() - 1);
-        self.queued.set(self.queued.get() - 1);
-    }
-}
+use lists::{Ends, KeyedEnds, Queues};
 
 /// A wait list's key: the unit key, whose list keeps its ends in its own
 /// state, or a key a capped map holds.
@@ -1564,12 +1576,6 @@ impl<K: ListKey> WaitList<K> {
         self.list.queues.queued() == 0
     }
 
-    /// Whether any wait is queued, on any key: the same count.
-    #[must_use]
-    pub fn any_waiting(&self) -> bool {
-        !self.is_idle()
-    }
-
     /// Waits queued across all keys (gauges, tests, leak asserts): the same
     /// count.
     #[must_use]
@@ -1664,9 +1670,12 @@ impl<K: ListKey> ListWait<K> {
             drop(nodes);
             return self.starved_by(waker);
         };
-        let SlabReserved::Slot(slot) = nodes.reserve() else {
-            drop(nodes);
-            return self.starved_by(waker);
+        let slot = match nodes.reserve() {
+            SlabReserved::Slot(slot) => slot,
+            SlabReserved::Full | SlabReserved::Exhausted => {
+                drop(nodes);
+                return self.starved_by(waker);
+            }
         };
         let tail = ends.tail.get();
         let node =
@@ -2493,7 +2502,7 @@ mod tests {
     /// dropped before any value. A dropped wait takes its route in the same
     /// step (ADR-0177 D4), so the hold reads no wait, the gate keeps no route
     /// and a gate of 8 never fills. Planted, the drop leaves the route and
-    /// the holder with its waker (KE12).
+    /// the holder with its waker.
     #[test]
     fn a_dropped_keyed_wait_leaves_no_route() {
         const WAITS: u64 = 1_000;
@@ -2701,11 +2710,13 @@ mod tests {
 
     /// 1,000 waits on one key, each polled once, so it is queued on its node
     /// with its waker stored, then dropped before any wake; then 1,000 more,
-    /// each woken and dropped unread. A wait's node is its future's, so a
-    /// drop while queued unlinks it and gives the node back, and a drop after
-    /// an unread wake passes the wake to the key's next wait, once (ADR-0177
-    /// D5): the pool is back at no node, no first poll starved, and the
-    /// baton reached the one wait behind each.
+    /// each the head a wake reaches and a poll reads, with the next queued
+    /// behind it; then one woken and dropped unread. A wait's node is its
+    /// future's, so a drop while queued unlinks it and gives the node back, a
+    /// poll that reads its wake gives it back, and a drop after an unread
+    /// wake passes the wake to the key's next wait (ADR-0177 D5): the pool is
+    /// back at no node, no first poll starved, and the baton reached the wait
+    /// behind.
     #[test]
     fn a_wait_dropped_while_queued_leaves_no_entry() {
         const WAITS: usize = 1_000;
@@ -2723,8 +2734,8 @@ mod tests {
         for _ in 0..WAITS {
             let mut woken = list.wait(7);
             assert!(!polled(&mut woken), "engagement: queued");
-            // `behind` is the head: the wake reaches it, and the new wait is
-            // the head after it, which the next pass's drop wakes in turn.
+            // `behind` is the head: the wake reaches it and its poll reads
+            // it, and the new wait is the head after it, for the next pass.
             assert!(list.wake_one(7), "engagement: the head is woken");
             assert!(polled(&mut behind), "the head's wake landed");
             behind = woken;
@@ -2939,8 +2950,9 @@ mod tests {
 
     /// A wait made and dropped before its first poll takes no node and moves
     /// no count; a wait woken and dropped unread passes its wake to the next
-    /// one, once; 1,000 of each on one key leave the pool empty, and a wait
-    /// polled after its Ready answers Ready again, with no node and no count.
+    /// one, once, so the wait behind that one stays queued; 1,000 of each on
+    /// one key leave the pool empty, and a wait polled after its Ready answers
+    /// Ready again, with no node and no count.
     #[test]
     fn unpolled_and_unread_drops_and_a_poll_after_ready_take_no_node() {
         const WAITS: usize = 1_000;
@@ -2953,11 +2965,17 @@ mod tests {
         for _ in 0..WAITS {
             let mut woken = list.wait(7);
             let mut next = list.wait(7);
-            assert!(!polled(&mut woken) && !polled(&mut next), "engagement: two queued");
+            let mut last = list.wait(7);
+            assert!(
+                !polled(&mut woken) && !polled(&mut next) && !polled(&mut last),
+                "engagement: three queued"
+            );
             assert!(list.wake_one(7), "engagement: the head is woken");
             drop(woken);
+            assert_eq!(list.waiting(), 1, "the baton woke one wait behind, not two");
             batons += usize::from(polled(&mut next));
             assert!(polled(&mut next), "a poll after Ready is Ready again");
+            drop(last);
         }
         assert_eq!(batons, WAITS, "each unread wake passed once");
         assert_eq!((list.waiting(), nodes.len(), nodes.full()), (0, 0, 0), "the pool is empty");

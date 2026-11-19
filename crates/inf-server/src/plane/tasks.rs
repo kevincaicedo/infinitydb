@@ -327,10 +327,17 @@ mod tests {
     #[cfg(feature = "doc")]
     fn the_idle_bill_and_its_plants_follow_the_strides() {
         const CELLS: u16 = 4;
-        const MIB: f64 = 1_048_576.0;
-        // The row's per-cell remainder: 4 MiB a cell of its 16 MiB at 4 cells, which holds the
+        const MIB_BYTES: u64 = 1_048_576;
+        const MIB: f64 = MIB_BYTES as f64;
+        // The row's fixed terms: pinned receive pools, mesh ring slots, the SQ and CQ, and the
+        // per-node remainder.
+        const RECEIVE_POOLS_BYTES: u64 = 64 * MIB_BYTES;
+        const MESH_RINGS_BYTES: u64 = 3 * MIB_BYTES;
+        const SQ_CQ_BYTES: u64 = 3 * MIB_BYTES / 2;
+        const REMAINDER_BYTES_NODE: u64 = 16 * MIB_BYTES;
+        // The row's per-cell remainder: 4 MiB a cell, 16 MiB at 4 cells, which holds the
         // reserves its named terms do not, the wait pool among them (ADR-0177 D8).
-        const REMAINDER_BYTES_CELL: u64 = 4 * 1_048_576;
+        const REMAINDER_BYTES_CELL: u64 = 4 * MIB_BYTES;
         let config = ConfigStore::default();
         let caps = crate::limits::plane_task_caps(config.boot_share(CELLS), CELLS)
             .expect("the default caps");
@@ -360,9 +367,11 @@ mod tests {
         let holder_chunk =
             inf_foundation::limits::chunk_slots_for(holder_bytes).expect("a holder's chunk");
         let gate = slab_bill(holders, holder_bytes, holder_chunk);
-        // Pinned receive pools 64 MiB, mesh ring slots 3 MiB, SQ and CQ 1.5 MiB, the per-cell
-        // remainder 16 MiB and the per-node remainder 16 MiB: the row's fixed terms.
-        let fixed = 100.5 * MIB;
+        let fixed = (RECEIVE_POOLS_BYTES
+            + MESH_RINGS_BYTES
+            + SQ_CQ_BYTES
+            + u64::from(CELLS) * REMAINDER_BYTES_CELL
+            + REMAINDER_BYTES_NODE) as f64;
         let bill = (fixed + (u64::from(CELLS) * (tasks + gate)) as f64) / MIB;
         let threshold = (bill * 100.0).ceil() / 100.0;
         println!(

@@ -621,14 +621,16 @@ pub const GATE_UNITS_PER_CONN_TASK: u32 = 32;
 
 /// The units a cell's fabric gate issues to its tasks (ADR-0177 D2, D4):
 /// `Σ T_j × W_j`, 32 a `conn` slot and `cells − 1` for the `owner-pub`
-/// pump; the other classes send nothing.
+/// pump; the other classes send nothing. Every class is named, so a class
+/// the caps gain is a compile error here until its units are counted.
 pub(crate) const fn gate_units(caps: &PlaneTaskCaps) -> u32 {
-    let conn = caps.conn.entries_max() * GATE_UNITS_PER_CONN_TASK;
-    match &caps.peers {
+    let PlaneTaskCaps { conn, peers, compact: _, shadow: _ } = caps;
+    let conn = conn.entries_max() * GATE_UNITS_PER_CONN_TASK;
+    match peers {
         None => conn,
-        // The `owner-pub` pump's one unit per peer: the `ns-apply` class's
-        // `cells − 1` slots.
-        Some(peers) => conn + peers.ns_apply.entries_max(),
+        // The `owner-pub` pump's one unit per peer, its own slots aside: the
+        // `ns-apply` class's `cells − 1` slots. `gated` sends nothing.
+        Some(PeerTaskCaps { ns_apply, owner_pub: _, gated: _ }) => conn + ns_apply.entries_max(),
     }
 }
 

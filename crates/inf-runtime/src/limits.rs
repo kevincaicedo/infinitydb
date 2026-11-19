@@ -89,9 +89,10 @@ pub const GATE_HOLDERS: Cap =
 
 /// The row a keyless wait list's refusal names (ADR-0177 D5): a keyed list built with no map
 /// (a node of one cell, whose credit list has no peer) holds no key, so a key given to it is
-/// past its cap and its build answers `<row>-full-at-assembly` under this name. No store is
-/// built at this cap and no census row takes it. Unit: keys per list. Owner: `WaitList::keyed`.
-/// Crossing: the build's typed refusal, before the cell serves.
+/// past its cap and its build answers `<row>-full-at-assembly` under this name. Its one entry
+/// is the type's minimum, not a bound: nothing reads it, and the refusal keeps the row's name
+/// alone. No store is built at this cap and no census row takes it. Unit: keys per list.
+/// Owner: `WaitList::keyed`. Crossing: the build's typed refusal, before the cell serves.
 pub const WAIT_LIST_KEYLESS: Cap = Cap::entries::<1>("wait-list-keyless", CapFill::Assembly);
 
 /// Routes, and holders, one cell's cold gate may number (ADR-0177 D4): 65,536, the ceiling the

@@ -818,7 +818,7 @@ impl<F: SegmentFs> TierCell<F> {
                 return false;
             }
         };
-        if owner.stall_waiters.any_waiting() {
+        if !owner.stall_waiters.is_idle() {
             owner.stall_waiters.wake_all(());
         }
         if cfg!(inf_canary_drop_closes_handles) {
@@ -1079,7 +1079,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         // is always reachable (bounded: waiters re-check, then repark),
         // whatever the flush leg returned — a fatal barrier stops the
         // cell after this visit, never before the wake.
-        if released > 0 || t.stall_waiters.any_waiting() {
+        if released > 0 || !t.stall_waiters.is_idle() {
             t.stall_waiters.wake_all(());
         }
         advanced?;

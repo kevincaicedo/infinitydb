@@ -1159,8 +1159,8 @@ ordered_rows=(
   # and billed by the idle row. Planted, it is built over (1 + k) C slots, k from its stride:
   # the idle node's resident memory a cell rises by k x C x s_conn, 2,500 x 3,104 B at 4 cells
   # (k = 1), over the idle-resident tool's 256 KiB control a cell, which the plain node's three
-  # boots stay within. The bytes are that product at the
-  # stride the plane's layout test prints; a stride that moves moves them with it.
+  # boots stay within. The bytes are that product at the stride the plane's layout test prints;
+  # a stride that moves moves them with it.
   "inf_canary_conn_slots_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 7760000 --control-bytes-cell 262144 --plant-row conn-tasks"
   # A finished conn task's header is reclaimed once no waker names it, so a settled node holds no
   # Retired conn header (O1's leak clause). Planted, the pump keeps a clone of its own waker past
@@ -1234,8 +1234,9 @@ ordered_rows=(
   "inf_canary_gate_frees_on_drop m0-capacity gate-stale --close-leg orphan"
   # The fabric gate's holders are resident from its build (ADR-0177 D8 with A1), billed by the
   # idle row. Planted, the gate is built over 2 H: the idle node's resident memory a cell rises
-  # by H x s_h, 83,075 x 48 B at 4 cells, over the idle-resident tool's 256 KiB control a cell. The bytes are that product at the stride
-  # the plane's layout test prints; a stride that moves moves them with it.
+  # by H x s_h, 83,075 x 48 B at 4 cells, over the idle-resident tool's 256 KiB control a cell.
+  # The bytes are that product at the stride the plane's layout test prints; a stride that
+  # moves moves them with it.
   "inf_canary_gate_holders_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 3987600 --control-bytes-cell 262144 --plant-row fabric-gate-holders"
   # A fabric reserve takes one of its task's units, so a fan wider than 32 legs runs in windows
   # and the share's fans stay within the gate's holders (ADR-0177 D4). Planted, it grants
@@ -1370,8 +1371,8 @@ ordered_rows=(
   # the gate row's per-cell remainder. Planted, the pool is built over (1 + k) T nodes, k the
   # fewest counts of T whose node bytes pass ten times the idle-resident tool's 256 KiB control
   # a cell: the idle node's resident memory a cell rises by k x T x s_node, 17 x 2,825 x 56 B
-  # at 4 cells. The bytes are
-  # that product at the stride the bill's test reads; a stride that moves moves them with it.
+  # at 4 cells. The bytes are that product at the stride the bill's test reads; a stride that
+  # moves moves them with it.
   "inf_canary_wait_nodes_oversized binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 2689400 --control-bytes-cell 262144 --plant-row wait-nodes"
   # A word resolves its slot by the generation bits it carries, the low bits of the occupant's
   # (ADR-0194 D6 with A2). Planted, the whole generation is compared with the field, and from

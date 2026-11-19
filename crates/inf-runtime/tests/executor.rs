@@ -310,29 +310,30 @@ fn waitlist_drop_passes_the_baton() {
     assert_eq!(list.waiting(), 0, "second was woken by the baton pass");
 }
 
-/// `any_waiting` is `waiting() > 0` in every state of a queue: empty, a
-/// live waiter behind a cancelled one, cancelled entries only, and a woken
-/// waiter that has not run yet.
+/// A keyed list is idle exactly when no wait is queued on any key: a wait
+/// on one key keeps it busy, a dropped wait unlinks at once, so the wait
+/// behind it is the only one left, and a woken wait leaves its queue before
+/// its task runs.
 #[test]
-fn waitlist_any_waiting_is_true_exactly_when_a_live_waiter_is_queued() {
+fn waitlist_is_idle_exactly_when_no_wait_is_queued_on_any_key() {
     let list = wait_list(&[1, 2, 3]);
-    assert!(!list.any_waiting(), "an empty list");
+    assert!(list.is_idle(), "an empty list");
     let first = polled(list.wait(1));
     let second = polled(list.wait(1));
     let other_key = polled(list.wait(2));
-    assert!(list.any_waiting());
-    // Cancelled in place: the entry stays queued until a wake skips it.
+    assert!(!list.is_idle(), "waits on two keys");
     drop(first);
-    assert_eq!(list.waiting(), 2);
-    assert!(list.any_waiting(), "a live waiter behind a cancelled entry");
+    assert_eq!(list.waiting(), 2, "the dropped wait unlinked at once");
+    assert!(!list.is_idle(), "the wait behind it is queued");
     drop(second);
+    assert!(!list.is_idle(), "another key's wait is queued");
     drop(other_key);
     assert_eq!(list.waiting(), 0);
-    assert!(!list.any_waiting(), "cancelled entries are not waiters");
+    assert!(list.is_idle(), "every dropped wait unlinked");
     let woken = polled(list.wait(3));
     assert!(list.wake_one(3));
     assert_eq!(list.waiting(), 0);
-    assert!(!list.any_waiting(), "a woken waiter is no longer queued");
+    assert!(list.is_idle(), "a woken wait is no longer queued");
     drop(woken);
 }
 

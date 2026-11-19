@@ -1105,7 +1105,7 @@ fn a_stalled_writer_is_woken_at_a_visit_whose_plan_is_refused() {
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     let queued = std::pin::Pin::new(&mut parked).poll(&mut cx).is_pending();
     assert!(queued, "engagement: the writer's wait is polled once, as its task polls it");
-    assert!(cell.nth(0).stall_waiters.any_waiting(), "engagement: a writer is parked");
+    assert!(!cell.nth(0).stall_waiters.is_idle(), "engagement: a writer is parked");
     inf_foundation::fault::arm(inf_log::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(1));
     let visited = cell.maintain_ns(
         &mut ks,
