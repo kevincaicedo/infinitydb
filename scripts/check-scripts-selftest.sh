@@ -3587,6 +3587,8 @@ builds_watch() { # <dir>: the lane's output unchanged; a line matching `release-
         fi
     done
 }
+# builds_launch: what starts the lane copy, `bash` unless a case names more.
+builds_launch=(bash)
 builds_run() { # <dir> <K> <J> [<NAME=value>…]: the lane copy over its rows, K builds at once on J jobs
     local dir=$1 k=$2 j=$3
     shift 3
@@ -3595,7 +3597,7 @@ builds_run() { # <dir> <K> <J> [<NAME=value>…]: the lane copy over its rows, K
     {
         env -u CARGO_TARGET_DIR -u CARGO_MAKEFLAGS -u MAKEFLAGS -u MFLAGS INF_CANARY_BUILDS="$k" \
             CARGO_BUILD_JOBS="$j" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" "$@" \
-            bash "$dir/scripts/sim-canaries.sh" 2>&1 | builds_watch "$dir"
+            "${builds_launch[@]}" "$dir/scripts/sim-canaries.sh" 2>&1 | builds_watch "$dir"
     } 7<>"$dir/hold" 8<>"$dir/began"
 }
 builds_caught() { # <log>: the cfgs the catches name, in the log's order
@@ -3833,7 +3835,16 @@ expect green "builds: no planted directory is left after a stop that took SIGKIL
 # A lane started with SIGTERM ignored passes the ignored signal to its builds
 # ahead: a stop (here by SIGINT) polls their groups before it waits for any
 # job, so its SIGKILL comes on time, and the held build never ends.
-builds_run_term_ignored() { (trap '' TERM; builds_run "$@"); }
+# The lane starts with SIGTERM ignored and SIGINT at its default, set by its
+# launcher whatever the caller's: a group the driver runs in the background
+# inherits SIGINT ignored, which a shell can neither trap nor reset.
+builds_run_term_ignored() {
+    local -a builds_launch=(python3 -I -S -c 'import os, signal, sys
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+os.execvp("bash", ["bash"] + sys.argv[1:])')
+    builds_run "$@"
+}
 dir=$(builds_lane builds-stop-ignored "$(test_row inf_canary_a_interrupt)" "$(test_row inf_canary_b_hold)" "$(test_row inf_canary_c)")
 expect red "builds: a lane copy started with SIGTERM ignored and stopped by SIGINT is red" builds_run_term_ignored "$dir" 3 4
 cp "$work/log" "$dir/run.log"
