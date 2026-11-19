@@ -36,9 +36,6 @@ fn any_file(_: &Path) -> bool {
 /// (`frame-barrier-unheld`), all 31 were appended (`writes-unstaged`), and no
 /// ack was read under the hold (`acked-under-hold`).
 #[test]
-#[ignore = "the pump takes a watermark wait for every always write it stages, so one \
-            connection's 31 writes staged in one pass under a held fsync park 31 waits; red \
-            until a pending entry carries its sequence"]
 fn a_task_waits_on_the_watermark_once_for_its_staged_writes() {
     let mut quiet = Quiet::boot(1, DurableScenario::SPIN_ITERS, 0);
     let mut setup = MiniClient::connect(&mut quiet.node, 0);

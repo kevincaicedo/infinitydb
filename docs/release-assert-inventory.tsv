@@ -534,6 +534,7 @@ I	1	crates/inf-server/src/plane.rs	expect	enable_durable built tier state	`enabl
 I	1	crates/inf-server/src/plane/conn.rs	expect	ends table	the block was written by `stage_argv_block` with `argc` 4-byte ends after the header
 I	1	crates/inf-server/src/plane/fabric.rs	expect	ends table	the block was written by `stage_argv_block` with `argc` 4-byte ends after the header
 I	1	crates/inf-server/src/plane/dispatch.rs	expect	guarded	`conn_ns.is_some()` is part of the arm's guard
+I	1	crates/inf-server/src/plane/dispatch.rs	expect	a durable entry implies the durable plane	`PendingReply::Durable` is pushed only after the durable cell staged its record (`ns_ddl.rs`'s two gated pushes), and the cell `enable_durable` installs is never removed
 I	1	crates/inf-server/src/plane/conn.rs	expect	header	the block was written by `OwnedCmd::from_argv_into`, or for a parked fabric entry by `stage_argv_block` (`OwnedCmd::from_staged`), with a 4-byte header
 I	1	crates/inf-server/src/plane/cell_loop.rs	expect	log completion without durable plane	`LogWrite`/`Fsync`/`ZeroFillWrite` tokens are minted by the durable cell, which exists for the plane's life once enabled
 I	1	crates/inf-server/src/plane/cell_loop.rs	expect	LogWritten without durable plane	`LogWrite` tokens are minted by the durable cell, which exists for the plane's life once enabled

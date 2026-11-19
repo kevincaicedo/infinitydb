@@ -44,7 +44,10 @@ pub(super) enum PendingReply<'u> {
     /// `always` durable write (M2-S08): the reply bytes are staged but the
     /// slot resolves only once the fsync watermark covers the record's
     /// durable seq (§8.2 — ack after fsync; FIFO per connection holds).
-    Durable { waiter: inf_runtime::WatermarkWait, reply: OwnedReply },
+    /// The entry carries the seq, not a waiter (ADR-0177 D5): the pump
+    /// waits on the watermark only for its front, so a pipeline of `always`
+    /// writes is one wait at a time, not one for each write.
+    Durable { seq: u64, reply: OwnedReply },
 }
 
 /// A fan's legs out, oldest first (ADR-0177 D4): each holds one of its
@@ -879,7 +882,12 @@ pub(super) async fn settle_reply<O: PlaneObserver + 'static, F: SegmentFs + Clon
         PendingReply::Gather(legs) => legs.finish(shared).await,
         #[cfg(feature = "doc")]
         PendingReply::JsonGather(gather) => gather.finish(shared).await,
-        PendingReply::Durable { waiter, reply } => {
+        PendingReply::Durable { seq, reply } => {
+            let waiter = {
+                let durable = shared.durable.borrow();
+                let cell = durable.as_ref().expect("a durable entry implies the durable plane");
+                cell.ack_gate.waiter(seq)
+            };
             waiter.await;
             reply
         }

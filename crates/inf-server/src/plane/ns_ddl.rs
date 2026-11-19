@@ -330,13 +330,11 @@ pub(super) async fn dispatch_ns<'u, O: PlaneObserver + 'static, F: SegmentFs + C
         match tiered::dispatch_tiered(shared, origin, ns, meta, argv, proto, gate).await {
             tiered::TieredReply::Done(reply) => pending.push_back(PendingReply::Done(reply)),
             tiered::TieredReply::Gated { reply, seq, gate: ClientAck } => {
-                let waiter = {
-                    let mut durable = shared.durable.borrow_mut();
-                    let cell = durable.as_mut().expect("tiered implies the durable plane");
-                    cell.note_gated_ack();
-                    cell.ack_gate.waiter(seq)
-                };
-                pending.push_back(PendingReply::Durable { waiter, reply });
+                let mut durable = shared.durable.borrow_mut();
+                let cell = durable.as_mut().expect("tiered implies the durable plane");
+                cell.note_gated_ack();
+                drop(durable);
+                pending.push_back(PendingReply::Durable { seq, reply });
             }
         }
         return true;
@@ -403,13 +401,8 @@ pub(super) async fn dispatch_ns<'u, O: PlaneObserver + 'static, F: SegmentFs + C
     }
     if let Some((seq, ClientAck)) = ApplyGate::client(NsApplyRead::new(meta, class)).settle(staged)
     {
-        let waiter = {
-            let mut durable = shared.durable.borrow_mut();
-            let cell = durable.as_mut().expect("staged above");
-            cell.note_gated_ack();
-            cell.ack_gate.waiter(seq)
-        };
-        pending.push_back(PendingReply::Durable { waiter, reply });
+        shared.durable.borrow_mut().as_mut().expect("staged above").note_gated_ack();
+        pending.push_back(PendingReply::Durable { seq, reply });
         return shared.with_conn(key, |_| ()).is_some();
     }
     pending.push_back(PendingReply::Done(reply));

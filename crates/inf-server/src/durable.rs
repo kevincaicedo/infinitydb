@@ -958,8 +958,9 @@ impl<F: SegmentFs> DurableCell<F> {
         matches!(self.ckpt.phase, CkptPhase::Idle) && self.manifest.idle()
     }
 
-    /// Registers one gated `always` ack (counter only; the waiter itself
-    /// is `ack_gate.waiter(seq)` at the dispatch site).
+    /// Registers one gated `always` ack (counter only; the reply's pending
+    /// entry carries its seq, and the pump takes `ack_gate.waiter(seq)` when
+    /// the entry is its front).
     pub fn note_gated_ack(&mut self) {
         self.acks_gated += 1;
     }
