@@ -111,15 +111,28 @@
 # the order above, as at K = 1, which builds nothing ahead. A build ahead that
 # failed is named with its log's last lines, and the leg builds again in
 # order, its output then in the lane's. A planted simulator is built ahead
-# only once the plain one is built. A cfg holding a binary row is never built
-# ahead, and before its rows every build ahead ends and none starts until
-# they are judged: its node runs with no build beside it, as the instrument
-# reads its resident memory. At most K planted directories live at once, and
-# a run a signal stops ends every build ahead before their directories go.
-# The lane's compiles share J jobs, CARGO_BUILD_JOBS or else the host's
-# processors: at K > 1 the lane names to every cargo a job pool of J - K
-# tokens (CARGO_MAKEFLAGS, `--jobserver-auth=fifo:<path>`), each of its at
-# most K cargos holding one job of its own, and K is at most J.
+# only once the plain one is built. A cfg runs alone when it holds a binary
+# row, or a crate-test or Loom row whose test `.config/nextest.toml` runs
+# alone (an override with `threads-required = "num-test-threads"`, read from
+# that file): it is never built ahead, and before its rows every build ahead
+# ends and none starts until they are judged, as the node's resident memory,
+# a test's time bound or a rate it reads would move with a build beside it.
+# At most K planted directories live at once. A run a signal stops sends
+# each build ahead's process group SIGTERM, then SIGKILL after 10 s, and waits
+# until every group is gone before their directories go.
+# The lane's compiles share J jobs: CARGO_BUILD_JOBS as cargo reads it (a
+# count, `default`, or a negative count taken from the host's processors),
+# else the host's processors; a cargo config's `build.jobs` is not read. At
+# K > 1 the lane names to every cargo a job pool of J - K tokens
+# (CARGO_MAKEFLAGS, `--jobserver-auth=fifo:<path>`; a cargo that inherits a
+# pool ignores its own job bound), each of its at most K cargos holding one
+# job of its own, and K is at most J: with nothing built ahead (the first cfg,
+# or one that runs alone) the cargo in the foreground has 1 + J - K jobs. A
+# pool inherited through CARGO_MAKEFLAGS, MAKEFLAGS or MFLAGS is a scope error
+# at K > 1, as each of the lane's cargos would hold a job that pool does not
+# count. Every command the lane runs has the pool's descriptor closed: a
+# cargo opens the pool by its path. Controls alone and the table-only read
+# build nothing ahead and read neither J nor a pool.
 # Each row's elapsed seconds follow its verdict (`<label>: elapsed`), and a
 # cfg's build ahead, its seconds and the wait for it head the cfg's rows, so
 # the log alone breaks a run down.
@@ -186,21 +199,40 @@ esac || {
   echo "sim-canaries: SCOPE ERROR — INF_CANARY_BUILDS wants 1 to $builds_max, got '$builds'"
   exit 1
 }
-# Controls alone build no plant, so nothing ahead.
-if [ "$controls_only" -eq 1 ]; then builds=1; fi
-# J, the jobs the lane's compiles share at K > 1: cargo's default when unset.
+# Controls alone and the table-only read build no plant, so nothing ahead.
+if [ "$controls_only" -eq 1 ] || [ "$table_only" -eq 1 ]; then builds=1; fi
+# J, the jobs the lane's compiles share at K > 1, read as cargo reads
+# CARGO_BUILD_JOBS: a count, `default`, or a negative count from the
+# processors, at least 1.
 build_jobs=1
 if [ "$builds" -gt 1 ]; then
-  build_jobs=${CARGO_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}
+  processors=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+  build_jobs=${CARGO_BUILD_JOBS:-default}
   case "$build_jobs" in
+    default) build_jobs=$processors ;;
     [1-9] | [1-9][0-9] | [1-9][0-9][0-9]) ;;
+    -[1-9] | -[1-9][0-9] | -[1-9][0-9][0-9])
+      build_jobs=$((processors + build_jobs))
+      if [ "$build_jobs" -lt 1 ]; then build_jobs=1; fi
+      ;;
     *)
-      echo "sim-canaries: SCOPE ERROR — at INF_CANARY_BUILDS $builds, CARGO_BUILD_JOBS wants 1" \
-        "to 999, got '$build_jobs'"
+      echo "sim-canaries: SCOPE ERROR — at INF_CANARY_BUILDS $builds, CARGO_BUILD_JOBS wants a" \
+        "count of 1 to 999, a negative one or 'default', got '$build_jobs'"
       exit 1
       ;;
   esac
   if [ "$builds" -gt "$build_jobs" ]; then builds=$build_jobs; fi
+fi
+if [ "$builds" -gt 1 ]; then
+  for inherited in "${CARGO_MAKEFLAGS:-}" "${MAKEFLAGS:-}" "${MFLAGS:-}"; do
+    case " $inherited" in
+      *" --jobserver-auth="* | *" --jobserver-fds="*)
+        echo "sim-canaries: SCOPE ERROR — at INF_CANARY_BUILDS $builds a job pool is inherited" \
+          "('$inherited'): set INF_CANARY_BUILDS=1, or run the lane outside that pool"
+        exit 1
+        ;;
+    esac
+  done
 fi
 if [ -n "${INF_CANARY_HOST:-}" ] && [ -z "${INF_CANARY_ROWS_FILE:-}" ]; then
   echo "sim-canaries: SCOPE ERROR — INF_CANARY_HOST is the self-test's stub route and needs" \
@@ -1582,25 +1614,49 @@ esac
 # process id, its start, and once it is waited for its exit status and the
 # wait, each empty before.
 ahead_pid=() ahead_began=() ahead_status=() ahead_waited=()
-# ahead_stop: every build ahead not yet waited for ends: its process group
-# (cargo and every compiler it started) is sent SIGTERM and waited for.
+# ahead_stop: every build ahead not yet waited for ends. Its process group
+# (cargo, and every compiler and linker it started) is sent SIGTERM, then
+# SIGKILL once 10 s pass, and the stop returns once every group is gone, its
+# tick a 1 s read of a FIFO nobody writes; past 20 s it names the groups left.
+# A job started but not yet recorded when a signal came is in `jobs -p`.
 ahead_stop() {
-  local j
+  local j pid groups='' alive tick=0
   for j in ${ahead_pid[@]+"${!ahead_pid[@]}"}; do
     [ -z "${ahead_status[$j]:-}" ] || continue
-    kill -TERM -- "-${ahead_pid[$j]}" 2>/dev/null || true
-    wait "${ahead_pid[$j]}" 2>/dev/null || true
+    groups="$groups ${ahead_pid[$j]}"
     ahead_status[$j]=stopped
   done
+  groups="$groups $(jobs -p 2>/dev/null | tr '\n' ' ')"
+  [ -n "${groups// /}" ] || return 0
+  for pid in $groups; do kill -TERM -- "-$pid" 2>/dev/null || true; done
+  for pid in $groups; do wait "$pid" 2>/dev/null || true; done
+  mkfifo "$work/tick" 2>/dev/null || true
+  exec 4<>"$work/tick"
+  while :; do
+    alive=''
+    for pid in $groups; do
+      if kill -0 -- "-$pid" 2>/dev/null; then alive="$alive $pid"; fi
+    done
+    [ -n "$alive" ] || break
+    if [ "$tick" -eq 10 ]; then
+      for pid in $alive; do kill -KILL -- "-$pid" 2>/dev/null || true; done
+    elif [ "$tick" -ge 20 ]; then
+      echo "   red: the process groups of builds ahead$alive outlived SIGKILL by 10 s"
+      break
+    fi
+    read -r -t 1 -u 4 _ || true
+    tick=$((tick + 1))
+  done
+  exec 4>&-
 }
-# On any exit every build ahead ends first; then the work directory goes, and
-# so do the planted directory of the cfg whose rows were running and of each
-# cfg built ahead (remove_planted, below), so a run a signal stops leaves no
-# planted build behind. The signals are trapped for the order: bash runs a
-# trapped signal's action once the build in the foreground has ended, so the
-# removal never runs beside a cargo still writing into the directory, where
-# an untrapped signal runs the exit trap at once. SIGKILL runs no trap and
-# leaves the builds.
+# On any exit every build ahead ends first, its whole process group; then the
+# work directory goes, and so do the planted directory of the cfg whose rows
+# were running and of each cfg built ahead (remove_planted, below), so a run a
+# signal stops leaves no planted build behind. The signals are trapped for the
+# order: bash runs a trapped signal's action once the build in the foreground
+# has ended, so the removal never runs beside a cargo still writing into the
+# directory, where an untrapped signal runs the exit trap at once. SIGKILL
+# runs no trap and leaves the builds.
 planted_cfg=
 trap 'ahead_stop
   case "$work" in */sim-canaries.??????) rm -rf -- "$work" ;; esac
@@ -1744,7 +1800,7 @@ crate_target_args() {
 # where the leg names the test to run (`-- <test>`).
 # planted_sim <cfg>: the planted simulator.
 planted_sim() {
-  RUSTFLAGS="--cfg $1" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
+  RUSTFLAGS="--cfg $1" 3>&- "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
     --target-dir "$TARGET_ROOT/canary-$1"
 }
 # planted_crate_test <cfg> <package> [<test>]: the crate's test target in
@@ -1753,7 +1809,7 @@ planted_crate_test() {
   local -a tail
   tail=(--no-run)
   if [ -n "${3:-}" ]; then tail=(-- "$3"); fi
-  RUSTFLAGS="--cfg $1" "$CARGO" test -p "$2" "${target_args[@]}" \
+  RUSTFLAGS="--cfg $1" 3>&- "$CARGO" test -p "$2" "${target_args[@]}" \
     --target-dir "$TARGET_ROOT/canary-$1" "${tail[@]}"
 }
 # planted_loom <cfg> <package> [<test>]: the Loom models, run on <test>, or
@@ -1762,7 +1818,7 @@ planted_loom() {
   local -a tail
   tail=(--no-run)
   if [ -n "${3:-}" ]; then tail=(-- "$3"); fi
-  RUSTFLAGS="--cfg loom --cfg $1" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$2" --release \
+  RUSTFLAGS="--cfg loom --cfg $1" LOOM_MAX_PREEMPTIONS=3 3>&- "$CARGO" test -p "$2" --release \
     --lib --target-dir "$TARGET_ROOT/canary-$1" "${tail[@]}"
 }
 
@@ -1776,7 +1832,7 @@ crate_test() {
   echo "== canary $label: $spec $target on the plain build must stay green"
   status=0
   "$CARGO" test -p "$package" "${target_args[@]}" --target-dir "$TARGET_ROOT" -- "$name" \
-    --show-output > "$control" 2>&1 || status=$?
+    --show-output > "$control" 2>&1 3>&- || status=$?
   if reason=$(judged_nothing crate-test "$status" "$control" "$name"); then
     nothing_judged "$label" "$reason"
     return
@@ -1836,7 +1892,7 @@ loom_test() {
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
   echo "== canary $label: $package on the plain loom build must stay green"
   status=0
-  RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" --release \
+  RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 3>&- "$CARGO" test -p "$package" --release \
     --lib --target-dir "$TARGET_ROOT/loom" -- "$name" --show-output > "$control" 2>&1 \
     || status=$?
   if reason=$(judged_nothing loom "$status" "$control" "$name"); then
@@ -1922,7 +1978,7 @@ scenario_row() {
   if [ "$sim_built" -eq 0 ]; then
     sim_built=1
     "$CARGO" build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT" \
-      || sim_built=2
+      3>&- || sim_built=2
   fi
   if [ "$sim_built" -eq 2 ]; then
     echo "== canary $label: the plain inf-sim build"
@@ -1941,7 +1997,7 @@ scenario_row() {
     index=${#control_legs[@]}
     control_legs+=("$leg")
     status=0
-    "$sim_target/release/inf-sim" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} \
+    3>&- "$sim_target/release/inf-sim" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} \
       > "$work/leg-$index.log" 2>&1 || status=$?
     if reason=$(judged_nothing scenario "$status" "$work/leg-$index.log"); then
       control_state+=("nothing $reason")
@@ -1976,7 +2032,7 @@ scenario_row() {
   planted="$sim_target/canary-$cfg/release/inf-sim"
   echo "== canary $label: lane seed $seed on the planted build must go red"
   status=0
-  "$planted" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} > "$log" 2>&1 \
+  3>&- "$planted" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} > "$log" 2>&1 \
     || status=$?
   if reason=$(judged_nothing scenario "$status" "$log"); then
     nothing_judged "$label" "$reason"
@@ -2032,7 +2088,7 @@ binary_preflights() {
       if [ -z "${INF_CANARY_BENCH:-}" ]; then
         echo "== binary rows: building inf-bench into $TARGET_ROOT/canary-plain"
         RUSTFLAGS= "$CARGO" build --release -p inf-bench --target-dir "$TARGET_ROOT/canary-plain" \
-          || bench_built=2
+          3>&- || bench_built=2
       fi
     fi
     index=${#preflight_names[@]}
@@ -2040,7 +2096,7 @@ binary_preflights() {
     if [ "$bench_built" -eq 2 ]; then preflight_state+=(unbuilt); continue; fi
     echo "== binary rows: $name --preflight"
     status=0
-    "$bench" "$name" --preflight > "$work/preflight-$index.log" 2>&1 || status=$?
+    3>&- "$bench" "$name" --preflight > "$work/preflight-$index.log" 2>&1 || status=$?
     tr -d '\000-\010\013-\037\177' <"$work/preflight-$index.log" \
       | LC_ALL=C awk 'NR <= 3 { print "   " substr($0, 1, 160) }'
     if reason=$(judged_nothing binary "$status" "$work/preflight-$index.log"); then
@@ -2099,7 +2155,7 @@ binary_row() {
     node_built=1
     echo "== binary rows: building the plain infinityd into $TARGET_ROOT/canary-plain"
     RUSTFLAGS= "$CARGO" build --release -p infinityd --target-dir "$TARGET_ROOT/canary-plain" \
-      || node_built=2
+      3>&- || node_built=2
   fi
   if [ "$node_built" -eq 2 ]; then
     echo "== canary $label: the plain infinityd build"
@@ -2109,7 +2165,7 @@ binary_row() {
   fi
   echo "== canary $label: building infinityd with --cfg $cfg into $TARGET_ROOT/canary-$cfg"
   built_at=$SECONDS
-  if ! RUSTFLAGS="--cfg $cfg" "$CARGO" build --release -p infinityd \
+  if ! RUSTFLAGS="--cfg $cfg" 3>&- "$CARGO" build --release -p infinityd \
       --target-dir "$TARGET_ROOT/canary-$cfg"; then
     echo "   red for another reason (the planted build failed; its output is above)"
     fail=1
@@ -2119,7 +2175,7 @@ binary_row() {
   ran_at=$SECONDS
   status=0
   "$bench" "$name" --base "$plain_node" --candidate "$sim_target/canary-$cfg/release/infinityd" \
-    "${flags[@]}" > "$log" 2>&1 || status=$?
+    "${flags[@]}" > "$log" 2>&1 3>&- || status=$?
   if reason=$(judged_nothing binary "$status" "$log"); then
     nothing_judged "$label" "$reason"
   elif [ "$status" -eq 0 ]; then
@@ -2169,10 +2225,81 @@ for row_cfg in "${cfg_order[@]}"; do
   done
 done
 rows=("${grouped[@]}")
+# The tests the nextest config runs alone, read at K > 1, where they schedule:
+# each override of `.config/nextest.toml` with `threads-required =
+# "num-test-threads"` gives its filter's binary (`<package>` a library's
+# tests, `<package>::<target>` an integration test's, `*<package>` every
+# binary of the package, from `package(<package>)`) in alone_binary and its
+# test (empty for every test) in alone_test, at one index. A filter outside
+# the shapes the config's gate admits (scripts/check-nextest-config.sh:
+# `binary_id(<package>)`, `binary_id(<package>::<target>)`,
+# `binary_id(<package>::bin/<name>)` or `package(<package>)`, each with an
+# optional `& test(=<name>)`) is a scope error, so no new shape drops a test
+# from the rule; so is a missing config.
+alone_binary=() alone_test=()
+alone_shape='^(binary_id\(([A-Za-z0-9_-]+)(::(bin/)?([A-Za-z0-9_-]+))?\)'
+alone_shape+='|package\(([A-Za-z0-9_-]+)\))( & test\(=([A-Za-z0-9_:]+)\))?$'
+if [ "$builds" -gt 1 ]; then
+  [ -f .config/nextest.toml ] || {
+    echo "sim-canaries: SCOPE ERROR — at INF_CANARY_BUILDS $builds the tests .config/nextest.toml" \
+      "runs alone schedule the lane, and it is missing"
+    exit 1
+  }
+  while IFS= read -r filter; do
+    [[ "$filter" =~ $alone_shape ]] || {
+      echo "sim-canaries: SCOPE ERROR — a run-alone filter of .config/nextest.toml this lane" \
+        "cannot read: $filter"
+      exit 1
+    }
+    if [ -n "${BASH_REMATCH[6]}" ]; then
+      alone_binary+=("*${BASH_REMATCH[6]}")
+    elif [ -n "${BASH_REMATCH[4]}" ]; then
+      alone_binary+=("${BASH_REMATCH[2]}::bin/${BASH_REMATCH[5]}")
+    else
+      alone_binary+=("${BASH_REMATCH[2]}${BASH_REMATCH[3]}")
+    fi
+    alone_test+=("${BASH_REMATCH[8]}")
+  done < <(awk '
+    function flush() { if (block && alone) print filter; block = 0; alone = 0; filter = "" }
+    /^\[\[profile\.default\.overrides\]\]/ { flush(); block = 1; next }
+    /^\[/ { flush(); next }
+    block && /^filter[ \t]*=/ {
+      filter = $0
+      sub(/^filter[ \t]*=[ \t]*/, "", filter)
+      quote = substr(filter, 1, 1)
+      filter = substr(filter, 2)
+      sub(quote ".*$", "", filter)
+    }
+    block && /^threads-required[ \t]*=[ \t]*"num-test-threads"/ { alone = 1 }
+    END { flush() }' .config/nextest.toml)
+fi
+
+# runs_alone <row words…>: zero when the row is a crate-test or Loom row whose
+# test the nextest config runs alone: its binary (a Loom model's is its
+# package's library tests) and its test name, which a filter's
+# `test(=<path>)` names whole or as the path's last segment.
+runs_alone() {
+  local package binary name j
+  case "$2" in
+    crate-test)
+      package=${3%%/*} name=$5 binary=$package
+      case "$4" in test:*) binary="$package::${4#test:}" ;; esac
+      ;;
+    loom) package=$3 name=$4 binary=$package ;;
+    *) return 1 ;;
+  esac
+  for j in ${alone_binary[@]+"${!alone_binary[@]}"}; do
+    case "${alone_binary[$j]}" in "$binary" | "*$package") ;; *) continue ;; esac
+    case "${alone_test[$j]}" in "" | "$name" | *"::$name") return 0 ;; esac
+  done
+  return 1
+}
+
 # cfg_kinds, at a cfg's index in cfg_order: what its build ahead may build,
-# ` tests` when it holds a crate-test or Loom row and ` sim` a scenario row,
-# or ` binary` alone when it holds a binary row, which none builds ahead.
-# One pass, as a cfg's rows stand together.
+# ` tests` when it holds a crate-test or Loom row and ` sim` a scenario row;
+# or why the cfg runs alone, which none builds ahead: ` binary` when it holds
+# a binary row, else ` alone` when a test row's test runs alone. One pass, as
+# a cfg's rows stand together.
 cfg_kinds=() kinds= row_cfg=
 for row in "${rows[@]}"; do
   # shellcheck disable=SC2206
@@ -2183,7 +2310,14 @@ for row in "${rows[@]}"; do
   fi
   case "$kinds:${parts[1]}" in
     " binary":* | *:binary) kinds=" binary" ;;
-    *:crate-test | *:loom) case "$kinds" in *tests*) ;; *) kinds="$kinds tests" ;; esac ;;
+    " alone":*) ;;
+    *:crate-test | *:loom)
+      if runs_alone "${parts[@]}"; then
+        kinds=" alone"
+      else
+        case "$kinds" in *tests*) ;; *) kinds="$kinds tests" ;; esac
+      fi
+      ;;
     *) case "$kinds" in *sim*) ;; *) kinds="$kinds sim" ;; esac ;;
   esac
 done
@@ -2320,9 +2454,14 @@ for index in "${!rows[@]}"; do
     cfg_index=$((cfg_index + 1))
     planted_cfg=${parts[0]}
     if [ "$builds" -gt 1 ]; then
-      if [ "${cfg_kinds[$cfg_index]}" = " binary" ]; then
-        echo "== canary $planted_cfg: a binary row's cfg: every build ahead ends, and none" \
-          "starts until its rows are judged"
+      case "${cfg_kinds[$cfg_index]}" in
+        " binary") alone="a binary row" ;;
+        " alone") alone="a test .config/nextest.toml runs alone" ;;
+        *) alone= ;;
+      esac
+      if [ -n "$alone" ]; then
+        echo "== canary $planted_cfg: its rows run alone ($alone): every build ahead ends, and" \
+          "none starts until they are judged"
         ahead_drain
       else
         ahead_fill "$cfg_index"
