@@ -16,9 +16,11 @@
 //! - `slab-holder-word`, `-2`: a reply's resolve, `get_mut_by_word` of the
 //!   first occupant's word at the fabric key's layout (24 index bits, the
 //!   low 23 of the generation).
-//! - `slab-node-get`, `-get-mut`: the same on a slab of 48 B wait nodes,
-//!   256 slots holding 255, one level (a node's cycle ends at the slab's
-//!   in-place release, which its own leg reads once the slab has it).
+//! - `slab-node-get`, `-get-mut`, `-cycle-release`: the same on a slab of
+//!   48 B wait nodes, 256 slots holding 255, one level: a get or a `get_mut`
+//!   of its first occupant, or a reserve, publish and release of its free
+//!   slot (a node's life ends at a release, which drops the occupant where it
+//!   lies and returns nothing).
 //! - `map-admit-remove-counter-2496`, `-159744`: on the capped map of `u64`
 //!   keys, that many live keys from one counter: the next counter key
 //!   admitted, then a live key drawn uniformly removed, its place in the
@@ -88,7 +90,7 @@ use std::task::{Context, Poll, Waker};
 
 use inf_foundation::bounded::{
     Admission, Built, Cap, CapCensus, CapFill, CappedMap, CappedSlab, Lookup, LookupMut, MapBuilt,
-    SlabReserved, SlotId, SlotWord, Taken, WordLookup, WrapWithProof,
+    Released, SlabReserved, SlotId, SlotWord, Taken, WordLookup, WrapWithProof,
 };
 use inf_foundation::limits::{
     GATE_KEY_GENERATION_BITS, GATE_KEY_INDEX_BITS, MAP_CHUNK_SLOTS_MAX, directory_levels,
@@ -128,6 +130,7 @@ pub enum HolderOp {
 pub enum NodeOp {
     Get,
     GetMut,
+    CycleRelease,
 }
 
 /// A counter leg's live routes: the keyed gate's default and its ceiling.
@@ -385,8 +388,20 @@ fn step_node_get_mut(slab: &mut NodeSlab, id: &SlotId<u32>) -> u64 {
     }
 }
 
+#[inline(never)]
+fn step_node_cycle_release(slab: &mut NodeSlab, key: u64) -> u64 {
+    let SlabReserved::Slot(slot) = slab.reserve() else { panic!("a free slot") };
+    let id = slot.publish([key; 6]);
+    match slab.release(id) {
+        Released::Dropped => 1,
+        Released::Stale | Released::Vacant => panic!("the node just published"),
+    }
+}
+
 /// A get or a `get_mut` of the node slab's first occupant: a poll's read of
-/// its node, and a wake's or a hook's write.
+/// its node, and a wake's or a hook's write; or a node's life on its one
+/// free slot: reserved and published at a wait's first poll, released at
+/// its wake or its drop.
 fn drive_node<const NOPS: u8>(op: NodeOp, ops: u64) -> u64 {
     let (mut slab, first, _census) = occupied(NODES_256, |value| [value; 6]);
     let slab = black_box(&mut slab);
@@ -395,6 +410,9 @@ fn drive_node<const NOPS: u8>(op: NodeOp, ops: u64) -> u64 {
     let accumulator = match op {
         NodeOp::Get => rate_loop::<NOPS>(ops, MASK_14, |_| step_node_get(slab, first)),
         NodeOp::GetMut => rate_loop::<NOPS>(ops, MASK_14, |_| step_node_get_mut(slab, first)),
+        NodeOp::CycleRelease => {
+            rate_loop::<NOPS>(ops, MASK_14, |key| step_node_cycle_release(slab, key))
+        }
     };
     // Engagement, after the counted loop: every op reached its node and the
     // slab holds its occupants alone.

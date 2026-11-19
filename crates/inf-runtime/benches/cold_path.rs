@@ -236,7 +236,7 @@ const LIST_KEY: Leg = Leg::Wait(WaitLeg::ListWaitWake { key: ListKey::Word });
 const MARK_WAIT_FOR: Leg = Leg::Wait(WaitLeg::MarkWaitFor);
 
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg, u8); 183] = [
+const LEGS: [(&str, Leg, u8); 185] = [
     ("enqueue-cancel-64", Leg::EnqueueCancel { depth: 64, background: 64 }, 0),
     ("enqueue-cancel-64-plus-one", Leg::EnqueueCancel { depth: 64, background: 64 }, 1),
     ("enqueue-cancel-16384", Leg::EnqueueCancel { depth: 4096, background: 16_384 }, 0),
@@ -372,6 +372,8 @@ const LEGS: [(&str, Leg, u8); 183] = [
     ("slab-node-get-plus-one", node(NodeOp::Get), 1),
     ("slab-node-get-mut", node(NodeOp::GetMut), 0),
     ("slab-node-get-mut-plus-one", node(NodeOp::GetMut), 1),
+    ("slab-node-cycle-release", node(NodeOp::CycleRelease), 0),
+    ("slab-node-cycle-release-plus-one", node(NodeOp::CycleRelease), 1),
     ("map-admit-remove-counter-2496", ROUTES_DEFAULT, 0),
     ("map-admit-remove-counter-2496-plus-one", ROUTES_DEFAULT, 1),
     ("map-admit-remove-counter-159744", ROUTES_CEILING, 0),
