@@ -251,6 +251,13 @@ type NodeSlot = [u64; 6];
 type NodeSlab = CappedSlab<NodeSlot, u32, WrapWithProof>;
 const NODES_256: Cap = Cap::entries::<256>("bench-nodes-256", CapFill::Serving);
 
+// The stand-in's slot is the product pool's, byte for byte, so the node legs read the stride
+// the pool builds; a node that grows or shrinks fails this build.
+const _: () = assert!(
+    NodeSlab::SLOT_BYTES == inf_runtime::WaitNodes::NODE_SLOT_BYTES,
+    "the bench's node slot is the pool's"
+);
+
 // The store's own derivation of its root's level: one directory over the
 // chunks for the one-level legs, two for the `-2` legs, so each op of a `-2`
 // leg walks one link more than its twin's; another cap does not compile.

@@ -330,10 +330,12 @@ pub(super) async fn dispatch_ns<'u, O: PlaneObserver + 'static, F: SegmentFs + C
         match tiered::dispatch_tiered(shared, origin, ns, meta, argv, proto, gate).await {
             tiered::TieredReply::Done(reply) => pending.push_back(PendingReply::Done(reply)),
             tiered::TieredReply::Gated { reply, seq, gate: ClientAck } => {
-                let mut durable = shared.durable.borrow_mut();
-                let cell = durable.as_mut().expect("tiered implies the durable plane");
-                cell.note_gated_ack();
-                drop(durable);
+                shared
+                    .durable
+                    .borrow_mut()
+                    .as_mut()
+                    .expect("tiered implies the durable plane")
+                    .note_gated_ack();
                 pending.push_back(PendingReply::Durable { seq, reply });
             }
         }

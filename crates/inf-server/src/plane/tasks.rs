@@ -48,23 +48,26 @@ fn peer_index(cell: CellId, origin: CellId) -> usize {
 }
 
 impl PlaneTasks {
-    /// Registers the six classes on `layout`, each from the function item it runs.
+    /// Registers the six classes on `layout`, each from the function item it runs. Every
+    /// class's cap is named, so a class the caps gain is a compile error here until it is
+    /// registered.
     pub(super) fn register<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         layout: &mut ExecutorLayout,
         caps: &PlaneTaskCaps,
     ) -> Result<PlaneTasks, CapError> {
+        let PlaneTaskCaps { conn: conn_cap, peers, compact, shadow } = caps;
         #[cfg(not(inf_canary_conn_slots_doubled))]
-        let conn = layout.class(&pump::<O, F>, caps.conn)?;
+        let conn = layout.class(&pump::<O, F>, *conn_cap)?;
         // Canary: the class is built over `(1 + k) C` slots, `k` from its own stride.
         #[cfg(inf_canary_conn_slots_doubled)]
         let conn = layout.class(
             &pump::<O, F>,
             crate::limits::conn_slots_doubled(
-                caps.conn,
+                *conn_cap,
                 ExecutorLayout::slot_shape(&pump::<O, F>).0,
             )?,
         )?;
-        let peers = match &caps.peers {
+        let peers = match peers {
             None => None,
             Some(PeerTaskCaps { ns_apply, owner_pub, gated }) => Some(PeerTasks {
                 ns_apply: (layout.class(&ns_apply_pump::<O, F>, *ns_apply)?, *ns_apply),
@@ -72,9 +75,9 @@ impl PlaneTasks {
                 gated: (layout.class(&gated_pump::<O, F>, *gated)?, *gated),
             }),
         };
-        let compact = (layout.class(&compact_pump::<O, F>, caps.compact)?, caps.compact);
-        let shadow = (layout.class(&shadow_pump::<O, F>, caps.shadow)?, caps.shadow);
-        Ok(PlaneTasks { conn: (conn, caps.conn), peers, compact, shadow })
+        let compact = (layout.class(&compact_pump::<O, F>, *compact)?, *compact);
+        let shadow = (layout.class(&shadow_pump::<O, F>, *shadow)?, *shadow);
+        Ok(PlaneTasks { conn: (conn, *conn_cap), peers, compact, shadow })
     }
 
     /// The `conn` tasks held (alive and Retired), the Retired among them, and
@@ -317,25 +320,33 @@ mod tests {
     /// slab and the fabric gate's holders. The gate row's threshold and the `binary` canaries'
     /// planted bytes (`conn` slots and gate holders doubled, the wait nodes oversized) are these
     /// strides' products, so a stride that moves turns this red until they move with it. The
-    /// cell's wait nodes, F7's E4 figure, are computed beside the bill and sit in its per-cell
-    /// remainder, so they move no threshold. The bill is the shipped node's, built with its
+    /// pool of wait nodes' resident bill is computed beside the bill and sits in its per-cell
+    /// remainder, so it moves no threshold. The bill is the shipped node's, built with its
     /// default features: a slim build's strides are its own.
     #[test]
     #[cfg(feature = "doc")]
     fn the_idle_bill_and_its_plants_follow_the_strides() {
         const CELLS: u16 = 4;
         const MIB: f64 = 1_048_576.0;
+        // The row's per-cell remainder: 4 MiB a cell of its 16 MiB at 4 cells, which holds the
+        // reserves its named terms do not, the wait pool among them (ADR-0177 D8).
+        const REMAINDER_BYTES_CELL: u64 = 4 * 1_048_576;
         let config = ConfigStore::default();
         let caps = crate::limits::plane_task_caps(config.boot_share(CELLS), CELLS)
             .expect("the default caps");
-        let peers = caps.peers.as_ref().expect("a cell with peers");
+        // Every class's cap is named, so a class the caps gain is a compile error here until
+        // the bill counts it.
+        let PlaneTaskCaps { conn, peers, compact, shadow } = &caps;
+        let Some(PeerTaskCaps { ns_apply, owner_pub, gated }) = peers else {
+            panic!("a cell with peers")
+        };
         let classes = [
-            (caps.conn, ExecutorLayout::slot_shape(&pump::<O, F>)),
-            (peers.ns_apply, ExecutorLayout::slot_shape(&ns_apply_pump::<O, F>)),
-            (peers.owner_pub, ExecutorLayout::slot_shape(&owner_pub_pump::<O, F>)),
-            (peers.gated, ExecutorLayout::slot_shape(&gated_pump::<O, F>)),
-            (caps.compact, ExecutorLayout::slot_shape(&compact_pump::<O, F>)),
-            (caps.shadow, ExecutorLayout::slot_shape(&shadow_pump::<O, F>)),
+            (*conn, ExecutorLayout::slot_shape(&pump::<O, F>)),
+            (*ns_apply, ExecutorLayout::slot_shape(&ns_apply_pump::<O, F>)),
+            (*owner_pub, ExecutorLayout::slot_shape(&owner_pub_pump::<O, F>)),
+            (*gated, ExecutorLayout::slot_shape(&gated_pump::<O, F>)),
+            (*compact, ExecutorLayout::slot_shape(&compact_pump::<O, F>)),
+            (*shadow, ExecutorLayout::slot_shape(&shadow_pump::<O, F>)),
         ];
         let tasks: u64 = classes
             .iter()
@@ -380,8 +391,8 @@ mod tests {
         );
         let gate_plant = u64::from(holders) * holder_bytes as u64;
         assert_eq!(plant_bytes(canaries, "inf_canary_gate_holders_doubled"), gate_plant, "H x s_h");
-        // F7's E4 figure: the pool's `T` nodes, every slot and directory written at its build,
-        // inside the per-cell remainder (16 MiB), which the threshold already counts.
+        // The pool's resident bill: its `T` nodes, every slot and directory written at its
+        // build, inside the row's per-cell remainder, which the threshold already counts.
         let nodes = crate::limits::wait_nodes(&caps).expect("the default pool").entries_max();
         let node_bytes = inf_runtime::WaitNodes::NODE_SLOT_BYTES;
         let node_chunk =
@@ -391,9 +402,12 @@ mod tests {
             "the_idle_bill_and_its_plants_follow_the_strides: wait nodes T {nodes}, node \
              {node_bytes} B, c {node_chunk}, pool {pool} B a cell"
         );
-        assert!(pool < 16 * 1_048_576, "the pool's {pool} B a cell pass the per-cell remainder");
+        assert!(
+            pool < REMAINDER_BYTES_CELL,
+            "the pool's {pool} B a cell pass the per-cell remainder, {REMAINDER_BYTES_CELL} B"
+        );
         // The oversized-pool canary: the pool over (1 + k) T, k the fewest counts of T whose
-        // node bytes pass ten of F7's controls a cell.
+        // node bytes pass ten times the idle-resident tool's 256 KiB control a cell.
         let k = crate::limits::wait_nodes_oversized_k(nodes);
         let count_bytes = u64::from(nodes) * node_bytes as u64;
         let pool_plant = u64::from(k) * count_bytes;

@@ -1151,10 +1151,11 @@ ordered_rows=(
   # slots at every step (O1). Planted, the slot is vacated at Closed, before its pump returns,
   # and O1 reads fewer slots than tasks.
   "inf_canary_conn_slot_frees_at_closed m0-capacity conn-tasks-unequal --close-leg close"
-  # The `conn` class's slots are the cell's share (ADR-0177 D2) and its bytes E-store's F7 bill.
-  # Planted, it is built over (1 + k) C slots, k from its stride: the idle node's resident
-  # memory a cell rises by k x C x s_conn, 2,500 x 3,104 B at 4 cells (k = 1), over F7's
-  # 256 KiB, which the plain node's three boots stay within. The bytes are that product at the
+  # The `conn` class's slots are the cell's share (ADR-0177 D2), resident whole from its build
+  # and billed by the idle row. Planted, it is built over (1 + k) C slots, k from its stride:
+  # the idle node's resident memory a cell rises by k x C x s_conn, 2,500 x 3,104 B at 4 cells
+  # (k = 1), over the idle-resident tool's 256 KiB control a cell, which the plain node's three
+  # boots stay within. The bytes are that product at the
   # stride the plane's layout test prints; a stride that moves moves them with it.
   "inf_canary_conn_slots_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 7760000 --control-bytes-cell 262144 --plant-row conn-tasks"
   # A finished conn task's header is reclaimed once no waker names it, so a settled node holds no
@@ -1220,9 +1221,9 @@ ordered_rows=(
   # report reads the stale completion.
   "inf_canary_gate_frees_on_drop crate-test inf-runtime lib an_orphaned_holder_frees_at_its_late_completion orphan-freed-at-drop"
   "inf_canary_gate_frees_on_drop m0-capacity gate-stale --close-leg orphan"
-  # The fabric gate's holders are resident from its build (ADR-0177 D8 with A1), billed by F7.
-  # Planted, the gate is built over 2 H: the idle node's resident memory a cell rises by H x
-  # s_h, 83,075 x 48 B at 4 cells, over F7's 256 KiB. The bytes are that product at the stride
+  # The fabric gate's holders are resident from its build (ADR-0177 D8 with A1), billed by the
+  # idle row. Planted, the gate is built over 2 H: the idle node's resident memory a cell rises
+  # by H x s_h, 83,075 x 48 B at 4 cells, over the idle-resident tool's 256 KiB control a cell. The bytes are that product at the stride
   # the plane's layout test prints; a stride that moves moves them with it.
   "inf_canary_gate_holders_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 3987600 --control-bytes-cell 262144 --plant-row fabric-gate-holders"
   # A fabric reserve takes one of its task's units, so a fan wider than 32 legs runs in windows
@@ -1352,8 +1353,9 @@ ordered_rows=(
   "inf_canary_uring_eof_rearms crate-test inf-runtime/uring test:driver_conformance eof_ends_the_receive recv-after-eof"
   # The cell's wait nodes are resident from the pool's build (ADR-0177 D5, D8 with A1), inside
   # the gate row's per-cell remainder. Planted, the pool is built over (1 + k) T nodes, k the
-  # fewest counts of T whose node bytes pass ten of F7's 256 KiB controls: the idle node's
-  # resident memory a cell rises by k x T x s_node, 17 x 2,825 x 56 B at 4 cells. The bytes are
+  # fewest counts of T whose node bytes pass ten times the idle-resident tool's 256 KiB control
+  # a cell: the idle node's resident memory a cell rises by k x T x s_node, 17 x 2,825 x 56 B
+  # at 4 cells. The bytes are
   # that product at the stride the bill's test reads; a stride that moves moves them with it.
   "inf_canary_wait_nodes_oversized binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 2689400 --control-bytes-cell 262144 --plant-row wait-nodes"
   # A word resolves its slot by the generation bits it carries, the low bits of the occupant's

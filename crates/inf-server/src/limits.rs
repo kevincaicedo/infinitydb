@@ -397,9 +397,9 @@ pub(crate) const fn per_origin(ceiling: &Cap, data_credits: u32) -> Result<Cap, 
 /// with Redis's `maxclients` frame and a close, before anything ran.
 pub const CONN_TASKS: Cap = Cap::entries::<CONN_TASKS_MAX>("conn-tasks", CapFill::Serving);
 
-/// KE21's plant (E-store's F7): the `conn` class over `(1 + k) C` slots,
+/// The doubled-`conn` canary's plant: the class over `(1 + k) C` slots,
 /// `k = ⌈512 KiB ÷ (C × s)⌉` from the class's stride `s`, so its rise passes
-/// F7's 256 KiB whatever the stride.
+/// the idle-resident tool's 256 KiB control a cell whatever the stride.
 #[cfg(inf_canary_conn_slots_doubled)]
 pub(crate) fn conn_slots_doubled(cap: Cap, stride: usize) -> Result<Cap, CapError> {
     let share = u64::from(cap.entries_max());
@@ -549,17 +549,17 @@ pub const WAIT_NODES: Cap = Cap::entries::<WAIT_NODES_MAX>("wait-nodes", CapFill
 /// `CapError::Layout` when `T` passes [`WAIT_NODES_MAX`]; derived never.
 pub(crate) const fn wait_nodes(caps: &PlaneTaskCaps) -> Result<Cap, CapError> {
     let nodes = task_slots(caps);
-    // Canary: the pool is built over (1 + k) T nodes, k the fewest whose nodes' bytes
-    // pass ten of F7's 256 KiB controls a cell, so the idle node's resident rise is one the
-    // resident tool gives a verdict on.
+    // Canary: the pool is built over (1 + k) T nodes, k the fewest whose nodes' bytes pass
+    // ten times the idle-resident tool's 256 KiB control a cell, so the idle node's resident
+    // rise is one the tool gives a verdict on.
     #[cfg(inf_canary_wait_nodes_oversized)]
     let nodes = nodes * (1 + wait_nodes_oversized_k(nodes));
     Cap::derived(&WAIT_NODES, nodes)
 }
 
-/// The oversized-pool canary's `k` at `nodes` (F7's control, 256 KiB a cell, ten times
-/// over): the fewest counts of `nodes` whose node bytes pass 2,621,440 B, at the stride the
-/// build reads.
+/// The oversized-pool canary's `k` at `nodes`: the fewest counts of `nodes` whose node bytes
+/// pass ten times the idle-resident tool's 256 KiB control a cell, 2,621,440 B, at the stride
+/// the build reads.
 #[cfg(any(all(test, feature = "doc"), inf_canary_wait_nodes_oversized))]
 pub(crate) const fn wait_nodes_oversized_k(nodes: u32) -> u32 {
     let stride = inf_runtime::WaitNodes::NODE_SLOT_BYTES as u64;
@@ -567,8 +567,8 @@ pub(crate) const fn wait_nodes_oversized_k(nodes: u32) -> u32 {
     (WAIT_NODES_PLANT_FLOOR_BYTES / per_count + 1) as u32
 }
 
-/// The bytes a cell the oversized-pool canary must pass: ten of F7's 256 KiB controls, the
-/// least resident rise the idle-resident tool separates from its control.
+/// The bytes a cell the oversized-pool canary must pass: ten times the idle-resident tool's
+/// 256 KiB control a cell, the least resident rise the tool separates from its control.
 #[cfg(any(all(test, feature = "doc"), inf_canary_wait_nodes_oversized))]
 pub(crate) const WAIT_NODES_PLANT_FLOOR_BYTES: u64 = 10 * 262_144;
 
