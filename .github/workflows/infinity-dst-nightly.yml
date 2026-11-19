@@ -99,6 +99,11 @@ jobs:
       - name: planted-bug canaries (scripts/sim-canaries.sh, shard ${{ matrix.shard }}/8)
         env:
           INF_CANARY_SHARD: ${{ matrix.shard }}/8
+          # One cfg's planted build at a time until a live shard is timed: the
+          # lane's K of 4 is bounded by the dev box's 12 GiB scope, and on a
+          # runner (16 GB on 4 vCPUs, or 7 GB on 2) neither the memory nor the
+          # time of builds ahead beside a run is measured.
+          INF_CANARY_BUILDS: "1"
         run: ./scripts/sim-canaries.sh
 
   fleet:
