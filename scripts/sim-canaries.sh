@@ -1626,12 +1626,14 @@ ahead_pid=() ahead_began=() ahead_status=() ahead_waited=()
 # SIGKILL once 3 s pass, and the stop polls each group until no process of it
 # is left but a zombie, its tick a 1 s read of the `tick` FIFO nobody writes
 # (made with the pool; a tick that is no FIFO would read at once, so the stop
-# then sends SIGKILL at once); past 10 s it names the groups left. A zombie
-# holds no file, and the lane reaps its own jobs only when it waits, so the
-# poll reads the process table (`ps`), and a group it cannot read is alive
-# while `kill -0` reaches it. Only then is each job waited for, so a leader
-# that ignores SIGTERM never holds the poll. A job started but not yet
-# recorded when a signal came is in `jobs -p`.
+# then sends SIGKILL at once); past 10 s it names the groups left. The poll
+# reads the process table (`ps`), a group alive while a process of it is
+# listed that is not a zombie, and `kill -0` only when the table cannot be
+# read: measured, a stop the lane entered from SIGINT saw `kill -0` reach a
+# group whose processes had all ended until the poll's 10 s bound, where the
+# table read finds it gone at the next tick. Only then is each job waited for,
+# so a leader that ignores SIGTERM never holds the poll. A job started but not
+# yet recorded when a signal came is in `jobs -p`.
 ahead_stop() {
   local j pid groups=' ' alive tick=0 kill_at=3 table
   for j in ${ahead_pid[@]+"${!ahead_pid[@]}"}; do
@@ -1672,7 +1674,9 @@ ahead_stop() {
 }
 # On any exit every build ahead ends first, its whole process group; then the
 # work directory goes, and so do the planted directory of the cfg whose rows
-# were running and of each cfg built ahead (remove_planted, below), so a run a
+# were running and of each cfg a build ahead was started for (ahead_began, set
+# before the fork, so a build a signal stopped before its process id was
+# recorded is counted too; remove_planted, below), so a run a
 # signal stops leaves no planted build behind. The signals are trapped for the
 # order: bash runs a trapped signal's action once the build in the foreground
 # has ended, so the removal never runs beside a cargo still writing into the
@@ -1682,7 +1686,7 @@ planted_cfg=
 trap 'ahead_stop
   case "$work" in */sim-canaries.??????) rm -rf -- "$work" ;; esac
   [ -z "$planted_cfg" ] || remove_planted "$planted_cfg"
-  for j in ${ahead_pid[@]+"${!ahead_pid[@]}"}; do remove_planted "${cfg_order[$j]}"; done' EXIT
+  for j in ${ahead_began[@]+"${!ahead_began[@]}"}; do remove_planted "${cfg_order[$j]}"; done' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -2258,7 +2262,7 @@ rows=("${grouped[@]}")
 # filter in none of the forms, is the gate's scope error and the lane's.
 alone_binary=() alone_test=()
 if [ "$builds" -gt 1 ]; then
-  alone_rows=$(scripts/check-nextest-config.sh --print-alone 2>&1) || {
+  alone_rows=$(env -u INF_CHECK_ROOT scripts/check-nextest-config.sh --print-alone 2>&1) || {
     echo "sim-canaries: SCOPE ERROR — at INF_CANARY_BUILDS $builds the tests the nextest config" \
       "runs alone schedule the lane, and its gate cannot name them:"
     printf '%s\n' "$alone_rows" | sed -n '1,5p'

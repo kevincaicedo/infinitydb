@@ -3832,16 +3832,36 @@ expect green "builds: the child that ignores SIGTERM had begun when the signal c
 expect red "builds: the stop's SIGKILL ended the child that ignores SIGTERM" kill -0 "${deaf:-0}"
 expect red "builds: the child that ignores SIGTERM never reached its own end" grep -q '^deaf-ended ' "$dir/events"
 expect green "builds: no planted directory is left after a stop that took SIGKILL" test -z "$(ls -d "$dir"/target/canary-* 2>/dev/null)"
+# A build ahead started but not yet recorded when a signal came: the stop ends
+# it (`jobs -p`), and its directory goes as every started cfg's does. The
+# plant: the lane copy takes SIGTERM between forking the build and recording
+# its process id, once that build began.
+dir=$(builds_lane builds-stop-unrecorded "$(test_row inf_canary_a)" "$(test_row inf_canary_b_hold)" "$(test_row inf_canary_c)")
+python3 -I - "$dir/scripts/sim-canaries.sh" <<'EOF'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+fork = '  ahead_build "${cfg_order[$1]}" </dev/null >/dev/null 2>&1 &\n'
+assert text.count(fork) == 1
+open(path, "w").write(text.replace(fork, fork + '  read -r -t 30 -u 8 _ || true; kill -TERM $$\n'))
+EOF
+expect red "builds: a lane copy stopped between a build's fork and its record is red" builds_run "$dir" 3 4
+expect green "builds: the unrecorded build ahead had begun when the signal came (the case's premise)" grep -q '^begin inf_canary_b_hold ' "$dir/events"
+expect green "builds: the unrecorded build ahead was stopped" grep -qx 'stopped inf_canary_b_hold' "$dir/events"
+expect green "builds: no planted directory is left after it, the unrecorded build's included" test -z "$(ls -d "$dir"/target/canary-* 2>/dev/null)"
 # A lane started with SIGTERM ignored passes the ignored signal to its builds
 # ahead: a stop (here by SIGINT) polls their groups before it waits for any
 # job, so its SIGKILL comes on time, and the held build never ends.
 # The lane starts with SIGTERM ignored and SIGINT at its default, set by its
 # launcher whatever the caller's: a group the driver runs in the background
-# inherits SIGINT ignored, which a shell can neither trap nor reset.
+# inherits SIGINT ignored, which a shell can neither trap nor reset. SIGPIPE
+# and SIGXFSZ, which Python ignores and an exec keeps ignored, go back to
+# their defaults too.
 builds_run_term_ignored() {
     local -a builds_launch=(python3 -I -S -c 'import os, signal, sys
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
-signal.signal(signal.SIGINT, signal.SIG_DFL)
+for default in (signal.SIGINT, signal.SIGPIPE, signal.SIGXFSZ):
+    signal.signal(default, signal.SIG_DFL)
 os.execvp("bash", ["bash"] + sys.argv[1:])')
     builds_run "$@"
 }
