@@ -1115,6 +1115,10 @@ ordered_rows=(
   # The same plant on the shipped classes (ADR-0194 A1): `conn`'s slot at 64 a chunk is past
   # one allocation, so the node's layout refuses its class at boot.
   "inf_canary_chunk_slots_fixed crate-test inf-server lib every_class_registers_at_its_chunk class-refused"
+  # The checkpoint wait list holds its one key from its build, before the cell serves, its map
+  # filled whole at assembly (ADR-0177 D5). Planted, the build holds a second key, past the
+  # map's cap of one, and the plane's assembly refuses it.
+  "inf_canary_ckpt_waiter_key_extra m0-smoke ckpt-waiter-keys-full-at-assembly"
   # A close ends the receive: the io_uring driver queues the fd's cancels before the close and
   # posts Closed after them, so no Recv with bytes follows Closed. Planted, Close posts Closed
   # as it queues the close, ahead of the reap that brings the bytes. One row a shape: the
@@ -1162,6 +1166,13 @@ ordered_rows=(
   # Retired conn header (O1's leak clause). Planted, the pump keeps a clone of its own waker past
   # its return: the reset client's header stays Retired with every per-step clause green.
   "inf_canary_conn_waker_kept m0-capacity conn-retired-kept --close-leg close"
+  # The credit wait list holds one key for each peer from its build, before the cell serves,
+  # its map filled whole at assembly (ADR-0177 D5). Planted, the build also holds the cell's
+  # own id, past the map's cap of `cells - 1`, and the plane's assembly refuses it.
+  "inf_canary_credit_waiter_key_extra m0-smoke credit-waiter-keys-full-at-assembly"
+  # The DDL wait list holds its one key from its build, as the checkpoint list does. Planted,
+  # the build holds a second key, and the plane's assembly refuses it.
+  "inf_canary_ddl_waiter_key_extra m0-smoke ddl-waiter-keys-full-at-assembly"
   # The divert parks an origin's durable apply behind its pump while the pump is applying or
   # holds its work (ADR-0083 D1), so an origin has one open gated slot, its back (ADR-0177 D6).
   # Planted, the queue alone diverts: a flat write runs inline while a tiered write of the same
@@ -1351,6 +1362,10 @@ ordered_rows=(
   # a positive result. Planted, a zero result re-arms it too, and the half-closed socket posts
   # a second zero-length Recv.
   "inf_canary_uring_eof_rearms crate-test inf-runtime/uring test:driver_conformance eof_ends_the_receive recv-after-eof"
+  # A wait dropped while queued unlinks its node and gives it back to the cell's pool in the
+  # same step (ADR-0177 D5). Planted, the drop leaves the node linked: the pool keeps it, and a
+  # thousand drops on one key fill the pool and starve the first polls after them.
+  "inf_canary_wait_drop_keeps_node crate-test inf-runtime lib a_wait_dropped_while_queued_leaves_no_entry wait-node-kept"
   # The cell's wait nodes are resident from the pool's build (ADR-0177 D5, D8 with A1), inside
   # the gate row's per-cell remainder. Planted, the pool is built over (1 + k) T nodes, k the
   # fewest counts of T whose node bytes pass ten times the idle-resident tool's 256 KiB control

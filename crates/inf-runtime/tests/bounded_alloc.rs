@@ -453,3 +453,45 @@ fn a_refused_map_build_step_retires_its_prefix_by_steps() {
     // The name keeps its row; every refused build shared it.
     assert_eq!(census.rows().count(), 1);
 }
+
+const WAIT_POOL: Cap = Cap::entries::<64>("alloc-wait-nodes", CapFill::Serving);
+const WAIT_KEYS: Cap = Cap::entries::<3>("alloc-wait-keys", CapFill::Assembly);
+
+/// The wait lists on the cell's pool (ADR-0177 D5): zero allocator calls after the pool's and
+/// the keyed list's build across waits made and polled, woken one at a time and whole, read,
+/// dropped while queued and dropped after an unread wake (the baton), on a unit list and a
+/// keyed one. A wait's node is the pool's, never an allocation of its own.
+#[test]
+fn no_allocator_call_after_build_across_waits_wakes_and_drops() {
+    let (census, _serve_mark) = CapCensus::new(CellId(2));
+    let nodes = inf_runtime::WaitNodes::build(WAIT_POOL, &census).expect("the pool");
+    let unit = inf_runtime::WaitList::unit(&nodes);
+    let keyed = inf_runtime::WaitList::keyed(&nodes, Some(WAIT_KEYS), &census, [1u32, 2, 3])
+        .expect("the keyed list");
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let before = ALLOC.thread_allocations();
+    let mut ready = 0u64;
+    for i in 0..CHURN {
+        let key = 1 + (i % 3) as u32;
+        let mut first = unit.wait(());
+        let mut second = keyed.wait(key);
+        let mut third = keyed.wait(key);
+        assert!(std::pin::Pin::new(&mut first).poll(&mut cx).is_pending());
+        assert!(std::pin::Pin::new(&mut second).poll(&mut cx).is_pending());
+        assert!(std::pin::Pin::new(&mut third).poll(&mut cx).is_pending());
+        assert!(unit.wake_one(()));
+        ready += u64::from(std::pin::Pin::new(&mut first).poll(&mut cx).is_ready());
+        // Woken and dropped unread: the baton goes to the key's next wait.
+        assert!(keyed.wake_one(key));
+        drop(second);
+        ready += u64::from(std::pin::Pin::new(&mut third).poll(&mut cx).is_ready());
+        // Dropped while queued: it unlinks.
+        let mut fourth = keyed.wait(key);
+        assert!(std::pin::Pin::new(&mut fourth).poll(&mut cx).is_pending());
+        drop(fourth);
+        assert_eq!(keyed.wake_all(key), 0, "no wait is left on the key");
+    }
+    assert_eq!(ALLOC.thread_allocations(), before, "an allocator call after the build");
+    assert_eq!(ready, 2 * CHURN, "every woken wait read its wake");
+    assert_eq!(nodes.len(), 0, "every node back in the pool");
+}

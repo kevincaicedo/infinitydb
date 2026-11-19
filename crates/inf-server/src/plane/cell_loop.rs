@@ -1526,6 +1526,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             node.gate_full.set(gate.full());
             node.gate_stale.set(gate.stale());
         }
+        node.wait_nodes_full.set(self.shared.wait_nodes.full());
         {
             let ps = self.shared.pubsub.borrow();
             node.pubsub_channels.set(ps.live_owned_channel_count());

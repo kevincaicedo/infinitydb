@@ -1048,13 +1048,26 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let credit_keys = crate::limits::credit_waiter_keys(cells)
             .map_err(|refused| PlaneBuildError::Waiters(inf_runtime::KeysRefused::Cap(refused)))?;
         let peers = (0..cells).filter(|&peer| peer != cell.0).map(CellId);
+        // Canary: the credit list's build also holds the cell's own id.
+        #[cfg(inf_canary_credit_waiter_key_extra)]
+        let peers = peers.chain([cell]);
         let credit_waiters = WaitList::keyed(&wait_nodes, credit_keys, &census, peers)
             .map_err(PlaneBuildError::Waiters)?;
+        // Canary: the DDL list's build holds a second key.
+        #[cfg(inf_canary_ddl_waiter_key_extra)]
+        let ddl_keys_held = [0u8, 1];
+        #[cfg(not(inf_canary_ddl_waiter_key_extra))]
+        let ddl_keys_held = [0u8];
         let ddl_keys = Some(crate::limits::DDL_WAITER_KEYS);
-        let ddl_waiters = WaitList::keyed(&wait_nodes, ddl_keys, &census, [0u8])
+        let ddl_waiters = WaitList::keyed(&wait_nodes, ddl_keys, &census, ddl_keys_held)
             .map_err(PlaneBuildError::Waiters)?;
+        // Canary: the checkpoint list's build holds a second key.
+        #[cfg(inf_canary_ckpt_waiter_key_extra)]
+        let ckpt_keys_held = [0u8, 1];
+        #[cfg(not(inf_canary_ckpt_waiter_key_extra))]
+        let ckpt_keys_held = [0u8];
         let ckpt_keys = Some(crate::limits::CKPT_WAITER_KEYS);
-        let ckpt_waiters = WaitList::keyed(&wait_nodes, ckpt_keys, &census, [0u8])
+        let ckpt_waiters = WaitList::keyed(&wait_nodes, ckpt_keys, &census, ckpt_keys_held)
             .map_err(PlaneBuildError::Waiters)?;
         let reader_waiters = WaitList::unit(&wait_nodes);
         node.cell.set(cell.0);
@@ -2127,6 +2140,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     #[cfg(feature = "fault-points")]
     pub fn gate_wrapped_takes(&self) -> u64 {
         self.shared.gate.borrow().wrapped_takes()
+    }
+
+    /// First polls that found the cell's wait pool empty or their list
+    /// without their key (`wait_nodes_full`): derived never (ADR-0177 D5).
+    pub fn wait_nodes_full(&self) -> u64 {
+        self.shared.wait_nodes.full()
     }
 
     /// The fabric gate's reserves that found every holder taken

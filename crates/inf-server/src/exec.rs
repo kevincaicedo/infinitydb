@@ -251,6 +251,10 @@ pub struct NodeState {
     /// awaits one (`gate_stale`).
     pub gate_full: Cell<u64>,
     pub gate_stale: Cell<u64>,
+    /// First polls that found the cell's wait pool empty or their list
+    /// without their key (`wait_nodes_full`; ADR-0177 D5, cell scope,
+    /// `# Tripwires`): derived never, published at the stats flush.
+    pub wait_nodes_full: Cell<u64>,
     /// Publish fan legs this cell's owner pump could not stage on the
     /// credit general sends leave free, each then sent as a general op
     /// (ADR-0192 D3). Cell scope; 0 by the reserve's proof, so any other

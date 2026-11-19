@@ -87,6 +87,13 @@ pub const GATE_HOLDERS_MAX: u32 = 1 << inf_foundation::limits::GATE_KEY_INDEX_BI
 pub const GATE_HOLDERS: Cap =
     Cap::entries::<GATE_HOLDERS_MAX>("fabric-gate-holders", CapFill::Serving);
 
+/// The row a keyless wait list's refusal names (ADR-0177 D5): a keyed list built with no map
+/// (a node of one cell, whose credit list has no peer) holds no key, so a key given to it is
+/// past its cap and its build answers `<row>-full-at-assembly` under this name. No store is
+/// built at this cap and no census row takes it. Unit: keys per list. Owner: `WaitList::keyed`.
+/// Crossing: the build's typed refusal, before the cell serves.
+pub const WAIT_LIST_KEYLESS: Cap = Cap::entries::<1>("wait-list-keyless", CapFill::Assembly);
+
 /// Routes, and holders, one cell's cold gate may number (ADR-0177 D4): 65,536, the ceiling the
 /// cell's own cap is clamped to. Owner: [`ColdReads`](crate::ColdReads), which builds the gate
 /// beside its pool. Crossing: none of its own — the cap below is clamped to it, so no namespace

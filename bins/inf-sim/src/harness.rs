@@ -2164,6 +2164,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             gate_full: plane.gate_full(),
             gate_stale: plane.gate_stale(),
             cold_gate_full: plane.cold_gate_full(),
+            wait_nodes_full: plane.wait_nodes_full(),
         };
         census.judge(index, plane.cap_census(), facts);
     }
