@@ -405,11 +405,13 @@ fn main() {
         let exit = driver::run_single(seed, determinism, run_one, |report| {
             println!(
                 "inf-sim: scenario m4-pressure leg {} seed {seed:#x}: {} stalls (p50 {} µs, p99 \
-                 {} µs), {} timeouts, peak committed {} B, seal-mark stride {} B, hash {:#018x}",
+                 {} µs), {} woken by progress in the throttled phase, {} timeouts, peak \
+                 committed {} B, seal-mark stride {} B, hash {:#018x}",
                 pressure_leg.name(),
                 report.stalls,
                 report.stall_p50_ns / 1_000,
                 report.stall_p99_ns / 1_000,
+                report.throttled_progress,
                 report.stall_timeouts,
                 report.peak_committed_bytes,
                 report.seal_mark_stride_bytes,

@@ -58,7 +58,7 @@ use inf_runtime::{CellExecutor, ExecutorLayout, GroupClass, TaskId, park};
 use inf_runtime::{
     CellPlane, Completion, CompletionResult, CompletionToken, Delivery, FabricAdmission,
     FabricGate, GatePermit, GateUnits, GateWait, IoClass, IoOp, Issue, LoopCx, OwnerPhase, RawFd,
-    TimerNotice, TimerOutcome, TimerSet, TokenClass, WaitList, WaitNodes, WaitPool, WatermarkSeat,
+    TimerNotice, TimerOutcome, TimerOwner, TimerSet, TokenClass, WaitList, WaitNodes, WaitPool,
 };
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
@@ -776,15 +776,15 @@ pub struct ServerPlane<
     /// Last CONFIG-store version pushed into the keyspace (M1-E3
     /// `hot-per-cell` sweep — one u64 compare per MAINTAIN, no re-parse).
     config_pushed: u64,
-    /// The cell's timer owners, one per role (ADR-0154 D4), reserved by
-    /// `new` before the loop exists: the accept retry's, and the durable
-    /// roles' until the durable plane takes them.
-    timers: ServerTimers,
-    /// The seat of the cell's one ack gate (ADR-0177 D5), answered by the
-    /// pool's build and kept with the durable roles' owners: the durable
-    /// plane takes it with them and builds its gate on it. A cell whose
-    /// durable plane is never enabled keeps it unused.
-    ack_seat: Option<WatermarkSeat>,
+    /// The accept retry's timer owner (ADR-0154 D4), reserved by `new`
+    /// before the loop exists.
+    accept_retry: TimerOwner,
+    /// What the durable plane takes once, at its build: the durable roles'
+    /// timer owners, reserved with the accept retry's, and the seat of the
+    /// cell's one ack gate, answered by the pool's build (ADR-0177 D5).
+    /// `None` from then on; a cell whose durable plane is never enabled
+    /// keeps them unused.
+    durable_owners: Option<DurableOwners>,
     /// Accepted fds are TCP sockets (`infinityd`, the e2e harness): the
     /// plane sets `tcp-keepalive` on them (ADR-0123 D3). The DST models
     /// no TCP stack and leaves this off.
@@ -1166,8 +1166,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             expiry_lag: 0,
             // MAX forces one push on the first MAINTAIN (boot-time config).
             config_pushed: u64::MAX,
-            timers,
-            ack_seat: Some(ack_seat),
+            accept_retry: timers.accept_retry,
+            durable_owners: Some(DurableOwners { timers: timers.durable, ack_seat }),
             tcp_transport: false,
             ckpt_epoch_seen: 0,
             early_fabric_flush: false,
@@ -1417,14 +1417,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         rotor: SegmentRotor<F>,
         recovered: Option<crate::RecoveredManifest>,
     ) -> std::io::Result<()> {
-        let owners = match (self.timers.durable.take(), self.ack_seat.take()) {
-            (Some(timers), Some(ack_seat)) => DurableOwners { timers, ack_seat },
-            // The owners and the seat are taken and handed back together: a
-            // second enable finds neither, and puts back what it took.
-            (timers, ack_seat) => {
-                (self.timers.durable, self.ack_seat) = (timers, ack_seat);
-                return Err(std::io::Error::other("the durable plane is enabled once"));
-            }
+        let Some(owners) = self.durable_owners.take() else {
+            return Err(std::io::Error::other("the durable plane is enabled once"));
         };
         let shard_dir = cfg.data_dir.join(format!("shard-{cell_id}"));
         let ckpt_dir = shard_dir.join("ckpt");
@@ -1432,8 +1426,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         {
             Ok(ckpt) => ckpt,
             Err(err) => {
-                self.timers.durable = Some(owners.timers);
-                self.ack_seat = Some(owners.ack_seat);
+                self.durable_owners = Some(owners);
                 return Err(err);
             }
         };

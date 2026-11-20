@@ -872,7 +872,10 @@ const FAR_LSN: u64 = u64::MAX / 2;
 #[inline(always)]
 fn wake_owed(gate: &WatermarkGate) {
     while gate.owes() {
-        gate.wake_covered(WAKE_BUDGET);
+        // The durable cell draws its budget down by the count; the rows read the waits'
+        // polls, so only a debug build checks it.
+        let woken = gate.wake_covered(WAKE_BUDGET);
+        debug_assert!(woken <= WAKE_BUDGET, "a call wakes at most its budget");
     }
 }
 

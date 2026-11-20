@@ -338,12 +338,21 @@ fn waitlist_is_idle_exactly_when_no_wait_is_queued_on_any_key() {
 }
 
 /// The watermark moved to `to` and every wait it covers woken: a gate with no plane calls
-/// `wake_covered` itself while it `owes()` (ADR-0177 A2.2).
+/// `wake_covered` itself while it `owes()` (ADR-0177 A2.2), here at a budget of 64. The calls
+/// are bounded by the queued waits' batches and one call that finds none covered; a gate still
+/// owing after them is red, never a hung test.
 fn advance_and_wake(gate: &WatermarkGate, to: u64) {
+    const BUDGET: usize = 64;
     gate.advance(to);
-    while gate.owes() {
-        gate.wake_covered(64);
+    let calls = gate.waiting().div_ceil(BUDGET) + 1;
+    for _ in 0..calls {
+        if !gate.owes() {
+            break;
+        }
+        let woken = gate.wake_covered(BUDGET);
+        assert!(woken <= BUDGET, "a call woke {woken}, past its budget");
     }
+    assert!(!gate.owes(), "wakes still owed after {calls} calls");
 }
 
 #[test]

@@ -347,7 +347,27 @@ const NS: NsId = NsId(7);
 const FIXTURE_ACKS: Cap = Cap::entries::<65_536>("log-fixture-acks", CapFill::Serving);
 
 /// The fixture gate's pool: a wait node for each ack task (ADR-0177 D5).
-const FIXTURE_WAIT_NODES: Cap = Cap::entries::<65_536>("log-fixture-wait-nodes", CapFill::Serving);
+const FIXTURE_WAIT_NODES: Cap =
+    Cap::entries::<{ FIXTURE_ACKS.entries_max() }>("log-fixture-wait-nodes", CapFill::Serving);
+
+/// The fixture gate's wake budget, a call: the pool's every wait, so one call wakes all a sync
+/// covers, and a second, if any, finds none covered.
+const FIXTURE_WAKES: usize = FIXTURE_WAIT_NODES.entries_max() as usize;
+
+/// The acks the watermark's last advance covers, woken as a gate with no durable cell wakes
+/// them itself (ADR-0177 A2.2). The calls are bounded by the queued waits' batches and one
+/// call that finds none covered; a gate still owing after them is red, never a hung test.
+fn wake_owed(gate: &WatermarkGate) {
+    let calls = gate.waiting().div_ceil(FIXTURE_WAKES) + 1;
+    for _ in 0..calls {
+        if !gate.owes() {
+            break;
+        }
+        let woken = gate.wake_covered(FIXTURE_WAKES);
+        assert!(woken <= FIXTURE_WAKES, "a call woke {woken}, past its budget");
+    }
+    assert!(!gate.owes(), "wakes still owed after {calls} calls");
+}
 
 thread_local! {
     /// The ack class of the executor this thread's fixture loop was built with.
@@ -488,6 +508,7 @@ impl CellPlane for DurablePlane {
             (TokenClass::Fsync, CompletionResult::Synced) => {
                 if let Some(end) = self.commit.on_fsync_complete(token_ticket(c.token), cx.now) {
                     self.gate.advance(end.to_u64());
+                    wake_owed(&self.gate);
                 }
             }
             (

@@ -114,13 +114,14 @@ pub(crate) struct DurableTimers {
     pub(crate) dead_group: Option<TimerArm>,
 }
 
-/// A server cell's timer owners, one per role. The plane keeps them; no
-/// role closes its owner, so no position frees after the assembly.
+/// A server cell's timer owners, one per role, as the assembly reserves
+/// them. The plane keeps the accept retry's, and the durable roles' with the
+/// seat of its ack gate until its durable plane takes them. No role closes
+/// its owner, so no position frees after the assembly.
 #[derive(Debug)]
 pub(crate) struct ServerTimers {
     pub(crate) accept_retry: TimerOwner,
-    /// Taken by the durable plane when it is built; `None` from then on.
-    pub(crate) durable: Option<DurableTimers>,
+    pub(crate) durable: DurableTimers,
 }
 
 impl ServerTimers {
@@ -137,7 +138,7 @@ impl ServerTimers {
             TimerRole::ALL.map(|role| reserve(&mut set, role));
         let timers = ServerTimers {
             accept_retry: accept_retry?,
-            durable: Some(DurableTimers {
+            durable: DurableTimers {
                 everysec: everysec?,
                 fill_hold: fill_hold?,
                 group_hold: group_hold?,
@@ -145,17 +146,16 @@ impl ServerTimers {
                 dead_fill: None,
                 #[cfg(inf_canary_hold_arms_nothing)]
                 dead_group: None,
-            }),
+            },
         };
         // Canary: each hold owner is armed and at once cancelled, one after
         // the other, before the loop exists; its episodes hold that dead arm.
         #[cfg(inf_canary_hold_arms_nothing)]
         let timers = {
             let mut timers = timers;
-            if let Some(durable) = timers.durable.as_mut() {
-                durable.dead_fill = dead_arm(&mut set, &durable.fill_hold);
-                durable.dead_group = dead_arm(&mut set, &durable.group_hold);
-            }
+            let durable = &mut timers.durable;
+            durable.dead_fill = dead_arm(&mut set, &durable.fill_hold);
+            durable.dead_group = dead_arm(&mut set, &durable.group_hold);
             timers
         };
         Ok((set, timers))
@@ -194,7 +194,7 @@ mod tests {
     fn the_assembly_reserves_one_owner_per_role_and_fills_its_row() {
         let (census, mark) = CapCensus::new(CellId(3));
         let (set, timers) = ServerTimers::build(&census).expect("assembled");
-        let durable = timers.durable.as_ref().expect("the durable roles' owners");
+        let durable = &timers.durable;
         let positions = [
             timers.accept_retry.position(),
             durable.everysec.position(),

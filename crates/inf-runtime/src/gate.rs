@@ -1268,7 +1268,46 @@ pub struct WaitPool {
 /// The seat of a pool's one [`WatermarkGate`] (ADR-0177 D5): answered once,
 /// by the pool's build, and carrying its pool. It is move-only, with no
 /// `Clone`, and [`WatermarkGate::build`] consumes it, so a second gate on one
-/// pool does not type-check.
+/// pool does not type-check. One gate on one seat builds:
+///
+/// ```
+/// # use inf_foundation::bounded::{Cap, CapCensus, CapFill};
+/// # use inf_foundation::CellId;
+/// # use inf_runtime::{WaitNodes, WatermarkGate};
+/// let (census, _serve_mark) = CapCensus::new(CellId(0));
+/// let Ok(pool) = WaitNodes::build(Cap::entries::<4>("x", CapFill::Serving), &census) else {
+///     return;
+/// };
+/// let _gate = WatermarkGate::build(pool.seat);
+/// ```
+///
+/// A second gate on the same seat does not, the seat having moved into the
+/// first:
+///
+/// ```compile_fail
+/// # use inf_foundation::bounded::{Cap, CapCensus, CapFill};
+/// # use inf_foundation::CellId;
+/// # use inf_runtime::{WaitNodes, WatermarkGate};
+/// let (census, _serve_mark) = CapCensus::new(CellId(0));
+/// let Ok(pool) = WaitNodes::build(Cap::entries::<4>("x", CapFill::Serving), &census) else {
+///     return;
+/// };
+/// let _gate = WatermarkGate::build(pool.seat);
+/// let _second = WatermarkGate::build(pool.seat); // use of a moved seat
+/// ```
+///
+/// Nor does a copy of the seat to build a second gate on:
+///
+/// ```compile_fail
+/// # use inf_foundation::bounded::{Cap, CapCensus, CapFill};
+/// # use inf_foundation::CellId;
+/// # use inf_runtime::WaitNodes;
+/// let (census, _serve_mark) = CapCensus::new(CellId(0));
+/// let Ok(pool) = WaitNodes::build(Cap::entries::<4>("x", CapFill::Serving), &census) else {
+///     return;
+/// };
+/// let _copy = pool.seat.clone(); // the seat is not `Clone`
+/// ```
 #[derive(Debug)]
 pub struct WatermarkSeat {
     nodes: WaitNodes,
@@ -1972,6 +2011,7 @@ impl WatermarkGate {
     /// Wakes the queued waits the watermark covers, in LSN order, at most
     /// `budget` of them, and answers how many it woke (ADR-0177 A2.2). The
     /// B-tree's `advance` wakes every wait it covers, so none is left: 0.
+    #[must_use]
     pub fn wake_covered(&self, budget: usize) -> usize {
         let _ = budget;
         0
