@@ -19,6 +19,7 @@
 //! cell × index the same way. `--verify-determinism` runs the scenario
 //! twice and requires `trace_hash` identity (L7).
 
+use crate::driver::Violations;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -34,7 +35,7 @@ use inf_store::{
 };
 
 use crate::durable::{
-    DurableScenario, DurableWorkload, MiniClient, Node, TraceObserver, boot, build_disk,
+    DurableScenario, DurableWorkload, MiniClient, Node, TraceObserver, WakeLeg, boot, build_disk,
 };
 use crate::net::Plant;
 
@@ -67,10 +68,13 @@ impl BackfillScenario {
 
 #[derive(Debug, Default)]
 pub struct BackfillReport {
-    pub violations: Vec<String>,
+    pub violations: Violations,
     /// Cap census rows read at the end of every life, summed over the
     /// cells and lives (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,
+    /// Census rows the crossing rule judged (their `crossings > 0`), summed
+    /// the same way: the rule's engagement.
+    pub cap_rows_crossed: u64,
     /// Boots driven (setup + one per phase cut).
     pub boots: u64,
     /// Power cuts in order, each with the walk progress it landed on.
@@ -142,6 +146,11 @@ fn base(scenario: &BackfillScenario) -> DurableScenario {
         spin_iters: DurableScenario::SPIN_ITERS,
         tier_budget: None,
         epoch_marks: None,
+        ledger_wedge: None,
+        stop_tick: false,
+        fill_dense: false,
+        wake: WakeLeg::OFF,
+        mget_audits: None,
     }
 }
 
@@ -657,6 +666,7 @@ pub fn run_backfill_scenario(scenario: &BackfillScenario) -> BackfillReport {
     let sealed = observer.seal();
     report.state_hash = sealed.state_hash;
     report.cap_rows_checked = sealed.census.rows_checked;
+    report.cap_rows_crossed = sealed.census.rows_crossed;
     report.violations.extend(sealed.census.violations);
     report
 }

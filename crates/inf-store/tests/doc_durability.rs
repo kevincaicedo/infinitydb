@@ -41,16 +41,20 @@ fn set_doc(store: &mut CellStore, key: &[u8], idoc: &[u8]) {
 }
 
 fn durable_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"docs".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"docs".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("namespace");
     ks
 }
@@ -147,7 +151,10 @@ fn replay_rule_handles_wrap_stale_missing_and_gap() {
         version: DOC_VERSION_MASK,
         idoc: &initial,
     };
-    assert_eq!(ks.apply_record(&full, NOW, ANCHOR, &mut NoSpill).unwrap(), ReplayOutcome::Applied);
+    assert_eq!(
+        inf_store::drive_record(&mut ks, &full, NOW, ANCHOR, &mut NoSpill, u64::MAX).unwrap(),
+        ReplayOutcome::Applied
+    );
     let wrap = RecordView::DocDelta {
         ns: NS,
         key: b"doc",
@@ -159,14 +166,17 @@ fn replay_rule_handles_wrap_stale_missing_and_gap() {
         program: program.as_bytes(),
         operand: &operand,
     };
-    assert_eq!(ks.apply_record(&wrap, NOW, ANCHOR, &mut NoSpill).unwrap(), ReplayOutcome::Applied);
+    assert_eq!(
+        inf_store::drive_record(&mut ks, &wrap, NOW, ANCHOR, &mut NoSpill, u64::MAX).unwrap(),
+        ReplayOutcome::Applied
+    );
     assert_eq!(
         ks.ns_store_mut(NS).unwrap().json_get(b"doc", NOW).unwrap().unwrap().version,
         0,
         "u24 version wraps exactly"
     );
     assert_eq!(
-        ks.apply_record(&wrap, NOW, ANCHOR, &mut NoSpill).unwrap(),
+        inf_store::drive_record(&mut ks, &wrap, NOW, ANCHOR, &mut NoSpill, u64::MAX).unwrap(),
         ReplayOutcome::SkippedDocDeltaStale,
         "re-applying the covered delta is stale across wrap"
     );
@@ -183,7 +193,7 @@ fn replay_rule_handles_wrap_stale_missing_and_gap() {
         operand: &operand,
     };
     assert_eq!(
-        ks.apply_record(&missing, NOW, ANCHOR, &mut NoSpill).unwrap(),
+        inf_store::drive_record(&mut ks, &missing, NOW, ANCHOR, &mut NoSpill, u64::MAX).unwrap(),
         ReplayOutcome::SkippedDocDeltaMissing
     );
 
@@ -199,7 +209,7 @@ fn replay_rule_handles_wrap_stale_missing_and_gap() {
         operand: &operand,
     };
     assert!(matches!(
-        ks.apply_record(&gap, NOW, ANCHOR, &mut NoSpill),
+        inf_store::drive_record(&mut ks, &gap, NOW, ANCHOR, &mut NoSpill, u64::MAX),
         Err(ReplayError::CorruptDocument("document delta base version is ahead"))
     ));
 }
@@ -212,7 +222,8 @@ fn replay_skips_prior_incarnation_instead_of_binding_by_version() {
     let mut operand = Vec::new();
     let opcode = encode_apply_op(&ApplyOp::NumIncrBy(Number::I64(1)), &mut operand) as u8;
     let mut ks = durable_keyspace();
-    ks.apply_record(
+    inf_store::drive_record(
+        &mut ks,
         &RecordView::DocFull {
             ns: NS,
             key: b"doc",
@@ -223,6 +234,7 @@ fn replay_skips_prior_incarnation_instead_of_binding_by_version() {
         NOW,
         ANCHOR,
         &mut NoSpill,
+        u64::MAX,
     )
     .expect("checkpoint image");
     let before = ks.state_digest(NOW);
@@ -238,7 +250,7 @@ fn replay_skips_prior_incarnation_instead_of_binding_by_version() {
         operand: &operand,
     };
     assert_eq!(
-        ks.apply_record(&old_delta, NOW, ANCHOR, &mut NoSpill).unwrap(),
+        inf_store::drive_record(&mut ks, &old_delta, NOW, ANCHOR, &mut NoSpill, u64::MAX).unwrap(),
         ReplayOutcome::SkippedDocDeltaStale
     );
     assert_eq!(ks.state_digest(NOW), before, "old incarnation cannot touch the new document");
@@ -255,20 +267,22 @@ fn replay_skips_prior_incarnation_instead_of_binding_by_version() {
         operand: &operand,
     };
     assert!(matches!(
-        ks.apply_record(&future_delta, NOW, ANCHOR, &mut NoSpill),
+        inf_store::drive_record(&mut ks, &future_delta, NOW, ANCHOR, &mut NoSpill, u64::MAX),
         Err(ReplayError::CorruptDocument("document delta lineage is ahead"))
     ));
     assert_eq!(ks.state_digest(NOW), before, "future lineage fails before mutation");
 
-    ks.apply_record(
+    inf_store::drive_record(
+        &mut ks,
         &RecordView::StringPostImage { ns: NS, key: b"doc", value: b"plain" },
         NOW,
         ANCHOR,
         &mut NoSpill,
+        u64::MAX,
     )
     .expect("later type change");
     assert_eq!(
-        ks.apply_record(&old_delta, NOW, ANCHOR, &mut NoSpill).unwrap(),
+        inf_store::drive_record(&mut ks, &old_delta, NOW, ANCHOR, &mut NoSpill, u64::MAX).unwrap(),
         ReplayOutcome::SkippedDocDeltaStale,
         "a later non-document incarnation is also a stale delta skip"
     );
@@ -276,6 +290,7 @@ fn replay_skips_prior_incarnation_instead_of_binding_by_version() {
 
 #[test]
 fn replay_uses_recorded_bounds_not_lowered_boot_config() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let initial = JsonParser::new().parse(br#"{"a":[1,2],"pad":"xxxxxxxx"}"#).expect("fixture");
     let expected = JsonParser::new().parse(br#"{"a":[2,3],"pad":"xxxxxxxx"}"#).expect("fixture");
     let mut ks = Keyspace::new(StoreConfig {
@@ -283,44 +298,50 @@ fn replay_uses_recorded_bounds_not_lowered_boot_config() {
         doc_max_path_matches: 1,
         ..StoreConfig::default()
     });
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"docs".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"docs".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("namespace");
-    ks.apply_record(
+    inf_store::drive_record(
+        &mut ks,
         &RecordView::DocFull { ns: NS, key: b"doc", lineage: LINEAGE, version: 1, idoc: &initial },
         NOW,
         ANCHOR,
         &mut NoSpill,
+        u64::MAX,
     )
     .expect("full images use the format bound");
     let program = compile(b"$.a[*]").expect("path");
     let mut operand = Vec::new();
     let opcode = encode_apply_op(&ApplyOp::NumIncrBy(Number::I64(1)), &mut operand) as u8;
-    let outcome = ks
-        .apply_record(
-            &RecordView::DocDelta {
-                ns: NS,
-                key: b"doc",
-                lineage: LINEAGE,
-                base_version: 1,
-                match_count: 2,
-                post_len: expected.len() as u32,
-                opcode,
-                program: program.as_bytes(),
-                operand: &operand,
-            },
-            NOW,
-            ANCHOR,
-            &mut NoSpill,
-        )
-        .expect("recorded acceptance bounds survive config reduction");
+    let outcome = inf_store::drive_record(
+        &mut ks,
+        &RecordView::DocDelta {
+            ns: NS,
+            key: b"doc",
+            lineage: LINEAGE,
+            base_version: 1,
+            match_count: 2,
+            post_len: expected.len() as u32,
+            opcode,
+            program: program.as_bytes(),
+            operand: &operand,
+        },
+        NOW,
+        ANCHOR,
+        &mut NoSpill,
+        u64::MAX,
+    )
+    .expect("recorded acceptance bounds survive config reduction");
     assert_eq!(outcome, ReplayOutcome::Applied);
     assert_eq!(ks.ns_store_mut(NS).unwrap().json_freeze(b"doc", NOW).unwrap().unwrap(), expected);
 }
@@ -332,34 +353,37 @@ fn replay_rejects_root_delete_atomically() {
     let mut operand = Vec::new();
     let opcode = encode_apply_op(&ApplyOp::Del, &mut operand) as u8;
     let mut ks = durable_keyspace();
-    ks.apply_record(
+    inf_store::drive_record(
+        &mut ks,
         &RecordView::DocFull { ns: NS, key: b"doc", lineage: LINEAGE, version: 1, idoc: &initial },
         NOW,
         ANCHOR,
         &mut NoSpill,
+        u64::MAX,
     )
     .expect("initial image");
     let before = ks.state_digest(NOW);
     let before_domain = ks.ns_store(NS).expect("store").doc_domain();
 
-    let error = ks
-        .apply_record(
-            &RecordView::DocDelta {
-                ns: NS,
-                key: b"doc",
-                lineage: LINEAGE,
-                base_version: 1,
-                match_count: 1,
-                post_len: initial.len() as u32,
-                opcode,
-                program: program.as_bytes(),
-                operand: &operand,
-            },
-            NOW,
-            ANCHOR,
-            &mut NoSpill,
-        )
-        .expect_err("root delete must use the generic key Delete record");
+    let error = inf_store::drive_record(
+        &mut ks,
+        &RecordView::DocDelta {
+            ns: NS,
+            key: b"doc",
+            lineage: LINEAGE,
+            base_version: 1,
+            match_count: 1,
+            post_len: initial.len() as u32,
+            opcode,
+            program: program.as_bytes(),
+            operand: &operand,
+        },
+        NOW,
+        ANCHOR,
+        &mut NoSpill,
+        u64::MAX,
+    )
+    .expect_err("root delete must use the generic key Delete record");
     assert!(matches!(error, ReplayError::InvalidMutation(inf_doc::ApplyError::RootDelete)));
     assert_eq!(ks.state_digest(NOW), before);
     assert_eq!(ks.ns_store(NS).expect("store").doc_domain(), before_domain);
@@ -388,7 +412,8 @@ fn checkpoint_walk_and_digest_use_canonical_bytes_and_version() {
     let replacement = JsonParser::new().parse(br#"{"n":42}"#).expect("fixture");
     // Same canonical value but a different exact version is a different
     // logical replay state (M6 WATCH consumes this epoch).
-    ks.apply_record(
+    inf_store::drive_record(
+        &mut ks,
         &RecordView::DocFull {
             ns: NS,
             key: b"doc",
@@ -399,6 +424,7 @@ fn checkpoint_walk_and_digest_use_canonical_bytes_and_version() {
         NOW,
         ANCHOR,
         &mut NoSpill,
+        u64::MAX,
     )
     .expect("test replay");
     assert_ne!(ks.state_digest(NOW), before);
@@ -444,7 +470,8 @@ fn replay_full(post: &[u8]) -> Leg {
     let mut ks = durable_keyspace();
     let full =
         RecordView::DocFull { ns: NS, key: b"doc", lineage: LINEAGE, version: 2, idoc: post };
-    ks.apply_record(&full, NOW, ANCHOR, &mut NoSpill).map_err(|error| format!("{error:?}"))?;
+    inf_store::drive_record(&mut ks, &full, NOW, ANCHOR, &mut NoSpill, u64::MAX)
+        .map_err(|error| format!("{error:?}"))?;
     let replayed = ks.ns_store_mut(NS).unwrap().json_freeze(b"doc", NOW).unwrap();
     if replayed.as_deref() != Some(post) {
         return Err("DocFull replay differs from the live bytes".into());
@@ -457,7 +484,8 @@ fn keyspace_holding(pre: &[u8]) -> Keyspace {
     let mut ks = durable_keyspace();
     let image =
         RecordView::DocFull { ns: NS, key: b"doc", lineage: LINEAGE, version: 1, idoc: pre };
-    ks.apply_record(&image, NOW, ANCHOR, &mut NoSpill).expect("the pre-image fits a DocFull");
+    inf_store::drive_record(&mut ks, &image, NOW, ANCHOR, &mut NoSpill, u64::MAX)
+        .expect("the pre-image fits a DocFull");
     ks
 }
 
@@ -499,7 +527,8 @@ fn replay_delta(pre: &[u8], program: &inf_doc::PathProgram, op: &ApplyOp<'_>, po
     let post_len = u32::try_from(post.len()).expect("a document length fits u32");
     let wire = delta_wire(program, op, post_len);
     let (decoded, _) = inf_log::decode_record(&wire).map_err(|error| format!("{error:?}"))?;
-    ks.apply_record(&decoded, NOW, ANCHOR, &mut NoSpill).map_err(|error| format!("{error:?}"))?;
+    inf_store::drive_record(&mut ks, &decoded, NOW, ANCHOR, &mut NoSpill, u64::MAX)
+        .map_err(|error| format!("{error:?}"))?;
     let replayed = ks.ns_store_mut(NS).unwrap().json_freeze(b"doc", NOW).unwrap();
     if replayed.as_deref() != Some(post) {
         return Err("DocDelta replay differs from the live bytes".into());
@@ -591,7 +620,7 @@ fn replay_planted(pre: &[u8], path: &[u8], op: &ApplyOp<'_>, post_len: u32) -> P
     let wire = delta_wire(&compile(path).expect("path"), op, post_len);
     let (decoded, _) = inf_log::decode_record(&wire).expect("a planted delta decodes");
     let before = (stored(ks.ns_store_mut(NS).expect("store")), ks.state_digest(NOW));
-    let verdict = ks.apply_record(&decoded, NOW, ANCHOR, &mut NoSpill);
+    let verdict = inf_store::drive_record(&mut ks, &decoded, NOW, ANCHOR, &mut NoSpill, u64::MAX);
     let after = (stored(ks.ns_store_mut(NS).expect("store")), ks.state_digest(NOW));
     let unchanged = after == before;
     Planted { verdict, after: after.0.0, unchanged }
@@ -617,7 +646,8 @@ fn replay_of_a_member_append_inside_a_replaced_member_is_typed() {
         let post_len = u32::try_from(recorded_len).expect("a small document");
         let wire = delta_wire_matching(&program, &op, post_len, 2);
         let (decoded, _) = inf_log::decode_record(&wire).expect("the planted delta decodes");
-        let verdict = ks.apply_record(&decoded, NOW, ANCHOR, &mut NoSpill);
+        let verdict =
+            inf_store::drive_record(&mut ks, &decoded, NOW, ANCHOR, &mut NoSpill, u64::MAX);
         (verdict, stored(ks.ns_store_mut(NS).expect("store")).0)
     };
     let (verdict, after) = replay(post.len());
@@ -642,7 +672,7 @@ fn replay_refuses_a_delta_whose_array_operand_is_empty() {
     let wire = delta_wire(&compile(b"$.a").expect("path"), &op, post_len);
     let (decoded, _) = inf_log::decode_record(&wire).expect("the record codec carries it");
     let before = (stored(ks.ns_store_mut(NS).expect("store")), ks.state_digest(NOW));
-    let verdict = ks.apply_record(&decoded, NOW, ANCHOR, &mut NoSpill);
+    let verdict = inf_store::drive_record(&mut ks, &decoded, NOW, ANCHOR, &mut NoSpill, u64::MAX);
     let refused = matches!(
         verdict,
         Err(ReplayError::InvalidDelta(inf_doc::DeltaDecodeError::EmptyArrayOperand))

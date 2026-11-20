@@ -19,10 +19,10 @@ use std::rc::Rc;
 
 use inf_alloc::BufferPool;
 use inf_foundation::CellId;
-use inf_foundation::bounded::CapCensus;
+use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_foundation::time::{Nanos, VirtualClock};
-use inf_log::{FsyncClass, SegmentConfig, StagingConfig};
-use inf_runtime::{CellExecutor, CellLoop, LoopConfig, WatermarkGate};
+use inf_log::{FsyncClass, LogGeometry, SegmentConfig, StagingConfig};
+use inf_runtime::{CellLoop, ExecutorLayout, LoopConfig, TaskAdmission, WatermarkGate};
 use support::{DurablePlane, IoMode, ScriptedDriver, test_dir};
 
 /// Deterministic xorshift64* (L7: no ambient randomness).
@@ -48,19 +48,24 @@ fn run_schedule(seed: u64, dir: &Path) {
         driver.delays.push_back(rng.below(4) as u32);
     }
     let clock = Rc::new(VirtualClock::new(Nanos::ZERO));
-    let (_census, serve_mark) = CapCensus::new(CellId(0));
+    let (census, serve_mark) = CapCensus::new(CellId(0));
+    let (timer_set, everysec_owner) = support::everysec_timers(&census);
     let mut lp = CellLoop::new(
         driver,
         Rc::clone(&clock),
         BufferPool::new(4, 1024),
         LoopConfig::default(),
         serve_mark,
+        timer_set,
+        support::loop_executor(&census),
     );
     // Small segments: rotation + seal fsyncs interleave with linked ones.
+    let staging = StagingConfig::with_capacity(16 << 10);
+    let segment = SegmentConfig { segment_bytes: 16 << 10, ..Default::default() };
     let mut plane = DurablePlane::new(
         dir,
-        StagingConfig::with_capacity(16 << 10),
-        SegmentConfig { segment_bytes: 16 << 10, ..Default::default() },
+        LogGeometry::new(staging, segment).expect("geometry"),
+        everysec_owner,
     );
     plane.jobs_per_iter = 1 + rng.below(24) as usize;
     let mut always = 0;
@@ -84,7 +89,7 @@ fn run_schedule(seed: u64, dir: &Path) {
         assert!(iters < 200_000, "schedule {seed:#x} failed to quiesce");
         let quiesced = plane.jobs.is_empty()
             && plane.staging.is_empty()
-            && plane.in_flight.is_empty()
+            && plane.commit.frames_unwritten() == 0
             && plane.commit.pending_fsyncs() == 0;
         idle = if quiesced { idle + 1 } else { 0 };
     }
@@ -117,16 +122,25 @@ fn no_ack_before_covering_fsync_across_random_schedules() {
 fn wake_storm_50k_drains_under_the_execute_budget() {
     const WAITERS: u64 = 50_000;
     const BUDGET: usize = 1024;
-    let mut executor = CellExecutor::new(4096);
+    /// The storm's waiters, all alive at once.
+    const STORM: Cap = Cap::entries::<{ WAITERS as u32 }>("storm-waiters", CapFill::Serving);
+    async fn storm_waiter(gate: WatermarkGate, lsn: u64, order: Rc<RefCell<Vec<u64>>>) {
+        gate.waiter(lsn).await;
+        order.borrow_mut().push(lsn);
+    }
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let mut layout = ExecutorLayout::new(&census);
+    let class = layout.class(&storm_waiter, STORM).expect("the storm's class");
+    let mut executor = layout.build().expect("no class refuses");
     let gate = WatermarkGate::new();
     let order = Rc::new(RefCell::new(Vec::with_capacity(WAITERS as usize)));
     for lsn in 1..=WAITERS {
         let gate = gate.clone();
         let order = Rc::clone(&order);
-        executor.spawn_local(async move {
-            gate.waiter(lsn).await;
-            order.borrow_mut().push(lsn);
-        });
+        let TaskAdmission::Granted(permit) = executor.reserve(class) else {
+            panic!("the storm's class holds every waiter");
+        };
+        permit.spawn_local(move || storm_waiter(gate, lsn, order));
     }
     // Futures suspend on first poll (spawn queues them once).
     while executor.run_ready(BUDGET) == BUDGET {}

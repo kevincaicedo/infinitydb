@@ -17,8 +17,9 @@
 //! - **aggregate VA** — creation past the cap fails typed before any
 //!   mmap and leaves nothing behind; drop returns exactly the ring;
 //! - **teardown** — drop removes the table (the `Region` unmaps —
-//!   reserved VA returns structurally), the plane's file half unlinks
-//!   `statvfs`-visibly, and accounting reads zero. The in-flight
+//!   reserved VA returns structurally), the plane's file half closes and
+//!   unlinks every file so that nothing holds its blocks (the shared
+//!   reclaim oracle, ADR-0200 D7), and accounting reads zero. The in-flight
 //!   cold-read half (pins defer unlinks; drained reads complete from
 //!   the still-open fd) is the S08 proof this teardown reuses —
 //!   `cold_hardened.rs::cancellation_and_unlink_discipline_on_uring`
@@ -31,11 +32,14 @@ use inf_log::blob::{ExtentId, ExtentWriter, list_extent_ids, unlink_extent_file}
 use inf_log::flush::unlink_tier_file;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    FsyncClass, MutationEffect, NsId, StagingConfig, StagingRing, TierFlush, TierFlushConfig,
+    FsyncClass, LogGeometry, MutationEffect, NsId, StagingRing, TierFlush, TierFlushConfig,
     TierIoMode,
 };
 use inf_store::KeyHasher;
 use inf_store::{Keyspace, NsError, NsMode, NsSpec, StoreConfig, TierSpec, TieredTable};
+
+#[cfg(unix)]
+mod reclaim;
 
 /// A tiered durable spec around `TierSpec::for_budget`, named fields
 /// overridable per test.
@@ -63,8 +67,10 @@ fn flush_for(ns: NsId, fs: &MemFs) -> TierFlush<MemFs> {
             mode: TierIoMode::Buffered,
             file_capacity: 256 << 10,
             slice_bytes: 1 << 20,
+            record_len_max: 16 << 20,
         },
         0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
 }
 
@@ -86,6 +92,7 @@ fn drain(table: &mut TieredTable, flush: &mut TierFlush<MemFs>) {
 /// the next creation.
 #[test]
 fn aggregate_va_bounds_creation_and_drop_returns_capacity() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     let tier = TierSpec::for_budget(8 << 20);
     let ring = tier.demotion_config().ring_reserve_bytes().expect("valid") as u64;
@@ -93,12 +100,12 @@ fn aggregate_va_bounds_creation_and_drop_returns_capacity() {
     // Room for two rings plus slack that a third cannot fit in.
     ks.set_tiered_va_limit(2 * ring + ring / 2);
 
-    ks.ns_create(tiered_spec(16, b"t-one", tier)).expect("first admits");
-    ks.ns_create(tiered_spec(17, b"t-two", tier)).expect("second admits");
+    ks.ns_create(tiered_spec(16, b"t-one", tier), &census).expect("first admits");
+    ks.ns_create(tiered_spec(17, b"t-two", tier), &census).expect("second admits");
     assert_eq!(ks.tiered_tables(), 2);
     assert_eq!(ks.tiering_usage().reserved_bytes, 2 * ring);
 
-    let refused = ks.ns_create(tiered_spec(18, b"t-three", tier));
+    let refused = ks.ns_create(tiered_spec(18, b"t-three", tier), &census);
     assert_eq!(
         refused,
         Err(NsError::TierVaLimitExceeded {
@@ -115,10 +122,10 @@ fn aggregate_va_bounds_creation_and_drop_returns_capacity() {
     assert_eq!(ks.tiering_usage().reserved_bytes, 2 * ring);
 
     // Drop returns exactly the ring; the freed capacity admits again.
-    ks.ns_drop(b"t-two").expect("drop");
+    ks.ns_drop_uncataloged(b"t-two").expect("drop");
     assert_eq!(ks.tiering_usage().reserved_bytes, ring, "exactly one ring returned");
     assert_eq!(ks.tiered_tables(), 1);
-    ks.ns_create(tiered_spec(18, b"t-three", tier)).expect("freed capacity admits");
+    ks.ns_create(tiered_spec(18, b"t-three", tier), &census).expect("freed capacity admits");
     assert_eq!(ks.tiering_usage().reserved_bytes, 2 * ring);
 }
 
@@ -127,6 +134,7 @@ fn aggregate_va_bounds_creation_and_drop_returns_capacity() {
 /// all, and the D2 clamps hold at registration.
 #[test]
 fn spec_materialization_and_hot_reload_apply_together() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     let tier = TierSpec {
         disk_budget_bytes: 64 << 20,
@@ -136,7 +144,7 @@ fn spec_materialization_and_hot_reload_apply_together() {
         blob_threshold_bytes: 8 << 10,
         ..TierSpec::for_budget(8 << 20)
     };
-    ks.ns_create(tiered_spec(16, b"tiered", tier)).expect("create");
+    ks.ns_create(tiered_spec(16, b"tiered", tier), &census).expect("create");
     let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
     assert_eq!(table.demotion().mem_budget_bytes, 8 << 20);
     assert_eq!(table.demotion().mutable_permille, 100);
@@ -149,7 +157,7 @@ fn spec_materialization_and_hot_reload_apply_together() {
     // unrepresentable through configuration).
     let bad = TierSpec { compaction_dead_ratio_pct: 10, ..tier };
     assert!(matches!(
-        ks.ns_create(tiered_spec(17, b"bad", bad)),
+        ks.ns_create(tiered_spec(17, b"bad", bad), &census),
         Err(NsError::InvalidTierConfig(_))
     ));
 
@@ -173,15 +181,18 @@ fn spec_materialization_and_hot_reload_apply_together() {
 
     // SET on a non-tiered namespace refuses typed (tiering is a
     // create-time decision — D1/D3).
-    ks.ns_create(NsSpec {
-        id: NsId(18),
-        name: b"plain".to_vec(),
-        mode: NsMode::Durable,
-        fsync: None,
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NsId(18),
+            name: b"plain".to_vec(),
+            mode: NsMode::Durable,
+            fsync: None,
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("plain durable");
     assert_eq!(ks.ns_set_tier(b"plain", tier), Err(NsError::NotTiered));
 }
@@ -194,10 +205,11 @@ fn spec_materialization_and_hot_reload_apply_together() {
 /// the test below).
 #[test]
 fn memory_fill_respects_each_namespace_budget() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     let tier = TierSpec { mutable_permille: 100, ..TierSpec::for_budget(8 << 20) };
-    ks.ns_create(tiered_spec(16, b"fill-a", tier)).expect("create");
-    ks.ns_create(tiered_spec(17, b"fill-b", tier)).expect("create");
+    ks.ns_create(tiered_spec(16, b"fill-a", tier), &census).expect("create");
+    ks.ns_create(tiered_spec(17, b"fill-b", tier), &census).expect("create");
     let fs = MemFs::new();
     let mut flushes = [flush_for(NsId(16), &fs), flush_for(NsId(17), &fs)];
     let budget = tier.mem_budget_bytes;
@@ -246,6 +258,7 @@ fn memory_fill_respects_each_namespace_budget() {
 /// exactly.
 #[test]
 fn disk_pressure_engages_before_the_cap() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     // Disk budget 16 MiB: the 7/8 threshold leaves 2 MiB of headroom —
     // two MAINTAIN slices — so a per-slice pressure check must observe
@@ -258,7 +271,7 @@ fn disk_pressure_engages_before_the_cap() {
         blob_threshold_bytes: 4 << 10,
         ..TierSpec::for_budget(8 << 20)
     };
-    ks.ns_create(tiered_spec(16, b"disky", tier)).expect("create");
+    ks.ns_create(tiered_spec(16, b"disky", tier), &census).expect("create");
     let fs = MemFs::new();
     let mut flush = flush_for(NsId(16), &fs);
     let budget = tier.disk_budget_bytes;
@@ -282,7 +295,7 @@ fn disk_pressure_engages_before_the_cap() {
         w.append_chunk(&value).expect("chunk");
         let sealed = w.finish().expect("finish");
         table.note_blob_bytes(sealed.device_bytes());
-        let mut ring = StagingRing::new(StagingConfig::default());
+        let mut ring = StagingRing::new(LogGeometry::default());
         table
             .stage_wal(
                 &mut ring,
@@ -338,13 +351,17 @@ fn disk_pressure_engages_before_the_cap() {
 }
 
 /// The D7 teardown on the real filesystem: drop removes the table (the
-/// reserved VA returns structurally), the plane's file half unlinks
-/// `statvfs`-visibly, and every accounting term reads zero. New access
-/// has nothing to route to — the store answers `None`, which is the
-/// plane's typed refusal.
+/// reserved VA returns structurally), the plane's file half closes and
+/// unlinks every file, and every accounting term reads zero. After the
+/// last unlink this process holds nothing under the root: no regular file
+/// is left, and no descriptor or mapping names an unlinked one (the shared
+/// reclaim oracle, ADR-0200 D7; Linux only for those two halves, the walk
+/// elsewhere). New access has nothing to route to — the store answers
+/// `None`, which is the plane's typed refusal.
 #[cfg(unix)]
 #[test]
 fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     use inf_log::fs::StdSegmentFs;
 
     let root = std::env::temp_dir().join(format!("inf-s19-teardown-{}", std::process::id()));
@@ -358,26 +375,13 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
     }
     let _cleanup = Cleanup(root.clone());
 
-    fn avail_bytes(path: &Path) -> u64 {
-        use std::os::unix::ffi::OsStrExt;
-        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path");
-        // SAFETY: `statvfs` is plain-old-data; the all-zero pattern is a
-        // valid value for every field and the call overwrites it.
-        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-        // SAFETY: `c` is a live NUL-terminated path and `stat` a valid
-        // exclusive out-pointer for the call's duration.
-        let rc = unsafe { libc::statvfs(c.as_ptr(), &mut stat) };
-        assert_eq!(rc, 0, "statvfs");
-        stat.f_bavail as u64 * stat.f_frsize as u64
-    }
-
     let mut ks = Keyspace::new(StoreConfig::default());
     let tier = TierSpec {
         mutable_permille: 100,
         blob_threshold_bytes: 4 << 10,
         ..TierSpec::for_budget(8 << 20)
     };
-    ks.ns_create(tiered_spec(16, b"doomed", tier)).expect("create");
+    ks.ns_create(tiered_spec(16, b"doomed", tier), &census).expect("create");
     let mut flush = TierFlush::new(
         StdSegmentFs,
         TierFlushConfig {
@@ -387,10 +391,11 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
             mode: TierIoMode::Buffered,
             file_capacity: 256 << 10,
             slice_bytes: 1 << 20,
+            record_len_max: 16 << 20,
         },
         0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     );
-    let avail_start = avail_bytes(&root);
 
     // Real data: records to tier files, one value out of line.
     let value = vec![0x33u8; (4 << 10) - 1];
@@ -437,7 +442,7 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
     assert!(!flush.sealed().is_empty() || flush.active().is_some(), "files exist to tear down");
 
     // The drop: registry + table go together; the Region unmaps.
-    ks.ns_drop(b"doomed").expect("drop");
+    ks.ns_drop_uncataloged(b"doomed").expect("drop");
     assert_eq!(ks.tiered_tables(), 0);
     assert_eq!(ks.tiering_usage().reserved_bytes, 0, "the ring returned structurally");
     assert_eq!(ks.tiering_usage().committed_bytes, 0);
@@ -453,12 +458,16 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
     // The plane's file half (the rig playing the plane, §3.3): unlink
     // every tier file and extent — no pins exist here; the pinned case
     // is the S08 proof cited in the module docs.
+    // The namespace's flush goes with its table first, closing every tier
+    // file it holds (the sealed files' parked handles and the active
+    // writer): a handle still open past its file's unlink keeps its blocks.
     let sealed_metas: Vec<_> = flush.sealed().to_vec();
+    let active = flush.active().map(|(_, _, _, _, path)| path.to_path_buf());
+    drop(flush);
     for meta in &sealed_metas {
-        flush.detach_sealed(meta.id).expect("sealed");
         unlink_tier_file(&StdSegmentFs, meta).expect("unlink tier file");
     }
-    if let Some((_, _, _, _, path)) = flush.active() {
+    if let Some(path) = active {
         std::fs::remove_file(path).expect("unlink active file");
     }
     for id in list_extent_ids(&StdSegmentFs, &ns_dir).expect("listing") {
@@ -469,13 +478,9 @@ fn namespace_drop_returns_disk_va_and_accounting_to_zero() {
         .map(|d| d.flatten().map(|e| e.path()).collect())
         .unwrap_or_default();
     assert!(leftover.is_empty(), "the namespace directory emptied: {leftover:?}");
-    // statvfs: the blocks came back (generous slack for shared-box churn).
-    let avail_end = avail_bytes(&root);
-    let slack = 16u64 << 20;
-    assert!(
-        avail_end + slack >= avail_start,
-        "statvfs shows the teardown returned the space (start {avail_start}, end {avail_end})"
-    );
+    // The space returned: nothing is left under the root, and nothing
+    // unlinked is still held.
+    reclaim::assert_reclaimed(&root, &[]);
 }
 
 /// A namespace created without `TIER-IO-MODE` gets a tier file this host's

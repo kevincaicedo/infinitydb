@@ -1,4 +1,5 @@
 use super::Rng;
+use crate::driver::Violations;
 use std::collections::{BTreeMap, VecDeque};
 
 mod checks;
@@ -561,7 +562,7 @@ pub struct Report {
     pub aborted: usize,
     pub retries: u32,
     pub stuck: Vec<usize>,
-    pub violations: Vec<String>,
+    pub violations: Violations,
     pub max_intents: usize,
     pub steps: usize,
 }

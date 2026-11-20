@@ -87,16 +87,20 @@ fn fixture(ns: NsId) -> Keyspace {
 /// A durable named namespace carrying the same index set (the replay
 /// arm's host — defaults never log, L2).
 fn durable_fixture(ns: NsId) -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(inf_store::NsSpec {
-        id: ns,
-        name: b"ledger".to_vec(),
-        mode: inf_store::NsMode::Durable,
-        fsync: Some(inf_store::FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        inf_store::NsSpec {
+            id: ns,
+            name: b"ledger".to_vec(),
+            mode: inf_store::NsMode::Durable,
+            fsync: Some(inf_store::FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("create durable ns");
     for &(id, path, key_type) in INDEXES {
         let program = compile(path.as_bytes()).expect("valid path").as_bytes().to_vec();
@@ -719,7 +723,8 @@ fn replay_maintenance_matches_live() {
         let idoc = parse(json);
         let lineage = DocLineage::new(u64::from(version)).expect("nonzero");
         let rec = RecordView::DocFull { ns, key, lineage, version, idoc: &idoc };
-        replayed.apply_record(&rec, now, anchor, &mut NoSpill).expect("replay");
+        inf_store::drive_record(&mut replayed, &rec, now, anchor, &mut NoSpill, u64::MAX)
+            .expect("replay");
     }
     let rec = RecordView::DocFull {
         ns,
@@ -728,10 +733,17 @@ fn replay_maintenance_matches_live() {
         version: 9,
         idoc: &overwrite,
     };
-    replayed.apply_record(&rec, now, anchor, &mut NoSpill).expect("replay");
-    replayed
-        .apply_record(&RecordView::Delete { ns, key: b"k2" }, now, anchor, &mut NoSpill)
+    inf_store::drive_record(&mut replayed, &rec, now, anchor, &mut NoSpill, u64::MAX)
         .expect("replay");
+    inf_store::drive_record(
+        &mut replayed,
+        &RecordView::Delete { ns, key: b"k2" },
+        now,
+        anchor,
+        &mut NoSpill,
+        u64::MAX,
+    )
+    .expect("replay");
     for &(id, ..) in INDEXES {
         assert_eq!(
             tree_entries(&live, ns, IndexId(id)),
@@ -744,7 +756,7 @@ fn replay_maintenance_matches_live() {
     let idoc = parse(docs[0].1);
     let lineage = DocLineage::new(7).expect("nonzero");
     let rec = RecordView::DocFull { ns, key: b"k9", lineage, version: 1, idoc: &idoc };
-    cold.apply_record(&rec, now, anchor, &mut NoSpill).expect("replay");
+    inf_store::drive_record(&mut cold, &rec, now, anchor, &mut NoSpill, u64::MAX).expect("replay");
     for &(id, ..) in INDEXES {
         assert!(
             tree_entries(&cold, ns, IndexId(id)).is_empty(),

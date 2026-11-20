@@ -4,10 +4,14 @@
 //! exit code and the next boot replays every frame.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)] // harness process, not cell code
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -15,7 +19,10 @@ use std::time::{Duration, Instant};
 /// One spawning test at a time (batch 69): macOS sets `CLOEXEC` after
 /// `socket(2)`, so a sibling test's `posix_spawn` in that window inherits
 /// this test's client socket and its port picker — the client then never
-/// sees the server's FIN, and the picked port is a ghost's.
+/// sees the server's FIN, and the picked port is a ghost's. Separate
+/// processes cannot race this way, so the lock binds the threads of one test
+/// process only.
+// nextest-in-process: a spawn race between the threads of one test process
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 fn unique() -> u32 {
@@ -32,16 +39,9 @@ fn data_root(tag: &str) -> PathBuf {
 }
 
 struct Server {
-    child: Child,
+    child: Node,
     port: u16,
     stderr: PathBuf,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl Server {
@@ -61,10 +61,9 @@ impl Server {
             .expect("addr")
             .port()
             .to_string();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_infinityd"));
-        command.args(["--port", &port, "--cells", cells]);
+        let mut command = NodeBinary::built().command().args(["--port", &port, "--cells", cells]);
         if durable {
-            command.arg("--data-dir").arg(dir).args(["--device-probe", "off"]);
+            command = command.arg("--data-dir").arg(dir).args(["--device-probe", "off"]);
         }
         let child = command
             .args(extra)

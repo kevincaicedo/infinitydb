@@ -1,10 +1,12 @@
-# cargo-fuzz crate for bins/inf-compare (F-L18-07, review of 2026-08-30, batch 63:
-# every parser in `bins/` gets a fuzz target). Standalone workspace —
-# built only by `cargo +nightly fuzz`.
+# cargo-fuzz crate for bins/inf-compare. A workspace of its own, outside the
+# root's, so its fuzzing features never unify into a shipping build;
+# `just check` compiles its targets on the pinned toolchain and
+# `cargo +nightly fuzz` runs them.
 [package]
 name = "inf-compare-fuzz"
 version = "0.0.0"
 edition = "2024"
+license = "Apache-2.0"
 publish = false
 
 [package.metadata]

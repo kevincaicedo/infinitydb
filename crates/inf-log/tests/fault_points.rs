@@ -20,6 +20,10 @@ use inf_log::{
     scan_log_dir, segment_file_name, write_manifest,
 };
 
+#[path = "common/rotor_geometry.rs"]
+mod rotor_geometry;
+use rotor_geometry::geometry;
+
 /// Canonical v2 stamp for hand-built test frames (epoch 1, covered 0 —
 /// attests nothing). `seq` matters only where a test builds sequential
 /// frames the recovery policy will walk; readers/scanners ignore it.
@@ -35,7 +39,7 @@ fn cfg() -> SegmentConfig {
 
 fn mem_rotor(fs: &MemFs) -> SegmentRotor<MemFs> {
     let dirs = create_cell_dirs(fs, &PathBuf::from("data/shard-0")).expect("dirs");
-    SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg()).expect("fresh rotor")
+    SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry(cfg())).expect("fresh rotor")
 }
 
 fn append_frame(rotor: &mut SegmentRotor<MemFs>, filler: usize) -> Result<Lsn, LogError> {
@@ -75,7 +79,7 @@ fn prealloc_no_space_fires_the_enospc_discipline() {
     fault::arm(inf_log::fault::PREALLOC_NO_SPACE, FaultSpec::Nth(1));
     let fs = MemFs::new();
     let dirs = create_cell_dirs(&fs, &PathBuf::from("data/shard-0")).expect("dirs");
-    let err = SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg())
+    let err = SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), geometry(cfg()))
         .expect_err("prealloc refused");
     assert!(matches!(err, LogError::NoSpace { .. }), "{err:?}");
 
@@ -84,7 +88,8 @@ fn prealloc_no_space_fires_the_enospc_discipline() {
     // space returning clears it — the S02 discipline through the named
     // point instead of a MemFs capacity budget.
     fault::disarm_all();
-    let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg()).expect("rotor");
+    let mut rotor =
+        SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry(cfg())).expect("rotor");
     fault::arm(inf_log::fault::PREALLOC_NO_SPACE, FaultSpec::FromNth(1));
     while !rotor.space_exhausted() {
         rotor.maintain(0).ok();
@@ -123,7 +128,7 @@ fn dir_fsync_fail_fires_at_the_recycle_rename_barrier() {
         prealloc: inf_log::PreallocPolicy::Immediate,
         ..Default::default()
     };
-    let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg).expect("rotor");
+    let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry(cfg)).expect("rotor");
     // Two rotations — one aligned frame fills a 4 KiB `Direct` segment
     // (MemFs segments are born allocated: every seal is a pool
     // candidate); pool seg 1.
@@ -159,7 +164,8 @@ fn dir_fsync_fail_fires_at_every_barrier_class() {
     fault::disarm_all();
     let dirs = create_cell_dirs(&fs, &PathBuf::from("data/shard-0")).expect("dirs");
     fault::arm(inf_log::fault::DIR_FSYNC_FAIL, FaultSpec::Nth(1));
-    let err = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg()).expect_err("barrier fails");
+    let err = SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry(cfg()))
+        .expect_err("barrier fails");
     assert!(matches!(err, LogError::Fsync(_)), "{err:?}");
     assert!(err.to_string().contains("injected fault: dir_fsync_fail"), "{err}");
 
@@ -297,4 +303,61 @@ fn manifest_rename_fail_leaves_the_old_unit_authoritative() {
     assert_eq!(survivor.ckpt_id, 1, "old unit authoritative after failed swap");
     write_manifest(&fs, &shard, &newer).expect("swap succeeds after the fault clears");
     assert_eq!(read_manifest(&fs, &shard).expect("readable").expect("present").ckpt_id, 2);
+}
+
+/// The listing tiers of the fault point under test, each with its
+/// directory: the in-memory and the simulated one (ADR-0202 D5; the std
+/// tier's errors are the kernel's).
+fn listing_tiers() -> (inf_log::fs::mem::MemFs, inf_log::fs::sim::SimDisk, PathBuf) {
+    let dir = PathBuf::from("data/shard-0/ns-17/cold");
+    use inf_log::fs::SegmentFs;
+    let mem = MemFs::new();
+    let sim = inf_log::fs::sim::SimDisk::new();
+    mem.create_dir_all(&dir).expect("dir");
+    sim.create_dir_all(&dir).expect("dir");
+    mem.create_meta(&dir.join("blob-000001.iblob")).expect("a name");
+    sim.create_meta(&dir.join("blob-000001.iblob")).expect("a name");
+    (mem, sim, dir)
+}
+
+/// ADR-0202 D5: `dir_listing_open_fail` refuses the open of a listing with
+/// the registry's injected error, on both tiers that carry it; the next
+/// open succeeds.
+#[test]
+fn dir_listing_open_fail_refuses_the_open() {
+    use inf_log::fs::{OpenedDir, SegmentFs};
+    fn refused<F: SegmentFs>(fs: &F, dir: &std::path::Path, tier: &str) {
+        fault::arm(inf_log::fault::DIR_LISTING_OPEN_FAIL, FaultSpec::Nth(1));
+        let err = fs.open_listing(dir).map(|_| ()).expect_err("the open is refused");
+        assert!(err.to_string().contains("injected fault: dir_listing_open_fail"), "{tier}: {err}");
+        assert!(matches!(fs.open_listing(dir).expect("then it opens"), OpenedDir::Open(_)));
+        fault::disarm_all();
+    }
+    let (mem, sim, dir) = listing_tiers();
+    refused(&mem, &dir, "mem");
+    refused(&sim, &dir, "sim");
+}
+
+/// ADR-0202 D5: `dir_listing_next_fail` fails a batch with the registry's
+/// injected error and leaves the batch holding no name; the stream answers
+/// the next call.
+#[test]
+fn dir_listing_next_fail_leaves_the_batch_empty() {
+    use inf_log::fs::{BatchEnd, DirStream, NameBatch, OpenedDir, SegmentFs};
+    fn failed<F: SegmentFs>(fs: &F, dir: &std::path::Path, tier: &str) {
+        let OpenedDir::Open(mut stream) = fs.open_listing(dir).expect("open") else {
+            panic!("{tier}: the directory is present")
+        };
+        let mut batch = NameBatch::new();
+        fault::arm(inf_log::fault::DIR_LISTING_NEXT_FAIL, FaultSpec::Nth(1));
+        let err = stream.next_batch(&mut batch).expect_err("the batch fails");
+        assert!(err.to_string().contains("injected fault: dir_listing_next_fail"), "{tier}: {err}");
+        assert!(batch.is_empty(), "{tier}: after an Err the batch holds no name");
+        assert_eq!(stream.next_batch(&mut batch).expect("then it lists"), BatchEnd::End);
+        assert_eq!(batch.len(), 1, "{tier}: the name");
+        fault::disarm_all();
+    }
+    let (mem, sim, dir) = listing_tiers();
+    failed(&mem, &dir, "mem");
+    failed(&sim, &dir, "sim");
 }

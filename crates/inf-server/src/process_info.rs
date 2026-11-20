@@ -6,8 +6,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(any(target_os = "linux", test))]
-mod stat;
+// A pure parser, compiled on every target: the crate root re-exports it for
+// its fuzz target, which reaches it through the crate (ADR-0198 D4).
+pub(crate) mod stat;
 
 /// Last observed process gauges. CPU values are microseconds, RSS is bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

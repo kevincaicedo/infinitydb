@@ -9,8 +9,8 @@
 //! - **Local commands** (every key owned by this cell, or no keys) execute
 //!   synchronously inside PARSE+EXECUTE — the L6 fast path pays nothing.
 //! - **Remote commands** run on a per-connection *pump* future. The pump
-//!   dispatches commands in pipeline order with up to [`REMOTE_WINDOW`]
-//!   remote ops in flight at once (the M0-E8 cross-cell remediation:
+//!   dispatches commands in pipeline order with one remote op in flight per
+//!   unit of its task's gate units at once (the M0-E8 cross-cell remediation:
 //!   one-hop-at-a-time execution was the 85% penalty), then emits replies
 //!   strictly in command order — out-of-order completions park in the
 //!   [`FabricGate`] until their turn. Sends always leave from the single
@@ -23,9 +23,11 @@
 //!   reply has been emitted (a pipeline barrier).
 //! - **Cross-cell vocabulary** (M0-experimental `Apply`, reshaped by M4):
 //!   single-owner commands ship as `Op::Apply { cmd: protocol, args: argv }`
-//!   and return the owner's raw RESP reply (`Outcome::Bytes`) — byte-exact
-//!   by construction. `DEL`/`EXISTS` (the only multi-key M0 commands) split
-//!   per key and aggregate typed `Outcome::Int` replies.
+//!   and return the owner's raw RESP reply — byte-exact by construction —
+//!   as `Outcome::Bytes` or `Outcome::ErrorReply`, tagged from the reply's
+//!   outcome, never from its bytes (ADR-0190 D3). `DEL`/`EXISTS` (the
+//!   only multi-key M0 commands) split per key and aggregate typed
+//!   `Outcome::Int` replies.
 //! - **Observer seam**: every apply point (local execution, and the owner
 //!   side of a remote `Apply`) reports `(argv, reply, now)` — `inf-sim`'s
 //!   linearizability oracle hangs off this; [`NoopObserver`] monomorphizes
@@ -43,27 +45,31 @@ use inf_fabric::{
     ApplyArgs, CellFabric, ErrCode, FabricToken, MAX_APPLY_ARGS, MAX_INLINE_APPLY_ARGS, Op,
     Outcome, SendError,
 };
-use inf_foundation::bounded::{CapCensus, ServeMark};
+use inf_foundation::CellId;
+use inf_foundation::bounded::{
+    Cap, CapCensus, CapError, CappedDeque, Reserve, Reserved, ServeMark,
+};
 use inf_foundation::time::Nanos;
-use inf_foundation::{CellId, LogHistogram};
 #[cfg(feature = "doc")]
 use inf_log::DocLineage;
 use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{FsyncClass, MutationEffect, SegmentRotor};
-use inf_runtime::GroupClass;
+use inf_runtime::{CellExecutor, ExecutorLayout, GroupClass, TaskId, park};
 use inf_runtime::{
-    CellPlane, Completion, CompletionResult, CompletionToken, FabricGate, GateWait, IoClass, IoOp,
-    Issue, LoopCx, RawFd, TokenClass, WaitList,
+    CellPlane, Completion, CompletionResult, CompletionToken, Delivery, FabricAdmission,
+    FabricGate, GatePermit, GateUnits, GateWait, IoClass, IoOp, Issue, LoopCx, OwnerPhase, RawFd,
+    TimerNotice, TimerOutcome, TimerSet, TokenClass, WaitList, WaitNodes,
 };
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
 use inf_store::{
-    CellStore, EvictBudget, ExpiryBudget, Keyspace, LogFullImage, NsId, NsMode, SlotRouter,
-    WallAnchor,
+    CellStore, EvictBudget, ExpiryBudget, Keyspace, KeyspaceSeed, LogFullImage, NsId, NsMode,
+    SlotRouter, WallAnchor,
 };
 use inf_wire::{
-    ArgvRef, CmdFlags, CommandId, ConnParser, Parsed, ParserLimits, Protocol, RespWriter, arity_ok,
-    extract_keys, lookup,
+    ArgvRef, CmdFlags, CommandId, ConnParser, ErrorPassthrough, OpenReply, OwnedReply, Parsed,
+    ParserLimits, Protocol, ReplyBuf, ReplyOutcome, ReplyStream, RespWriter, SuccessView,
+    ZeroByteReply, arity_ok, extract_keys, lookup,
 };
 
 #[cfg(test)]
@@ -71,50 +77,90 @@ use inf_wire::{
 mod cache_boot_tests;
 mod cell_loop;
 mod conn;
+mod credit;
 mod dispatch;
 mod fabric;
 mod ns_ddl;
 mod publish;
 mod pumps;
 mod scatter;
+#[cfg(test)]
+#[path = "seed_tests.rs"]
+mod seed_tests;
 mod shared;
+mod tasks;
 mod tiered;
+mod timers;
+// The owner split's one caller is the JSON gather, so both carry its feature.
+#[cfg(feature = "doc")]
+mod json_gather;
+#[cfg(feature = "doc")]
+mod split;
 
 pub use conn::OwnedOutcome;
-use conn::{ACCEPT_RETRY, ACCEPT_RETRY_TIMER_KEY, CONN_SLOT_CAP, MAXCLIENTS_REFUSAL, OwnedCmd};
-use dispatch::{PendingReply, close_after_reply, is_scatter, pump, render_outcome};
-use fabric::{
-    GatherPart, StagedApply, flush_apply_stage, flush_parse_stage, handle_fabric_op,
-    parse_stageable, stage_argv_block_argv, stage_or_handle, strip_single_element,
+use conn::{
+    CONN_SLOT_CAP, ClosedBy, ConnSlot, Emitted, Link, MAXCLIENTS_REFUSAL, OwnedCmd, PeerStream,
+    RecvArm, RunOut,
 };
+use credit::{FanLegs, FanReserve, PlaneFabric, PointOp, PubFanArgv};
+pub use credit::{MeshConfigRefused, checked_mesh_config};
+use dispatch::{
+    CountedLegs, LegWindow, Legs, OrderedLegs, PendingReply, close_after_reply, is_scatter, pump,
+    render_outcome, send_windowed,
+};
+use fabric::{
+    StagedApply, flush_apply_stage, flush_parse_stage, handle_fabric_op, parse_stageable,
+    stage_argv_block, stage_argv_block_argv, stage_or_handle, staged_outcome, wire_reply,
+};
+#[cfg(feature = "doc")]
+pub use json_gather::parse_json_mget_leg;
 use ns_ddl::{
-    SendNow, dispatch_ns, program_ckpt, program_ns_ddl, send_apply, send_apply_ns, try_send_apply,
+    SendNow, SendRefused, Sent, dispatch_ns, program_ckpt, program_ns_ddl, send_apply,
+    send_apply_ns, send_fan_leg, try_send_apply,
 };
 use publish::{
-    dispatch_pubsub, enforce_output_cap, flush_sub_deltas, handle_pubsub_apply, owner_pub_pump,
-    unsubscribe_closed_conn,
+    SubNotes, dispatch_pubsub, enforce_output_cap, flush_sub_deltas, handle_pubsub_apply,
+    owner_pub_pump, unsubscribe_closed_conn,
 };
-use pumps::{compact_pump, ns_apply_pump, shadow_pump};
+use pumps::{compact_pump, gated_pump, ns_apply_pump, shadow_pump};
 use scatter::{
-    CountedFold, ScatterScope, error_reply, extract_keys_iter, extract_keys_slices, int_reply,
-    keyspace_level, ns_dbsize_local, parse_publisher_tag, peer_cells, program_keys, program_move,
-    program_msetnx, program_randomkey, program_scan, return_error, run_local, simple_reply,
-    stages_despite_error, u64_decimal,
+    CROSS_CELL_EXECUTION_FAILED, CountedFold, ScatterScope, error_reply, extract_keys_iter,
+    extract_keys_slices, int_reply, keyspace_level, ns_dbsize_local, parse_publisher_tag,
+    peer_cells, program_keys, program_move, program_msetnx, program_randomkey, program_scan,
+    read_array_leg, run_local, simple_reply, stages, u64_decimal,
 };
 pub use scatter::{fold_live_entries, parse_array_header, parse_scan_head, parse_take_reply};
-use shared::{DurableAdmission, NsApplyOutcome, handle_ns_apply, tier_to_fan};
+use shared::{
+    ApplyGate, ClientAck, DurableAdmission, GatedBook, NsApplyOutcome, NsApplyRead, Parked,
+    ParkedDeques, ParkedFull, PeerDeques, apply_drop, handle_ns_apply, tier_to_fan,
+};
+use tasks::{PeerPumps, PlaneTasks};
+
+/// ADR-0189 D4's fail-stop: a namespace change `META` holds that this cell
+/// cannot apply, or a leg the origin reads as refused. A cell left on the
+/// old value would serve and export it, so the node stops with
+/// [`EXIT_DURABLE_FAILSTOP`](crate::EXIT_DURABLE_FAILSTOP), the stderr line
+/// naming the arm; the boot serves `META`'s value on every cell.
+fn ddl_fail_stop(arm: &str, detail: &str) -> ! {
+    eprintln!("namespace DDL {arm} failed (fail-stop): {detail}");
+    std::process::exit(crate::EXIT_DURABLE_FAILSTOP);
+}
+pub(crate) use timers::DurableTimers;
+use timers::ServerTimers;
+pub use timers::{TimerAssemblyError, TimerRole};
 
 use crate::control::{
     BoardSweep, CellIssuer, CheckpointEpoch, CkptFinalCredit, CkptQuota, ControlHandle,
     IssuerRefused, RecoveryBoard,
 };
-use crate::durable::{DurableCell, DurableConfig, EVERYSEC_TIMER_KEY};
+use crate::durable::{DrainHold, DurableCell, DurableConfig};
 #[cfg(feature = "doc")]
 use crate::exec::DocLogAdmission;
 use crate::exec::{
-    ConnCx, ConnNamespace, NodeInfo, TIER_FLUSH_GAUGES, TierFlushGauge, execute, execute_slices,
-    stall_request, unavailable_default_allows,
+    COLD_GAUGES, ColdGauge, ConnCx, ConnNamespace, NodeInfo, NodeState, TIER_FLUSH_GAUGES,
+    TierFlushGauge, execute, execute_slices, stall_request, unavailable_default_allows,
 };
+use crate::limits::ACCEPT_RETRY;
 use crate::pubsub::{self, PubSubCell, SubKind};
 use crate::recover::{RecoverPhase, Recovery, RecoveryProgress};
 
@@ -149,64 +195,204 @@ pub(super) struct ConnSlab<T = Conn> {
 
 /// One fabric-origin namespace apply parked for its origin's FIFO pump
 /// (M4-S26 tiered; M4.5-S27 added flat durable applies under staging
-/// pressure — the suspension-capable sibling of the gated-reply future).
+/// pressure). Its origin is its deque's; its argv one flat copy behind one
+/// pointer (ADR-0177 D6).
 pub(super) struct NsApply {
     token: FabricToken,
+    args: OwnedCmd,
     ns: NsId,
     proto: Protocol,
-    args: Vec<Vec<u8>>,
     /// The frame's program mark (ADR-0115), carried to the pump.
     program: bool,
 }
 
-/// One fabric-origin PUBLISH parked at the owner cell.
+/// One fabric-origin PUBLISH parked at the owner cell: its origin is its
+/// deque's, and its frame `[channel, payload]` or `[channel, payload,
+/// conn, seq]` one flat copy (ADR-0177 D6). The publisher tag `(conn, seq)`
+/// is the origin's (ADR-0101 D1/D2): opaque here, echoed on the origin
+/// cell's fan leg only.
 pub(super) struct OwnerPub {
-    origin: CellId,
     token: FabricToken,
-    channel: Vec<u8>,
-    payload: Vec<u8>,
-    /// The publisher tag `(conn, seq)` as the origin sent it (ADR-0101
-    /// D1/D2): opaque here, echoed on the origin cell's fan leg only.
-    tag: Option<(Vec<u8>, Vec<u8>)>,
+    frame: OwnedCmd,
 }
 
+impl OwnerPub {
+    fn channel(&self) -> &[u8] {
+        self.frame.arg(0)
+    }
+
+    fn payload(&self) -> &[u8] {
+        self.frame.arg(1)
+    }
+
+    /// The publisher tag, when the frame carries one.
+    fn tag(&self) -> Option<(&[u8], &[u8])> {
+        (self.frame.argc() == 4).then(|| (self.frame.arg(2), self.frame.arg(3)))
+    }
+}
+
+/// One origin's `always` verdict slot (ADR-0177 D3, D6): `Open` from before
+/// the apply's first effect, named by its [`GatedTicket`]'s number, then the
+/// reply that waits for this cell's fsync watermark to cover its `seq`.
+pub(super) enum Gated {
+    Open { ticket: u32 },
+    Verdict(GatedVerdict),
+}
+
+/// A gated reply: the fabric token it answers, its record's `seq`, and its
+/// bytes and outcome (ADR-0190 D1), the bytes behind one pointer.
+pub(super) struct GatedVerdict {
+    token: FabricToken,
+    seq: u64,
+    reply: Box<[u8]>,
+    outcome: ReplyOutcome,
+}
+
+impl GatedVerdict {
+    /// The verdict of `reply`, gated on `seq`. A buffer exactly its bytes
+    /// (a reply detached from FABRIC-IN's scratch) becomes the verdict's
+    /// without a copy; a larger one (a pump's pooled buffer) is copied once,
+    /// exact, and goes back to the cell's pool.
+    fn new<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        shared: &Shared<O, F>,
+        token: FabricToken,
+        seq: u64,
+        reply: OwnedReply,
+    ) -> GatedVerdict {
+        let outcome = reply.outcome();
+        let buf = reply.into_bytes();
+        let bytes = if buf.len() == buf.capacity() {
+            buf.into_boxed_slice()
+        } else {
+            let exact = Box::<[u8]>::from(buf.as_slice());
+            shared.recycle_reply_buf(buf);
+            exact
+        };
+        GatedVerdict { token, seq, reply: bytes, outcome }
+    }
+
+    fn parked_bytes(&self) -> u64 {
+        self.reply.len() as u64
+    }
+}
+
+impl Parked for NsApply {
+    fn parked_bytes(&self) -> u64 {
+        self.args.len_bytes()
+    }
+
+    fn waits(&self) -> bool {
+        true
+    }
+}
+
+impl Parked for OwnerPub {
+    fn parked_bytes(&self) -> u64 {
+        self.frame.len_bytes()
+    }
+
+    fn waits(&self) -> bool {
+        true
+    }
+}
+
+impl Parked for Gated {
+    fn parked_bytes(&self) -> u64 {
+        match self {
+            Gated::Open { .. } => 0,
+            Gated::Verdict(verdict) => verdict.parked_bytes(),
+        }
+    }
+
+    /// An open slot is its apply's, still running; a verdict waits for the
+    /// `gated` task.
+    fn waits(&self) -> bool {
+        match self {
+            Gated::Open { .. } => false,
+            Gated::Verdict(_) => true,
+        }
+    }
+}
+
+// ADR-0177 D6: a peer's `d` entries fit one deque's backing at the ceiling of
+// credits, so each entry stays within `PARKED_ENTRY_BYTES_MAX`.
+const _: () = assert!(
+    core::mem::size_of::<NsApply>() <= crate::limits::PARKED_ENTRY_BYTES_MAX,
+    "a parked namespace apply fits a parked entry"
+);
+const _: () = assert!(
+    core::mem::size_of::<OwnerPub>() <= crate::limits::PARKED_ENTRY_BYTES_MAX,
+    "a parked publish fits a parked entry"
+);
+const _: () = assert!(
+    core::mem::size_of::<Gated>() <= crate::limits::PARKED_ENTRY_BYTES_MAX,
+    "a gated verdict fits a parked entry"
+);
+
+/// A connection queue's entry: a command PARSE deferred to the pump, or a
+/// reply PARSE wrote while the pump owed the connection earlier replies (a
+/// `-LOADING` refusal, a protocol error), queued so it leaves after them.
+enum Queued {
+    Command(OwnedCmd),
+    Reply(OwnedReply),
+}
+
+impl Queued {
+    /// The heap bytes the entry holds.
+    fn mem(&self) -> usize {
+        match self {
+            Queued::Command(cmd) => cmd.mem(),
+            Queued::Reply(reply) => reply.bytes().len(),
+        }
+    }
+
+    /// Returns the entry's buffer to its pool.
+    fn recycle<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        self,
+        shared: &Shared<O, F>,
+    ) {
+        match self {
+            Queued::Command(cmd) => shared.recycle_cmd_buf(cmd.into_buf()),
+            Queued::Reply(reply) => shared.recycle_reply_buf(reply.into_bytes()),
+        }
+    }
+}
+
+/// A connection's slab entry: its context, its queue and its pump, which
+/// every occupied state holds, and its state (ADR-0123 A2, ADR-0196 A1).
 #[allow(clippy::disallowed_types, reason = "container: A")]
 pub(super) struct Conn {
-    fd: RawFd,
-    parser: ConnParser,
     cx: ConnCx,
-    /// Staged reply bytes awaiting RESPOND.
-    out: Vec<u8>,
-    /// One in-flight Send max: two outstanding sends on one socket have no
-    /// kernel ordering guarantee.
-    send_inflight: bool,
-    closing: bool,
-    close_after_flush: bool,
-    /// A pump future owns this connection's execution order.
-    pump_active: bool,
-    queue: VecDeque<OwnedCmd>,
-    recv_disarmed: bool,
-    rearm_recv: bool,
-    /// Injected-clock ms since the staged output first exceeded the pub/sub
-    /// soft cap (M1-S11); 0 = under the soft limit.
-    cob_soft_since_ms: u64,
-    /// The output-cap kill was already requested (idempotent counter guard).
-    cob_kill_sent: bool,
-    /// Injected-clock ms of the last received buffer (accept counts);
-    /// the `timeout` reaper's input (ADR-0123 D2) — one store per
-    /// `Recv`, never per command.
-    last_active_ms: u64,
+    /// The commands PARSE deferred, and the replies it wrote while the pump
+    /// owed earlier ones, which the pump dequeues in pipeline order in
+    /// every occupied state: a close runs them to the end.
+    queue: VecDeque<Queued>,
+    /// The connection's pump (ADR-0177 D2), made at its admission; it
+    /// lives until the connection's slot retires.
+    pump: TaskId,
+    /// The pump read the queue empty with nothing pending and parked:
+    /// whoever queues a command for it, or moves its slot, wakes it by id.
+    /// While clear, the pump owns the connection's execution order.
+    pump_parked: bool,
     /// Remote-publish sequence (ADR-0101 D1): a subscribed connection's
     /// forwarded `PUBLISH` carries `(key, seq)` so the owner's fan leg
     /// back to this cell can pair the publisher's own frames with its
     /// own reply. Never advances for unsubscribed publishers.
     publish_seq: u64,
-    /// The publisher's own frames a tagged fan leg delivered, keyed by
-    /// sequence; the pump emits each right after that publish's count
-    /// reply (ADR-0101 D3/D4). Bounded by the in-flight window and
-    /// empty for every connection that is not a self-subscribed
-    /// publisher.
-    self_push: Vec<(u64, Vec<u8>)>,
+    slot: ConnSlot,
+    /// Canary: a closing slot's descriptor copy, which RESPOND sends to.
+    #[cfg(inf_canary_closing_slot_sends)]
+    closing_fd: Option<RawFd>,
+    /// Canary: the mark as a side flag beside a live parser.
+    #[cfg(inf_canary_mark_applied_late)]
+    late_mark: bool,
+    /// Canary: the 1→0 deltas captured at `Closed`, before the drain.
+    #[cfg(inf_canary_registry_dropped_at_closed)]
+    closed_notes: Option<SubNotes>,
+    /// Canary: the connection's owners were dropped after its first reply
+    /// left, its socket left open.
+    #[cfg(inf_canary_conn_owner_lost)]
+    owner_lost: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -215,15 +401,6 @@ pub(super) struct ConnKey {
     generation: u32,
 }
 
-/// One owner-side `always` reply deferred on the fsync watermark.
-pub(super) struct GatedReply {
-    to: CellId,
-    token: FabricToken,
-    seq: u64,
-    reply: Vec<u8>,
-}
-
-#[allow(clippy::disallowed_types, reason = "container: E")]
 pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> {
     cell: CellId,
     cells: u16,
@@ -238,20 +415,20 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// injected-clock instant (fabric service continues — deadlock safety).
     stall_until: Cell<Nanos>,
     store: RefCell<Keyspace>,
-    fabric: RefCell<CellFabric>,
+    fabric: RefCell<PlaneFabric>,
     conns: RefCell<ConnSlab>,
-    gate: FabricGate<OwnedOutcome>,
+    /// The fabric gate (ADR-0177 D4): it mints every request's key and
+    /// holds its waiter; each send borrows it for one synchronous step, and
+    /// each reply's waiter for its life.
+    gate: RefCell<FabricGate<OwnedOutcome>>,
+    /// The cell's wait nodes (ADR-0177 D5): every wait list of the cell
+    /// takes them, its durable and tiered cells' among them.
+    wait_nodes: WaitNodes,
     credit_waiters: WaitList<CellId>,
     observer: RefCell<O>,
     node: Rc<NodeInfo>,
     /// Loop-granularity clock for futures (set each step from `cx.now`).
     now: Cell<Nanos>,
-    /// Fabric token round-trip latency, nanoseconds (hop RTT gate).
-    rtt_ns: RefCell<LogHistogram>,
-    /// Per-destination `(token, send time)` FIFO: replies return in send
-    /// order per cell pair, so RTT is recorded at *delivery* (FABRIC-IN),
-    /// not when the windowed pump finally awaits the parked value.
-    rtt_sent: RefCell<Vec<VecDeque<(u64, Nanos)>>>,
     /// Recycled reply buffers (gate values, pump-local replies) — the
     /// remote path's per-op heap traffic was a top M0-R1 cost. Bounded by
     /// [`REPLY_POOL_MAX`]/[`REPLY_POOL_BUF_CAP`].
@@ -288,10 +465,18 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// Pub/sub registries (M1-S10): local subscriber lists, owner-side
     /// per-cell counts, the replicated pattern index.
     pubsub: RefCell<PubSubCell<ConnKey>>,
-    /// Fabric-origin PUBLISHes awaiting this cell's owner pump (FIFO — the
-    /// queue preserves per-publisher delivery order across fan-outs).
-    pub_queue: RefCell<VecDeque<OwnerPub>>,
-    pub_pump_active: Cell<bool>,
+    /// Fabric-origin PUBLISHes awaiting this cell's owner pump: per origin,
+    /// FIFO, so per-publisher delivery order holds across fan-outs (a
+    /// publisher's frames come from one origin); the pump takes the origins
+    /// in rotation (ADR-0177 D6).
+    owner_pubs: RefCell<PeerDeques<OwnerPub>>,
+    /// The owner pump read every origin's publishes empty and parked:
+    /// FABRIC-IN wakes it when it queues one.
+    pub_pump_parked: Cell<bool>,
+    /// The cell's one publish-fan reserve (ADR-0192 D3): the owner pump,
+    /// made at plane start and never ending, takes it at its first poll and
+    /// holds it for the cell's life, so one fan is open at a time.
+    fan_reserve: Cell<Option<FanReserve>>,
     /// The connection knobs (ADR-0123 D5): `maxclients` share, `timeout`,
     /// `tcp-keepalive`, both output-buffer classes — read at assembly,
     /// refreshed by the MAINTAIN config sweep.
@@ -312,16 +497,6 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// (a tiered namespace is a configuration of `MODE durable` —
     /// ADR-0062 D1); inner state stays empty until one materializes.
     tier: RefCell<Option<crate::tier_cell::TierCell<F>>>,
-    /// Dropped tiered namespaces whose tier files wait for the catalog
-    /// swap that drops them (ADR-0100 D5): `(ns, epoch)` recorded on the
-    /// origin, before that swap, by the DROP program or a `CREATE`
-    /// rollback, and on a peer, after it, by the `INF.NSFAN DROP` apply
-    /// (ADR-0186 D1). A fault-injected stop at `ns_drop_before_meta`
-    /// records `u64::MAX`, an epoch no swap reaches, so those files hold
-    /// until the restart. Consumed by `TierCell::sync_namespaces`, which
-    /// parks the tier files on the entry's epoch. Bounded by DDL rate —
-    /// one entry per drop, consumed at the next MAINTAIN.
-    ns_drop_releases: RefCell<Vec<(NsId, u64)>>,
     /// Fabric-origin tiered applies (M4-S26): per-origin FIFO queues. A
     /// tiered apply can suspend on a cold read, so it cannot run inside
     /// the synchronous FABRIC-IN drain — each origin's applies run on
@@ -332,19 +507,45 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// M4.5-S27 (ADR-0083 D1): flat durable-namespace applies join the
     /// same per-origin queue under staging pressure — pacing instead of
     /// the owner-side `-BUSY` refusal — and whenever the pump already
-    /// holds this origin's work (FIFO = apply order). Bounded by the
-    /// origins' fabric windows, never a new unbounded queue.
-    ns_applies: RefCell<Vec<VecDeque<NsApply>>>,
-    ns_pump_active: RefCell<Vec<bool>>,
-    /// Gated `always` verdicts the apply pumps produced (M4.5-S29):
-    /// each is a fabric reply awaiting this cell's fsync watermark. The
-    /// pump queues the verdict and moves on — holding its FIFO across the
-    /// durability wait serialized every fabric origin to one write per
-    /// fsync (the S29 flat-scaling defect). FABRIC-IN drains this into
-    /// the same deferred-reply futures the synchronous drain spawns
-    /// (ADR-0015 D6 — the client-visible ack still never precedes this
-    /// cell's fsync). Bounded by the origins' fabric windows.
-    pump_gated: RefCell<VecDeque<GatedReply>>,
+    /// holds this origin's work (FIFO = apply order). Each origin's deque
+    /// is over its data credits `d` (ADR-0177 D6).
+    ns_applies: RefCell<PeerDeques<NsApply>>,
+    /// Per origin, its pump read the origin's queue empty and parked:
+    /// FABRIC-IN wakes it when it queues an apply. While clear the pump
+    /// holds the origin's order, which the divert reads.
+    ns_pump_parked: RefCell<Vec<bool>>,
+    /// Gated `always` verdicts, per origin in `seq` order (ADR-0177 D3,
+    /// D6): an apply, inline or on its origin's pump, opens its slot before
+    /// its first effect and fills it with its verdict, then moves on
+    /// (holding the FIFO across the durability wait serialized every origin
+    /// to one write per fsync, M4.5-S29). The one `gated` task publishes
+    /// every verdict the watermark covers (ADR-0015 D6: the client-visible
+    /// ack never precedes this cell's fsync).
+    gated: Rc<GatedBook>,
+    /// The `gated` task, made at plane start and never ending, found no
+    /// verdict pending and parked; FABRIC-IN wakes it when one waits.
+    gated_pump_parked: Cell<bool>,
+    /// The plane's task classes (ADR-0177 D2): each task the plane makes is
+    /// reserved through them, in `plane/tasks.rs`.
+    tasks: PlaneTasks,
+    /// The peer pumps' ids, set at plane start; `None` at one cell.
+    peer_pumps: core::cell::OnceCell<Option<PeerPumps>>,
+    /// PARSE's completed takes of the inbox (ADR-0196 D2): each adds 1
+    /// after the last entry it took, wrapping, compared with `!=` only. A
+    /// `Peer` run-out ends its parser once the count moved past the take
+    /// count stamped when the slot entered its `Peer` state.
+    inbox_takes: Cell<u64>,
+    /// The pumps whose `Peer` run-out found no take since its stamp, each
+    /// waiting for PARSE's next take, which wakes them all.
+    reader_waiters: WaitList<()>,
+    /// How many pumps wait on `reader_waiters`: PARSE's guard, so a take
+    /// with none waiting pays one load and one branch. A gauge, cell scope.
+    reader_waiting: Cell<u64>,
+    /// The marked slots whose receive is owed one `RecvArm` (ADR-0196
+    /// A1.3): a pump's `QUIT` and the stop's mark have no loop context to
+    /// push it, so RESPOND pushes it for each key still `Flushing` `Open`.
+    /// At most one entry a mark, so at most the occupied slots.
+    mark_rearms: RefCell<Vec<ConnKey>>,
     /// Node control-thread handle (id allocation + catalog persistence).
     control: RefCell<Option<Arc<ControlHandle>>>,
     /// DDL pumps parked on catalog persistence (ADR-0015 D3).
@@ -405,16 +606,12 @@ const PENDING_HIGH_WATER: usize = 1024;
 const PENDING_LOW_WATER: usize = 64;
 /// Max fabric ops drained per FABRIC-IN step (bounded drain).
 const FABRIC_DRAIN_MAX: usize = 1024;
-/// Remote ops one connection may have in flight at once. Replies that land
-/// out of order park in the `FabricGate` (≤ one value each) until emitted,
-/// so this also bounds parked-reply memory per connection.
-const REMOTE_WINDOW: usize = 32;
 /// Replies (of any kind) awaiting in-order emission per connection; locals
 /// executed eagerly behind a slow remote stage their bytes here.
 const PENDING_REPLIES_MAX: usize = 256;
 /// Reply-pool bounds: buffers kept per cell, and the largest buffer worth
 /// keeping (anything bigger is freed, so one giant value can't pin memory).
-/// Sized to the parked-reply working set — up to `conns × REMOTE_WINDOW`
+/// Sized to the parked-reply working set — up to `conns × GATE_UNITS_PER_CONN_TASK`
 /// `Bytes` gate values hold pool buffers at once on the natural-routing
 /// leg; at 256 the pool exhausted and the overflow paid malloc/free per
 /// reply (M2.5 Phase H allocator lever). Worst-case retention is
@@ -541,11 +738,15 @@ pub struct ServerPlane<
 > {
     shared: Rc<Shared<O, F>>,
     listener: RawFd,
+    /// The one handle that inserts a client row: an accept registers its
+    /// client through it, and no command's context holds it.
+    admission: crate::ClientAdmission,
     started: bool,
     /// Recv completions staged from step 1 for PARSE+EXECUTE (step 3+4).
     inbox: Vec<(ConnKey, BufferId, u32)>,
-    /// Reusable FABRIC-IN scratch: owner-side reply bytes for this drain.
-    reply_scratch: Vec<u8>,
+    /// Reusable FABRIC-IN scratch: owner-side reply bytes for this drain,
+    /// one reply opened per op it answers.
+    reply_scratch: ReplyStream,
     /// Fabric-apply prefetch batch (reused across FABRIC-IN steps).
     apply_stage: Vec<StagedApply>,
     apply_stage_bytes: Vec<u8>,
@@ -557,6 +758,13 @@ pub struct ServerPlane<
     /// Reusable FABRIC-IN scratch: replies staged while the fabric is
     /// borrowed by `drain`, sent the moment it ends.
     staged_replies: Vec<(CellId, FabricToken, StagedReply)>,
+    /// A test node's reply order: each drain's replies newest first, so an
+    /// origin's fan reads its legs' replies out of send order; and the
+    /// largest drain so reversed, the hook's engagement.
+    #[cfg(test)]
+    reverse_replies: bool,
+    #[cfg(test)]
+    reversed_batch_max: usize,
     /// Doorbell-wakeup park board (M0-R1): this cell sets `[cell]` in the
     /// park handshake; peers read it at flush. Single-writer per slot — the
     /// same blessed class as the fabric doorbells, NOT shared mutable
@@ -568,10 +776,10 @@ pub struct ServerPlane<
     /// Last CONFIG-store version pushed into the keyspace (M1-E3
     /// `hot-per-cell` sweep — one u64 compare per MAINTAIN, no re-parse).
     config_pushed: u64,
-    /// The everysec wheel key was armed (M2-S05; once per plane).
-    everysec_armed: bool,
-    /// An accept-retry wheel key is pending (F-L11-02: at most one).
-    accept_retry_armed: bool,
+    /// The cell's timer owners, one per role (ADR-0154 D4), reserved by
+    /// `new` before the loop exists: the accept retry's, and the durable
+    /// roles' until the durable plane takes them.
+    timers: ServerTimers,
     /// Accepted fds are TCP sockets (`infinityd`, the e2e harness): the
     /// plane sets `tcp-keepalive` on them (ADR-0123 D3). The DST models
     /// no TCP stack and leaves this off.
@@ -625,10 +833,14 @@ struct BootRecovery<F: SegmentFs> {
 /// An owner-side reply produced during the FABRIC-IN drain (ranges index
 /// into the reply scratch buffer).
 enum StagedReply {
-    Bytes(usize, usize),
+    /// A reply's bytes in the drain's scratch with its outcome, read from
+    /// the reply's writer, never chosen (ADR-0190 D2).
+    Bytes(usize, usize, ReplyOutcome),
     Int(i64),
     Nil,
-    /// The adopt ack (ADR-0128): returns the origin's credit, nothing else.
+    /// The adopt ack (ADR-0128), or an applied namespace DDL leg
+    /// (ADR-0189 D5): its variant is all it carries, and it returns the
+    /// origin's credit.
     Ok,
     /// Typed refusal for an op the M0 plane does not speak.
     Refused,
@@ -649,16 +861,55 @@ pub enum StopPhase {
     Drained,
 }
 
+/// A cell's connection owners, as [`ServerPlane::conn_owners`] reads them:
+/// raw counts, which the simulator compares (ADR-0177 D2's O1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ConnOwners {
+    /// `conn` tasks whose slots the executor holds: alive, and Retired (a
+    /// finished task whose slot a waker or a queued wake still names, until
+    /// the `run_ready` that reclaims it).
+    pub held: u32,
+    /// Of `held`, the Retired.
+    pub retired: u32,
+    /// Occupied connection slots: the slab's count.
+    pub slots: usize,
+    /// The `conn` class's slots, the cell's connection share `C`.
+    pub share: u32,
+}
+
+/// What a cell's stop waits on (ADR-0199 D3): the wait the drain's last
+/// MAINTAIN step returned from. Every wait of the drive names its variant,
+/// so a stop that cannot end says why, beside its phase.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StopHold {
+    /// Connection slots still occupied: flushing, closing or draining.
+    Connections { live: usize },
+    /// This cell is `Quiet`; the assembly has not yet seen every cell
+    /// `Quiet` ([`ServerPlane::finish_stop`]).
+    NodeQuiet,
+    /// The stop checkpoint of this epoch is not yet published on the
+    /// cell's board slot.
+    StopCheckpoint { epoch: u64 },
+    /// The final sync was requested in this step.
+    FinalSyncRequested,
+    /// The durable cell is not quiescent: the first of its terms that
+    /// holds it.
+    Durable(DrainHold),
+}
+
 /// The drain's own state (one `Option` check per MAINTAIN while serving).
 struct StopDrive {
     phase: StopPhase,
-    /// Every live connection has been marked `close_after_flush`.
+    /// Every occupied slot has had the stop's mark.
     conns_marked: bool,
     /// The assembly saw every cell `Quiet` (`finish_stop`).
     finish: bool,
     /// The stop checkpoint (ADR-0159 D3).
     checkpoint: StopCheckpoint,
     final_sync_requested: bool,
+    /// The wait the last step returned from; `None` before the first step
+    /// and once `Drained`.
+    hold: Option<StopHold>,
 }
 
 /// A stop's checkpoint (ADR-0159 D3): the cell's final credit until the
@@ -671,29 +922,161 @@ enum StopCheckpoint {
     Requested(CheckpointEpoch),
 }
 
+/// Why [`ServerPlane::new`] built no plane: nothing was written to its
+/// node, and what was built dropped while the census assembles.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PlaneBuildError {
+    /// The keyspace's seed was refused (ADR-0189 D4): a catalog the seeding
+    /// refuses, a spec refused, or a seeded table's build refused.
+    Seed(inf_store::NsError),
+    /// The timer assembly was refused.
+    Timers(TimerAssemblyError),
+    /// A per-origin deque was refused (ADR-0177 D6): the mesh's credits
+    /// past their ceiling, or the allocator.
+    Parked(inf_foundation::bounded::CapError),
+    /// The task classes' caps or their registration were refused
+    /// (ADR-0177 D1, D2): a connection share past its ceiling.
+    Tasks(inf_foundation::bounded::CapError),
+    /// The executor's storage was refused (ADR-0177 D2).
+    Executor(inf_runtime::ExecutorInitError),
+    /// A plane-start pump found its class full at assembly: the class's
+    /// cap is short of the plane's own demand.
+    Assembly(inf_foundation::bounded::AssemblyFull),
+    /// The fabric gate's holders were refused (ADR-0177 D4): `H` past its
+    /// ceiling, or the allocator.
+    Gate(inf_foundation::bounded::CapError),
+    /// The cell's wait nodes were refused (ADR-0177 D5).
+    WaitNodes(inf_foundation::bounded::CapError),
+    /// A keyed wait list's keys were refused (ADR-0177 D5): the cells past
+    /// their ceiling, the map's build, or a key past its cap.
+    Waiters(inf_runtime::KeysRefused),
+}
+
+/// The plane's fabric gate (ADR-0177 D4); under `fault-points` with its
+/// holder slots at the first generation `config` names.
+fn build_gate(
+    config: &crate::config::ConfigStore,
+    origin: u16,
+    units: u32,
+    holders: Option<inf_foundation::bounded::Cap>,
+    census: &Rc<CapCensus>,
+    nodes: &WaitNodes,
+) -> Result<FabricGate<OwnedOutcome>, inf_foundation::bounded::CapError> {
+    #[cfg(feature = "fault-points")]
+    if let Some(first) = config.gate_first_generation() {
+        return FabricGate::build_at_generation(origin, units, holders, census, nodes, first);
+    }
+    #[cfg(not(feature = "fault-points"))]
+    let _ = config;
+    FabricGate::build(origin, units, holders, census, nodes)
+}
+
+impl core::fmt::Display for PlaneBuildError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            // A refused seed is the boot's error, and its text is the
+            // refusal's `Debug`, which names the variant and its fields.
+            PlaneBuildError::Seed(refused) => write!(f, "{refused:?}"),
+            PlaneBuildError::Timers(refused) => write!(f, "{refused}"),
+            PlaneBuildError::Parked(refused) => write!(f, "a per-origin deque: {refused}"),
+            PlaneBuildError::Tasks(refused) => write!(f, "the plane's task classes: {refused}"),
+            PlaneBuildError::Executor(refused) => write!(f, "{refused}"),
+            PlaneBuildError::Assembly(refused) => write!(f, "{refused}"),
+            PlaneBuildError::Gate(refused) => write!(f, "the fabric gate: {refused}"),
+            PlaneBuildError::WaitNodes(refused) => write!(f, "the wait nodes: {refused}"),
+            PlaneBuildError::Waiters(refused) => write!(f, "{refused}"),
+        }
+    }
+}
+
+impl std::error::Error for PlaneBuildError {}
+
 impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, F> {
     /// `listener` must be a listening fd this plane's driver will own.
-    /// Returns the plane and its cell's serve mark: the cap census is built
-    /// here, once, with `cell`, and the host hands the mark to the cell's
-    /// loop, which takes it as its first iteration begins (ADR-0163 D2).
+    /// Returns the plane, its cell's serve mark, its cell's timer set and its
+    /// cell's executor, its plane-start pumps made (ADR-0177 D2):
+    /// the cap census is built here, once, with `cell`; then on it the
+    /// keyspace from `seed` ([`KeyspaceSeed::build`], its one builder), so
+    /// every capped store of the cell registers on that census; then the set
+    /// and the server's timer owners (`ServerTimers::build`, their one
+    /// constructor), before anything is written to `node`; the plane keeps
+    /// the owners. The host hands the mark and the set to the cell's loop,
+    /// which takes the mark as its first iteration begins (ADR-0163 D2,
+    /// ADR-0154 D1, ADR-0189 D4).
+    ///
+    /// # Errors
+    /// The seed's refusal, the timer assembly's or a per-origin deque's: no
+    /// plane, `node` unwritten, and what was built dropped while the census
+    /// assembles. The timer assembly's is derived never on a correct build
+    /// but for the allocator's refusal; a deque's, but for the allocator's
+    /// and a mesh past `FABRIC_CREDITS_PER_PEER_MAX` that no mesh check
+    /// passed.
     #[allow(clippy::too_many_arguments)] // construction-time wiring, not an API surface
-    #[allow(clippy::disallowed_types, reason = "container: E")]
     pub fn new(
         cell: CellId,
         cells: u16,
         listener: RawFd,
-        store: Keyspace,
+        seed: KeyspaceSeed,
         fabric: CellFabric,
         node: Rc<NodeInfo>,
+        admission: crate::ClientAdmission,
         observer: O,
         route_local_only: bool,
-    ) -> (ServerPlane<O, F>, ServeMark) {
+    ) -> Result<(ServerPlane<O, F>, ServeMark, TimerSet, CellExecutor), PlaneBuildError> {
+        let (census, serve_mark) = CapCensus::new(cell);
+        let share = node.config.borrow().boot_share(cells);
+        let caps = crate::limits::plane_task_caps(share, cells).map_err(PlaneBuildError::Tasks)?;
+        // `H` is checked against the key's index field before anything is built.
+        let holders = crate::limits::gate_holders(&caps, cells, fabric.data_credits())
+            .map_err(PlaneBuildError::Gate)?;
+        let mut layout = ExecutorLayout::new(&census);
+        let tasks =
+            PlaneTasks::register::<O, F>(&mut layout, &caps).map_err(PlaneBuildError::Tasks)?;
+        let mut executor = layout.build().map_err(PlaneBuildError::Executor)?;
+        // The cell's wait nodes, one for each task slot, before any wait list (ADR-0177 D5).
+        let node_cap = crate::limits::wait_nodes(&caps).map_err(PlaneBuildError::WaitNodes)?;
+        let wait_nodes = WaitNodes::build(node_cap, &census).map_err(PlaneBuildError::WaitNodes)?;
+        let store = seed.build(&census).map_err(PlaneBuildError::Seed)?;
+        let (timer_set, timers) = ServerTimers::build(&census).map_err(PlaneBuildError::Timers)?;
+        let parked = ParkedDeques::build(cell, cells, fabric.data_credits(), &census)
+            .map_err(PlaneBuildError::Parked)?;
+        let units = crate::limits::gate_units(&caps);
+        let gate = build_gate(&node.config.borrow(), cell.0, units, holders, &census, &wait_nodes)
+            .map_err(PlaneBuildError::Gate)?;
+        // The keyed lists, each key held from the build (ADR-0177 D5): the credit list's peers,
+        // and the one key the DDL and checkpoint pumps wait on.
+        let credit_keys = crate::limits::credit_waiter_keys(cells)
+            .map_err(|refused| PlaneBuildError::Waiters(inf_runtime::KeysRefused::Cap(refused)))?;
+        let peers = (0..cells).filter(|&peer| peer != cell.0).map(CellId);
+        // Canary: the credit list's build also holds the cell's own id.
+        #[cfg(inf_canary_credit_waiter_key_extra)]
+        let peers = peers.chain([cell]);
+        let credit_waiters = WaitList::keyed(&wait_nodes, credit_keys, &census, peers)
+            .map_err(PlaneBuildError::Waiters)?;
+        // Canary: the DDL list's build holds a second key.
+        #[cfg(inf_canary_ddl_waiter_key_extra)]
+        let ddl_keys_held = [0u8, 1];
+        #[cfg(not(inf_canary_ddl_waiter_key_extra))]
+        let ddl_keys_held = [0u8];
+        let ddl_keys = Some(crate::limits::DDL_WAITER_KEYS);
+        let ddl_waiters = WaitList::keyed(&wait_nodes, ddl_keys, &census, ddl_keys_held)
+            .map_err(PlaneBuildError::Waiters)?;
+        // Canary: the checkpoint list's build holds a second key.
+        #[cfg(inf_canary_ckpt_waiter_key_extra)]
+        let ckpt_keys_held = [0u8, 1];
+        #[cfg(not(inf_canary_ckpt_waiter_key_extra))]
+        let ckpt_keys_held = [0u8];
+        let ckpt_keys = Some(crate::limits::CKPT_WAITER_KEYS);
+        let ckpt_waiters = WaitList::keyed(&wait_nodes, ckpt_keys, &census, ckpt_keys_held)
+            .map_err(PlaneBuildError::Waiters)?;
+        let reader_waiters = WaitList::unit(&wait_nodes);
         node.cell.set(cell.0);
         node.cells.set(cells);
-        let (census, serve_mark) = CapCensus::new(cell);
         node.cap_census.replace(Some(Rc::clone(&census)));
         // ADR-0123 D5: the connection knobs before the first accept.
         let knobs = crate::config::conn_knobs(&node.config.borrow(), cells);
+        let (fabric, fan_reserve) = PlaneFabric::new(fabric);
+        let gated = Rc::new(GatedBook::new(parked.gated, Rc::clone(&node)));
         let plane = ServerPlane {
             shared: Rc::new(Shared {
                 cell,
@@ -705,13 +1088,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 store: RefCell::new(store),
                 fabric: RefCell::new(fabric),
                 conns: RefCell::new(ConnSlab::default()),
-                gate: FabricGate::new(),
-                credit_waiters: WaitList::new(),
+                gate: RefCell::new(gate),
+                wait_nodes,
+                credit_waiters,
                 observer: RefCell::new(observer),
                 node,
                 now: Cell::new(Nanos(0)),
-                rtt_ns: RefCell::new(LogHistogram::new()),
-                rtt_sent: RefCell::new(vec![VecDeque::new(); usize::from(cells)]),
                 reply_pool: RefCell::new(Vec::new()),
                 cmd_pool: RefCell::new(Vec::new()),
                 reply_pool_bytes: Cell::new(0),
@@ -724,20 +1106,27 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 adopted: RefCell::new(Vec::new()),
                 adopt_acks: RefCell::new(Vec::new()),
                 pubsub: RefCell::new(PubSubCell::new(cells)),
-                pub_queue: RefCell::new(VecDeque::new()),
-                pub_pump_active: Cell::new(false),
+                owner_pubs: RefCell::new(parked.owner_pubs),
+                pub_pump_parked: Cell::new(false),
+                fan_reserve: Cell::new(Some(fan_reserve)),
                 knobs: Cell::new(knobs),
                 parser_limits: Cell::new(ParserLimits::default()),
                 durable: RefCell::new(None),
                 census,
                 tier: RefCell::new(None),
-                ns_drop_releases: RefCell::new(Vec::new()),
-                ns_applies: RefCell::new((0..cells).map(|_| VecDeque::new()).collect::<Vec<_>>()),
-                ns_pump_active: RefCell::new(vec![false; usize::from(cells)]),
-                pump_gated: RefCell::new(VecDeque::new()),
+                ns_applies: RefCell::new(parked.ns_applies),
+                ns_pump_parked: RefCell::new(vec![false; usize::from(cells)]),
+                gated,
+                gated_pump_parked: Cell::new(false),
+                tasks,
+                peer_pumps: core::cell::OnceCell::new(),
+                inbox_takes: Cell::new(0),
+                reader_waiters,
+                reader_waiting: Cell::new(0),
+                mark_rearms: RefCell::new(Vec::new()),
                 control: RefCell::new(None),
-                ddl_waiters: WaitList::new(),
-                ckpt_waiters: WaitList::new(),
+                ddl_waiters,
+                ckpt_waiters,
                 ddl_epoch_seen: Cell::new(0),
                 ddl_gen_seen: Cell::new(0),
                 ckpt_quota: RefCell::new(None),
@@ -754,20 +1143,24 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 blind_overwrite_ceiling: Cell::new(false),
             }),
             listener,
+            admission,
             started: false,
             inbox: Vec::new(),
-            reply_scratch: Vec::new(),
+            reply_scratch: ReplyStream::new(Vec::new()),
             apply_stage: Vec::new(),
             apply_stage_bytes: Vec::new(),
             parse_stage: Vec::new(),
             parse_stage_bytes: Vec::new(),
             staged_replies: Vec::new(),
+            #[cfg(test)]
+            reverse_replies: false,
+            #[cfg(test)]
+            reversed_batch_max: 0,
             park_flags: None,
             expiry_lag: 0,
             // MAX forces one push on the first MAINTAIN (boot-time config).
             config_pushed: u64::MAX,
-            everysec_armed: false,
-            accept_retry_armed: false,
+            timers,
             tcp_transport: false,
             ckpt_epoch_seen: 0,
             early_fabric_flush: false,
@@ -779,7 +1172,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             stop: None,
             stop_checkpoint: true,
         };
-        (plane, serve_mark)
+        // Plane start (ADR-0177 D2): the peer pumps, in the cell's setup,
+        // before its loop exists; each parks at its first poll.
+        let peer_pumps = tasks::start_peer_pumps(&mut executor, &plane.shared)
+            .map_err(PlaneBuildError::Assembly)?;
+        let set = plane.shared.peer_pumps.set(peer_pumps);
+        debug_assert!(set.is_ok(), "plane start runs once");
+        Ok((plane, serve_mark, timer_set, executor))
     }
 
     /// Starts loop-resident boot recovery (M2-S15): the cell serves from
@@ -804,7 +1203,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.boot = Some(BootRecovery {
             // Loop-resident boots defer boot-metadata fsyncs into driver
             // barriers (M2.5-S01): ready never blocks on the device.
-            rec: Recovery::new(fs.clone(), cell_id, cfg, anchor, now).deferred_boot_sync(),
+            rec: Recovery::new(
+                fs.clone(),
+                cell_id,
+                cfg,
+                anchor,
+                now,
+                Rc::clone(&self.shared.census),
+            )
+            .deferred_boot_sync(),
             fs,
             cfg: cfg.clone(),
             cell_id,
@@ -885,17 +1292,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                         // (M4-S26; ADR-0057 D6): the flush pipeline
                         // resumes with the manifested catalog and the
                         // cold-read table inherits the boot-opened fds.
-                        if !recovered_tiers.is_empty() {
-                            let ks = self.shared.store.borrow();
-                            let mut tier = self.shared.tier.borrow_mut();
-                            let tier = tier.as_mut().expect("enable_durable built tier state");
-                            for rt in recovered_tiers {
-                                let spec = ks
-                                    .ns_get_by_id(rt.ns)
-                                    .and_then(|spec| spec.tier)
-                                    .expect("recovered namespace carries a tier block");
-                                tier.install_recovered(rt.ns, &spec, rt.flush, rt.files);
-                            }
+                        if let Err(err) = self.install_recovered_tiers(recovered_tiers) {
+                            self.boot_error = Some(err);
+                            return;
                         }
                         // Boot-metadata durability rides driver barriers at
                         // the head of the commit ledger (M2.5-S01): every
@@ -904,6 +1303,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                         // waiting on the device.
                         if let Some(cell) = self.shared.durable.borrow_mut().as_mut() {
                             cell.arm_boot_barriers(cx, barrier_dirs);
+                            // The durable plane exists from here: its tick
+                            // starts, once (ADR-0154 D4).
+                            cell.arm_everysec(cx);
                         }
                         self.shared
                             .node
@@ -927,6 +1329,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                         if let Some(board) = &self.loading_board {
                             let slot = board.slot(boot.cell_id);
                             slot.publish_tier_replay(stats.tier_replay);
+                            slot.publish_step_facts(stats.step);
                             slot.mark_ready(
                                 stats.ckpt_records + stats.records_applied,
                                 stats.torn_truncated_at,
@@ -950,14 +1353,54 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         }
     }
 
+    /// Installs every recovered tiered namespace's owner at the position the
+    /// node's directory names Declared for it (ADR-0148 D2, D5), before the
+    /// cell serves. The writer seeded the directory from the same catalog
+    /// the store recovered, so a refusal is a boot error, never a guess.
+    fn install_recovered_tiers(
+        &mut self,
+        recovered: Vec<crate::recover::RecoveredTierNs<F>>,
+    ) -> std::io::Result<()> {
+        if recovered.is_empty() {
+            return Ok(());
+        }
+        let ks = self.shared.store.borrow();
+        let mut tier = self.shared.tier.borrow_mut();
+        let tier = tier.as_mut().expect("enable_durable built tier state");
+        for rt in recovered {
+            let spec = ks
+                .ns_get_by_id(rt.ns)
+                .and_then(|spec| spec.tier)
+                .expect("recovered namespace carries a tier block");
+            let permit = tier.admit_install(rt.ns).map_err(|refused| {
+                std::io::Error::other(format!(
+                    "the recovered tiered namespace {} has no grant this cell can install \
+                     ({refused:?})",
+                    rt.ns.0
+                ))
+            })?;
+            tier.install_recovered(permit, &spec, rt.flush, rt.files);
+        }
+        Ok(())
+    }
+
     /// Enables the durable plane for this cell (M2-S08/S10/S11): the
     /// assembly runs recovery first (`recover::open_cell_log`) and hands
     /// the tail-opened rotor plus the recovered manifest here, before the
     /// loop starts. `cell_id` names the shard directory the checkpoint and
-    /// manifest drivers write under.
+    /// manifest drivers write under. `cfg` is the configuration `rotor` was
+    /// recovered under (`begin_recovery` stores that one value): the cell
+    /// builds its staging ring from `cfg.geometry`, and a frame the ring
+    /// seals fits the rotor's segment only because both come from that one
+    /// geometry (ADR-0191 D4).
+    ///
+    /// The durable plane takes the plane's three durable timer owners
+    /// (everysec, fill hold, group hold), which it holds for the cell's life.
     ///
     /// # Errors
-    /// Checkpoint-directory scan failure (boot-time listing).
+    /// Checkpoint-directory scan failure (boot-time listing), with the
+    /// owners handed back to the plane; a second enable, which no caller
+    /// makes, finds them taken.
     pub fn enable_durable(
         &mut self,
         fs: F,
@@ -966,14 +1409,34 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         rotor: SegmentRotor<F>,
         recovered: Option<crate::RecoveredManifest>,
     ) -> std::io::Result<()> {
+        let Some(owners) = self.timers.durable.take() else {
+            return Err(std::io::Error::other("the durable plane is enabled once"));
+        };
         let shard_dir = cfg.data_dir.join(format!("shard-{cell_id}"));
         let ckpt_dir = shard_dir.join("ckpt");
-        let ckpt = crate::ckpt::CkptCell::new(fs.clone(), ckpt_dir.clone(), cell_id, cfg.ckpt)?;
+        let ckpt = match crate::ckpt::CkptCell::new(fs.clone(), ckpt_dir.clone(), cell_id, cfg.ckpt)
+        {
+            Ok(ckpt) => ckpt,
+            Err(err) => {
+                self.timers.durable = Some(owners);
+                return Err(err);
+            }
+        };
+        // The cell's tiered grants (ADR-0148 D2): the node's directory and
+        // this cell's receipts, from the catalog writer's control plane; a
+        // cell with none installs no tiered owner.
+        let grants = self.shared.control.borrow().as_ref().and_then(|control| {
+            let receipts = control.take_tier_receipts(cell_id)?;
+            let directory = Arc::clone(control.tier_directory());
+            Some(crate::tier_cell::CellGrants::new(directory, receipts))
+        });
         *self.shared.tier.borrow_mut() = Some(crate::tier_cell::TierCell::new(
             fs.clone(),
             u32::from(cell_id),
             shard_dir.clone(),
             Rc::clone(&self.shared.census),
+            self.shared.wait_nodes.clone(),
+            grants,
         ));
         let manifest = crate::ckpt::ManifestCell::new(
             fs,
@@ -986,22 +1449,32 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 begin_lsn: m.begin_lsn,
             }),
         );
-        *self.shared.durable.borrow_mut() =
-            Some(DurableCell::new(cfg, rotor, ckpt, manifest, &self.shared.census));
+        let durable = DurableCell::new(
+            cfg,
+            rotor,
+            ckpt,
+            manifest,
+            &self.shared.census,
+            &self.shared.wait_nodes,
+            owners,
+        );
+        *self.shared.durable.borrow_mut() = Some(durable);
         Ok(())
     }
 
-    /// The tiered MAINTAIN half (M4-S26): reconcile the namespace set,
-    /// run the per-namespace drivers (demote → the round's advance →
-    /// release, admission cadence, extent reclaim, retirement unlink),
-    /// then the cell's one turn (the plan pass and the issue pass, which
-    /// offer the round's groups to the device budget — ADR-0178 D3's
-    /// tier row), spawn compaction read chains, tear down dropped
-    /// namespaces, and drain queued cold-read intents into
+    /// The tiered MAINTAIN half (M4-S26): the directory pass (a receipt
+    /// for each grant Retiring that this cell never held, ADR-0148 D3), the
+    /// per-namespace drivers of every Live owner (demote → the round's
+    /// advance → release, admission cadence, extent reclaim, retirement
+    /// unlink), then the cell's one turn (the plan pass and the issue pass,
+    /// which offer the round's groups to the device budget — ADR-0178 D3's
+    /// tier row), spawn compaction read chains, drain the dropped
+    /// namespaces' owners, and drain queued cold-read intents into
     /// `IoOp::TierRead`s — once per reactor iteration (the S10 admission
     /// rule). Zero-cost when no tiered namespace was ever created: one
     /// `None` check.
     fn tier_maintain(&mut self, cx: &mut LoopCx<'_>) {
+        use crate::tier_cell::TaskRoom;
         /// The plane's flush admission: a short borrow of the durable
         /// cell per offer (the tier borrow is held by the caller; the
         /// durable cell is not — no nested `RefCell` conflict). Every
@@ -1018,44 +1491,53 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 }
             }
         }
-        let mut compact_reads: Vec<crate::tier_cell::CompactRead> = Vec::new();
-        let mut shadow_reads: Vec<(NsId, inf_store::ShadowRead)> = Vec::new();
+        let compact_reads: Vec<crate::tier_cell::CompactRead>;
+        let shadow_reads: Vec<(NsId, inf_store::ShadowRead)>;
+        // ADR-0177 D2: a read is taken only by spending a slot of its class's
+        // room, read once a pass, so no namespace is marked in flight with
+        // none to run it; a namespace the room cannot serve is counted.
+        let waits = &self.shared.node.tier_maint_task_waits;
+        let mut compact_room = TaskRoom::new(self.shared.tasks.compact_room(cx.executor), waits);
+        let mut shadow_room = TaskRoom::new(self.shared.tasks.shadow_room(cx.executor), waits);
         let mut flush_ops: Vec<IoOp> = Vec::new();
         let cold = {
             let mut tier_slot = self.shared.tier.borrow_mut();
             let Some(tier) = tier_slot.as_mut() else { return };
-            tier.sync_namespaces(
-                &self.shared.store.borrow(),
-                &mut self.shared.ns_drop_releases.borrow_mut(),
-            );
-            if tier.namespaces.is_empty() && tier.cold.is_none() {
+            tier.directory_pass();
+            if tier.positions_held() == 0 && tier.cold.is_none() {
                 return;
             }
+            // F3: a cell's store holds a tiered table iff its position is
+            // Live with that id; both change in one step of each apply.
+            debug_assert!(
+                {
+                    let ks = self.shared.store.borrow();
+                    let tables = ks.ns_iter().filter(|spec| spec.tier.is_some()).count();
+                    tables == tier.live_count()
+                        && tier.live().all(|t| ks.tiered_store(t.ns).is_some())
+                },
+                "a tiered table without its Live owner, or an owner without its table"
+            );
             // The durable plane is read, never borrowed mutably, while the
             // namespaces' drivers run: each tick of the reclaim marks reads
             // its staged seq, its watermark and ack classes in this step.
             let durable = self.shared.durable.borrow();
             let transition_idle = durable.as_ref().is_some_and(DurableCell::ckpt_transition_idle);
             let mut ks = self.shared.store.borrow_mut();
-            let mut units = 0u32;
-            let mut fatal: Option<String> = None;
             let now_us = cx.now.as_micros();
-            for at in 0..tier.namespaces.len() {
-                match tier.maintain_ns(&mut ks, at, durable.as_ref(), transition_idle, now_us) {
-                    Ok((used, work)) => {
-                        units += used;
-                        compact_reads.extend(work);
-                    }
-                    // A tier fsync failure is fatal: fsync failure is
-                    // fail-stop (ADR-0056 D4).
-                    Err(err) if err.is_fatal() => {
-                        fatal = Some(err.to_string());
-                        break;
-                    }
-                    Err(_) => {}
-                }
-            }
+            let pass = tier.maintain_pass(
+                &mut ks,
+                durable.as_ref(),
+                transition_idle,
+                now_us,
+                &mut compact_room,
+            );
             drop(durable);
+            let mut units = pass.units;
+            compact_reads = pass.reads;
+            // A tier fsync failure is fatal: fsync failure is fail-stop
+            // (ADR-0056 D4).
+            let mut fatal = pass.fatal.map(|err| err.to_string());
             // ADR-0178 D3: the cell's turn offers each ready group to the
             // durable cell's device budget at its exact device size (the
             // tier cell has no budget of its own — one owner per fact).
@@ -1075,18 +1557,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // M4.5-S37 (ADR-0093 D4): the shadow reconciler's reads —
             // oldest winner first, bounded per table, Foreground once
             // the pinned suffix crosses half its cap.
-            for t in &tier.namespaces {
-                if let Some(table) = ks.tiered_store_mut(t.ns) {
-                    let reads = table.shadow_work(inf_store::SHADOW_READS_IN_FLIGHT);
-                    shadow_reads.extend(reads.into_iter().map(|read| (t.ns, read)));
-                }
-            }
+            shadow_reads = tier.shadow_pass(&mut ks, &mut shadow_room);
             // ADR-0100 D5: a dropped namespace's files unlink only once
             // the catalog swap carrying the drop is durable.
             let control = self.shared.control.borrow().clone();
-            units += tier.maintain_teardown(|epoch| {
-                control.as_ref().is_none_or(|control| control.persisted(epoch))
-            });
+            let durable = self.shared.durable.borrow();
+            units += tier.maintain_draining(
+                |epoch| control.as_ref().is_none_or(|control| control.persisted(epoch)),
+                |fence| durable.as_ref().is_none_or(|cell| cell.commit.settled_through(fence)),
+            );
+            drop(durable);
             if units > 0 {
                 cx.charge(GroupClass::Maintenance, units);
             }
@@ -1098,11 +1578,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             }
             // Reactor-drive flush observables (M4.5-S31, ADR-0084 D6).
             let stats = &tier.flush_stats;
-            let files_sealed: u64 =
-                tier.namespaces.iter().map(|t| t.flush.sealed().len() as u64).sum();
+            let files_sealed: u64 = tier.live().map(|t| t.flush.sealed().len() as u64).sum();
             let mut gauges = [0u64; TIER_FLUSH_GAUGES];
-            let files_active =
-                tier.namespaces.iter().filter(|t| t.flush.active().is_some()).count() as u64;
+            let files_active = tier.live().filter(|t| t.flush.active().is_some()).count() as u64;
             for (slot, value) in [
                 (TierFlushGauge::Rounds, stats.rounds),
                 (TierFlushGauge::WriteRetries, stats.write_retries),
@@ -1118,10 +1596,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 (TierFlushGauge::PlanWaits, stats.plan_waits),
                 (TierFlushGauge::TurnContended, stats.turn_contended),
                 (TierFlushGauge::RoundsPlanned, stats.rounds_planned),
+                (TierFlushGauge::FileIdsExhausted, stats.file_ids_exhausted),
             ] {
                 gauges[slot as usize] = value;
             }
             self.shared.node.tier_flush.set(gauges);
+            let (capacity, written) = tier.window_bytes();
+            self.shared.node.tier_window_capacity_bytes.set(capacity);
+            self.shared.node.tier_window_written_bytes.set(written);
+            self.shared.node.tier_ns_positions.set(tier.positions_held());
+            self.shared.node.tier_position_conflicts.set(tier.position_conflicts());
             tier.cold.clone()
         };
         // Reactor-drive flush ops (M4.5-S31): pushed outside the tier
@@ -1130,13 +1614,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         for op in flush_ops {
             cx.push(op);
         }
+        // Each read was taken by spending a slot of its room, read in this
+        // step with nothing else reserving either class: each spawn meets a
+        // slot (ADR-0177 D2).
         for read in compact_reads {
-            let shared = Rc::clone(&self.shared);
-            let _ = cx.executor.poll_immediate(compact_pump(shared, read));
+            if !tasks::spawn_compact(cx.executor, &self.shared, read) {
+                unreachable!("MAINTAIN spawns a read only for a slot its room spent");
+            }
         }
         for (ns, read) in shadow_reads {
-            let shared = Rc::clone(&self.shared);
-            let _ = cx.executor.poll_immediate(shadow_pump(shared, ns, read));
+            if !tasks::spawn_shadow(cx.executor, &self.shared, ns, read) {
+                unreachable!("MAINTAIN spawns a read only for a slot its room spent");
+            }
         }
         // Extent-seal fdatasyncs (ADR-0061 D3): each barrier is in the
         // ledger and its extent-seal window entry; the op rides the driver
@@ -1207,6 +1696,23 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 counters.pool_dry,
                 counters.queue_full,
             ]);
+            let (members, windows) = cold.delivery_pending();
+            let mut gauges = [0u64; COLD_GAUGES];
+            for (slot, value) in [
+                (ColdGauge::DeliveryWork, counters.delivery_work),
+                (ColdGauge::DeliveryWorkTurnMax, u64::from(counters.delivery_work_turn_max)),
+                (ColdGauge::DeliveryPendingMembers, members),
+                (ColdGauge::DeliveryPendingWindows, windows),
+                (ColdGauge::DeliveryDelayP99Us, cold.delivery_delay_percentile_us(99.0)),
+                (ColdGauge::ReceiptsForeign, counters.receipts_foreign),
+                (ColdGauge::LinksStale, counters.links_stale),
+                (ColdGauge::IdentityExhausted, cold.identity_refusals()),
+                (ColdGauge::IdentityPairsUsed, cold.identity_pairs_used()),
+                (ColdGauge::GateFull, cold.cold_gate_full()),
+            ] {
+                gauges[slot as usize] = value;
+            }
+            self.shared.node.cold.set(gauges);
         }
     }
 
@@ -1241,6 +1747,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             return Err(IssuerRefused { plane, mismatch, issuer });
         }
         *self.shared.node.memory_board.borrow_mut() = Some(Arc::clone(control.memory_board()));
+        *self.shared.node.ddl_gauges.borrow_mut() = Some(Arc::clone(control.ddl_gauges()));
         *self.shared.control.borrow_mut() = Some(control);
         *self.shared.ckpt_quota.borrow_mut() = Some(issuer.quota);
         self.final_credit = Some(issuer.final_credit);
@@ -1273,6 +1780,21 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// between scheduler steps.
     pub fn ckpt_waiters_for_sim(&self) -> usize {
         self.shared.ckpt_waiters.waiting()
+    }
+
+    /// Waits parked on this cell's durability watermark (`always` acks; 0
+    /// on a cell with no durable plane), for the simulator's loop-tier
+    /// tests: used only between scheduler steps.
+    pub fn ack_waiters_for_sim(&self) -> usize {
+        self.shared.durable.borrow().as_ref().map_or(0, |cell| cell.ack_gate.waiting())
+    }
+
+    /// Cold-read members this cell's turns have yet to visit (its cold
+    /// host's pending delivery; 0 on a cell with no cold host), for the
+    /// simulator's park test: used only between scheduler steps.
+    pub fn cold_pending_for_sim(&self) -> u64 {
+        let tier = self.shared.tier.borrow();
+        tier.as_ref().and_then(|t| t.cold.as_ref()).map_or(0, |cold| cold.delivery_pending().0)
     }
 
     /// Wires this plane's slot of the doorbell-wakeup park board (the same
@@ -1318,7 +1840,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         }
         let mut fabric = shared.fabric.borrow_mut();
         let token = fabric.next_token();
-        if fabric.send(to, &Op::AdoptConn { token, fd }).is_err() {
+        // A general send: a refusal, the reserve's included, keeps the
+        // socket local, as a peer without credit always did.
+        if fabric.stage_general(to, &PointOp::adopt_conn(token, fd)).is_err() {
             return false;
         }
         shared.adopt_acks.borrow_mut().push(token.0);
@@ -1357,9 +1881,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             return;
         }
         let ns = self.conn_default_ns();
-        let inserted = self.shared.conns.borrow_mut().insert(Conn {
-            fd,
-            parser: ConnParser::new(self.shared.parser_limits.get()),
+        let parser_limits = self.shared.parser_limits.get();
+        let node = Rc::clone(&self.shared.node);
+        let now_ms = cx.now.as_millis();
+        let inserted = tasks::admit_conn(cx.executor, &self.shared, |pump| Conn {
             cx: ConnCx {
                 proto: Protocol::Resp2,
                 id: 0,
@@ -1368,27 +1893,32 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 ns,
                 sub_channels: Vec::new(),
                 sub_patterns: Vec::new(),
-                node: Rc::clone(&self.shared.node),
+                node,
                 close_requested: Cell::new(false),
             },
-            out: Vec::new(),
-            send_inflight: false,
-            closing: false,
-            close_after_flush: false,
-            pump_active: false,
             queue: VecDeque::new(),
-            recv_disarmed: false,
-            rearm_recv: false,
-            cob_soft_since_ms: 0,
-            cob_kill_sent: false,
-            last_active_ms: cx.now.as_millis(),
+            pump,
+            pump_parked: false,
             publish_seq: 0,
-            self_push: Vec::new(),
+            slot: ConnSlot::Active {
+                link: Link::new(fd, now_ms),
+                parser: ConnParser::new(parser_limits),
+                recv: RecvArm::Armed,
+            },
+            #[cfg(inf_canary_closing_slot_sends)]
+            closing_fd: None,
+            #[cfg(inf_canary_mark_applied_late)]
+            late_mark: false,
+            #[cfg(inf_canary_registry_dropped_at_closed)]
+            closed_notes: None,
+            #[cfg(inf_canary_conn_owner_lost)]
+            owner_lost: false,
         });
         let Some(key) = inserted else {
             // Admission bound (batch 12): the slab is full below
-            // the token slot width — the same refusal as the
-            // `maxclients` share.
+            // the token slot width, or the `conn` class is full (a closed
+            // connection's pump still ending holds its task) — the same
+            // refusal as the `maxclients` share.
             self.refuse_accept(cx, fd);
             return;
         };
@@ -1409,9 +1939,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         node.total_connections.set(node.total_connections.get() + 1);
         // Peer address capture is a recorded deviation (CLIENT LIST
         // placeholder) until the accept path carries peernames.
-        node.clients.borrow_mut().register(
+        self.admission.register(
             id,
-            key.packed(),
+            Some(key.packed()),
             "0.0.0.0:0".to_string(),
             cx.now.as_millis(),
         );
@@ -1467,6 +1997,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 finish: false,
                 checkpoint,
                 final_sync_requested: false,
+                hold: None,
             });
         }
     }
@@ -1487,6 +2018,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.stop.as_ref().map_or(StopPhase::Serving, |s| s.phase)
     }
 
+    /// What the cell's stop waits on, as its last drain step named it
+    /// (ADR-0199 D3); `None` while serving, before the first step and once
+    /// `Drained`.
+    #[must_use]
+    pub fn stop_hold(&self) -> Option<StopHold> {
+        self.stop.as_ref().and_then(|s| s.hold)
+    }
+
     /// Whether a stop takes a checkpoint before its final sync (on by
     /// default — the next boot then replays nothing; `infinityd
     /// --shutdown-checkpoint off`).
@@ -1495,36 +2034,59 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 
     /// One MAINTAIN step of the drain (ADR-0124 D2). Returns without
-    /// touching anything while serving.
+    /// touching anything while serving; records the wait a step returns
+    /// from, and `Drained` once none is left.
     fn drive_stop(&mut self) {
         let Some(stop) = self.stop.as_mut() else { return };
         if stop.phase == StopPhase::Drained {
             return;
         }
+        match Self::drain_step(stop, &self.shared, self.stop_checkpoint) {
+            Ok(()) => {
+                stop.phase = StopPhase::Drained;
+                stop.hold = None;
+            }
+            Err(hold) => stop.hold = Some(hold),
+        }
+    }
+
+    /// The drain's steps in order (ADR-0124 D2), each wait named by the
+    /// hold it returns (ADR-0199 D3); `Ok` once nothing is left to wait on.
+    fn drain_step(
+        stop: &mut StopDrive,
+        shared: &Shared<O, F>,
+        stop_checkpoint: bool,
+    ) -> Result<(), StopHold> {
         // Step 2: connections flush and close (QUIT's path — bytes read
-        // after the mark are dropped; a command in flight finishes).
+        // after the mark are dropped; a command in flight finishes). The
+        // stop's one walk marks every slot: an active one flushes, and a
+        // `Peer` parser of any other state ends, so what is parsed and
+        // queued runs and what is not yet parsed is released (ADR-0196
+        // A1.1).
         if !stop.conns_marked {
             stop.conns_marked = true;
-            self.shared.conns.borrow_mut().for_each_mut(|conn| conn.close_after_flush = true);
+            Self::mark_every_slot(shared);
         }
-        if self.shared.conns.borrow().live > 0 {
-            return;
+        // A draining slot's pump still running its queue or shipping its
+        // 1→0 deltas sends fabric ops; its slot stays occupied until the
+        // pump returns, so it ends before the node-wide barrier too.
+        let live = shared.conns.borrow().live;
+        if live > 0 {
+            return Err(StopHold::Connections { live });
         }
         stop.phase = StopPhase::Quiet;
         if !stop.finish {
-            return;
+            return Err(StopHold::NodeQuiet);
         }
         // Steps 3–4: a durable cell publishes its stop checkpoint, then
         // its final sync lands. A cell still in boot recovery has no
         // durable plane yet: it acked nothing, and its disk is the
         // previous life's — Drained.
-        let mut durable = self.shared.durable.borrow_mut();
+        let mut durable = shared.durable.borrow_mut();
         if let Some(cell) = durable.as_mut() {
-            let control = self.shared.control.borrow();
-            if self.stop_checkpoint
-                && let Some(control) = control.as_ref()
-            {
-                let me = self.shared.cell.0;
+            let control = shared.control.borrow();
+            if stop_checkpoint && let Some(control) = control.as_ref() {
+                let me = shared.cell.0;
                 // ADR-0159 D3: the final credit issues once, after the
                 // all-cells-Quiet barrier, even past ordinary exhaustion.
                 // `set_control` accepted only this cell's credit, so it
@@ -1537,29 +2099,90 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 if let StopCheckpoint::Requested(epoch) = stop.checkpoint
                     && control.ckpt_board().slot(me).published() < epoch.get()
                 {
-                    return;
+                    return Err(StopHold::StopCheckpoint { epoch: epoch.get() });
                 }
             }
             if !stop.final_sync_requested {
                 stop.final_sync_requested = true;
                 cell.request_final_sync();
-                return;
+                return Err(StopHold::FinalSyncRequested);
             }
-            if !cell.quiescent() {
-                return;
+            cell.quiescent().map_err(StopHold::Durable)?;
+        }
+        Ok(())
+    }
+
+    /// The stop's mark of every occupied slot (ADR-0124 D2, ADR-0196 A1.1).
+    fn mark_every_slot(shared: &Shared<O, F>) {
+        let mut rearms = shared.mark_rearms.borrow_mut();
+        let mut conns = shared.conns.borrow_mut();
+        let ConnSlab { slots, gens, .. } = &mut *conns;
+        for (slot, entry) in slots.iter_mut().enumerate() {
+            let Some(conn) = entry.as_mut() else { continue };
+            // Canary: the stop's mark reaches active slots alone, so a
+            // `Peer` parser keeps its held bytes past the stop.
+            #[cfg(inf_canary_stop_skips_peer_reader)]
+            if !matches!(conn.slot, ConnSlot::Active { .. }) {
+                continue;
+            }
+            if conn.mark() {
+                rearms.push(ConnKey { slot: slot as u32, generation: gens[slot] });
             }
         }
-        stop.phase = StopPhase::Drained;
     }
 
     pub fn connections(&self) -> usize {
         self.shared.conns.borrow().live
     }
 
+    /// Takes of fabric holders past the key's generation field: the
+    /// near-wrap leg's engagement (`fault-points` only).
+    #[cfg(feature = "fault-points")]
+    pub fn gate_wrapped_takes(&self) -> u64 {
+        self.shared.gate.borrow().wrapped_takes()
+    }
+
+    /// First polls that found the cell's wait pool empty or their list
+    /// without their key (`wait_nodes_full`): derived never (ADR-0177 D5).
+    pub fn wait_nodes_full(&self) -> u64 {
+        self.shared.wait_nodes.full()
+    }
+
+    /// The fabric gate's reserves that found every holder taken
+    /// (`gate_full`): derived never (ADR-0177 D4, E7).
+    pub fn gate_full(&self) -> u64 {
+        self.shared.gate.borrow().full()
+    }
+
+    /// The cold gate's requests refused for no free route or holder
+    /// (`cold_gate_full`): derived never while its cap is its product
+    /// (ADR-0177 D4); 0 on a cell with no cold engine. Not the fabric gate's
+    /// `gate_full`.
+    pub fn cold_gate_full(&self) -> u64 {
+        let tier = self.shared.tier.borrow();
+        tier.as_ref().and_then(|tier| tier.cold.as_ref()).map_or(0, |cold| cold.cold_gate_full())
+    }
+
+    /// The fabric gate's completions for no holder that awaits one
+    /// (`gate_stale`): derived never (ADR-0177 D4, E8).
+    pub fn gate_stale(&self) -> u64 {
+        self.shared.gate.borrow().stale()
+    }
+
+    /// O1's two owners (ADR-0177 D2): the `conn` tasks `executor`, this
+    /// cell's, holds and how many of them are Retired, and the occupied
+    /// connection slots, with the class's slots `C` that bound both. A
+    /// connection's slot vacates as its pump returns, so the tasks alive
+    /// equal the slots at every step; the simulator judges it.
+    pub fn conn_owners(&self, executor: &CellExecutor) -> ConnOwners {
+        let (held, retired, share) = self.shared.tasks.conn_tasks(executor);
+        ConnOwners { held, retired, slots: self.connections(), share }
+    }
+
     /// Outstanding async work: pending fabric replies + credit waiters.
     /// Quiescence (sim) means zero.
     pub fn suspended(&self) -> usize {
-        self.shared.gate.pending() + self.shared.credit_waiters.waiting()
+        self.shared.gate.borrow().holders() + self.shared.credit_waiters.waiting()
     }
 
     /// This cell's fabric counters (the DST's drain-fairness oracle,
@@ -1680,11 +2303,29 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         extract_keys(meta, argv).any(|key| !self.shared.router.is_local(key, self.shared.cell))
     }
 
-    fn initiate_close(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
-        if let Some(fd) = self.shared.with_conn(key, |conn| {
-            conn.closing = true;
-            conn.fd
-        }) {
+    /// The plane's immediate close of `key` (`timeout`, the `CLIENT KILL`
+    /// sweep): an active or flushing slot's one `Close` goes out. A slot
+    /// already closing holds no descriptor, so nothing can close it twice.
+    fn close_at_once(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
+        let fd = self.shared.with_conn(key, Conn::close_at_once).flatten();
+        self.push_close(cx, key, fd);
+    }
+
+    /// The peer of `key` is gone (a receive or send error): the slot's one
+    /// `Close` goes out, its `Peer` parser kept for the entries reaped
+    /// before the error.
+    fn peer_gone(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
+        let takes = self.shared.inbox_takes.get();
+        let fd = self.shared.with_conn(key, |conn| conn.peer_gone(takes)).flatten();
+        self.push_close(cx, key, fd);
+    }
+
+    /// Pushes the `Close` of the descriptor a transition to `Closing` gave.
+    fn push_close(&self, cx: &mut LoopCx<'_>, key: ConnKey, fd: Option<RawFd>) {
+        if let Some(fd) = fd {
+            // Canary: the closing slot keeps a copy of its descriptor.
+            #[cfg(inf_canary_closing_slot_sends)]
+            self.shared.with_conn(key, |conn| conn.closing_fd = Some(fd));
             cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, key) });
         }
     }
@@ -1735,11 +2376,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let refused = ConnKey { slot: CONN_SLOT_CAP, generation: 0 };
         cx.push(IoOp::Close { fd, token: Self::token(TokenClass::Close, refused) });
     }
+}
 
-    /// Spawn the per-connection windowed pump with its first command.
-    fn spawn_pump(&self, cx: &mut LoopCx<'_>, key: ConnKey, first: OwnedCmd) {
-        let shared = Rc::clone(&self.shared);
-        let _ = cx.executor.poll_immediate(pump(shared, key, first));
+impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Drop for ServerPlane<O, F> {
+    /// The cell stops here: the census is marked `Stopping` before the
+    /// plane's fields drop, so every container of its `Shared` drops after
+    /// the mark (at the plane's last `Rc` or at the last future in the
+    /// loop's executor that holds one). The cell's loop marks it too, in its
+    /// own `Drop`; the mark is idempotent, so the order between the two is
+    /// no one's.
+    fn drop(&mut self) {
+        self.shared.census.mark_stopping();
     }
 }
 
@@ -1785,3 +2432,27 @@ mod conn_default_tests {
 #[cfg(test)]
 #[path = "move_tests.rs"]
 mod move_tests;
+
+#[cfg(test)]
+#[path = "reply_outcome_tests.rs"]
+mod reply_outcome_tests;
+
+#[cfg(test)]
+#[path = "close_tests.rs"]
+mod close_tests;
+
+#[cfg(test)]
+#[path = "stop_tests.rs"]
+mod stop_tests;
+
+#[cfg(test)]
+#[path = "wire_rig.rs"]
+mod wire_rig;
+
+#[cfg(test)]
+#[path = "capacity_tests.rs"]
+mod capacity_tests;
+
+#[cfg(test)]
+#[path = "window_tests.rs"]
+mod window_tests;

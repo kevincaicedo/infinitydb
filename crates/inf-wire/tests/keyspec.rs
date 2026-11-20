@@ -189,16 +189,64 @@ fn arity_validation_matches_redis_convention() {
     assert!(arity_ok(del, 12));
 }
 
-proptest! {
-    /// Random byte strings must never false-positive into a command (the
-    /// verify word-compare in the perfect hash).
-    #[test]
-    fn random_names_do_not_false_positive(name in proptest::collection::vec(any::<u8>(), 0..12)) {
-        if let Some(meta) = lookup(&name) {
-            // The only way to resolve is to actually be the command name,
-            // case-insensitively.
-            prop_assert!(name.eq_ignore_ascii_case(meta.name.as_bytes()));
+/// The rule `lookup` serves, as the standard library states it: the
+/// registry row whose name equals the input under ASCII case folding.
+fn oracle(input: &[u8]) -> Option<CommandId> {
+    COMMANDS.iter().find(|m| m.name.as_bytes().eq_ignore_ascii_case(input)).map(|m| m.id)
+}
+
+/// One edit of a spelling, at a position taken modulo its length.
+#[derive(Clone, Copy, Debug)]
+enum Edit {
+    Set(usize, u8),
+    Insert(usize, u8),
+    Delete(usize),
+    FlipBit5(usize),
+}
+
+fn edit() -> impl Strategy<Value = Edit> {
+    prop_oneof![
+        (any::<usize>(), any::<u8>()).prop_map(|(at, byte)| Edit::Set(at, byte)),
+        (any::<usize>(), any::<u8>()).prop_map(|(at, byte)| Edit::Insert(at, byte)),
+        any::<usize>().prop_map(Edit::Delete),
+        any::<usize>().prop_map(Edit::FlipBit5),
+    ]
+}
+
+fn apply(name: &str, edits: &[Edit]) -> Vec<u8> {
+    let mut bytes = name.as_bytes().to_vec();
+    for edit in edits {
+        let len = bytes.len();
+        match *edit {
+            Edit::Insert(at, byte) => bytes.insert(at % (len + 1), byte),
+            Edit::Set(at, byte) if len > 0 => bytes[at % len] = byte,
+            Edit::Delete(at) if len > 0 => {
+                bytes.remove(at % len);
+            }
+            Edit::FlipBit5(at) if len > 0 => bytes[at % len] ^= 0x20,
+            Edit::Set(..) | Edit::Delete(_) | Edit::FlipBit5(_) => {}
         }
+    }
+    bytes
+}
+
+/// Random bytes up to one past the longest name a lookup reads, and
+/// registry names with one or two random edits.
+fn spelling() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        proptest::collection::vec(any::<u8>(), 0..=17),
+        (0..COMMANDS.len(), proptest::collection::vec(edit(), 1..=2))
+            .prop_map(|(row, edits)| apply(COMMANDS[row].name, &edits)),
+    ]
+}
+
+proptest! {
+    /// `lookup` resolves exactly a registry name under ASCII letter
+    /// folding: it answers every spelling as the standard library's compare
+    /// against the registry does, `Some` and `None` alike.
+    #[test]
+    fn lookup_agrees_with_the_oracle_on_random_bytes(input in spelling()) {
+        prop_assert_eq!(lookup(&input).map(|m| m.id), oracle(&input));
     }
 }
 

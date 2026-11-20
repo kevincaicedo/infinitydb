@@ -3,6 +3,8 @@
 //! limit on everything"). Bounds older than this module still live
 //! beside their code; a new one lands here.
 
+use inf_foundation::bounded::{Cap, CapFill};
+
 /// Control groups (16 slots each) one alias enumeration may **load**
 /// (ADR-0139 D9). Charged by the traversal when it reads a group's
 /// control bytes, fragment match or not: a chain that ends in its 32nd
@@ -55,6 +57,36 @@ pub const SETTLE_READ_CHARGE_BYTES: u64 = 128 << 10;
 /// walks (ADR-0174 R10): one budget byte, a byte of the RAM window
 /// the walk passes. Owner and crossing: as [`SETTLE_READ_CHARGE_BYTES`].
 pub const SETTLE_WALK_BYTE_CHARGE: u64 = 1;
+
+/// The recovery step budget's price (ADR-0174 A1) of one RAM unit of boot
+/// work outside the record walk: one checkpoint entry's apply beside its
+/// bytes (a ref's pair probe, insert and live-set probe), one listed
+/// address the end of the checkpoint releases (a probe and a death), one
+/// parked death the hand-over stamps or extent id it seeds, one listed name
+/// the start step's tier map handles (its manifest search, an append), or
+/// one catalog file its build adds to the table and the pipeline — at
+/// most five ordered-map or index operations and no scan. 64 budget bytes,
+/// a few cache misses' worth beside the byte prices: an estimate the
+/// reference-box run calibrates, never a measurement. Owner: the recovery
+/// driver, which charges it per unit and hands a unit's handler the number
+/// its budget left buys, at least one. Crossing: the step yields once its
+/// charge reaches the budget, at the next unit, and the next step resumes
+/// at its cursor.
+pub const RECOVER_PROBE_CHARGE_BYTES: u64 = 64;
+
+/// The recovery step budget's price (ADR-0174 A1) of one probe group the
+/// boot's ticket rebuild scans (ADR-0093 A4′): the group's bytes — sixteen
+/// control bytes, sixteen 8-byte slots and their 8-byte hashes, 272 — at the
+/// walked-byte price, beside the classification of its cold slots, a probe
+/// chain each and no scan. Owner: the recovery driver, which charges it per
+/// group and hands the rebuild the number its budget left buys, at least
+/// one. Crossing: the step yields once its charge reaches the budget, at the
+/// next group or returned slot, and the next step resumes at the rebuild's
+/// own cursor.
+pub const REBUILD_GROUP_CHARGE_BYTES: u64 =
+    crate::index::Index::<crate::index::TieredMode>::GROUP_BYTES as u64 * SETTLE_WALK_BYTE_CHARGE;
+
+const _: () = assert!(REBUILD_GROUP_CHARGE_BYTES == 272, "a tiered probe group is 272 bytes");
 
 /// Wheel nodes one store may hold (ADR-0008 A1 rule 7): the node's
 /// `next` link is 24 bits and `NIL` (2²⁴ − 1) is reserved, so node indices
@@ -128,3 +160,43 @@ const _: () = assert!(DOC_IDOC_BYTES_MAX <= inf_log::DOC_VERSION_MASK as usize);
 // The record clamp only ever lowers the format ceiling.
 #[cfg(feature = "doc")]
 const _: () = assert!(DOC_BODY_BYTES_MAX <= inf_doc::limits::DOC_BYTES_MAX);
+
+/// Ids one chunk of a boot id list holds (ADR-0174 A1): the tier map's two
+/// extent-id lists, the hand-over's revive list and the end of the
+/// checkpoint's release list, 32 KiB a chunk. Owner: `IdChunks`, whose
+/// chunk table grows by doubling at 24 B a chunk. Crossing: a full chunk
+/// ends and the next push starts a new one, so no push copies the ids
+/// already listed (INF: the table is 59 KiB at 10⁷ ids).
+pub const ID_CHUNK_IDS: usize = 4096;
+
+/// Seal marks one tiered table holds: the record starts its ro-boundary may
+/// seal to (ADR-0053 D2), the first record placed in each stride bucket of
+/// commit pages between the boundary and the tail. The stride is fixed at the
+/// table's construction so that the ring's buckets are at most half this cap
+/// (a ring past 4,096 pages strides by pages), so the window holds at most
+/// half the cap and one more. Owner: the table's seal marks, one deque per
+/// tiered table per cell, built with the table. Crossing: coalesce — at the
+/// cap the back mark takes the new start, so a seal step's landing points
+/// coarsen; each such merge counts as the row's crossing in `INFO caps`, and
+/// none occurs while the stride holds.
+pub const SEAL_MARKS_MAX: u32 = 8192;
+
+/// The seal marks' cap: `SEAL_MARKS_MAX` record starts under the census name
+/// `seal-marks`, filled while the cell serves.
+pub const SEAL_MARKS: Cap = Cap::entries::<SEAL_MARKS_MAX>("seal-marks", CapFill::Serving);
+
+/// Sealed-dead intervals one address space holds before `flushed` passes
+/// them (ADR-0052 D2, ADR-0174 D2 rule 6): ring-top holes and tail pads. The
+/// window crosses at most one interior ring multiple, plus one in transition,
+/// plus one page pad, which `flushed` passes before its record applies; two
+/// are reached. Owner: the table's address space, one deque built with it.
+/// Crossing: pace — a placement that would push a mark while the deque is
+/// full is refused before any mutation, and its wait target is the front
+/// hole's end, the `flushed` value that pops it: a live writer parks on the
+/// tail stall, and boot replay demotes to that address. Each refused ask
+/// counts as the row's crossing in `INFO caps`.
+pub const HOLE_MARKS_MAX: u32 = 3;
+
+/// The hole marks' cap: `HOLE_MARKS_MAX` intervals under the census name
+/// `hole-marks`, filled while the cell serves.
+pub const HOLE_MARKS: Cap = Cap::entries::<HOLE_MARKS_MAX>("hole-marks", CapFill::Serving);

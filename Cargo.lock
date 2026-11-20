@@ -147,6 +147,7 @@ dependencies = [
  "inf-server",
  "inf-store",
  "inf-wire",
+ "libc",
  "serde_json",
 ]
 
@@ -543,6 +544,7 @@ dependencies = [
  "inf-runtime",
  "inf-server",
  "inf-store",
+ "libc",
 ]
 
 [[package]]

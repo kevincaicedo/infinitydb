@@ -15,7 +15,7 @@ use std::path::Path;
 
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    MutationEffect, NsId, StagingConfig, StagingRing, TIER_FOOTER_BYTES, TIER_FRAME_BYTES,
+    LogGeometry, MutationEffect, NsId, StagingRing, TIER_FOOTER_BYTES, TIER_FRAME_BYTES,
     TIER_HEADER_BYTES, TierFlush, TierFlushConfig, TierIoMode,
 };
 use inf_store::KeyHasher;
@@ -57,6 +57,7 @@ impl Rig {
     /// frame is rewritten, and therefore the tier leg of write
     /// amplification.
     fn new(slice_bytes: u64, file_capacity: u64) -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let fs = MemFs::new();
         let demote = DemotionConfig { slice_bytes, ..DemotionConfig::for_budget(BUDGET, PAGE) };
         let mut ks = Keyspace::new(StoreConfig::default());
@@ -70,6 +71,7 @@ impl Rig {
                 },
                 demote,
                 2048,
+                &census,
             )
             .is_ok()
         );
@@ -82,8 +84,10 @@ impl Rig {
                 mode: TierIoMode::Buffered,
                 file_capacity,
                 slice_bytes,
+                record_len_max: 16 << 20,
             },
             0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
         Rig { ks, fs, flush }
     }
@@ -230,7 +234,7 @@ fn user_bytes_count_key_plus_value_at_the_record_boundary() {
 #[test]
 fn wal_bytes_track_exactly_what_the_ring_accepted() {
     let mut rig = Rig::narrow();
-    let mut ring = StagingRing::new(StagingConfig::default());
+    let mut ring = StagingRing::new(LogGeometry::default());
     let mut expected = 0u64;
 
     for i in 0..512u32 {
@@ -337,7 +341,7 @@ fn compaction_bytes_are_relocation_volume_not_a_numerator_leg() {
     let mut rig = Rig::narrow();
     let hash = KeyHasher::default().hash(b"k");
     rig.table().insert(b"k", b"value", hash).expect("fits");
-    let mut ring = StagingRing::new(StagingConfig::default());
+    let mut ring = StagingRing::new(LogGeometry::default());
     let effect = MutationEffect::StringSet { ns: NS, key: b"k", value: b"value" };
     rig.table().stage_wal(&mut ring, &effect).expect("room");
     rig.quiesce();
@@ -363,7 +367,7 @@ fn compaction_bytes_are_relocation_volume_not_a_numerator_leg() {
 /// residue still sitting in the mutable region is a few percent rather
 /// than the measurement. Returns the namespace's accounting.
 fn amplification_run(rig: &mut Rig) -> inf_store::WriteAccounting {
-    let mut ring = StagingRing::new(StagingConfig::default());
+    let mut ring = StagingRing::new(LogGeometry::default());
     let value = vec![0x77u8; 512];
     for i in 0..16_384u32 {
         let key = format!("k:{i:06}");
@@ -377,7 +381,7 @@ fn amplification_run(rig: &mut Rig) -> inf_store::WriteAccounting {
             rig.drain();
             // The LOG step drains the staging ring in production; here
             // the test only needs its admission bound reset.
-            ring = StagingRing::new(StagingConfig::default());
+            ring = StagingRing::new(LogGeometry::default());
         }
     }
     rig.quiesce();

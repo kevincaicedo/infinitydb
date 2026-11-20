@@ -90,14 +90,18 @@ struct Rig {
 }
 
 fn rig(n: usize) -> Rig {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut arena = Arena::new(ArenaConfig::default());
     let mut arena_addrs = Vec::with_capacity(n);
     let ring = (n * RECORD_LEN * 2).next_power_of_two();
-    let mut space = AddressSpace::new(AddressSpaceConfig {
-        reserve_bytes: ring,
-        page_bytes: 1 << 20,
-        life_origin: LogicalAddr::ZERO,
-    })
+    let mut space = AddressSpace::new(
+        AddressSpaceConfig {
+            reserve_bytes: ring,
+            page_bytes: 1 << 20,
+            life_origin: LogicalAddr::ZERO,
+        },
+        &census,
+    )
     .expect("reservation");
     let mut logical_addrs = Vec::with_capacity(n);
     let value = [b'v'; VAL_LEN];
@@ -198,6 +202,7 @@ fn bench_scalar_patch(n: usize, label: &str) {
 /// ring drains amortized into the sweep exactly like arena free-list
 /// reuse is.
 fn bench_relocate(n: usize, label: &str) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     use inf_store::{Index, MemoryMode};
     // Arena side: alternate value sizes across class boundaries so every
     // op reallocates (the M3 realloc lane).
@@ -246,6 +251,7 @@ fn bench_relocate(n: usize, label: &str) {
         DemotionConfig::for_budget(ring as u64, 1 << 20),
         n * 2,
         KeyHasher::default(),
+        &census,
     )
     .expect("reservation");
     let mut tiered: Vec<(u64, LogicalAddr, usize, u32)> = Vec::with_capacity(n);
@@ -291,6 +297,7 @@ fn bench_relocate(n: usize, label: &str) {
 }
 
 fn main() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     // Pair-assert the bench-local record image against a real table write
     // before trusting any row (the layout-twin check).
     let mut probe = TieredTable::new(
@@ -302,6 +309,7 @@ fn main() {
         DemotionConfig::for_budget(1 << 16, 1 << 12),
         64,
         KeyHasher::default(),
+        &census,
     )
     .expect("reservation");
     let key = key_of(7);

@@ -36,6 +36,7 @@ use super::*;
 use crate::exec::Argv;
 use inf_runtime::ColdRefused;
 use inf_store::{LogicalAddr, TieredLookup, TieredTable};
+use inf_wire::{Domain, Refusal};
 mod write;
 
 use write::{
@@ -61,6 +62,9 @@ const ERR_UNSUPPORTED: &str =
     "ERR this command is not supported on tiered namespaces in M4 (string family only)";
 const ERR_COLD_IO: &str = "ERR cold read failed (tier I/O error)";
 const ERR_COLD_BUSY: &str = "BUSY cold-read queue saturated, try again";
+/// The cell's cold-read host has spent its identity space (ADR-0181 R4):
+/// permanent for its boot, so each read is answered once, never `BUSY`.
+const ERR_COLD_IDENTITY: &str = Refusal::IdentityExhausted(Domain::ColdRead).render();
 const ERR_STALLED: &str =
     "STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)";
 const ERR_FAILED: &str = "ERR durable plane failed (fail-stop)";
@@ -68,23 +72,65 @@ const ERR_BLOB_READ: &str = "ERR blob extent read failed (tier I/O error)";
 const ERR_TOO_LARGE: &str = "ERR value exceeds BLOB-MAX for this namespace";
 const ERR_OOM: &str = "OOM command not allowed when used memory > 'maxmemory'.";
 
-/// Outcome of one tiered command.
-pub(super) enum TieredReply {
-    Done(Vec<u8>),
+/// Outcome of one tiered command under its apply's gate (ADR-0015 D6).
+pub(super) enum TieredReply<G> {
+    Done(OwnedReply),
     /// An `always`-class write: the reply may only ship once the fsync
     /// watermark covers `seq` (§8.2 — ack after fsync).
+    /// `gate` is what it waits behind.
     Gated {
-        reply: Vec<u8>,
+        reply: OwnedReply,
+        seq: u64,
+        gate: G,
+    },
+}
+
+/// What one tiered command did: its producers report, its gate decides.
+pub(super) enum TierWrite {
+    Done(OwnedReply),
+    /// A write that staged its durable effect at `seq`, in any class.
+    Staged {
+        reply: OwnedReply,
         seq: u64,
     },
 }
 
+/// A RAM record whose bytes are its value. A `StringExtent` record's RAM
+/// bytes are its 24-byte extent reference (ADR-0061 D1), so the one
+/// constructor reads the type tag first: a [`Resolved::Ram`] cannot name
+/// a reference (issue #11, a promoted reference served as the value).
+mod inline {
+    use inf_store::{LogicalAddr, TieredTable, TypeTag};
+
+    #[derive(Copy, Clone)]
+    pub(super) struct InlineAddr(LogicalAddr);
+
+    impl InlineAddr {
+        /// `None` for a `StringExtent` record: its value is in the extent.
+        pub(super) fn of(table: &TieredTable, addr: LogicalAddr) -> Option<InlineAddr> {
+            (table.record(addr).type_tag != TypeTag::StringExtent).then_some(InlineAddr(addr))
+        }
+
+        /// Planted-bug canary (`scripts/sim-canaries.sh`): the post-wait
+        /// re-resolve takes its RAM record as inline without the tag.
+        #[cfg(inf_canary_promoted_extent_inline)]
+        pub(super) fn unchecked(addr: LogicalAddr) -> InlineAddr {
+            InlineAddr(addr)
+        }
+
+        pub(super) fn addr(self) -> LogicalAddr {
+            self.0
+        }
+    }
+}
+use inline::InlineAddr;
+
 /// One resolved key.
 enum Resolved {
     Miss,
-    /// RAM-resident; the caller re-reads parts inside its own borrow
-    /// (no await separates resolution from use on the Ram arm).
-    Ram(LogicalAddr),
+    /// RAM-resident inline record; the caller re-reads parts inside its own
+    /// borrow (no await separates resolution from use on the Ram arm).
+    Ram(InlineAddr),
     /// Cold record fetched and key-verified (owned copy).
     Cold {
         addr: LogicalAddr,
@@ -134,7 +180,7 @@ enum WriteBlock {
     /// of its own.
     ExtentWindow(crate::durable::ExtentTurn),
     /// Terminal typed reply.
-    Reply(Vec<u8>),
+    Reply(OwnedReply),
 }
 
 /// The displaced record a write kills: `(addr, encoded_len, version)`.
@@ -183,20 +229,50 @@ impl WriteGuard {
     }
 }
 
-/// One tiered command, executed to a complete reply. `class` is the
-/// namespace's fsync class (tiered ⊆ durable — ADR-0062 D1).
-pub(super) async fn dispatch_tiered<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+/// One tiered command, executed to a complete reply under its apply's gate:
+/// it stages with the gate's fsync class (tiered ⊆ durable — ADR-0062 D1),
+/// and a staged write's reply is gated when the gate waits.
+/// One future, so the gate is held across the command beside its arguments
+/// and never copied into a second frame.
+pub(super) async fn dispatch_tiered<O, F, G>(
     shared: &Rc<Shared<O, F>>,
     origin: ExecOrigin,
     ns: NsId,
     meta: &'static inf_wire::CommandMeta,
     argv: &[&[u8]],
     proto: Protocol,
-    class: Option<FsyncClass>,
-) -> TieredReply {
+    gate: ApplyGate<G>,
+) -> TieredReply<G>
+where
+    O: PlaneObserver + 'static,
+    F: SegmentFs + Clone + 'static,
+{
     let started = shared.now.get();
     let cold_before = cold_issued(shared);
-    let outcome = run_command(shared, ns, meta, argv, proto, class).await;
+    let outcome = run_command(shared, ns, meta, argv, proto, gate.class()).await;
+    note_served(shared, origin, ns, argv, (started, cold_before), &outcome);
+    let (reply, staged) = match outcome {
+        TierWrite::Done(reply) => (reply, None),
+        TierWrite::Staged { reply, seq } => (reply, Some(seq)),
+    };
+    match gate.settle(staged) {
+        Some((seq, gate)) => TieredReply::Gated { reply, seq, gate },
+        None => TieredReply::Done(reply),
+    }
+}
+
+/// A served tiered command's service time and execution, recorded after its
+/// reply is complete; `before` is the loop clock and the cold reads issued
+/// when it began.
+fn note_served<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    origin: ExecOrigin,
+    ns: NsId,
+    argv: &[&[u8]],
+    before: (Nanos, u64),
+    outcome: &TierWrite,
+) {
+    let (started, cold_before) = before;
     // Split service histograms (ADR-0064 D3): µs on the loop clock,
     // lane-tagged by whether this command issued any cold read. The
     // loop clock is frozen per reactor iteration, so a command that
@@ -214,8 +290,8 @@ pub(super) async fn dispatch_tiered<O: PlaneObserver + 'static, F: SegmentFs + C
             tier.ram_hit_us.record(elapsed);
         }
     }
-    let reply_bytes = match &outcome {
-        TieredReply::Done(r) | TieredReply::Gated { reply: r, .. } => r.as_slice(),
+    let reply_bytes = match outcome {
+        TierWrite::Done(r) | TierWrite::Staged { reply: r, .. } => r.bytes(),
     };
     shared.observer.borrow_mut().on_execute(
         shared.cell,
@@ -225,7 +301,6 @@ pub(super) async fn dispatch_tiered<O: PlaneObserver + 'static, F: SegmentFs + C
         reply_bytes,
         shared.now.get(),
     );
-    outcome
 }
 
 fn cold_issued<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -247,7 +322,7 @@ async fn run_command<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>
     argv: &[&[u8]],
     proto: Protocol,
     class: Option<FsyncClass>,
-) -> TieredReply {
+) -> TierWrite {
     match meta.id {
         CommandId::Get => read_value(shared, ns, argv.arg(1), proto).await,
         CommandId::Mget => mget(shared, ns, argv, proto).await,
@@ -291,10 +366,10 @@ fn done_error<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
     message: &str,
-) -> TieredReply {
-    let mut reply = shared.take_reply_buf();
-    RespWriter::new(&mut reply, proto).error(message);
-    TieredReply::Done(reply)
+) -> TierWrite {
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    RespWriter::new(reply.reply(), proto).error(message);
+    TierWrite::Done(reply.finish())
 }
 
 // ---- resolution (the hardened fetch-verify-retry shape) ----
@@ -370,6 +445,7 @@ fn probe<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         // Permanent (ADR-0167 D3): the one cold-read-failure reply, never
         // backpressure a client would retry.
         Err(ColdRefused::Unrepresentable(_)) => Probe::Fail(ERR_COLD_IO),
+        Err(ColdRefused::IdentityExhausted) => Probe::Fail(ERR_COLD_IDENTITY),
     }
 }
 
@@ -413,8 +489,8 @@ async fn serve_cold_image<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'st
     }
     match ext {
         Some(ext) => match fetch_extent(shared, ns, ext).await {
-            Some(value) => Resolved::Extent { addr, value, version, encoded_len },
-            None => Resolved::Fail(ERR_BLOB_READ),
+            Ok(value) => Resolved::Extent { addr, value, version, encoded_len },
+            Err(line) => Resolved::Fail(line),
         },
         None => {
             let value = TieredTable::decode_record(&image).value.to_vec();
@@ -446,6 +522,32 @@ async fn resolve<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     resolved
 }
 
+/// Serves a RAM-resident record by its type: an inline record as itself,
+/// a `StringExtent` record's value from its extent (chunked async reads).
+/// The probe's RAM arm and the re-resolve after a cold wait both come
+/// here — a reference a concurrent read promoted into RAM while this one
+/// waited is the second's case (issue #11). No await separates the
+/// caller's lookup from this borrow, so the table and the record stand.
+async fn resolve_ram<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+    shared: &Rc<Shared<O, F>>,
+    ns: NsId,
+    addr: LogicalAddr,
+) -> Resolved {
+    let (ext, version, encoded_len) = {
+        let ks = shared.store.borrow();
+        let table = ks.tiered_store(ns).expect("resolved on this table");
+        if let Some(inline) = InlineAddr::of(table, addr) {
+            return Resolved::Ram(inline);
+        }
+        let parts = table.record(addr);
+        (inf_store::ExtentRef::decode(parts.value), parts.version, parts.encoded_len)
+    };
+    match fetch_extent(shared, ns, ext).await {
+        Ok(value) => Resolved::Extent { addr, value, version, encoded_len },
+        Err(line) => Resolved::Fail(line),
+    }
+}
+
 async fn resolve_inner<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
@@ -457,29 +559,7 @@ async fn resolve_inner<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
     let mut replans: u8 = 0;
     'attempt: loop {
         let plan = match probe(shared, ns, key, hash, &exclude, 0, TieredTable::RECORD_HEADER_LEN) {
-            Probe::Ram(addr) => {
-                // Blob-resident RAM records carry a 24-byte reference —
-                // fetch the value from the extent (chunked async reads).
-                let ext = {
-                    let ks = shared.store.borrow();
-                    let table = ks.tiered_store(ns).expect("resolved on this table");
-                    let parts = table.record(addr);
-                    (parts.type_tag == inf_store::TypeTag::StringExtent).then(|| {
-                        (
-                            inf_store::ExtentRef::decode(parts.value),
-                            parts.version,
-                            parts.encoded_len,
-                        )
-                    })
-                };
-                let Some((ext, version, encoded_len)) = ext else {
-                    return Resolved::Ram(addr);
-                };
-                return match fetch_extent(shared, ns, ext).await {
-                    Some(value) => Resolved::Extent { addr, value, version, encoded_len },
-                    None => Resolved::Fail(ERR_BLOB_READ),
-                };
-            }
+            Probe::Ram(addr) => return resolve_ram(shared, ns, addr).await,
             Probe::Miss => return Resolved::Miss,
             Probe::Fail("__replan") => {
                 replans += 1;
@@ -500,6 +580,9 @@ async fn resolve_inner<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
         // Re-resolve after the resume; decode inside the borrow.
         enum After {
             Serve(Resolved),
+            /// The key is RAM-resident after the wait (a promotion or a
+            /// write moved it): served by its type outside the borrow.
+            ServeRam(LogicalAddr),
             /// Key-verified single-window fetch: the verbatim image
             /// serves (and may promote) outside the borrow.
             ServeCold {
@@ -517,7 +600,10 @@ async fn resolve_inner<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
                 return Resolved::Fail("ERR the selected namespace was dropped (INF.NS USE again)");
             };
             match table.lookup(key, hash, &exclude) {
-                TieredLookup::Ram(promoted) => After::Serve(Resolved::Ram(promoted)),
+                #[cfg(not(inf_canary_promoted_extent_inline))]
+                TieredLookup::Ram(now) => After::ServeRam(now),
+                #[cfg(inf_canary_promoted_extent_inline)]
+                TieredLookup::Ram(now) => After::Serve(Resolved::Ram(InlineAddr::unchecked(now))),
                 TieredLookup::Miss => After::Serve(Resolved::Miss),
                 TieredLookup::Cold(now) if now != addr => After::Retry,
                 TieredLookup::Cold(_) => done.bytes(|window| {
@@ -560,6 +646,7 @@ async fn resolve_inner<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'stati
             After::ServeCold { image } => {
                 return serve_cold_image(shared, ns, hash, addr, image, promote).await;
             }
+            After::ServeRam(now) => return resolve_ram(shared, ns, now).await,
             After::Serve(resolved) => return resolved,
             After::Retry => {
                 if !exclude.contains(&addr) {
@@ -628,13 +715,14 @@ async fn read_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     key: &[u8],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let hash = shared.hasher.hash(key);
-    let mut reply = shared.take_reply_buf();
-    let mut w = RespWriter::new(&mut reply, proto);
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    let mut w = RespWriter::new(reply.reply(), proto);
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         Resolved::Miss => w.null(),
-        Resolved::Ram(addr) => {
+        Resolved::Ram(inline) => {
+            let addr = inline.addr();
             let ks = shared.store.borrow();
             let table = ks.tiered_store(ns).expect("resolved on this table");
             // Planted-bug canary (ADR-0129 A1, `scripts/sim-canaries.sh`):
@@ -653,7 +741,7 @@ async fn read_value<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         Resolved::Cold { value, .. } | Resolved::Extent { value, .. } => w.bulk(&value),
         Resolved::Fail(message) => w.error(message),
     }
-    TieredReply::Done(reply)
+    TierWrite::Done(reply.finish())
 }
 
 async fn mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -661,14 +749,15 @@ async fn mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     argv: &[&[u8]],
     proto: Protocol,
-) -> TieredReply {
-    let mut reply = shared.take_reply_buf();
-    RespWriter::new(&mut reply, proto).array_header(argv.len() - 1);
+) -> TierWrite {
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    RespWriter::new(reply.reply(), proto).array_header(argv.len() - 1);
     for key in &argv[1..] {
         let hash = shared.hasher.hash(key);
-        let mut w = RespWriter::new(&mut reply, proto);
+        let mut w = RespWriter::new(reply.reply(), proto);
         match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
-            Resolved::Ram(addr) => {
+            Resolved::Ram(inline) => {
+                let addr = inline.addr();
                 let ks = shared.store.borrow();
                 let table = ks.tiered_store(ns).expect("resolved on this table");
                 w.bulk(table.record(addr).value);
@@ -681,12 +770,12 @@ async fn mget<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             // abandoned, exactly what GET answers for the same key.
             Resolved::Fail(message) => {
                 reply.clear();
-                RespWriter::new(&mut reply, proto).error(message);
-                return TieredReply::Done(reply);
+                RespWriter::new(reply.reply(), proto).error(message);
+                return TierWrite::Done(reply.finish());
             }
         }
     }
-    TieredReply::Done(reply)
+    TierWrite::Done(reply.finish())
 }
 
 async fn exists<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -694,7 +783,7 @@ async fn exists<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     argv: &[&[u8]],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let mut count = 0i64;
     for key in &argv[1..] {
         let hash = shared.hasher.hash(key);
@@ -708,9 +797,9 @@ async fn exists<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             Resolved::Fail(message) => return done_error(shared, proto, message),
         }
     }
-    let mut reply = shared.take_reply_buf();
-    RespWriter::new(&mut reply, proto).int(count);
-    TieredReply::Done(reply)
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    RespWriter::new(reply.reply(), proto).int(count);
+    TierWrite::Done(reply.finish())
 }
 
 async fn strlen<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -718,13 +807,14 @@ async fn strlen<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     key: &[u8],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let hash = shared.hasher.hash(key);
-    let mut reply = shared.take_reply_buf();
-    let mut w = RespWriter::new(&mut reply, proto);
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    let mut w = RespWriter::new(reply.reply(), proto);
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         Resolved::Miss => w.int(0),
-        Resolved::Ram(addr) => {
+        Resolved::Ram(inline) => {
+            let addr = inline.addr();
             let ks = shared.store.borrow();
             let table = ks.tiered_store(ns).expect("resolved on this table");
             w.int(table.record(addr).value.len() as i64);
@@ -734,7 +824,7 @@ async fn strlen<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         }
         Resolved::Fail(message) => w.error(message),
     }
-    TieredReply::Done(reply)
+    TierWrite::Done(reply.finish())
 }
 
 async fn type_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -742,16 +832,16 @@ async fn type_cmd<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     key: &[u8],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let hash = shared.hasher.hash(key);
-    let mut reply = shared.take_reply_buf();
-    let mut w = RespWriter::new(&mut reply, proto);
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    let mut w = RespWriter::new(reply.reply(), proto);
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         Resolved::Ram(_) | Resolved::Cold { .. } | Resolved::Extent { .. } => w.simple("string"),
         Resolved::Miss => w.simple("none"),
         Resolved::Fail(message) => w.error(message),
     }
-    TieredReply::Done(reply)
+    TierWrite::Done(reply.finish())
 }
 
 async fn ttl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -759,17 +849,17 @@ async fn ttl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     key: &[u8],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let hash = shared.hasher.hash(key);
-    let mut reply = shared.take_reply_buf();
-    let mut w = RespWriter::new(&mut reply, proto);
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    let mut w = RespWriter::new(reply.reply(), proto);
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         // No expiry on tiered namespaces in M4: live keys never expire.
         Resolved::Ram(_) | Resolved::Cold { .. } | Resolved::Extent { .. } => w.int(-1),
         Resolved::Miss => w.int(-2),
         Resolved::Fail(message) => w.error(message),
     }
-    TieredReply::Done(reply)
+    TierWrite::Done(reply.finish())
 }
 
 async fn getrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -777,14 +867,14 @@ async fn getrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     argv: &[&[u8]],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let (Some(start), Some(end)) = (parse_i64(argv.arg(2)), parse_i64(argv.arg(3))) else {
         return done_error(shared, proto, "ERR value is not an integer or out of range");
     };
     let key = argv.arg(1);
     let hash = shared.hasher.hash(key);
-    let mut reply = shared.take_reply_buf();
-    let mut w = RespWriter::new(&mut reply, proto);
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    let mut w = RespWriter::new(reply.reply(), proto);
     let slice_of = |value: &[u8], w: &mut RespWriter<'_>| {
         let len = value.len() as i64;
         let from = if start < 0 { (len + start).max(0) } else { start.min(len) };
@@ -797,7 +887,8 @@ async fn getrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     };
     match resolve(shared, ns, key, hash, PromoteOnCold::Read).await {
         Resolved::Miss => w.bulk(b""),
-        Resolved::Ram(addr) => {
+        Resolved::Ram(inline) => {
+            let addr = inline.addr();
             let ks = shared.store.borrow();
             let table = ks.tiered_store(ns).expect("resolved on this table");
             slice_of(table.record(addr).value, &mut w);
@@ -805,7 +896,7 @@ async fn getrange<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         Resolved::Cold { value, .. } | Resolved::Extent { value, .. } => slice_of(&value, &mut w),
         Resolved::Fail(message) => w.error(message),
     }
-    TieredReply::Done(reply)
+    TierWrite::Done(reply.finish())
 }
 
 async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
@@ -813,7 +904,7 @@ async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     ns: NsId,
     argv: &[&[u8]],
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     let Some(cursor) = crate::exec::parse_cursor(argv.arg(1)) else {
         return done_error(shared, proto, "ERR invalid cursor");
     };
@@ -868,10 +959,15 @@ async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     // authoritative). A typed read failure fails the whole page — the
     // client retries its cursor — never a silently shorter page with an
     // advanced cursor (C2; the DBSIZE drain's rule).
+    #[cfg(not(inf_canary_scan_chunk_of_one))]
     let chunk = {
         let tier = shared.tier.borrow();
         tier.as_ref().and_then(|t| t.cold.as_ref()).map_or(1, inf_runtime::ColdReads::qd_cap).max(1)
     };
+    // Canary: a chunk of one, so the page awaits each cold key before it
+    // names the next, one device read a driver entry.
+    #[cfg(inf_canary_scan_chunk_of_one)]
+    let chunk = 1;
     let fail = |shared: &Rc<Shared<O, F>>, message: &'static str| {
         if let Some(table) = shared.store.borrow_mut().tiered_store_mut(ns) {
             table.note_cold_read_error();
@@ -924,15 +1020,15 @@ async fn scan<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
             }
         }
     }
-    let mut reply = shared.take_reply_buf();
-    let mut w = RespWriter::new(&mut reply, proto);
+    let mut reply = OpenReply::new(shared.take_reply_buf());
+    let mut w = RespWriter::new(reply.reply(), proto);
     w.array_header(2);
     w.bulk(next.to_string().as_bytes());
     w.array_header(keys.len());
     for key in &keys {
         w.bulk(key);
     }
-    TieredReply::Done(reply)
+    TierWrite::Done(reply.finish())
 }
 
 /// `DBSIZE` on a tiered namespace (ADR-0093 A3): exact under open
@@ -949,14 +1045,14 @@ async fn dbsize<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
     proto: Protocol,
-) -> TieredReply {
+) -> TierWrite {
     match dbsize_count(shared, ns, proto).await {
         Ok(len) => {
-            let mut reply = shared.take_reply_buf();
-            RespWriter::new(&mut reply, proto).int(len as i64);
-            TieredReply::Done(reply)
+            let mut reply = OpenReply::new(shared.take_reply_buf());
+            RespWriter::new(reply.reply(), proto).int(len as i64);
+            TierWrite::Done(reply.finish())
         }
-        Err(reply) => TieredReply::Done(reply),
+        Err(reply) => TierWrite::Done(reply),
     }
 }
 
@@ -969,7 +1065,7 @@ pub(super) async fn dbsize_count<O: PlaneObserver + 'static, F: SegmentFs + Clon
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
     proto: Protocol,
-) -> Result<u64, Vec<u8>> {
+) -> Result<u64, OwnedReply> {
     let snapshot = |shared: &Rc<Shared<O, F>>| -> Option<Vec<inf_store::ShadowTicket>> {
         let ks = shared.store.borrow();
         let table = ks.tiered_store(ns)?;
@@ -1028,7 +1124,7 @@ async fn drain_shadow_tickets<O: PlaneObserver + 'static, F: SegmentFs + Clone +
     proto: Protocol,
     mut pending: Vec<inf_store::ShadowTicket>,
     snapshot: impl Fn(&Rc<Shared<O, F>>) -> Option<Vec<inf_store::ShadowTicket>>,
-) -> Result<(), Vec<u8>> {
+) -> Result<(), OwnedReply> {
     for _pass in 0..2 {
         if pending.is_empty() {
             break;
@@ -1048,11 +1144,11 @@ async fn drain_shadow_tickets<O: PlaneObserver + 'static, F: SegmentFs + Clone +
                 Err(cause) => {
                     table.shadow_read_failed(ticket.cold);
                     let addr = ticket.cold.to_raw();
-                    let mut reply = shared.take_reply_buf();
-                    RespWriter::new(&mut reply, proto).error(&format!(
+                    let mut reply = OpenReply::new(shared.take_reply_buf());
+                    RespWriter::new(reply.reply(), proto).error(&format!(
                         "ERR DBSIZE: shadow twin at {addr} unreadable ({cause}) — ADR-0093 A3"
                     ));
-                    return Err(reply);
+                    return Err(reply.finish());
                 }
             }
         }
@@ -1112,6 +1208,7 @@ fn plan_key_fetch<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
                 Err(ColdRefused::QueueFull) => Ok(KeyFetch::Busy),
                 // Permanent (ADR-0167 D3): the page fails typed, never BUSY.
                 Err(ColdRefused::Unrepresentable(_)) => Err(ERR_COLD_IO),
+                Err(ColdRefused::IdentityExhausted) => Err(ERR_COLD_IDENTITY),
             }
         }
         None => {
@@ -1160,18 +1257,22 @@ async fn decode_key(plan: ColdPlan) -> Result<Option<Vec<u8>>, &'static str> {
 /// a concurrent reclaim's unlink cannot invalidate the reads (POSIX
 /// keeps the inode; the S08 cancellation test's contract). Pins ride a
 /// synthetic high-bit `TierFileId` so extent reads never alias a tier
-/// file's retirement gate.
+/// file's retirement gate. A failed fetch answers its reply line: the blob
+/// read's, or the spent identity space's.
 async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     ns: NsId,
     ext: inf_store::ExtentRef,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, &'static str> {
     debug_assert_eq!(ext.offset, 0, "v1 extent references start at 0");
-    let reader = {
+    // The hold lives as long as the reader: a drop meanwhile holds the
+    // namespace's owner (ADR-0148 D3).
+    let (reader, _hold) = {
         let tier = shared.tier.borrow();
-        tier.as_ref()?.open_extent_reader(ns, ext.extent_id).ok()?
+        let tier = tier.as_ref().ok_or(ERR_BLOB_READ)?;
+        tier.open_extent_reader(ns, ext.extent_id).map_err(|_| ERR_BLOB_READ)?
     };
-    let fd = reader.raw_fd()?;
+    let fd = reader.raw_fd().ok_or(ERR_BLOB_READ)?;
     let file = inf_runtime::TierFileId::new(0x8000_0000 | (ext.extent_id as u32 & 0x7FFF_FFFF));
     let total_frames = ext.len.div_ceil(inf_log::TIER_FRAME_DATA as u64);
     let window_frames_cap = (crate::tier_cell::COLD_POOL_BUF / inf_log::TIER_FRAME_BYTES) as u64;
@@ -1183,7 +1284,7 @@ async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         let frames = window_frames_cap.min(total_frames - first);
         let wait = {
             let tier = shared.tier.borrow();
-            let cold = tier.as_ref().and_then(|t| t.cold.clone())?;
+            let cold = tier.as_ref().and_then(|t| t.cold.clone()).ok_or(ERR_BLOB_READ)?;
             // Same-clock stamp as `on_completion` (the `cold_read_p99_us`
             // pair).
             let asked = cold.enqueue(
@@ -1194,15 +1295,19 @@ async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
                 inf_runtime::ReadClass::Foreground,
                 shared.now.get().as_micros(),
             );
-            // Either refusal ends the fetch, which the resolver answers
-            // `ERR_BLOB_READ` (ADR-0167 D3's callers table).
+            // A temporary or a request's refusal ends the fetch, which the
+            // resolver answers `ERR_BLOB_READ` (ADR-0167 D3's callers table);
+            // the spent identity space answers its own line (ADR-0181 R4).
             match asked {
                 Ok(wait) => wait,
-                Err(ColdRefused::QueueFull | ColdRefused::Unrepresentable(_)) => return None,
+                Err(ColdRefused::QueueFull | ColdRefused::Unrepresentable(_)) => {
+                    return Err(ERR_BLOB_READ);
+                }
+                Err(ColdRefused::IdentityExhausted) => return Err(ERR_COLD_IDENTITY),
             }
         };
         let done = wait.await;
-        done.outcome().ok()?;
+        done.outcome().map_err(|_| ERR_BLOB_READ)?;
         // Extract into a scratch and extend — `tier_extract` REPLACES its
         // output's contents, so handing it the accumulator erased every
         // previously assembled window and this loop never terminated for
@@ -1220,11 +1325,11 @@ async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
         });
         drop(done);
         if !ok {
-            return None;
+            return Err(ERR_BLOB_READ);
         }
     }
     drop(reader); // the fd stayed open across every read
-    Some(out)
+    Ok(out)
 }
 
 // ---- small helpers ----
@@ -1232,21 +1337,16 @@ async fn fetch_extent<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static
 fn int_write_reply<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
     shared: &Rc<Shared<O, F>>,
     proto: Protocol,
-    class: Option<FsyncClass>,
-    outcome: Result<(u64, Option<Vec<u8>>), Vec<u8>>,
+    outcome: Result<(u64, Option<Vec<u8>>), OwnedReply>,
     int_of: impl FnOnce(Option<&[u8]>) -> i64,
-) -> TieredReply {
+) -> TierWrite {
     match outcome {
         Ok((seq, old_value)) => {
-            let mut reply = shared.take_reply_buf();
-            RespWriter::new(&mut reply, proto).int(int_of(old_value.as_deref()));
-            if class == Some(FsyncClass::Always) {
-                TieredReply::Gated { reply, seq }
-            } else {
-                TieredReply::Done(reply)
-            }
+            let mut reply = OpenReply::new(shared.take_reply_buf());
+            RespWriter::new(reply.reply(), proto).int(int_of(old_value.as_deref()));
+            TierWrite::Staged { reply: reply.finish(), seq }
         }
-        Err(err) => TieredReply::Done(err),
+        Err(err) => TierWrite::Done(err),
     }
 }
 

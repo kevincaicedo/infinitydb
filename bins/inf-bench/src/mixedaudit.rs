@@ -372,7 +372,7 @@ pub fn cmd_mixed_audit(args: &[String]) -> Result<(), String> {
         .get("seed")
         .map_or(Ok(0x51D0_2026), |v| v.parse())
         .map_err(|e| format!("--seed: {e}"))?;
-    let bin = flags.str_or("infinityd-bin", "target/release/infinityd");
+    let bin = flags.str_or("infinityd-bin", &crate::cli::default_infinityd_bin());
     let pin_start = flags.str_or("pin-start", "4");
     let artifacts_root = flags.str_or("artifacts-root", ".artifacts/m4/s20");
     let data_root = flags.str_or("data-root", &std::env::temp_dir().to_string_lossy());

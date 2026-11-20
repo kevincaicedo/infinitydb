@@ -28,9 +28,9 @@ use inf_log::{
 use inf_store::KeyHasher;
 use inf_store::{
     AddrClass, AddressSpaceConfig, CompactionConfig, CompactionWork, DemotionConfig, Displaced,
-    Index, KeyWindow, LogicalAddr, SHADOW_READS_IN_FLIGHT, SHADOW_TICKETS_CAP, SettleError,
-    SettleOutcome, SettleReason, SettleSlot, ShadowProbe, ShadowRebuildError, ShadowRefusal,
-    ShadowVerdict, TieredLookup, TieredMode, TieredTable, forced_collision_pair,
+    Index, KeyWindow, LogicalAddr, RebuildStep, SHADOW_READS_IN_FLIGHT, SHADOW_TICKETS_CAP,
+    SettleError, SettleOutcome, SettleReason, SettleSlot, ShadowProbe, ShadowRebuildError,
+    ShadowRefusal, ShadowVerdict, TieredLookup, TieredMode, TieredTable, forced_collision_pair,
     forced_collision_triple,
 };
 
@@ -73,6 +73,7 @@ impl Harness {
     }
 
     fn with_demote(demote: DemotionConfig, ring: u64) -> Harness {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut table = TieredTable::new(
             AddressSpaceConfig {
                 reserve_bytes: ring as usize,
@@ -82,6 +83,7 @@ impl Harness {
             demote,
             64,
             KeyHasher::default(),
+            &census,
         )
         .expect("reservation");
         // The arm under test; the shipping default is off (ADR-0093 D8).
@@ -660,6 +662,7 @@ fn promotion_skips_a_tickets_cold_slot() {
 /// for the cold slot ends the ticket.
 #[test]
 fn recovery_appliers_reform_pairs_in_both_orders() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let origin = LogicalAddr::from_raw(1 << 20).expect("fits");
     let pre_life = LogicalAddr::from_raw(4096).expect("fits");
     let make = || {
@@ -672,6 +675,7 @@ fn recovery_appliers_reform_pairs_in_both_orders() {
             DemotionConfig::for_budget(RING, PAGE),
             64,
             KeyHasher::default(),
+            &census,
         )
         .expect("reservation")
     };
@@ -921,6 +925,7 @@ fn recovered_table() -> TieredTable {
 /// home-group collisions needs the final group mask up front — growth
 /// would re-home half of them).
 fn recovered_table_sized(initial_keys: usize) -> TieredTable {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let origin = LogicalAddr::from_raw(1 << 20).expect("fits");
     let mut t = TieredTable::new(
         AddressSpaceConfig {
@@ -931,6 +936,7 @@ fn recovered_table_sized(initial_keys: usize) -> TieredTable {
         DemotionConfig::for_budget(RING, PAGE),
         initial_keys,
         KeyHasher::default(),
+        &census,
     )
     .expect("reservation");
     t.seed_recovered_files(
@@ -1063,6 +1069,74 @@ fn rebuild_sends_pairs_beyond_the_cap_to_the_boot_settle_one_at_a_time() {
     assert_eq!(t.shadow_counters().rebuild_over_cap, EXCESS as u64);
     assert_eq!(t.shadow_counters().rebuild_settled_same_key, EXCESS as u64);
     assert_eq!(t.len(), SHADOW_TICKETS_CAP + EXCESS, "every key once");
+}
+
+/// The rebuild a bounded number of probe groups a call (ADR-0174 A1.3):
+/// driven at one and at three groups a call, no call scans more than its
+/// bound, every call but a returned slot's or the last one scans exactly
+/// it, the groups scanned cover every probe group of the index, and the
+/// table ends where the whole rebuild leaves it — the same tickets, the same
+/// slots handed back in the same order, the same settles.
+#[test]
+fn a_rebuild_stepped_a_few_groups_a_call_ends_where_the_whole_rebuild_does() {
+    const EXCESS: usize = 50;
+    let build = || {
+        let mut t = recovered_table_sized(2 * (SHADOW_TICKETS_CAP + EXCESS));
+        let mut images: HashMap<u64, Vec<u8>> = HashMap::new();
+        let mut addr = 64u64;
+        for i in 0..SHADOW_TICKETS_CAP + EXCESS {
+            let key = format!("cap:{i}").into_bytes();
+            let hash = KeyHasher::default().hash(&key);
+            t.replay_ref(hash, LogicalAddr::from_raw(addr).expect("fits"));
+            images.insert(addr, record_image(&key, b"old"));
+            image(&mut t, &key, b"new", hash);
+            addr += 64;
+        }
+        (t, images)
+    };
+    let (mut whole, images) = build();
+    let mut handed_whole = Vec::new();
+    whole
+        .rebuild_shadow_tickets(|slot| -> Result<KeyWindow, String> {
+            handed_whole.push(slot.cold);
+            Ok(window_of(&images[&slot.cold.to_raw()]))
+        })
+        .expect("the whole rebuild");
+    for max in [1usize, 3] {
+        let (mut t, images) = build();
+        let mut rebuild = t.begin_shadow_rebuild();
+        let (mut handed, mut groups) = (Vec::new(), 0usize);
+        // Bound: every call scans a group or hands back a slot.
+        loop {
+            let step = t.shadow_rebuild_step(&mut rebuild, max);
+            let (RebuildStep::Settle { groups: scanned, .. }
+            | RebuildStep::More { groups: scanned }
+            | RebuildStep::Done { groups: scanned }) = step;
+            assert!(scanned <= max, "a call scanned {scanned} groups over its bound {max}");
+            groups += scanned;
+            match step {
+                RebuildStep::Settle { slot, .. } => {
+                    handed.push(slot.cold);
+                    let window = Ok::<_, String>(window_of(&images[&slot.cold.to_raw()]));
+                    let outcome = t.settle_rebuilt_window(slot, window).expect("a settle");
+                    assert_eq!(outcome, SettleOutcome::SameKey);
+                }
+                RebuildStep::More { groups: scanned } => {
+                    assert_eq!(scanned, max, "More at its bound")
+                }
+                RebuildStep::Done { .. } => break,
+            }
+        }
+        assert!(
+            groups >= t.index_group_count(),
+            "{groups} groups scanned, every one at least once"
+        );
+        assert_eq!(handed, handed_whole, "the slots handed back, in the whole rebuild's order");
+        assert_eq!(t.shadow_pending(), whole.shadow_pending(), "the same tickets");
+        assert_eq!(t.shadow_counters(), whole.shadow_counters(), "the same counters at {max}");
+        assert_eq!(t.len(), whole.len(), "every key once");
+    }
+    assert_eq!(handed_whole.len(), EXCESS, "VACUOUS: the pairs past the cap");
 }
 
 /// Keys whose home group under the default hasher is `home` at `mask`
@@ -1418,6 +1492,7 @@ struct Rig {
 
 impl Rig {
     fn new() -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         // A zero mutable target: every page but the tail's seals, so the
         // first file fills, overflows and seals under a small corpus.
         let demote =
@@ -1432,6 +1507,7 @@ impl Rig {
             demote,
             2048,
             KeyHasher::default(),
+            &census,
         )
         .expect("ring");
         let flush = TierFlush::new(
@@ -1443,8 +1519,10 @@ impl Rig {
                 mode: TierIoMode::Buffered,
                 file_capacity: FILE_CAPACITY,
                 slice_bytes: PAGE,
+                record_len_max: 16 << 20,
             },
             0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
         Rig { table, fs, flush }
     }
@@ -1787,5 +1865,94 @@ fn a_flushed_winner_is_imaged_by_the_walk_not_referenced() {
         images.iter().any(|k| k == b"k") && !refs.contains(&w),
         "the ticketed winner is imaged even below the flushed watermark (D5) — refs {refs:?}, \
          images {images:?}"
+    );
+}
+
+/// ADR-0177 D2's shadow crossing reads `shadow_read_owed`: whether the
+/// reconciler would hand one more read now. The O(1) predicate is false at
+/// four reads in flight and with every unverified ticket in flight, true
+/// below four with one unissued; over a seeded history of reads, failed
+/// reads, verifications without a settle, resolutions (each a ticket's
+/// drop) and new tickets it equals the walk of the offered tickets, and the
+/// test's own in-flight reads stay within the unverified tickets.
+#[test]
+fn the_owe_bit_equals_the_walk_of_the_offered_tickets() {
+    let mut h = Harness::new();
+    for i in 0..6u32 {
+        h.insert(format!("k:{i}").as_bytes(), b"v");
+    }
+    h.drain_to_cold();
+    for i in 0..2u32 {
+        h.shadow_set(format!("k:{i}").as_bytes(), b"w");
+    }
+    assert_eq!(h.table.shadow_work(16).len(), 2, "both tickets read");
+    assert!(!h.table.shadow_read_owed(), "every unverified ticket is in flight");
+    for i in 2..6u32 {
+        h.shadow_set(format!("k:{i}").as_bytes(), b"w");
+    }
+    assert!(h.table.shadow_read_owed(), "below four in flight, four unissued");
+    assert_eq!(h.table.shadow_work(16).len(), 2, "up to the in-flight bound");
+    assert!(!h.table.shadow_read_owed(), "four in flight, two unissued");
+    assert!(!h.table.shadow_read_owed_by_walk(), "the walk agrees at four in flight");
+
+    let mut h = Harness::new();
+    let keys: Vec<Vec<u8>> = (0..24u32).map(|i| format!("h:{i}").into_bytes()).collect();
+    for key in &keys {
+        h.insert(key, b"v");
+    }
+    h.drain_to_cold();
+    let mut open = 0usize;
+    let mut in_flight: Vec<(u64, LogicalAddr)> = Vec::new();
+    let mut state = 0x5EED_0B1Eu64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let (mut issued, mut failed, mut resolved, mut verified) = (0, 0, 0, 0);
+    for step in 0..2_000u32 {
+        match next() % 6 {
+            0 if open < keys.len() => {
+                h.shadow_set(&keys[open], b"w");
+                open += 1;
+            }
+            1 => {
+                let reads = h.table.shadow_work((next() % 6) as usize);
+                issued += reads.len();
+                in_flight.extend(reads.iter().map(|r| (r.ticket.hash, r.ticket.cold)));
+            }
+            2 if !in_flight.is_empty() => {
+                let (_, cold) = in_flight.swap_remove((next() as usize) % in_flight.len());
+                h.table.shadow_read_failed(cold);
+                failed += 1;
+            }
+            3 | 4 if !in_flight.is_empty() => {
+                let (hash, cold) = in_flight.swap_remove((next() as usize) % in_flight.len());
+                let image = h.tier[&cold.to_raw()].clone();
+                if next() % 2 == 0 {
+                    h.table.resolve_shadow(hash, cold, &image);
+                    resolved += 1;
+                } else {
+                    h.table.verify_shadow(hash, cold, &image);
+                    verified += 1;
+                }
+            }
+            _ => {}
+        }
+        assert!(
+            in_flight.len() <= h.table.shadow_unverified(),
+            "step {step}: in flight ≤ unverified"
+        );
+        assert_eq!(
+            h.table.shadow_read_owed(),
+            h.table.shadow_read_owed_by_walk(),
+            "step {step}: the owe bit against the walk"
+        );
+    }
+    assert!(
+        issued > 0 && failed > 0 && resolved > 0 && verified > 0 && open == keys.len(),
+        "VACUOUS: issued {issued}, failed {failed}, resolved {resolved}, verified {verified}, \
+         tickets {open}"
     );
 }

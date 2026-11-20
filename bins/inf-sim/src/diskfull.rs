@@ -29,6 +29,7 @@
 //! admission behavior; the device-ENOSPC latch legs live in the
 //! crash-matrix rows, where the fault points are.)
 
+use crate::driver::Violations;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -73,7 +74,7 @@ type ModelEntry = (Vec<u8>, usize);
 
 #[derive(Debug, Default)]
 pub struct DiskfullReport {
-    pub violations: Vec<String>,
+    pub violations: Violations,
     pub refusals: u64,
     pub reopens: u64,
     pub relocated_bytes: u64,
@@ -105,6 +106,7 @@ struct World {
 
 impl World {
     fn new(seed: u64) -> World {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let mut ks =
             Keyspace::new(StoreConfig { hasher: KeyHasher::from_seed(seed), ..Default::default() });
         let demote = DemotionConfig {
@@ -121,6 +123,7 @@ impl World {
             },
             demote,
             1024,
+            &census,
         )
         .expect("materialize");
         let table = ks.tiered_store_mut(NS).expect("materialized");
@@ -136,8 +139,10 @@ impl World {
                 mode: TierIoMode::Buffered,
                 file_capacity: 16 * PAGE,
                 slice_bytes: PAGE,
+                record_len_max: 16 << 20,
             },
             0,
+            &census,
         );
         World {
             ks,
@@ -160,6 +165,7 @@ impl World {
         self.report.state.number(b"value", value);
     }
 
+    #[track_caller]
     fn violation(&mut self, text: String) {
         if self.report.violations.len() < 16 {
             self.report.violations.push(text);

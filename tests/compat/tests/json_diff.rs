@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test target: the oracle's address comes from the environment (ADR-0209 D3)"
+)]
 //! InfinityDB against a pinned RedisJSON, under RESP2 and RESP3: a reply that
 //! differs from the oracle's fails unless its case and protocol are on the
 //! allowlist, which admits it whatever its bytes, and an allowlist entry
@@ -57,9 +61,9 @@ fn json_matrix_matches_pinned_redisjson() {
         candidate_roundtrip(&mut candidate, &["FLUSHALL"]);
 
         for case in JSON_CASES {
-            let argv = strings(case.argv);
+            let argv = case.args();
             let oracle_reply = oracle.roundtrip(&argv).expect("oracle command");
-            let candidate_reply = candidate_roundtrip(&mut candidate, case.argv);
+            let candidate_reply = candidate.execute_wire(&encode_command(&argv));
             match compare(case, protocol, &oracle_reply, &candidate_reply, DEVIATIONS) {
                 Ok(Comparison::Exact) => exact += 1,
                 Ok(Comparison::Allowed { deviation_index, semantic_equal: same }) => {

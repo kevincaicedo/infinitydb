@@ -191,6 +191,30 @@ fn tier_walk_step<F: SegmentFs>(
 }
 
 /// Walk-slice cursor bookkeeping: 0 = this pass finished.
+/// Leaves the walk's current namespace, whichever way it ended (walked to
+/// its end, or dropped mid-walk under either branch): the next one starts
+/// at its first pass with its cursor and resume point cleared, so no
+/// namespace inherits another's place. A tiered namespace dropped past its
+/// first pass would otherwise hand the next tiered one a later pass, whose
+/// walk was never begun: its address references and images left out of
+/// the checkpoint, or the walk's latch read with no walk pinned.
+fn next_namespace(
+    ns_idx: &mut usize,
+    cursor: &mut u64,
+    resume: &mut Option<inf_store::ChainPos>,
+    tier_pass: &mut u8,
+    walk_done: &mut bool,
+    ns_ids: &[u32],
+) {
+    *ns_idx += 1;
+    *cursor = 0;
+    *resume = None;
+    *tier_pass = 0;
+    if *ns_idx == ns_ids.len() {
+        *walk_done = true;
+    }
+}
+
 fn advance_pass(cursor: &mut u64, tier_pass: &mut u8, next: u64) {
     if next == 0 {
         *cursor = 0;
@@ -584,23 +608,16 @@ impl<F: SegmentFs> DurableCell<F> {
                             bound_splits += 1;
                         }
                         TierStep::NsDone => {
-                            *ns_idx += 1;
-                            *cursor = 0;
-                            *resume = None;
-                            *tier_pass = 0;
-                            if *ns_idx == ns_ids.len() {
-                                *walk_done = true;
-                            }
+                            next_namespace(ns_idx, cursor, resume, tier_pass, walk_done, ns_ids);
                         }
                     }
                     continue;
                 }
                 match ks.ns_store_mut(ns) {
                     // Dropped mid-walk: its records replay as skips anyway.
+                    // A tiered namespace dropped mid-walk lands here too.
                     None => {
-                        *ns_idx += 1;
-                        *cursor = 0;
-                        *resume = None;
+                        next_namespace(ns_idx, cursor, resume, tier_pass, walk_done, ns_ids);
                     }
                     Some(store) => {
                         let bytes = &mut emitted;
@@ -642,8 +659,7 @@ impl<F: SegmentFs> DurableCell<F> {
                             },
                         );
                         if done {
-                            *ns_idx += 1;
-                            *cursor = 0;
+                            next_namespace(ns_idx, cursor, resume, tier_pass, walk_done, ns_ids);
                         } else {
                             *cursor = at.group;
                             *resume = at.chain;
@@ -651,9 +667,6 @@ impl<F: SegmentFs> DurableCell<F> {
                                 force_seal = true;
                                 bound_splits += 1;
                             }
-                        }
-                        if *ns_idx == ns_ids.len() {
-                            *walk_done = true;
                         }
                     }
                 }

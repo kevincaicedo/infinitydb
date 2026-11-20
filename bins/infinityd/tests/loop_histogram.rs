@@ -14,12 +14,16 @@ mod loop_scrape;
 #[path = "../../inf-bench/src/resp.rs"]
 mod resp;
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 struct Server {
-    child: Child,
+    child: Node,
     root: PathBuf,
 }
 
@@ -37,7 +41,8 @@ fn spawn() -> (Server, u16) {
         std::env::temp_dir().join(format!("inf-loop-snapshot-{}-{port}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
     let stderr = root.join("stderr");
-    let child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+    let child = NodeBinary::built()
+        .command()
         .args(["--cells", "4", "--port", &port.to_string(), "--device-probe", "off"])
         .arg("--data-dir")
         .arg(&root)

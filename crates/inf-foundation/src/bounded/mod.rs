@@ -26,9 +26,21 @@ use core::num::NonZeroU32;
 
 mod census;
 mod deque;
+mod map;
+mod slab;
+mod store;
 
-pub use census::{CapCensus, CapRow, CensusPhase, ServeMark};
+pub use census::{CapCensus, CapRow, CensusPhase, ServeMark, SlabInstance};
 pub use deque::{CappedDeque, DequeSlot, Reserved};
+pub use map::{
+    Admission, CappedMap, ExactKey, MapBuilder, MapBuilt, MapRetired, MapRetiring, OccupiedSlot,
+    VacantSlot,
+};
+pub use slab::{
+    Built, CappedSlab, Generation, GenerationPolicy, Lookup, LookupMut, NamedReservation, Released,
+    Retire, Retiring, SlabBuilder, SlabReserved, SlabRetiring, SlotId, SlotReservation, SlotWord,
+    Taken, WordLookup, WrapWithProof,
+};
 
 /// When a container's host fills it: while the cell serves, or whole before
 /// the cell's serve mark (ADR-0163 D2). The census keeps the fill on the row
@@ -73,6 +85,26 @@ impl Cap {
         Cap { name, entries, fill }
     }
 
+    /// `n` entries under `ceiling`'s name and fill, for a cap its host
+    /// computes from boot configuration (ADR-0177 D1): `1 <= n <=` the
+    /// ceiling's entries, else `CapError::Layout`, returned before the cell
+    /// serves. Spelled only in a `limits.rs`, as `Cap::entries` is, so every
+    /// derived cap is still a nonzero `Cap` a named `limits` const bounds,
+    /// and its census row carries the derived value under the ceiling's
+    /// name.
+    ///
+    /// # Errors
+    /// `CapError::Layout` when `n` is 0 or above the ceiling's entries.
+    pub const fn derived(ceiling: &Cap, n: u32) -> Result<Cap, CapError> {
+        if n > ceiling.entries.get() {
+            return Err(CapError::Layout);
+        }
+        match NonZeroU32::new(n) {
+            Some(entries) => Ok(Cap { name: ceiling.name, entries, fill: ceiling.fill }),
+            None => Err(CapError::Layout),
+        }
+    }
+
     /// The row's name on the cell's census.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -100,8 +132,9 @@ impl Cap {
 pub enum CapError {
     /// The allocator refused the backing.
     Alloc,
-    /// `entries × stride` passes the backing's byte bound, or the shape is
-    /// not representable on this host.
+    /// `entries × stride` passes the backing's byte bound, a slab's chunk is
+    /// not the count its slot's bytes take (`chunk_slots_for`), or the shape
+    /// is not representable on this host.
     Layout,
     /// The census refused the row: a name registered with a second cap value
     /// or a second fill, an `Assembly` name registered twice, a name past
@@ -120,6 +153,38 @@ impl fmt::Display for CapError {
 }
 
 impl std::error::Error for CapError {}
+
+/// A capped container its host fills whole at the cell's assembly answered
+/// `Full` there: the host's cap is short of its own demand. The one home of
+/// the refusal's text, `<row>-full-at-assembly`, with the census row's name
+/// (the cap's), so a log or a canary names the row that refused. Derived
+/// never on a correct build: an `Assembly` cap is its host's demand.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AssemblyFull {
+    row: &'static str,
+}
+
+impl AssemblyFull {
+    /// The refusal of `cap`'s container at its cell's assembly.
+    #[must_use]
+    pub const fn new(cap: Cap) -> AssemblyFull {
+        AssemblyFull { row: cap.name() }
+    }
+
+    /// The census row that refused.
+    #[must_use]
+    pub const fn row(self) -> &'static str {
+        self.row
+    }
+}
+
+impl fmt::Display for AssemblyFull {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-full-at-assembly", self.row)
+    }
+}
+
+impl std::error::Error for AssemblyFull {}
 
 /// A payload that may be merged or dropped at a cap (ADR-0151 D2's
 /// coalescing row). A type opts in by name, and a reply, a pin or a
@@ -156,10 +221,38 @@ mod tests {
         assert_eq!(ONE.fill(), CapFill::Assembly);
     }
 
+    /// A derived cap: 0, 1, the ceiling − 1, the ceiling and the ceiling + 1
+    /// against a ceiling of 16, and `u32::MAX`; the name and the fill are
+    /// the ceiling's.
+    #[test]
+    fn a_derived_cap_takes_the_ceilings_name_and_fill_within_its_entries() {
+        const CEILING: Cap = Cap::entries::<16>("per-origin", CapFill::Serving);
+        for n in [1, 15, 16] {
+            let cap = Cap::derived(&CEILING, n).expect("within the ceiling");
+            assert_eq!(
+                (cap.name(), cap.entries_max(), cap.fill()),
+                ("per-origin", n, CapFill::Serving)
+            );
+        }
+        for n in [0, 17, u32::MAX] {
+            assert_eq!(Cap::derived(&CEILING, n), Err(CapError::Layout), "n = {n}");
+        }
+        const ASSEMBLY: Cap = Cap::entries::<1>("one", CapFill::Assembly);
+        assert_eq!(Cap::derived(&ASSEMBLY, 1).map(Cap::fill), Ok(CapFill::Assembly));
+    }
+
     #[test]
     fn errors_name_their_cause() {
         assert_eq!(CapError::Alloc.to_string(), "the allocator refused the backing");
         assert!(CapError::Layout.to_string().contains("byte bound"));
         assert!(CapError::Census.to_string().contains("census"));
+    }
+
+    #[test]
+    fn an_assembly_refusal_names_its_census_row() {
+        const OWNERS: Cap = Cap::entries::<4>("timer-owners", CapFill::Assembly);
+        let full = AssemblyFull::new(OWNERS);
+        assert_eq!(full.row(), "timer-owners");
+        assert_eq!(full.to_string(), "timer-owners-full-at-assembly");
     }
 }

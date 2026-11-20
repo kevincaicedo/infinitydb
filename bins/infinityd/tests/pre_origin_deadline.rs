@@ -10,9 +10,14 @@
 //! cannot go red on a correct binary; a regression goes red only when the
 //! pipeline lands inside that millisecond, so the test boots several times.
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// Boots per run. A release binary that clamped onto the origin served the
@@ -28,11 +33,11 @@ const CELLS: &str = "4";
 const PIPELINE: &[u8] = b"*5\r\n$3\r\nSET\r\n$3\r\nsxp\r\n$1\r\nv\r\n$4\r\nEXAT\r\n$1\r\n1\r\n\
     *2\r\n$3\r\nGET\r\n$3\r\nsxp\r\n";
 
-struct Node {
-    child: Child,
+struct Booted {
+    child: Node,
 }
 
-impl Node {
+impl Booted {
     /// Stops the node and returns its stderr, which names why a boot
     /// failed (a reset alone does not).
     fn stderr(&mut self) -> String {
@@ -44,17 +49,10 @@ impl Node {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let mut text = String::new();
-        if let Some(mut pipe) = self.child.stderr.take() {
+        if let Some(mut pipe) = self.child.take_stderr() {
             let _ = pipe.read_to_string(&mut text);
         }
         text
-    }
-}
-
-impl Drop for Node {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -76,7 +74,7 @@ fn reply_end(buf: &[u8], start: usize) -> Option<usize> {
 
 /// Reads until `count` whole replies have arrived, within `deadline`.
 fn read_replies(
-    node: &mut Node,
+    node: &mut Booted,
     stream: &mut TcpStream,
     count: usize,
     deadline: Instant,
@@ -109,7 +107,7 @@ fn read_replies(
 }
 
 /// Boots a volatile node and connects the moment its listener accepts.
-fn boot_and_connect() -> (Node, TcpStream) {
+fn boot_and_connect() -> (Booted, TcpStream) {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .expect("probe bind")
         .local_addr()
@@ -117,15 +115,14 @@ fn boot_and_connect() -> (Node, TcpStream) {
         .port();
     // `INF_PRE_ORIGIN_BIN` points the test at another build, to show it red
     // against a binary that clamps onto the origin.
-    let binary = std::env::var("INF_PRE_ORIGIN_BIN")
-        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_infinityd").to_owned());
-    let child = Command::new(binary)
+    let child = NodeBinary::built_or("INF_PRE_ORIGIN_BIN")
+        .command()
         .args(["--port", &port.to_string(), "--cells", CELLS])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn infinityd");
-    let mut node = Node { child };
+    let mut node = Booted { child };
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)) {

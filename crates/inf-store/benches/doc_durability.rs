@@ -66,16 +66,20 @@ fn gate_doc() -> Vec<u8> {
 }
 
 fn keyspace(documents: usize) -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig { initial_keys: documents, ..Default::default() });
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"bench".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"bench".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("namespace");
     ks
 }
@@ -164,14 +168,15 @@ fn replay_once(documents: usize, histories: usize, idoc: &[u8]) -> f64 {
     let mut ks = keyspace(documents);
     for index in 0..documents {
         let key = key_of(index);
-        let outcome = ks
-            .apply_record(
-                &RecordView::DocFull { ns: NS, key: &key, lineage: LINEAGE, version: 1, idoc },
-                NOW,
-                ANCHOR,
-                &mut NoSpill,
-            )
-            .expect("initial full");
+        let outcome = inf_store::drive_record(
+            &mut ks,
+            &RecordView::DocFull { ns: NS, key: &key, lineage: LINEAGE, version: 1, idoc },
+            NOW,
+            ANCHOR,
+            &mut NoSpill,
+            u64::MAX,
+        )
+        .expect("initial full");
         assert_eq!(outcome, ReplayOutcome::Applied);
     }
     let program = compile(b"$.n").expect("path");
@@ -182,24 +187,25 @@ fn replay_once(documents: usize, histories: usize, idoc: &[u8]) -> f64 {
     for depth in 0..histories {
         for index in 0..documents {
             let key = key_of(index);
-            let outcome = ks
-                .apply_record(
-                    &RecordView::DocDelta {
-                        ns: NS,
-                        key: &key,
-                        lineage: LINEAGE,
-                        base_version: depth as u32 + 1,
-                        match_count: 1,
-                        post_len: idoc.len() as u32,
-                        opcode,
-                        program: program.as_bytes(),
-                        operand: &operand,
-                    },
-                    NOW,
-                    ANCHOR,
-                    &mut NoSpill,
-                )
-                .expect("valid sequential delta");
+            let outcome = inf_store::drive_record(
+                &mut ks,
+                &RecordView::DocDelta {
+                    ns: NS,
+                    key: &key,
+                    lineage: LINEAGE,
+                    base_version: depth as u32 + 1,
+                    match_count: 1,
+                    post_len: idoc.len() as u32,
+                    opcode,
+                    program: program.as_bytes(),
+                    operand: &operand,
+                },
+                NOW,
+                ANCHOR,
+                &mut NoSpill,
+                u64::MAX,
+            )
+            .expect("valid sequential delta");
             assert_eq!(outcome, ReplayOutcome::Applied);
         }
     }

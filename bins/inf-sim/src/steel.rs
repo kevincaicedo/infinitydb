@@ -19,6 +19,7 @@
 //! Every event folds into `trace_hash`; `--verify-determinism` runs the
 //! scenario twice and requires hash identity (L7).
 
+use crate::driver::Violations;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -33,15 +34,16 @@ use inf_log::{
     TierIoMode, tier_extract, tier_frame_offset, tier_frame_span,
 };
 use inf_runtime::{
-    BackendDriver, CellExecutor, CompletionResult, CompletionToken, GateWait, IoGate, IoOp,
-    PollImmediate, RawFd, StableBytesMut, TokenClass, Wait,
+    BackendDriver, CellExecutor, CompletionResult, CompletionToken, ExecutorLayout, IoGate, IoOp,
+    KeyedAdmission, KeyedWait, PollImmediate, RawFd, StableBytesMut, TaskAdmission, TaskClass,
+    TokenClass, Wait,
 };
 use inf_store::{
     AddrClass, AddressSpaceConfig, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsId,
     StoreConfig, TieredLookup, TieredTable,
 };
 
-use crate::net::{CellNet, Plant, SimDriver};
+use crate::net::{CellNet, Plant, SimDriver, drain_violations};
 
 const NS: NsId = NsId(77);
 const RING: usize = 1 << 20;
@@ -67,7 +69,7 @@ impl SteelScenario {
 
 #[derive(Debug, Default)]
 pub struct SteelReport {
-    pub violations: Vec<String>,
+    pub violations: Violations,
     pub cold_reads: u64,
     pub promotions: u64,
     pub trace_hash: u64,
@@ -120,7 +122,7 @@ impl Ctx {
     }
 }
 
-type Waiter = GateWait<CompletionToken, CompletionResult>;
+type Waiter = KeyedWait<CompletionToken, CompletionResult>;
 type Answer = Option<(Vec<u8>, u32, bool)>;
 
 enum Planned {
@@ -165,7 +167,10 @@ fn plan(ctx: &Rc<RefCell<Ctx>>, key: &[u8], hash: u64, exclude: &[LogicalAddr]) 
                 buf: stable,
                 token,
             });
-            let waiter = ctx.gate.waiter(token);
+            let KeyedAdmission::Granted(permit) = ctx.gate.reserve(token) else {
+                unreachable!("the steel thread mints each token once and reads one at a time");
+            };
+            let waiter = permit.register();
             Planned::Fetch { buf, addr, frame_count, skip, waiter }
         }
     }
@@ -248,15 +253,40 @@ fn pump_until<T>(
     panic!("m4-steel pump exceeded its bound");
 }
 
-fn run_get(ctx: &Rc<RefCell<Ctx>>, ex: &mut CellExecutor, key: &[u8]) -> (Answer, bool) {
+/// One steel `GET` as a task: its answer kept for the caller.
+async fn get_task(ctx: Rc<RefCell<Ctx>>, key: Vec<u8>, sink: Rc<RefCell<Option<Answer>>>) {
+    let answer = steel_get(ctx, key).await;
+    *sink.borrow_mut() = Some(answer);
+}
+
+/// The steel thread's I/O gate: one read is in flight at a time, so its routes and holders never
+/// fill.
+const IO_GATE_HOLDERS: inf_foundation::bounded::Cap = inf_foundation::bounded::Cap::entries::<64>(
+    "io-gate-holders",
+    inf_foundation::bounded::CapFill::Serving,
+);
+
+/// The steel thread's executor of one class, its `GET` task, on a census of its own.
+fn get_executor() -> (CellExecutor, TaskClass) {
+    let (census, _mark) = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0));
+    let mut layout = ExecutorLayout::new(&census);
+    let gets = layout.class(&get_task, crate::limits::STEEL_GETS).expect("the steel's class");
+    (layout.build().expect("the steel's executor"), gets)
+}
+
+fn run_get(
+    ctx: &Rc<RefCell<Ctx>>,
+    (ex, gets): &mut (CellExecutor, TaskClass),
+    key: &[u8],
+) -> (Answer, bool) {
     let done: Rc<RefCell<Option<Answer>>> = Rc::new(RefCell::new(None));
     let sink = Rc::clone(&done);
     let fut_ctx = Rc::clone(ctx);
     let key = key.to_vec();
-    let outcome = ex.poll_immediate(async move {
-        let answer = steel_get(fut_ctx, key).await;
-        *sink.borrow_mut() = Some(answer);
-    });
+    let TaskAdmission::Granted(permit) = ex.reserve(*gets) else {
+        panic!("the steel's class holds its one GET");
+    };
+    let outcome = permit.poll_immediate(|| get_task(fut_ctx, key, sink));
     match outcome {
         PollImmediate::Completed => {
             (done.borrow_mut().take().expect("completed future stored its answer"), false)
@@ -283,6 +313,7 @@ fn run_life(
     report: &mut SteelReport,
     hasher: KeyHasher,
 ) -> (LogicalAddr, u32) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     // Replay the ledger into a fresh life (the harness plays the WAL).
     let mut ks = Keyspace::new(StoreConfig { hasher, ..Default::default() });
     assert!(
@@ -291,6 +322,7 @@ fn run_life(
             AddressSpaceConfig { reserve_bytes: RING, page_bytes: PAGE, life_origin },
             DemotionConfig::for_budget(RING as u64, PAGE as u64),
             64,
+            &census,
         )
         .is_ok()
     );
@@ -331,8 +363,10 @@ fn run_life(
             mode: TierIoMode::Buffered,
             file_capacity: TIER_FILE_CAPACITY_DEFAULT,
             slice_bytes: PAGE as u64,
+            record_len_max: 16 << 20,
         },
         tier_file_id,
+        &census,
     );
     table.flush_drain(&mut flush).expect("flush drain");
     assert_eq!(table.space().flushed(), tail, "drain confirms the whole sealed range");
@@ -354,12 +388,12 @@ fn run_life(
         ks,
         pool: AlignedPool::new(2, POOL_BUF),
         driver: SimDriver::with_disk(CellNet::new(0, 0xD15C_0000, Plant::None), disk.clone()),
-        gate: IoGate::new(),
+        gate: IoGate::build(IO_GATE_HOLDERS, &census).expect("the steel thread's gate"),
         tiers,
         _tier_handles: handles,
         next_token: 1,
     }));
-    let mut ex = CellExecutor::new(8);
+    let mut ex = get_executor();
 
     // Cold-read every model key; content + version compared (never
     // addresses — §3.1).
@@ -450,6 +484,7 @@ fn run_life(
     if ctx.pool.reconcile().is_err() {
         report.violations.push("aligned-pool lease leak".into());
     }
+    drain_violations(core::slice::from_ref(ctx.driver.net()), &mut report.violations);
     (tail, flush.next_file_id())
 }
 

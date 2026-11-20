@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 use inf_foundation::time::Nanos;
 use inf_log::fs::StdSegmentFs;
 use inf_log::{
-    CkptConfig, MutationEffect, NsId, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
-    create_cell_dirs,
+    CkptConfig, LogGeometry, MutationEffect, NsId, SegmentConfig, SegmentRotor, StagingConfig,
+    StagingRing, create_cell_dirs,
 };
 use inf_server::{DurableConfig, Recovery, RecoveryProgress, boot_prefetch_threads_spawned};
 use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StateDigest, StoreConfig, WallAnchor};
@@ -57,8 +57,12 @@ fn scratch(tag: &str) -> PathBuf {
 fn cfg(root: &Path, boot_prefetch: bool) -> DurableConfig {
     DurableConfig {
         data_dir: root.to_path_buf(),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 64 << 10, ..Default::default() },
+        // A staging ring no larger than one segment (the harness rule).
+        geometry: LogGeometry::new(
+            StagingConfig::with_capacity(64 << 10),
+            SegmentConfig { segment_bytes: 64 << 10, ..Default::default() },
+        )
+        .expect("the fixture's log geometry"),
         ckpt: CkptConfig::default(),
         recover: inf_server::RecoverConfig { boot_prefetch, ..Default::default() },
         flush_bound: 1,
@@ -70,16 +74,20 @@ fn cfg(root: &Path, boot_prefetch: bool) -> DurableConfig {
 }
 
 fn fresh_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"ledger".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"ledger".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("ns");
     ks
 }
@@ -91,8 +99,8 @@ fn write_log(root: &Path, frames: usize, per_frame: usize) {
     let shard = root.join(format!("shard-{CELL}"));
     let dirs = create_cell_dirs(&StdSegmentFs, &shard).expect("dirs");
     let mut rotor =
-        SegmentRotor::create_fresh(StdSegmentFs, dirs.log.clone(), config.segment).expect("rotor");
-    let mut ring = StagingRing::new(config.staging);
+        SegmentRotor::create_fresh(StdSegmentFs, dirs.log.clone(), config.geometry).expect("rotor");
+    let mut ring = StagingRing::new(config.geometry);
     let value = vec![0x5Au8; 512];
     for frame in 0..frames {
         for i in 0..per_frame {
@@ -173,9 +181,17 @@ fn assert_a_live_prefetch_thread_is_counted() {
 /// Recovers the log at `root` with the given arm; returns the digest and
 /// the number of prefetch threads spawned during the run.
 fn recover(root: &Path, boot_prefetch: bool) -> (StateDigest, u64) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let before = boot_prefetch_threads_spawned();
     let mut ks = fresh_keyspace();
-    let mut rec = Recovery::new(StdSegmentFs, CELL, &cfg(root, boot_prefetch), anchor(), now());
+    let mut rec = Recovery::new(
+        StdSegmentFs,
+        CELL,
+        &cfg(root, boot_prefetch),
+        anchor(),
+        now(),
+        std::rc::Rc::clone(&census),
+    );
     while rec.step(&mut ks, u64::MAX).expect("step") == RecoveryProgress::Working {}
     // The typed half: the rotor the plane inherits is over the bare tier.
     let (rotor, _stats, _seed): (SegmentRotor<StdSegmentFs>, _, _) = rec.finish();

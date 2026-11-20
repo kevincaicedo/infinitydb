@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use inf_log::fs::StdSegmentFs;
 use inf_log::{
-    MutationEffect, NsId, ReaderConfig, SegmentConfig, SegmentId, SegmentReader, SegmentRotor,
-    StagingConfig, StagingRing, create_cell_dirs, segment_file_name,
+    LogGeometry, MutationEffect, NsId, ReaderConfig, SegmentConfig, SegmentId, SegmentReader,
+    SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, segment_file_name,
 };
 
 /// M2-S22 cold-cache row (`INF_BENCH_COOL=1`): evict the segment from the
@@ -73,8 +73,9 @@ fn write_segment(root: &Path, segment_bytes: u32) -> (PathBuf, u64, u64) {
     let fs = StdSegmentFs;
     let dirs = create_cell_dirs(&fs, &root.join("shard-0")).expect("dirs");
     let cfg = SegmentConfig { segment_bytes, ..Default::default() };
-    let mut rotor = SegmentRotor::create_fresh(fs, dirs.log.clone(), cfg).expect("rotor");
-    let mut ring = StagingRing::new(StagingConfig::with_capacity(1 << 20));
+    let geometry = LogGeometry::new(StagingConfig::with_capacity(1 << 20), cfg).expect("geometry");
+    let mut rotor = SegmentRotor::create_fresh(fs, dirs.log.clone(), geometry).expect("rotor");
+    let mut ring = StagingRing::new(geometry);
 
     let value = payload(256);
     let mut key = *b"user:0000000000000000";

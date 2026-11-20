@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    MutationEffect, NsId, SegmentConfig, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs,
+    LogGeometry, MutationEffect, NsId, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
+    create_cell_dirs,
 };
 
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
@@ -63,8 +64,9 @@ fn append_path_performs_zero_heap_allocations() {
     // Segment large enough that the measured loop never rotates —
     // rotation/prealloc is MAINTAIN work, not the append path.
     let cfg = SegmentConfig { segment_bytes: 32 << 20, ..Default::default() };
-    let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg).expect("rotor");
-    let mut ring = StagingRing::new(StagingConfig::with_capacity(64 << 10));
+    let geometry = LogGeometry::new(StagingConfig::with_capacity(64 << 10), cfg).expect("geometry");
+    let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry).expect("rotor");
+    let mut ring = StagingRing::new(geometry);
 
     let value = [0x5A_u8; 64];
     let effects = [
@@ -113,9 +115,10 @@ fn four_frames_in_flight_phase() {
     let fs = MemFs::new();
     let dirs = create_cell_dirs(&fs, &PathBuf::from("data/shard-1")).expect("dirs");
     let cfg = SegmentConfig { segment_bytes: 32 << 20, ..Default::default() };
-    let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, cfg).expect("rotor");
-    let mut ring =
-        StagingRing::new(StagingConfig { capacity_bytes: 64 << 10, frames_in_flight: 4 });
+    let staging = StagingConfig { capacity_bytes: 64 << 10, frames_in_flight: 4 };
+    let geometry = LogGeometry::new(staging, cfg).expect("geometry");
+    let mut rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry).expect("rotor");
+    let mut ring = StagingRing::new(geometry);
     let value = [0xA5_u8; 64];
     let effect = MutationEffect::StringSet { ns: NsId(1), key: b"user:0042", value: &value };
     // Fixed scaffolding: no per-iteration allocation in the test either.

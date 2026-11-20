@@ -64,10 +64,10 @@ use inf_foundation::time::Nanos;
 use inf_log::fs::sim::SimDisk;
 use inf_log::fs::{SegmentFs, SegmentIoMode};
 use inf_log::{
-    FRAME_ALIGN, FsyncClass, GroupCommit, MutationEffect, SegmentConfig, SegmentRotor,
+    FRAME_ALIGN, FsyncClass, GroupCommit, LogGeometry, MutationEffect, SegmentConfig, SegmentRotor,
     StagingConfig, StagingRing, ZERO_FILL_SLICE_BYTES, create_cell_dirs,
 };
-use inf_log::{FrameId, FramePlan, Lsn};
+use inf_log::{FrameBarrier, FrameId, FramePlan, Lsn};
 use inf_server::open_cell_log;
 
 const SEGMENT_BYTES: u32 = 64 << 10;
@@ -95,6 +95,13 @@ struct Rig {
     seq: u32,
 }
 
+/// The rig's ring: 16 KiB buffers, four frames in flight, beside the
+/// rig's 64 KiB segments.
+fn rig_geometry(segment: SegmentConfig) -> LogGeometry {
+    let staging = StagingConfig { capacity_bytes: 16 << 10, frames_in_flight: 4 };
+    LogGeometry::new(staging, segment).expect("the rig's log geometry")
+}
+
 fn direct_cfg() -> SegmentConfig {
     SegmentConfig {
         segment_bytes: SEGMENT_BYTES,
@@ -116,12 +123,13 @@ impl Rig {
     fn new() -> Rig {
         let disk = SimDisk::new();
         let dirs = create_cell_dirs(&disk, Path::new("data/shard-0")).expect("dirs");
-        let rotor = SegmentRotor::create_fresh_deferred(disk.clone(), dirs.log, direct_cfg())
-            .expect("rotor");
+        let geometry = rig_geometry(direct_cfg());
+        let rotor =
+            SegmentRotor::create_fresh_deferred(disk.clone(), dirs.log, geometry).expect("rotor");
         let mut rig = Rig {
             disk,
             rotor,
-            ring: StagingRing::new(StagingConfig { capacity_bytes: 16 << 10, frames_in_flight: 4 }),
+            ring: StagingRing::new(geometry),
             commit: ledger(),
             model: BTreeMap::new(),
             frame_keys: Vec::new(),
@@ -140,8 +148,7 @@ impl Rig {
         model: BTreeMap<Vec<u8>, (Vec<u8>, bool)>,
         seq: u32,
     ) -> Rig {
-        let mut ring =
-            StagingRing::new(StagingConfig { capacity_bytes: 16 << 10, frames_in_flight: 4 });
+        let mut ring = StagingRing::new(rig_geometry(direct_cfg()));
         ring.set_frame_epoch(rotor.resume_epoch());
         Rig { disk, rotor, ring, commit: ledger(), model, frame_keys: Vec::new(), seq }
     }
@@ -199,8 +206,9 @@ impl Rig {
         // pipeline is always drained and `Wait` is unreachable.
         let rotation_due = self.rotor.rotation_due(frame_len);
         let write_through_ok = self.rotor.next_frame_write_through_ok(frame_len);
-        let plan = self.commit.frame_plan(write_through_ok, rotation_due);
-        assert_ne!(plan, FramePlan::Wait, "drained rig never waits");
+        let FramePlan::Seal(plan) = self.commit.frame_plan(write_through_ok, rotation_due) else {
+            panic!("drained rig never waits");
+        };
         let (slot, handoff) = self.rotor.begin_frame_deferred(frame_len, 0).expect("reserve");
         assert_eq!(handoff.is_some(), rotation_due);
         assert_eq!(slot.write_through_ok(), write_through_ok);
@@ -211,30 +219,19 @@ impl Rig {
         let end = slot.base().advance(slot.len());
         let covered = self.commit.watermark().map_or(0, |l| l.to_u64());
         let lease = self.ring.seal(slot.first_record_lsn(), covered, slot.layout());
-        let id = self.commit.note_frame_queued(end, slot.len());
+        // The bytes are copied out for the rig's own execution; the
+        // ledger's queue holds the lease until the write lands.
+        let bytes = self.ring.leased_frame(&lease).to_vec();
+        let queued = self.commit.note_frame_queued(end, lease, plan, Nanos::ZERO);
         self.frame_keys.push((end.to_u64(), keys));
         let offset = FileOffset::from_u32_bytes(slot.base().offset);
-        let bytes = self.ring.leased_frame(&lease).to_vec();
-        let issued = match plan {
-            FramePlan::WriteThrough => Issued::Through {
-                id,
-                ticket: self.commit.register_write_through(Nanos::ZERO),
-                offset,
-                bytes,
-            },
-            FramePlan::LinkedFsync => Issued::Linked {
-                id,
-                ticket: self.commit.register_linked_fsync(Nanos::ZERO),
-                offset,
-                bytes,
-            },
-            FramePlan::Plain => Issued::Plain { id, offset, bytes },
-            FramePlan::Wait => unreachable!("asserted above"),
+        let id = queued.id;
+        let issued = match queued.barrier {
+            FrameBarrier::WriteThrough(ticket) => Issued::Through { id, ticket, offset, bytes },
+            FrameBarrier::Linked(ticket) => Issued::Linked { id, ticket, offset, bytes },
+            FrameBarrier::None => Issued::Plain { id, offset, bytes },
         };
         self.rotor.commit_frame_queued(slot);
-        // The plane releases the lease at LogWritten; here the bytes are
-        // copied out, so the lease can go now.
-        self.ring.release(lease);
         (issued, seal)
     }
 
@@ -254,20 +251,27 @@ impl Rig {
         match issued {
             Issued::Through { id, ticket, offset, bytes } => {
                 self.disk.driver_write_through(fd, offset, &bytes).expect("through");
-                self.commit.note_frame_written(id);
+                self.landed(id);
                 self.complete(ticket);
             }
             Issued::Linked { id, ticket, offset, bytes } => {
                 self.disk.driver_write_at(fd, offset, &bytes).expect("write");
-                self.commit.note_frame_written(id);
+                self.landed(id);
                 self.disk.driver_fdatasync(fd).expect("fsync");
                 self.complete(ticket);
             }
             Issued::Plain { id, offset, bytes } => {
                 self.disk.driver_write_at(fd, offset, &bytes).expect("write");
-                self.commit.note_frame_written(id);
+                self.landed(id);
             }
         }
+    }
+
+    /// The frame's write landed: the ledger hands its lease back to the
+    /// ring.
+    fn landed(&mut self, id: inf_log::FrameId) {
+        let written = self.commit.note_frame_written(id);
+        self.ring.release(written.lease);
     }
 
     fn complete(&mut self, ticket: inf_log::FsyncTicket) {
@@ -309,11 +313,15 @@ fn recover_in(
     mode: SegmentIoMode,
     context: &str,
 ) -> (SegmentRotor<SimDisk>, inf_server::RecoverStats) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh_keyspace(FsyncClass::Always);
-    let mut cfg = config(SEGMENT_BYTES);
-    cfg.segment.io_mode = mode;
+    let segment =
+        SegmentConfig { segment_bytes: SEGMENT_BYTES, io_mode: mode, ..Default::default() };
+    let cfg =
+        inf_server::DurableConfig { geometry: rig_geometry(segment), ..config(SEGMENT_BYTES) };
     let (rotor, stats, _) =
-        open_cell_log(disk.clone(), &mut ks, CELL, &cfg, anchor(), now()).expect("recovers");
+        open_cell_log(disk.clone(), &mut ks, CELL, &cfg, anchor(), now(), &census)
+            .expect("recovers");
     let store = ks.ns_store_mut(NS).expect("ns");
     for (key, (value, acked)) in model {
         let got = store.get(key, now()).map(<[u8]>::to_vec);
@@ -549,7 +557,8 @@ fn flush_to_fua_transition_keeps_every_acked_record() {
             let dirs = create_cell_dirs(&disk, Path::new("data/shard-0")).expect("dirs");
             let cfg = SegmentConfig { segment_bytes: SEGMENT_BYTES, ..Default::default() };
             let rotor =
-                SegmentRotor::create_fresh_deferred(disk.clone(), dirs.log, cfg).expect("rotor");
+                SegmentRotor::create_fresh_deferred(disk.clone(), dirs.log, rig_geometry(cfg))
+                    .expect("rotor");
             let mut rig = Rig::recovered(disk.clone(), rotor, BTreeMap::new(), 0);
             for _ in 0..1 + rng.next_below(3) {
                 let (op, h) = rig.seal_frame(1 + rng.next_below(3) as u32);

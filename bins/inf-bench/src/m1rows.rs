@@ -28,6 +28,9 @@ mod empty_node;
 mod memory;
 
 pub(crate) use empty_node::EmptyNodeValues;
+#[cfg(test)]
+pub(crate) use empty_node::RECEIVE_BUFFERS_DEFAULT;
+pub(crate) use empty_node::{EMPTY_NODE_CELLS, MemoryLeg, PinUnproven, PinnedRss, idle_leg};
 
 fn control(port: u16, argv: &[&[u8]]) -> Result<Vec<u8>, String> {
     let mut conn = connect("127.0.0.1", port)?;
@@ -117,7 +120,7 @@ pub fn cmd_gate_run_m1(flags: &Flags) -> Result<(), String> {
     let maxmemory_mb: u64 = flags.u64_or("maxmemory-mb", 256)?;
     let subs: usize = flags.usize_or("subs", 512)?;
     let sub_channels: usize = flags.usize_or("sub-channels", 50)?;
-    let infinityd = flags.str_or("infinityd-bin", "target/release/infinityd");
+    let infinityd = flags.str_or("infinityd-bin", &crate::cli::default_infinityd_bin());
     let redis_bin = flags.str_or("redis-bin", "redis-server");
     let reference_box = flags.bool("reference-box");
 

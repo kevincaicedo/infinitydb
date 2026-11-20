@@ -24,6 +24,8 @@ use crate::evict::EvictionPolicy;
 use crate::extents::{BLOB_THRESHOLD_DEFAULT, BlobConfig};
 use crate::tiered::compact::CompactionConfig;
 
+pub mod ddl;
+
 /// First id available to named namespaces. Ids `0..16` are the implicit
 /// default namespaces (`db0`..`db15`, always `memory`) and never appear in
 /// the registry or the catalog (ADR-0015 D2).
@@ -126,6 +128,20 @@ impl TierSpec {
             tail_stall_timeout_ms: 1_000,
         }
         .with_default_blob_threshold()
+    }
+
+    /// `M`: the largest encoded record this spec's namespace admits in one
+    /// life (the store's one formula, `record_len_max_in_ring`, over its
+    /// ring), the bound a pipeline's window pool is sized by with
+    /// the slice. A spec with no representable ring (one
+    /// [`validate`](Self::validate) refuses) answers the format's largest,
+    /// the limit of that formula as the ring grows: a pool sized by it holds
+    /// every span such a namespace could select.
+    #[must_use]
+    pub fn record_len_max(&self) -> u64 {
+        self.ring_bytes().map_or(crate::record::RECORD_ENCODED_LEN_MAX as u64, |ring| {
+            crate::record::record_len_max_in_ring(ring)
+        })
     }
 
     /// The largest `BLOB-THRESHOLD` a ring of `ring_bytes` can honour
@@ -336,6 +352,13 @@ pub enum NsError {
     /// `MEM-BUDGET` — adding tiering post-hoc is a create-time decision
     /// (drop + recreate), not a reload.
     NotTiered,
+    /// A mutator that takes no receipt, called on the node's cataloged
+    /// keyspace, whose entries change only with the catalog writer's
+    /// receipt (ADR-0189 D4): an internal error.
+    Cataloged,
+    /// A receipt mutator called on an uncataloged keyspace (a model or a
+    /// planeless tier, which no catalog writer answers): an internal error.
+    Uncataloged,
 }
 
 /// Valid namespace names: 1..=128 bytes of `[a-zA-Z0-9_.-]`, not colliding
@@ -728,6 +751,33 @@ mod tests {
             "registration runs the same gauntlet"
         );
         assert_eq!(reg.iter().count(), 0);
+    }
+
+    /// `M` has one formula, read by the spec and the table alike: half the
+    /// ring up to the format's largest record. Below, at and above the
+    /// ring where the two cross; a spec with no representable ring answers
+    /// the formula's limit.
+    #[test]
+    fn the_largest_record_is_one_formula_over_the_ring() {
+        let format = crate::record::RECORD_ENCODED_LEN_MAX as u64;
+        for (ring, want) in [
+            (4u64 << 20, 2u64 << 20),
+            (32 << 20, 16 << 20),
+            (2 * format, format),
+            (2 * format + 2, format),
+            (64 << 20, format),
+            (u64::MAX, format),
+        ] {
+            assert_eq!(crate::record::record_len_max_in_ring(ring), want, "ring {ring}");
+        }
+        for budget in [3u64 << 20, 31 << 20, 63 << 20, 1 << 30] {
+            let spec = TierSpec::for_budget(budget);
+            let ring = spec.ring_bytes().expect("a representable ring");
+            assert_eq!(spec.record_len_max(), crate::record::record_len_max_in_ring(ring));
+        }
+        let unrepresentable = TierSpec { mem_budget_bytes: u64::MAX, ..TierSpec::for_budget(1) };
+        assert_eq!(unrepresentable.ring_bytes(), None);
+        assert_eq!(unrepresentable.record_len_max(), format);
     }
 
     /// ADR-0102 D2: the default threshold follows the ring — a quarter

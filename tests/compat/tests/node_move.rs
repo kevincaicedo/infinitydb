@@ -1,6 +1,10 @@
 //! H3 binary tier: cross-owner moves under deterministic memory pressure.
 //! Preload with no limit, then lower maxmemory below both cells' live bytes.
 
+// nextest-stall-default: one four-byte SET into a tiered namespace, inside a
+// window of at least its 64 MiB MEM-BUDGET; no write parks (ADR-0053 D4), so
+// the stall bound is never read.
+
 use std::io::Write;
 use std::net::TcpStream;
 use std::path::Path;

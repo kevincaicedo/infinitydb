@@ -6,12 +6,17 @@
 #![cfg(target_os = "linux")]
 //! Real startup refusal for a sparse segment outside the log address range.
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
+
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 struct Boot {
-    child: Child,
+    child: Node,
     root: PathBuf,
 }
 
@@ -36,7 +41,8 @@ fn oversized_segment_boot_refuses_without_panic_or_log_changes() {
     let segment = log_dir.join("seg-000000.ilog");
     std::fs::File::create(&segment).unwrap().set_len(1u64 << 32).unwrap();
     let stderr = root.join("stderr");
-    let child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+    let child = NodeBinary::built()
+        .command()
         .args(["--port", "0", "--cells", "1", "--data-dir"])
         .arg(&root)
         .args(["--device-probe", "off"])

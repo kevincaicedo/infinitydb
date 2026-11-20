@@ -40,3 +40,7 @@ harness = false
 [[bench]]
 name = "blob_roundtrip"
 harness = false
+
+[[bench]]
+name = "ledger_frame"
+harness = false

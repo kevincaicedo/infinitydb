@@ -81,3 +81,30 @@ pub use ser::{
     serialize_reply_into_bounded,
 };
 pub use tape::{CanonicalDoc, DocStr, TapeDoc};
+
+/// The build profile keeps what this crate's tests check. The workspace
+/// manifest builds inf-doc at opt-level 1 in its dev and test profiles, and
+/// rustc drops debug assertions and overflow checks above opt-level 0 unless
+/// cargo asks for them; every `debug_assert!` here and every arithmetic step
+/// the tests reach would then pass unchecked. These two tests are red in any
+/// build of inf-doc without either, whatever key turned it off.
+#[cfg(test)]
+mod build_profile {
+    #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "the constant is the build's setting, and it is what this test judges"
+    )]
+    fn keeps_debug_assertions() {
+        assert!(cfg!(debug_assertions), "inf-doc was built without debug assertions");
+    }
+
+    /// Both operands pass through `black_box`, so the compiler can neither
+    /// fold the sum nor prove it overflows: only the run-time check panics.
+    #[test]
+    #[should_panic(expected = "attempt to add with overflow")]
+    fn keeps_overflow_checks() {
+        let sum = std::hint::black_box(u8::MAX) + std::hint::black_box(1);
+        std::hint::black_box(sum);
+    }
+}

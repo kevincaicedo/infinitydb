@@ -16,8 +16,8 @@ use inf_log::fs::sim::{SimDisk, SimDiskConfig};
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
     CkptConfig, DocLineage, FRAME_HEADER_LEN, Lsn, Manifest, MutationEffect, NsId, RecordView,
-    SegmentConfig, SegmentId, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs,
-    segment_file_name, write_manifest,
+    SegmentConfig, SegmentId, SegmentRotor, StagingRing, create_cell_dirs, segment_file_name,
+    write_manifest,
 };
 use inf_server::{DurableConfig, RecoverStats, open_cell_log};
 use inf_store::{FsyncClass, Keyspace, NsMode, NsSpec, StoreConfig, WallAnchor};
@@ -37,8 +37,7 @@ fn matrix_path() -> PathBuf {
 fn config(segment_bytes: u32) -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes, ..Default::default() },
+        geometry: crash_matrix::geometry(SegmentConfig { segment_bytes, ..Default::default() }),
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         flush_bound: 1,
@@ -50,16 +49,20 @@ fn config(segment_bytes: u32) -> DurableConfig {
 }
 
 fn keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"docs".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"docs".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("namespace");
     ks
 }
@@ -130,8 +133,8 @@ impl<F: SegmentFs + Clone> LogBuilder<F> {
     fn new(fs: F, cfg: &DurableConfig) -> LogBuilder<F> {
         let dirs = create_cell_dirs(&fs, Path::new(SHARD_DIR)).expect("cell directories");
         let rotor =
-            SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg.segment).expect("rotor");
-        LogBuilder { fs, rotor, ring: StagingRing::new(cfg.staging), log_dir: dirs.log }
+            SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg.geometry).expect("rotor");
+        LogBuilder { fs, rotor, ring: StagingRing::new(cfg.geometry), log_dir: dirs.log }
     }
 
     /// Appends exactly one frame. `covered_lsn` is the preceding fsync
@@ -163,9 +166,10 @@ impl<F: SegmentFs + Clone> LogBuilder<F> {
 }
 
 fn recover<F: SegmentFs + Clone + 'static>(fs: F, cfg: &DurableConfig) -> (Keyspace, RecoverStats) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = keyspace();
     let (_rotor, stats, _manifest) =
-        open_cell_log(fs, &mut ks, CELL, cfg, ANCHOR, NOW).expect("document recovery");
+        open_cell_log(fs, &mut ks, CELL, cfg, ANCHOR, NOW, &census).expect("document recovery");
     (ks, stats)
 }
 
@@ -223,7 +227,8 @@ fn delta_before_fsync(seeds: u64) {
     for seed in 0..seeds {
         // Small sectors make the one pending delta frame genuinely
         // tearable instead of merely present/absent.
-        let disk = SimDisk::with_config(SimDiskConfig { sector_bytes: 32 });
+        let disk =
+            SimDisk::with_config(SimDiskConfig { sector_bytes: 32, ..SimDiskConfig::default() });
         let mut log = LogBuilder::new(disk.clone(), &cfg);
         let full = log.frame(&[fixtures.full(b"doc", 1, &fixtures.v1)], 0);
         log.sync(full.base.segment);

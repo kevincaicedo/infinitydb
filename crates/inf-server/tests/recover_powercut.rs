@@ -47,8 +47,8 @@ fn build_and_cut(disk: &SimDisk, seed: u64) -> Lsn {
     let config = cfg();
     let dirs = create_cell_dirs(disk, Path::new("data/shard-0")).expect("dirs");
     let mut rotor =
-        SegmentRotor::create_fresh(disk.clone(), dirs.log.clone(), config.segment).expect("rotor");
-    let mut ring = StagingRing::new(config.staging);
+        SegmentRotor::create_fresh(disk.clone(), dirs.log.clone(), config.geometry).expect("rotor");
+    let mut ring = StagingRing::new(config.geometry);
     let mut rng = SplitMix64::new(seed | 1);
     let mut synced_end = Lsn::new(rotor.active_segment(), 0);
     let ops = 120 + (rng.next_below(200)) as usize;
@@ -104,7 +104,15 @@ fn reference_replay(disk: &SimDisk) -> StateDigest {
         let outcome = reader.apply_frames(|frame| {
             for record in frame.records() {
                 let (_, record) = record.expect("valid record in valid frame");
-                ks.apply_record(&record, now(), anchor(), &mut inf_store::NoSpill).expect("apply");
+                inf_store::drive_record(
+                    &mut ks,
+                    &record,
+                    now(),
+                    anchor(),
+                    &mut inf_store::NoSpill,
+                    u64::MAX,
+                )
+                .expect("apply");
             }
             Ok::<(), std::convert::Infallible>(())
         });
@@ -117,6 +125,7 @@ fn reference_replay(disk: &SimDisk) -> StateDigest {
 
 #[test]
 fn power_cut_states_recover_or_fail_stop_per_the_taxonomy() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut recovered = 0u32;
     let mut beyond_discarded = 0u64;
     for seed in 0..64u64 {
@@ -130,9 +139,10 @@ fn power_cut_states_recover_or_fail_stop_per_the_taxonomy() {
         // un-covered (no surviving attestation reaches it) and truncates,
         // counted. A refusal here would be a policy regression.
         let (rotor, stats, _unit) =
-            open_cell_log(disk.clone(), &mut ks, CELL, &cfg(), anchor(), now()).unwrap_or_else(
-                |err| panic!("seed {seed}: honest power-cut image refused to recover: {err}"),
-            );
+            open_cell_log(disk.clone(), &mut ks, CELL, &cfg(), anchor(), now(), &census)
+                .unwrap_or_else(|err| {
+                    panic!("seed {seed}: honest power-cut image refused to recover: {err}")
+                });
         let resume = Lsn::new(rotor.active_segment(), rotor.active_written());
         assert!(
             resume >= synced_end,
@@ -148,8 +158,9 @@ fn power_cut_states_recover_or_fail_stop_per_the_taxonomy() {
         drop(rotor);
         // Determinism across re-boots of the same surviving image.
         let mut ks2 = fresh_keyspace();
-        let (_r2, _s2, _u2) = open_cell_log(disk.clone(), &mut ks2, CELL, &cfg(), anchor(), now())
-            .expect("second boot of a recovered image");
+        let (_r2, _s2, _u2) =
+            open_cell_log(disk.clone(), &mut ks2, CELL, &cfg(), anchor(), now(), &census)
+                .expect("second boot of a recovered image");
         assert_eq!(ks2.state_digest(now()), reference, "seed {seed}: re-recovery diverged");
         recovered += 1;
     }

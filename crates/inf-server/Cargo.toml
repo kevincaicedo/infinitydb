@@ -29,6 +29,11 @@ doc = ["inf-store/doc", "dep:inf-doc"]
 # costs the tiered SET path. Never in a shipping build; `infinityd
 # --blind-overwrite-ceiling` exists only with it.
 bench-diagnostics = []
+# The plane's first generation for its fabric gate's holders, so the
+# simulator's near-wrap leg reaches the key's generation field. Off in every
+# shipping build (scripts/check-shipping-features.sh); `inf-sim`'s `dst`
+# requests it.
+fault-points = ["inf-runtime/fault-points"]
 
 [lints]
 workspace = true
@@ -37,7 +42,7 @@ workspace = true
 inf-alloc = { workspace = true, features = ["test-counting-allocator"] }
 # M2-S16: recovery/fault tests arm named points (dev-only unification).
 inf-foundation = { workspace = true, features = ["fault-points", "collision-oracle"] }
-inf-store = { workspace = true, features = ["collision-oracle"] }
+inf-store = { workspace = true, features = ["collision-oracle", "test-support"] }
 # M2.5-S12 (ADR-0031): recovery tests hand-build legacy v1 frames (CRC32C)
 # — no shipping code path emits them anymore.
 inf-simd.workspace = true

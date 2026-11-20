@@ -7,8 +7,11 @@
 #   BODY <sym> <start> <end> <instrs>
 #   ATOMIC <sym> <line> <mnemonic>   an atomic instruction inside a body,
 #                                    or the outline-atomics helper it calls
-#   CALL <sym> <line> <target>       a direct call/branch leaving the body
+#   CALL <sym> <line> <target>       a direct call or branch, conditional or not, leaving the
+#                                    body
 #   INDIRECT <sym> <line> <call|jump>  an indirect branch inside a body
+#   UNREAD <sym> <line> <mnemonic>   a control transfer the scan has no edge rule for, or one
+#                                    behind a word the prefix table does not hold (`<word>+<m>`)
 #
 # Bodies are delimited structurally — the symbol label line, then
 # `.cfi_startproc` … `.cfi_endproc` (emitted for both ELF and Mach-O), with
@@ -26,10 +29,12 @@
 # body: Mach-O opens with `.section __TEXT,…` / `.build_version`, ELF with
 # `.text` and `@function`.
 #
-# Mnemonics are matched on the instruction's FIRST TWO fields, so an x86
-# `lock` prefix — emitted as its own tab-separated field, `lock<TAB><TAB>
-# cmpxchgq` — is caught. The old pattern anchored the whole set at the line
-# start and therefore missed exactly the spelling a refcount CAS produces.
+# Every rule reads a line through `mnemonic_at`: its mnemonic is the first
+# field past the x86 prefix words (`is_prefix`), each emitted as its own
+# field. An x86 `lock` — `lock<TAB><TAB>cmpxchgq`, the spelling a refcount
+# CAS produces — is an atomic itself; `notrack` or `bnd` before a branch
+# leaves it a branch, read with its operands. A word the table does not hold,
+# before a transfer, is UNREAD: an unknown prefix cannot hide a branch.
 #
 # Atomics are spelled per target, and each spelling is a row below (the
 # gate is ADR-0106 D8's):
@@ -64,8 +69,66 @@ function is_outline_atomic(t) {
     return t ~ /^__aarch64_(cas(1|2|4|8|16)|(swp|ldadd|ldclr|ldeor|ldset)(1|2|4|8))_(relax|acq|rel|acq_rel)$/
 }
 
+# The x86 prefixes an assembler prints as a word of their own before the mnemonic: `lock`,
+# `xacquire`/`xrelease`, `rep` and its forms, `notrack` and `bnd` (before a branch), the size and
+# REX words, a segment override (a hint before a `j<cc>`) and LLVM's `{vex}`-style encoding
+# pseudo-prefixes. aarch64 prints none.
+function is_prefix(w) {
+    return w ~ /^(lock|xacquire|xrelease|rep|repe|repz|repne|repnz|notrack|bnd)$/ ||
+           w ~ /^(data16|data32|addr16|addr32|rex|rex64|cs|ds|es|fs|gs|ss)$/ ||
+           w ~ /^[{](vex|vex2|vex3|evex|disp8|disp32)[}]$/
+}
+
+# The field that holds the current line's mnemonic: the first past its prefix words.
+function mnemonic_at(   i) {
+    i = 1
+    while (i < NF && is_prefix($i)) i++
+    return i
+}
+
 function is_branch(m) {
     return m ~ /^(call|callq|calll|jmp|jmpq|bl|br|blr|b)$/
+}
+
+# FEAT_CMPBR's compare-and-branch: `cb<cc>` and its byte and halfword forms `cbb<cc>`/`cbh<cc>`,
+# a register or immediate compare, then the target (`cbgt x0, x1, <t>`, `cbne x0, #5, <t>`).
+function is_cmp_branch(m) {
+    return m ~ /^cb[bh]?(eq|ne|gt|ge|lt|le|hi|hs|lo|ls)$/
+}
+
+# A conditional branch: x86's every `j<cc>` (not `jmp`), aarch64's `b.<cond>` and `bc.<cond>`,
+# `cbz`/`cbnz`, `tbz`/`tbnz` and `cb<cc>`. To a local label it stays in the body. To a symbol it
+# is a conditional tail call, which LLVM emits on x86-64 for a direct callee (`jne <sym>`), and
+# its target is an edge as a jump's is: a scan that skipped it would leave that callee unscanned.
+function is_cond_branch(m) {
+    return m ~ /^j(a|ae|b|be|c|cxz|e|ecxz|g|ge|l|le|na|nae|nb|nbe|nc|ne|ng|nge|nl|nle|no|np|ns|nz|o|p|pe|po|rcxz|s|z)$/ ||
+           m ~ /^bc?\.[a-z][a-z]$/ || m ~ /^(cbz|cbnz|tbz|tbnz)$/ || is_cmp_branch(m)
+}
+
+# Every other control transfer of the two families, for a closed world: x86's remaining `j`,
+# `loop`, far and `call` forms and `xbegin` (its operand is the abort path), aarch64's
+# pointer-authenticated branches. A body that holds one is red (UNREAD), never assumed clean: the
+# scan has no edge rule for it, so a spelling the tables above do not read cannot leave its
+# target unscanned in silence.
+function is_transfer(m) {
+    return m ~ /^(j[a-z]+|loop[a-z]*|l?call[a-z]*|ljmp[a-z]*|xbegin[wlq]?)$/ ||
+           m ~ /^(b|bl|br|blr)(aa|ab|aaz|abz)$/
+}
+
+function is_any_transfer(m) {
+    return is_branch(m) || is_cond_branch(m) || is_transfer(m)
+}
+
+# The conditional branch's target, by its operand's position past the mnemonic's field `mi`, so
+# a trailing comment (`jne <t> # TAILCALL`) is never read as it: the first operand; the second
+# after `cbz`/`cbnz`'s register (`cbz x0, <t>`); the third after `tbz`/`tbnz`'s register and bit
+# (`tbnz w8, #0, <t>`) and after a compare-and-branch's two (`cbgt x0, x1, <t>`).
+function cond_target(m, mi,   t) {
+    if (m ~ /^(cbz|cbnz)$/) t = $(mi + 2)
+    else if (m ~ /^(tbz|tbnz)$/ || is_cmp_branch(m)) t = $(mi + 3)
+    else t = $(mi + 1)
+    sub(/,$/, "", t)
+    return t
 }
 
 # A call returns to the body; a jump (a jump table, or a tail branch) does not.
@@ -111,17 +174,21 @@ inbody == 1 {
     # Directives and labels are not instructions.
     if ($0 ~ /^[[:space:]]*\./ || $0 ~ /^[^[:space:]]/ || $0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) { next }
     instrs++
-    if (is_atomic($1)) { print "ATOMIC " cur " " NR " " $1 }
-    else if (is_atomic($2)) { print "ATOMIC " cur " " NR " " $2 }
-    if (is_branch($1)) {
-        tgt = $2
+    mi = mnemonic_at()
+    m = $mi
+    # An atomic is a prefix word (`lock`), the mnemonic, or the word after an unknown one.
+    for (k = 1; k <= mi + 1; k++) {
+        if (is_atomic($k)) { print "ATOMIC " cur " " NR " " $k; break }
+    }
+    if (is_branch(m)) {
+        tgt = $(mi + 1)
         # AT&T `*` marks an indirect operand (`callq *8(%rax)`, `jmpq
         # *.LJTI0_0(,%rax,8)`); `*sym@GOTPCREL(%rip)` is a direct call
         # through the GOT, the spelling Rust's no-PLT default gives externs.
         star = (tgt ~ /^\*/)
         sub(/^\*/, "", tgt)
         if (tgt ~ /^[%]/ || tgt ~ /^[xw][0-9]+$/ || tgt == "" || (star && tgt !~ /@GOTPCREL\(%rip\)$/)) {
-            print "INDIRECT " cur " " NR " " (is_call($1) ? "call" : "jump")
+            print "INDIRECT " cur " " NR " " (is_call(m) ? "call" : "jump")
         }
         else if (!is_local(tgt)) {
             sub(/@.*$/, "", tgt)
@@ -129,6 +196,20 @@ inbody == 1 {
             if (is_outline_atomic(tgt)) { print "ATOMIC " cur " " NR " " tgt }
             print "CALL " cur " " NR " " tgt
         }
+    }
+    else if (is_cond_branch(m)) {
+        tgt = cond_target(m, mi)
+        if (tgt != "" && !is_local(tgt)) {
+            sub(/@.*$/, "", tgt)
+            if (is_outline_atomic(tgt)) { print "ATOMIC " cur " " NR " " tgt }
+            print "CALL " cur " " NR " " tgt
+        }
+    }
+    else if (is_transfer(m)) { print "UNREAD " cur " " NR " " m }
+    # A transfer, with its operand, behind a word the prefix table does not hold: never read past
+    # it. (aarch64's landing pad `bti jc` has no operand after its `jc`.)
+    else if (mi + 2 <= NF && is_any_transfer($(mi + 1))) {
+        print "UNREAD " cur " " NR " " m "+" $(mi + 1)
     }
     next
 }

@@ -1,0 +1,10 @@
+# The waker probe's nested crate: one out-of-line function, whose body is not
+# in the probe's asm, for the gate's closed callee list to refuse.
+[package]
+name = "waker-atomics-probe-nested"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"

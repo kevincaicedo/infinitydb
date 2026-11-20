@@ -10,17 +10,25 @@ use std::path::PathBuf;
 use inf_log::FRAME_ALIGN;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, Lsn, MutationEffect, NsId, ReaderConfig, SegmentConfig,
-    SegmentId, SegmentReader, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs,
+    FRAME_HEADER_LEN, FRAME_TRAILER_LEN, LogGeometry, Lsn, MutationEffect, NsId, ReaderConfig,
+    SegmentConfig, SegmentId, SegmentReader, SegmentRotor, StagingConfig, StagingRing,
+    create_cell_dirs,
 };
 
 const FRAME_OVERHEAD: u32 = (FRAME_HEADER_LEN + FRAME_TRAILER_LEN) as u32;
 
-fn mem_rotor(fs: &MemFs, segment_bytes: u32) -> (SegmentRotor<MemFs>, PathBuf) {
+/// A rotor of `segment_bytes` segments and a ring of `staging`, built from
+/// one checked geometry.
+fn mem_log(
+    fs: &MemFs,
+    staging: StagingConfig,
+    segment_bytes: u32,
+) -> (SegmentRotor<MemFs>, StagingRing, PathBuf) {
     let dirs = create_cell_dirs(fs, &PathBuf::from("data/shard-0")).expect("dirs");
     let cfg = SegmentConfig { segment_bytes, ..Default::default() };
-    let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), cfg).expect("rotor");
-    (rotor, dirs.log)
+    let geometry = LogGeometry::new(staging, cfg).expect("the test's log geometry");
+    let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), geometry).expect("rotor");
+    (rotor, StagingRing::new(geometry), dirs.log)
 }
 
 fn encoded(effect: &MutationEffect<'_>) -> Vec<u8> {
@@ -50,8 +58,7 @@ impl Rng {
 #[test]
 fn accounting_is_exact_at_every_append_and_drain_site() {
     let fs = MemFs::new();
-    let (mut rotor, _) = mem_rotor(&fs, 1 << 20);
-    let mut ring = StagingRing::new(StagingConfig::with_capacity(4096));
+    let (mut rotor, mut ring, _) = mem_log(&fs, StagingConfig::with_capacity(4096), 1 << 20);
 
     assert_eq!(ring.staged_bytes(), 0);
     assert_eq!(ring.pending_frame_len(), FRAME_OVERHEAD);
@@ -103,9 +110,8 @@ fn accounting_is_exact_at_every_append_and_drain_site() {
 #[test]
 fn full_ring_refuses_with_typed_backpressure_and_bounded_memory() {
     let fs = MemFs::new();
-    let (mut rotor, _) = mem_rotor(&fs, 1 << 20);
     let capacity = 1024u32;
-    let mut ring = StagingRing::new(StagingConfig::with_capacity(capacity));
+    let (mut rotor, mut ring, _) = mem_log(&fs, StagingConfig::with_capacity(capacity), 1 << 20);
 
     let value = [0xCD_u8; 100];
     let effect = MutationEffect::StringSet { ns: NsId(1), key: b"key", value: &value };
@@ -139,8 +145,7 @@ fn full_ring_refuses_with_typed_backpressure_and_bounded_memory() {
 #[test]
 fn backlogged_ring_keeps_staging_and_stays_bounded() {
     let fs = MemFs::new();
-    let (mut rotor, _) = mem_rotor(&fs, 1 << 20);
-    let mut ring = StagingRing::new(StagingConfig::with_capacity(512));
+    let (mut rotor, mut ring, _) = mem_log(&fs, StagingConfig::with_capacity(512), 1 << 20);
 
     ring.stage(&MutationEffect::Delete { ns: NsId(1), key: b"one" }).expect("fits");
     let lease = ring.flush_into(&mut rotor, 0).expect("flush").expect("frame");
@@ -206,9 +211,9 @@ impl OwnedEffect {
 fn storm_loses_and_reorders_nothing() {
     let fs = MemFs::new();
     let segment_bytes = 8 << 10;
-    let (mut rotor, log_dir) = mem_rotor(&fs, segment_bytes);
     let capacity = 512;
-    let mut ring = StagingRing::new(StagingConfig::with_capacity(capacity));
+    let (mut rotor, mut ring, log_dir) =
+        mem_log(&fs, StagingConfig::with_capacity(capacity), segment_bytes);
     let mut rng = Rng(0xC0FF_EE00_0000_0001);
 
     let workload: Vec<OwnedEffect> = (0..2_000)
@@ -298,8 +303,7 @@ fn storm_loses_and_reorders_nothing() {
 #[should_panic(expected = "stale StagedAt")]
 fn stale_token_is_rejected_by_generation_check() {
     let fs = MemFs::new();
-    let (mut rotor, _) = mem_rotor(&fs, 1 << 20);
-    let mut ring = StagingRing::new(StagingConfig::with_capacity(512));
+    let (mut rotor, mut ring, _) = mem_log(&fs, StagingConfig::with_capacity(512), 1 << 20);
 
     let stale = ring.stage(&MutationEffect::Delete { ns: NsId(1), key: b"a" }).expect("fits");
     let lease = ring.flush_into(&mut rotor, 0).expect("flush").expect("frame");
@@ -318,8 +322,8 @@ fn ring_of_k_plus_one_buffers_releases_leases_in_any_order() {
     // generation in any order (completions reorder), and the fourth seal
     // waits for a free buffer — bounded by construction, never a queue.
     let fs = MemFs::new();
-    let (mut rotor, _) = mem_rotor(&fs, 1 << 20);
-    let mut ring = StagingRing::new(StagingConfig { capacity_bytes: 4096, frames_in_flight: 3 });
+    let staging = StagingConfig { capacity_bytes: 4096, frames_in_flight: 3 };
+    let (mut rotor, mut ring, _) = mem_log(&fs, staging, 1 << 20);
     assert_eq!(ring.resident_bytes(), 4 * (4096 + 2 * FRAME_ALIGN as usize));
     assert_eq!(ring.max_record_len(), 4096 - FRAME_OVERHEAD, "the admission bound ignores K");
     assert_eq!(ring.frames_in_flight(), 3);
@@ -377,8 +381,8 @@ fn flush_into_releases_the_lease_when_the_write_fails() {
     use inf_foundation::fault::{self, FaultSpec};
     fault::disarm_all();
     let fs = MemFs::new();
-    let (mut rotor, _) = mem_rotor(&fs, 1 << 20);
-    let mut ring = StagingRing::new(StagingConfig { frames_in_flight: 1, ..Default::default() });
+    // A ring no larger than one segment (the harness rule).
+    let (mut rotor, mut ring, _) = mem_log(&fs, StagingConfig::with_capacity(1 << 20), 1 << 20);
     ring.stage(&MutationEffect::StringSet { ns: NsId(1), key: b"k", value: b"v" }).expect("stage");
     fault::arm(inf_log::fault::LOG_APPEND_SHORT_WRITE, FaultSpec::Nth(1));
     let err = ring.flush_into(&mut rotor, 0).expect_err("the short write fails the append");

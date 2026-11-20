@@ -70,6 +70,7 @@ fn every_declared_point_has_a_matrix_row() {
     }
 }
 
+// nextest-long: 25 s
 #[test]
 fn node_rows_execute_and_prove_their_verdicts() {
     let executable = std::env::current_exe().expect("test executable");
@@ -82,6 +83,8 @@ fn node_rows_execute_and_prove_their_verdicts() {
         .arg(if profile == "debug" { "test" } else { profile })
         .arg("--target-dir")
         .arg(profile_dir.parent().expect("target directory"))
+        .args(["--carrier-limit-seconds", &crash_matrix::NODE_CARRIER_LIMIT_SECONDS.to_string()])
+        .args(["--carrier-budget-seconds", &crash_matrix::NODE_CARRIER_BUDGET_SECONDS.to_string()])
         .status()
         .expect("run node crash matrix (requires Python 3.11+)");
     assert!(status.success(), "node crash rows were not proved by their carrying tests");

@@ -2,6 +2,7 @@
 //! traffic, cuts, reboots, and the per-phase oracles it drives.
 
 use super::*;
+use crate::driver::Violations;
 
 // ---- the run ---------------------------------------------------------------
 
@@ -21,8 +22,9 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         trace: Vec::new(),
         trace_hash: 0,
         state_hash: 0,
-        violations: Vec::new(),
+        violations: Violations::new(),
         cap_rows_checked: 0,
+        cap_rows_crossed: 0,
         stalled: false,
         clean_stop_steps: 0,
         clean_stop_replay_records: 0,
@@ -42,8 +44,13 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         frame_waits_barrier: 0,
         frame_waits_rotation: 0,
         frame_waits_reorder: 0,
+        frame_waits_ledger: 0,
+        frame_waits_ack_map: 0,
+        ledger_prealloc_deferrals: 0,
         ckpt_downgrades: 0,
         ckpt_bound_splits: 0,
+        disk_calls: Vec::new(),
+        disk_calls_unlogged: 0,
         plant_fired: false,
         frame_waits_fill: 0,
         frame_waits_group: 0,
@@ -83,10 +90,17 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         lift_plant_sidecars: 0,
         tier_budget_cells: Vec::new(),
         epoch_marks_cells: Vec::new(),
+        ledger_wedge: None,
+        stop_tick: None,
+        timers: super::TimersReport::default(),
+        wake: super::WakeReport::default(),
+        mget: super::MgetAuditReport::default(),
     };
-    let fail = |report: &mut DurableReport, what: String| {
+    #[track_caller]
+    fn fail(report: &mut DurableReport, what: String) {
         report.violations.push(what);
-    };
+    }
+    let dense_leg = scenario.fill_dense;
 
     // ---- boot 1 + DDL ------------------------------------------------
     // With a prelude the first life runs in the prelude's barrier class
@@ -130,11 +144,10 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         }
     }
 
-    // The tier-budget shape's namespaces: tiered `always`, the leg's
-    // window with a tenth of it mutable, every generated value inline
-    // (the threshold is above the generator's largest value, so the tier
-    // class, not the blob class, carries the bytes), the shape's
-    // `MAINTAIN-SLICE`.
+    // The tier-budget shape's namespaces: tiered `always`, each load's
+    // window and mutable fraction, every generated value inline (the
+    // threshold is above the generator's largest value, so the tier class,
+    // not the blob class, carries the bytes), the load's `MAINTAIN-SLICE`.
     if let Some(shape) = scenario.tier_budget {
         for index in shape.namespaces.indices() {
             let class = NsClass::TierBudget(index);
@@ -250,6 +263,11 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     }
 
     // ---- writers -----------------------------------------------------
+    if scenario.fill_dense {
+        for net in &node.nets {
+            net.borrow_mut().deliver_whole();
+        }
+    }
     let mut writers = Vec::new();
     let classes = [
         (NsClass::Always, scenario.always_writers),
@@ -529,6 +547,18 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let total_ops: u64 = writers.iter().map(|w| w.quota).sum();
     let cut_step = 200 + rng.next_below(total_ops * 6);
     let cut_step = scenario.epoch_marks.map_or(cut_step, |leg| leg.cut_step(cut_step));
+    let cut_step = scenario.tier_budget.map_or(cut_step, |shape| {
+        shape.leg.cut_step(cut_step, tier_turn_bound_ns(scenario, shape))
+    });
+    // The ledger-wedge leg cuts on its own reading (`LedgerWedge::cut_due`),
+    // at the seeded step or after the held seal's fold.
+    let seeded_cut = cut_step;
+    let mut ledger_wedge = scenario.ledger_wedge.map(ledger_wedge::LedgerWedge::new);
+    let cut_step = if ledger_wedge.is_some() { u64::MAX } else { cut_step };
+    // The stop-tick shape requests its stop on its own reading
+    // (`StopTick::stop_due`), never at the seeded cut.
+    let mut stop_tick = scenario.stop_tick.then(|| stop_tick::StopTick::new(scenario, &mut rng));
+    let cut_step = if stop_tick.is_some() { u64::MAX } else { cut_step };
     // M3-S23: two seeded mid-run equivalence instants. Each quiesces
     // (drain in-flight, send nothing new), compares live state against a
     // read-only shadow replay, then resumes. The cut itself is never
@@ -541,7 +571,12 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     let mut idle_steps = 0u64;
     let mut last_progress = 0u64;
     let mut log_oracle = LogOracle::new(scenario.cells);
+    let mut timers_oracle = super::timers::TimersOracle::new(scenario);
+    let mut wake_oracle = super::timers::WakeOracle::new(scenario);
     let mut tier_oracle = TierTurnOracle::new(&node, scenario.cells, true);
+    let mut turn_shape = TurnShape::new(scenario);
+    let mut thief_premise = ThiefPremise::new(scenario);
+    let mut tier_spend = TierSpendSteps::new(scenario);
     let no_model_leg = scenario.tier_budget.is_some_and(|shape| shape.leg.model_absent());
     if no_model_leg {
         tier_oracle.arm_after_the_visits_bound();
@@ -559,7 +594,24 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             break;
         }
         log_oracle.sample(&node, &mut report);
+        timers_oracle.sample(&node, clock.now(), &mut report.timers);
+        wake_oracle.sample(&node, &mut report.wake);
         tier_oracle.sample(&node, &disk, scenario, &mut report);
+        turn_shape.sample(&node);
+        thief_premise.sample(&node, scenario, clock.now());
+        tier_spend.sample(&node, step);
+        if let Some(wedge) = ledger_wedge.as_mut() {
+            wedge.observe(step, &node, &disk, clock.now());
+            if wedge.cut_due(step, seeded_cut) {
+                break;
+            }
+        }
+        if let Some(arm) = &stop_tick {
+            let below_quota = writers.iter().any(|w| w.sent < w.quota);
+            if arm.stop_due(step, below_quota, &node, usize::from(scenario.cells)) {
+                break;
+            }
+        }
         let quiesce = next_check < checks_at.len() && step >= checks_at[next_check];
         let mut progress = 0u64;
         for writer in &mut writers {
@@ -704,6 +756,9 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     if scenario.clean_stop && scenario.plant != Plant::StopKill {
         let cells = usize::from(scenario.cells);
         for cell in 0..cells {
+            if stop_tick.is_some() {
+                node.plane_mut(cell).set_stop_checkpoint(false);
+            }
             node.plane_mut(cell).request_stop();
         }
         let mut steps = 0u64;
@@ -720,12 +775,18 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
                 for cell in 0..cells {
                     node.plane_mut(cell).finish_stop();
                 }
+                if let Some(arm) = stop_tick.as_mut() {
+                    arm.arm(steps, &node, &disk, clock.now(), cells);
+                }
             }
             steps += 1;
             report.scheduler_steps += 1;
             if let Err(err) = node.step(&mut rng, &clock, &disk, scenario.step_ns_max) {
                 fail(&mut report, format!("clean stop: {err}"));
                 return finish(report, &observer, &clock);
+            }
+            if let Some(arm) = stop_tick.as_mut() {
+                arm.observe(&node, &disk, clock.now(), cells);
             }
             for writer in &mut writers {
                 let bytes = node.nets[writer.cell].borrow_mut().client_recv(writer.fd);
@@ -737,11 +798,20 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             }
             if steps > STALL_STEPS {
                 report.stalled = true;
+                // Each cell's phase beside the wait that holds it (ADR-0199 D3).
+                let holds: Vec<Option<inf_server::StopHold>> =
+                    (0..cells).map(|c| node.plane(c).stop_hold()).collect();
+                let arm = stop_tick.as_ref().map_or_else(String::new, |arm| {
+                    let read = arm.report(&node, cells);
+                    let line = format!("; {}", read.describe());
+                    report.stop_tick = Some(read);
+                    line
+                });
                 fail(
                     &mut report,
                     format!(
                         "CLEAN STOP LIVENESS VIOLATION seed {:#x}: cells still {phases:?} after    \
-                                                   {steps} steps",
+                                                   {steps} steps, held by {holds:?}{arm}",
                         scenario.seed
                     ),
                 );
@@ -749,6 +819,9 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             }
         }
         report.clean_stop_steps = steps;
+        if let Some(arm) = &stop_tick {
+            arm.judge(scenario.seed, &node, cells, &mut report);
+        }
         for writer in &writers {
             if !node.nets[writer.cell].borrow().closed(writer.fd) {
                 fail(
@@ -765,8 +838,13 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
 
     // ---- POWER CUT ----------------------------------------------------
     let cut_time = clock.now();
+    report.disk_calls = disk.logged_calls(0);
+    report.disk_calls_unlogged = disk.calls_unlogged();
     if let Some(leg) = scenario.epoch_marks {
         epoch_marks_scrape(scenario, leg, &node, &mut report);
+    }
+    if let Some(wedge) = &ledger_wedge {
+        wedge.judge(scenario.seed, &node, &mut report);
     }
     for cell in 0..usize::from(scenario.cells) {
         if let Some(stats) = node.plane(cell).durable_stats() {
@@ -775,6 +853,12 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
             report.frame_waits_barrier += stats.frame_waits_barrier;
             report.frame_waits_rotation += stats.frame_waits_rotation;
             report.frame_waits_reorder += stats.frame_waits_reorder;
+            if scenario.reorder_oracle && stats.frame_waits_reorder > 0 {
+                frame_queue_filled(scenario.seed, cell, &node, &mut report);
+            }
+            report.frame_waits_ledger += stats.frame_waits_ledger;
+            report.frame_waits_ack_map += stats.frame_waits_ack_map;
+            report.ledger_prealloc_deferrals += stats.ledger_prealloc_deferrals;
             report.frame_waits_fill += stats.frame_waits_fill;
             report.frame_waits_group += stats.frame_waits_group;
             report.frame_waits_pace += stats.frame_waits_pace;
@@ -903,7 +987,11 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     }
     if let Some(shape) = scenario.tier_budget {
         tier_budget_scrape(scenario, shape, &node, &disk, &mut report);
+        turn_shape.judge(scenario, shape, &node, &mut report);
+        thief_premise.judge(scenario.seed, &mut report);
+        tier_spend.judge(scenario.seed, &mut report);
     }
+    derived_ledger_counters(scenario.seed, &mut report);
     engagement_checks(scenario, &node, &mut report);
     if scenario.budget_oracle {
         budget_oracles(scenario, &node, clock.now(), &mut report);
@@ -939,6 +1027,18 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
                 );
             }
         }
+    }
+    // The dense leg's timers rows: engaged, within the roles, and one
+    // armed timer between hold episodes.
+    if dense_leg {
+        for what in report.timers.dense_violations(scenario.seed) {
+            fail(&mut report, what);
+        }
+    }
+    // TM3: a held frame's park asks no longer than its window, and a run
+    // of the leg judges at least one.
+    for what in wake_oracle.violations(scenario.seed, &report.wake) {
+        fail(&mut report, what);
     }
     // Batch 42 (F-L01-01): a tick that fired over staged records and
     // counted itself idle dropped its due — the records wait a second.
@@ -1015,8 +1115,8 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
         fail(
             &mut report,
             format!(
-                "REORDER WINDOW NOT ENGAGED seed {:#x}: the wedged device never filled the \
-                 completion ledger's window (frames_in_flight_max {depth}) — the scenario \
+                "VACUOUS seed {:#x}: frame-queue-unengaged — the wedged device never filled the \
+                 completion ledger's frame queue (frames_in_flight_max {depth}): the scenario \
                  proves nothing about the bound",
                 scenario.seed
             ),
@@ -1132,7 +1232,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     }
     // ADR-0124 D4's observable: a boot after a clean stop replays no tail
     // record on any cell — the stop checkpoint covered everything.
-    if scenario.clean_stop && scenario.plant != Plant::StopKill {
+    if scenario.clean_stop && scenario.plant != Plant::StopKill && !scenario.stop_tick {
         for cell in 0..usize::from(scenario.cells) {
             let mut probe = MiniClient::connect(&mut node, cell);
             let reply = probe.call(
@@ -1243,6 +1343,7 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     report.equivalence_checks = equivalence.checks;
     report.documents_compared = equivalence.documents_compared;
     report.corpus_documents_used = writers.iter().map(|w| w.corpus_docs_used).sum();
+    audit_report(scenario, &writers, &mut report);
 
     // ---- audit ----------------------------------------------------------
     if audit_ledgers(
@@ -1286,6 +1387,56 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
     finish(report, &observer, &clock)
 }
 
+/// The frame queue's cap on a cell that held a frame for it: the hold
+/// answers only at the queue's own admission, so the queue's census row
+/// read its cap. A row short of it held the frame early (token
+/// `frame-queue-unfilled`).
+fn frame_queue_filled(seed: u64, cell: usize, node: &Node, report: &mut DurableReport) {
+    let name = inf_log::limits::FRAME_QUEUE.name();
+    let census = node.plane(cell).cap_census();
+    let Some(row) = census.row(name) else {
+        let what = format!(
+            "REORDER WINDOW VIOLATION seed {seed:#x} cell {cell}: frame-queue-unfilled — a frame \
+             held for the queue and no `{name}` row"
+        );
+        report.violations.push(what);
+        return;
+    };
+    if row.high_water < row.entries_max {
+        let what = format!(
+            "REORDER WINDOW VIOLATION seed {seed:#x} cell {cell}: frame-queue-unfilled — a frame \
+             held for the queue at a high water of {} of its {}",
+            row.high_water, row.entries_max
+        );
+        report.violations.push(what);
+    }
+}
+
+/// The fsync ledger's derived counters, read 0 on every seed: the ack map
+/// holds at most the frame queue, the ledger and one point, which is its
+/// cap, so no frame waits for it; and the rotation class holds at most two
+/// prealloc and two zero-fill barriers (a seal, then the barriers of the two
+/// generations after it), so no MAINTAIN skips one. A nonzero count is a
+/// derivation the run disproved.
+fn derived_ledger_counters(seed: u64, report: &mut DurableReport) {
+    if report.frame_waits_ack_map > 0 {
+        let what = format!(
+            "LEDGER DERIVATION VIOLATION seed {seed:#x}: ack-map-held — {} frame hold(s) on a \
+             full ack map",
+            report.frame_waits_ack_map
+        );
+        report.violations.push(what);
+    }
+    if report.ledger_prealloc_deferrals > 0 {
+        let what = format!(
+            "LEDGER DERIVATION VIOLATION seed {seed:#x}: ledger-prealloc-deferred — {} prealloc \
+             or zero-fill barrier(s) skipped at the rotation class's budget",
+            report.ledger_prealloc_deferrals
+        );
+        report.violations.push(what);
+    }
+}
+
 /// Preallocs that found the pool non-empty — neither a miss nor a space
 /// failure (ADR-0090 A16): the takes the recycle rules are about.
 /// The tier-budget shape's per-cell scrape at the cut (before the node
@@ -1300,11 +1451,11 @@ fn run_observed(scenario: &DurableScenario, observer: TraceObserver) -> DurableR
 /// the model (the driver's own tally), every ready group's wait within
 /// the fair turn's bound `n × T_c` computed from the model and the
 /// scenario's step (the plane's gauge, judged by the harness's
-/// arithmetic), the spend equal to the disk's tier bytes and ops with the
-/// ops a cut caught between push and submit (exact), and the leg's own
-/// reads: contention and refusals on the legs that reach them, a plan
-/// passed over on the eight-namespace leg, neither on the control leg;
-/// with the write-fault plant, a retry.
+/// arithmetic), and the leg's own reads: contention and refusals on the
+/// legs that reach them, a plan passed over on the eight-namespace leg,
+/// neither on the control leg; with the write-fault plant, a retry. The
+/// spend's equality is judged at every step boundary ([`TierSpendSteps`]),
+/// the cut its last.
 fn tier_budget_scrape(
     scenario: &DurableScenario,
     shape: TierBudgetShape,
@@ -1312,11 +1463,7 @@ fn tier_budget_scrape(
     disk: &SimDisk,
     report: &mut DurableReport,
 ) {
-    let bound_ns = fair_turn_bound_ns(
-        scenario.device.model_share,
-        u64::from(shape.namespaces.get()),
-        scenario.step_ns_max,
-    );
+    let bound_ns = tier_turn_bound_ns(scenario, shape);
     let pass_bound = tier_pass_bound_bytes(scenario.device.model_share);
     if scenario.plant == crate::net::Plant::TierWriteEio {
         report.plant_fired |= disk.faults_fired() > 0;
@@ -1336,9 +1483,9 @@ fn tier_budget_scrape(
     }
 }
 
-/// One cell's tier class at the cut: the budget's counters, the driver's
-/// observed and queued tier I/O, the turn's gauges and each namespace's
-/// watermarks.
+/// One cell's tier class at the cut: the budget's counters, the spend's
+/// three terms ([`tier_spend_terms`]), the turn's gauges and each
+/// namespace's watermarks.
 fn tier_budget_cell(
     node: &Node,
     cell: usize,
@@ -1349,20 +1496,20 @@ fn tier_budget_cell(
     use inf_server::TierFlushGauge as G;
     let counted = stats.io_budget[IoClass::TierFlush.index()];
     let observed = node.cells[cell].0.driver().observed_io();
-    let (queued_bytes, queued_ops) = node.cells[cell].0.driver().queued_tier_io();
+    let terms = tier_spend_terms(node, cell, stats);
     let gauges = node.plane(cell).tier_flush_gauges();
     let gauge = |slot: G| gauges[slot as usize];
     TierBudgetCell {
         cell: cell as u16,
         unattainable: counted.unattainable,
         deferrals: counted.deferrals,
-        spent_bytes: counted.spent_bytes,
-        spent_ops: counted.spent_ops,
+        spent_bytes: terms.spent_bytes,
+        spent_ops: terms.spent_ops,
         overrun_bytes: counted.overrun_bytes,
-        driver_bytes: observed.bytes[IoClass::TierFlush.index()],
-        driver_ops: observed.ops[IoClass::TierFlush.index()],
-        queued_bytes,
-        queued_ops,
+        driver_bytes: terms.driver_bytes,
+        driver_ops: terms.driver_ops,
+        queued_bytes: terms.queued_bytes,
+        queued_ops: terms.queued_ops,
         pass_bytes_max: observed.tier_pass_bytes_max,
         pass_ops_max: observed.tier_pass_ops_max,
         groups_deferred: gauge(G::GroupsDeferred),
@@ -1426,10 +1573,10 @@ fn tier_budget_vacuous(
 /// The tier class's oracles on one cell, each independent of the
 /// budget's code: no offer above the cap and no overrun, one driver
 /// entry's tier bytes within the cap and the pool, every ready group's
-/// wait within `n × T_c` (with the leg's engagement), the spend equal to
-/// the disk's tier bytes and ops with what a cut caught queued, and the
-/// control leg's reads. The no-model leg reads its own clauses in place
-/// of the cap's and the wait's ([`tier_no_model_oracles`]).
+/// wait within `n × T_c` (with the leg's engagement), and the control
+/// leg's reads. The no-model leg reads its own clauses in place of the
+/// cap's and the wait's ([`tier_no_model_oracles`]). The spend's equality
+/// has one judge, [`TierSpendSteps`], whose last step is the cut.
 fn tier_budget_oracles(
     scenario: &DurableScenario,
     leg: TierBudgetLeg,
@@ -1444,6 +1591,21 @@ fn tier_budget_oracles(
             "TIER-CAP VIOLATION seed {seed:#x} cell {cell}: {} tier offer(s) above the class \
              cap, {} B issued by the overrun (no tier offer is above the cap)",
             record.unattainable, record.overrun_bytes
+        ));
+    }
+    // The round's op bound (ADR-0155 D3: 70 writes and 4 barriers), read
+    // from the driver's own per-pass tier count: a wiring read of the op
+    // count on every seed. No leg's round comes near the bound (a 1 MiB
+    // slice stages a few ops), so the read is vacuous for the bound itself,
+    // whose evidence is the round plan's envelope test.
+    let round_ops_max = u64::from(
+        inf_log::limits::TIER_ROUND_WRITES_MAX + inf_log::limits::TIER_ROUND_BARRIERS_MAX,
+    );
+    if record.pass_ops_max > round_ops_max {
+        report.violations.push(format!(
+            "TIER-OPS VIOLATION seed {seed:#x} cell {cell}: one driver entry carried {} tier \
+             ops, past a round's {round_ops_max}",
+            record.pass_ops_max
         ));
     }
     if leg.model_absent() {
@@ -1466,23 +1628,9 @@ fn tier_budget_oracles(
     }
     if leg.expects_contention() && (record.turn_waits == 0 || record.turn_contended == 0) {
         report.violations.push(format!(
-            "TIER-TURN VACUOUS seed {seed:#x} cell {cell}: the turn refused {} time(s) and was \
-             contended {} time(s); the leg needs both",
+            "TIER-CONTENTION VACUOUS seed {seed:#x} cell {cell}: the turn refused {} time(s) and \
+             was contended {} time(s); the leg needs both",
             record.turn_waits, record.turn_contended
-        ));
-    }
-    let seen_bytes = record.driver_bytes + record.queued_bytes;
-    let seen_ops = record.driver_ops + record.queued_ops;
-    if record.spent_bytes != seen_bytes || record.spent_ops != seen_ops {
-        report.violations.push(format!(
-            "TIER-SPEND VIOLATION seed {seed:#x} cell {cell}: the budget spent {} B {} ops, the \
-             driver saw {} B {} ops ({} B {} ops queued at the cut)",
-            record.spent_bytes,
-            record.spent_ops,
-            seen_bytes,
-            seen_ops,
-            record.queued_bytes,
-            record.queued_ops
         ));
     }
     // G4's count is judged per iteration by `TierTurnOracle`, its
@@ -1494,6 +1642,368 @@ fn tier_budget_oracles(
             record.turn_contended, record.plan_waits
         ));
     }
+}
+
+/// The thief leg's shape clause, judged on a cell whose wait bound held:
+/// the regime the planted turn needs, read from the driver's tally of
+/// each entry's tier writes by namespace directory. Engaged when one entry
+/// carried two or more of the second namespace's writes totalling
+/// 256 KiB to one group's bytes (a write group of two ops or more: the
+/// builder takes the longest run within one group's bytes and ops, and a
+/// round's sync waits for its writes), and the first namespace's writes
+/// reached the driver in two entries or more, each past its first at most
+/// two writes and 69,632 B: the second's group is then above the thief's
+/// on bytes and not below it on ops, so the planted turn holds it
+/// whichever axis binds. A tier write whose file names no `ns-<id>`
+/// directory leaves the shape read from no file.
+struct TurnShape {
+    cells: Vec<TurnShapeCell>,
+}
+
+/// One cell's reading of the thief leg's shape.
+#[derive(Clone, Copy, Debug, Default)]
+struct TurnShapeCell {
+    /// The first and second namespaces' directory ids, once both exist.
+    dirs: Option<(u32, u32)>,
+    /// The driver entry folded last: a frozen cell runs no entry in a step.
+    entry_seen: u64,
+    thief_entries: u64,
+    thief_later_writes_max: u64,
+    thief_later_bytes_max: u64,
+    victim_group: bool,
+}
+
+impl TurnShape {
+    /// The most writes and bytes one entry of the first namespace past its
+    /// first may carry: one batch and its tail of a 64 KiB slice, two
+    /// writes of at most 17 frames.
+    const THIEF_WRITES_MAX: u64 = 2;
+    const THIEF_BYTES_MAX: u64 = 69_632;
+    /// The second namespace's write group: two writes or more, 256 KiB to
+    /// one group's bytes.
+    const VICTIM_WRITES_MIN: u64 = 2;
+    const VICTIM_BYTES: core::ops::RangeInclusive<u64> =
+        256 * 1024..=inf_log::limits::TIER_GROUP_BYTES_MAX;
+
+    fn new(scenario: &DurableScenario) -> TurnShape {
+        let thief = scenario.tier_budget.is_some_and(|shape| shape.leg.is_thief());
+        let cells = if thief { usize::from(scenario.cells) } else { 0 };
+        TurnShape { cells: vec![TurnShapeCell::default(); cells] }
+    }
+
+    /// Folds each cell's last driver entry, once an entry. Sampled in the
+    /// traffic phase, after each step: the setup's entries carry no tier
+    /// write.
+    fn sample(&mut self, node: &Node) {
+        for (cell, read) in self.cells.iter_mut().enumerate() {
+            let Some(tally) = node.cells[cell].0.driver().tier_dirs() else { continue };
+            if tally.entries == read.entry_seen {
+                continue;
+            }
+            read.entry_seen = tally.entries;
+            if read.dirs.is_none() {
+                read.dirs = tier_budget_dirs(&node.plane(cell).keyspace());
+            }
+            let Some((thief, victim)) = read.dirs else { continue };
+            for row in &tally.entry {
+                if row.ns == thief {
+                    read.thief_entries += 1;
+                    if read.thief_entries > 1 {
+                        read.thief_later_writes_max = read.thief_later_writes_max.max(row.writes);
+                        read.thief_later_bytes_max = read.thief_later_bytes_max.max(row.bytes);
+                    }
+                } else if row.ns == victim
+                    && row.writes >= Self::VICTIM_WRITES_MIN
+                    && Self::VICTIM_BYTES.contains(&row.bytes)
+                {
+                    read.victim_group = true;
+                }
+            }
+        }
+    }
+
+    /// One line a cell whose wait bound held and whose shape is unreached.
+    /// A red wait bound needs no witness, and on a planted run the held
+    /// group never reaches the driver.
+    fn judge(
+        &self,
+        scenario: &DurableScenario,
+        shape: TierBudgetShape,
+        node: &Node,
+        report: &mut DurableReport,
+    ) {
+        let bound_ns = tier_turn_bound_ns(scenario, shape);
+        for (cell, read) in self.cells.iter().enumerate() {
+            let record = report.tier_budget_cells.iter().find(|r| usize::from(r.cell) == cell);
+            if record.is_none_or(|record| record.group_wait_ns_max > bound_ns) {
+                continue;
+            }
+            let tally = node.cells[cell].0.driver().tier_dirs();
+            let unnamed = tally.map_or(0, |tally| tally.unnamed_writes);
+            let why = if unnamed > 0 {
+                format!("{unnamed} tier write(s) named no ns-<id> directory")
+            } else if !read.victim_group {
+                format!(
+                    "no driver entry carried two or more of the second namespace's writes \
+                     totalling {} to {} B",
+                    Self::VICTIM_BYTES.start(),
+                    Self::VICTIM_BYTES.end()
+                )
+            } else if read.thief_entries < 2 {
+                format!(
+                    "the first namespace's writes reached the driver in {} entries",
+                    read.thief_entries
+                )
+            } else if read.thief_later_writes_max > Self::THIEF_WRITES_MAX
+                || read.thief_later_bytes_max > Self::THIEF_BYTES_MAX
+            {
+                format!(
+                    "an entry of the first namespace past its first carried up to {} write(s) \
+                     and {} B, past {} and {} B",
+                    read.thief_later_writes_max,
+                    read.thief_later_bytes_max,
+                    Self::THIEF_WRITES_MAX,
+                    Self::THIEF_BYTES_MAX
+                )
+            } else {
+                continue;
+            };
+            report.violations.push(format!(
+                "VACUOUS seed {:#x} cell {cell}: turn-shape-unreached — {why}",
+                scenario.seed
+            ));
+        }
+    }
+}
+
+/// The three terms of the spend's equality, the rule that the tier class's
+/// spend equals the tier bytes and ops the sim disk saw (ADR-0178 I10), on
+/// one cell between two iterations: the tier class's spend in the budget's
+/// ledger, the tier bytes and ops the driver observed, and those granted
+/// and not yet submitted. A grant waits in one place, the cell loop's
+/// queue: the plane pushes MAINTAIN's grants there in the iteration that
+/// granted them, and the next iteration's first driver entry takes the
+/// queue whole.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct TierSpendTerms {
+    spent_bytes: u64,
+    spent_ops: u64,
+    driver_bytes: u64,
+    driver_ops: u64,
+    queued_bytes: u64,
+    queued_ops: u64,
+}
+
+impl TierSpendTerms {
+    /// The spend's equality: the spend is what the driver saw and what
+    /// waits to be submitted, on both axes.
+    fn holds(&self) -> bool {
+        self.spent_bytes == self.driver_bytes + self.queued_bytes
+            && self.spent_ops == self.driver_ops + self.queued_ops
+    }
+}
+
+/// The one reader of the terms of the spend's equality on `cell`: the step
+/// check reads it at every step boundary and the scrape at the cut.
+/// Population: one cell's budget, driver and loop.
+fn tier_spend_terms(node: &Node, cell: usize, stats: &inf_server::DurableStats) -> TierSpendTerms {
+    let tier = inf_runtime::IoClass::TierFlush.index();
+    let counted = stats.io_budget[tier];
+    let cell_loop = &node.cells[cell].0;
+    let observed = cell_loop.driver().observed_io();
+    #[cfg(not(inf_canary_tier_spend_driver_queue))]
+    let (queued_bytes, queued_ops) = crate::net::tier_io_of(cell_loop.next_submit_ops());
+    // A planted canary: the queued term reads the driver's own queue, empty
+    // between two iterations, so the equality breaks at the first step a
+    // grant waits and no step reads a tier op queued (a vacuity plant).
+    #[cfg(inf_canary_tier_spend_driver_queue)]
+    let (queued_bytes, queued_ops) = cell_loop.driver().driver_queue_tier_io();
+    TierSpendTerms {
+        spent_bytes: counted.spent_bytes,
+        spent_ops: counted.spent_ops,
+        driver_bytes: observed.bytes[tier],
+        driver_ops: observed.ops[tier],
+        queued_bytes,
+        queued_ops,
+    }
+}
+
+/// The spend's equality judged at every step boundary of the traffic phase,
+/// per cell: every grant waits in the cell loop's queue across exactly one
+/// boundary (a step runs each cell's iteration once), so the term read from
+/// that queue is tested where it differs from the driver's. A cell's first
+/// broken step is its violation; the steps whose loop queue held a tier op
+/// are the check's liveness, and a cell that spent with none is vacuous:
+/// the check told the two queues apart nowhere on it.
+struct TierSpendSteps {
+    cells: Vec<TierSpendCell>,
+}
+
+/// One cell's reading of the step check.
+#[derive(Clone, Copy, Debug, Default)]
+struct TierSpendCell {
+    /// Steps whose cell-loop queue held a tier op.
+    queued_steps: u64,
+    /// Steps at which the equality broke, and the first of them.
+    broken_steps: u64,
+    first_broken: Option<(u64, TierSpendTerms)>,
+    /// The tier ops spent at the last boundary read.
+    spent_ops: u64,
+}
+
+impl TierSpendSteps {
+    fn new(scenario: &DurableScenario) -> TierSpendSteps {
+        let cells = if scenario.tier_budget.is_some() { usize::from(scenario.cells) } else { 0 };
+        TierSpendSteps { cells: vec![TierSpendCell::default(); cells] }
+    }
+
+    /// One pass a cell over the ops its last iteration pushed.
+    fn sample(&mut self, node: &Node, step: u64) {
+        for (cell, read) in self.cells.iter_mut().enumerate() {
+            let Some(stats) = node.plane(cell).durable_stats() else { continue };
+            let terms = tier_spend_terms(node, cell, &stats);
+            read.spent_ops = terms.spent_ops;
+            if terms.queued_ops > 0 {
+                read.queued_steps += 1;
+            }
+            if !terms.holds() {
+                read.broken_steps += 1;
+                read.first_broken.get_or_insert((step, terms));
+            }
+        }
+    }
+
+    /// One violation line a cell whose equality broke, at its first broken
+    /// step, and one vacuity line a cell that spent with no queued step.
+    fn judge(&self, seed: u64, report: &mut DurableReport) {
+        for (cell, read) in self.cells.iter().enumerate() {
+            if let Some((step, terms)) = read.first_broken {
+                report.violations.push(format!(
+                    "TIER-SPEND VIOLATION seed {seed:#x} cell {cell}: at step {step} the budget \
+                     spent {} B {} ops, the driver saw {} B {} ops and the cell loop's queue held \
+                     {} B {} ops for the next submit; {} step(s) broke the equality",
+                    terms.spent_bytes,
+                    terms.spent_ops,
+                    terms.driver_bytes,
+                    terms.driver_ops,
+                    terms.queued_bytes,
+                    terms.queued_ops,
+                    read.broken_steps
+                ));
+            }
+            if read.spent_ops > 0 && read.queued_steps == 0 {
+                report.violations.push(format!(
+                    "VACUOUS seed {seed:#x} cell {cell}: tier-spend-unqueued — the tier class \
+                     spent {} op(s) and no step boundary found a tier op in the cell loop's \
+                     queue, so the check told that queue from the driver's nowhere",
+                    read.spent_ops
+                ));
+            }
+        }
+    }
+}
+
+/// The thief leg's premise, read on every run of it: from the first pass
+/// the turn reads contended on a cell, for `n × T_c` of injected time, the
+/// first namespace holds a sealed backlog (sealed less flushed) of at
+/// least its slice, the `MAINTAIN-SLICE` its spec carries. A thief whose
+/// backlog runs short leaves openings to the second namespace under any
+/// visit order, so the planted turn cannot hold the second's group past
+/// the bound. The plant gives the thief more of the class than the fair
+/// turn does, so this reads the premise's necessary half, where the plain
+/// run can.
+struct ThiefPremise {
+    cells: Vec<PremiseCell>,
+    window_ns: u64,
+}
+
+/// One cell's reading of the thief leg's premise.
+#[derive(Clone, Copy, Debug, Default)]
+struct PremiseCell {
+    /// The injected time of the first contended pass.
+    from_ns: Option<u64>,
+    /// The first namespace's `MAINTAIN-SLICE`, from its spec.
+    slice_bytes: Option<u64>,
+    /// The least sealed backlog read inside the window.
+    least_bytes: Option<u64>,
+}
+
+impl ThiefPremise {
+    fn new(scenario: &DurableScenario) -> ThiefPremise {
+        let thief = scenario.tier_budget.filter(|shape| shape.leg.is_thief());
+        let window_ns = thief.map_or(0, |shape| tier_turn_bound_ns(scenario, shape));
+        let cells = if thief.is_some() { usize::from(scenario.cells) } else { 0 };
+        ThiefPremise { cells: vec![PremiseCell::default(); cells], window_ns }
+    }
+
+    fn sample(&mut self, node: &Node, scenario: &DurableScenario, now: Nanos) {
+        use inf_server::TierFlushGauge as G;
+        let Some(shape) = scenario.tier_budget else { return };
+        for (cell, read) in self.cells.iter_mut().enumerate() {
+            if read.from_ns.is_none()
+                && node.plane(cell).tier_flush_gauges()[G::TurnContended as usize] > 0
+            {
+                read.from_ns = Some(now.0);
+            }
+            let Some(from) = read.from_ns else { continue };
+            if now.0 > from.saturating_add(self.window_ns) {
+                continue;
+            }
+            let keyspace = node.plane(cell).keyspace();
+            if read.slice_bytes.is_none() {
+                read.slice_bytes = thief_slice_bytes(&keyspace);
+            }
+            let flushed = tier_budget_flushed(&keyspace, shape);
+            if let Some(&(_, flushed, sealed, _)) = flushed.iter().find(|row| row.0 == 0) {
+                let backlog = sealed.saturating_sub(flushed);
+                read.least_bytes =
+                    Some(read.least_bytes.map_or(backlog, |least| least.min(backlog)));
+            }
+        }
+    }
+
+    /// One line a contended cell whose premise is unread or short; a cell
+    /// the turn never contended on is the contention clause's.
+    fn judge(&self, seed: u64, report: &mut DurableReport) {
+        for (cell, read) in self.cells.iter().enumerate() {
+            if read.from_ns.is_none() {
+                continue;
+            }
+            let why = match (read.slice_bytes, read.least_bytes) {
+                (None, _) => "the first namespace carries no tier spec, so no slice".to_string(),
+                (Some(_), None) => {
+                    "the first namespace's backlog was read at no step of the window".to_string()
+                }
+                (Some(slice), Some(least)) if least < slice => format!(
+                    "the first namespace's backlog read {least} B, below its slice of {slice} B, \
+                     within n × T_c of the first contended pass"
+                ),
+                (Some(_), Some(_)) => continue,
+            };
+            report
+                .violations
+                .push(format!("VACUOUS seed {seed:#x} cell {cell}: thief-premise-short — {why}"));
+        }
+    }
+}
+
+/// The first tier-budget namespace's `MAINTAIN-SLICE` on one cell, read
+/// from its spec in the keyspace: the product's own parse of its load's
+/// slice.
+fn thief_slice_bytes(keyspace: &inf_store::Keyspace) -> Option<u64> {
+    let name = NsClass::TierBudget(0).name();
+    let spec = keyspace.ns_iter().find(|spec| spec.name.as_slice() == name)?;
+    spec.tier.map(|tier| tier.maintain_slice_bytes)
+}
+
+/// The first two tier-budget namespaces' ids on one cell, once both
+/// exist: the `ns-<id>` directories their files sit in.
+fn tier_budget_dirs(keyspace: &inf_store::Keyspace) -> Option<(u32, u32)> {
+    let id = |index: u8| {
+        let name = NsClass::TierBudget(index).name();
+        keyspace.ns_iter().find(|spec| spec.name.as_slice() == name).map(|spec| spec.id.0)
+    };
+    Some((id(0)?, id(1)?))
 }
 
 /// Whether every tier-budget writer has sent its quota and holds no
@@ -1561,6 +2071,13 @@ fn fair_turn_bound_ns(share: inf_runtime::DeviceModel, namespaces: u64, step_ns_
     let ops = axis(share.write_ops_per_s, inf_log::limits::TIER_GROUP_OPS_MAX as u64);
     let t_c = bytes.unwrap_or(0).max(ops.unwrap_or(0));
     namespaces * t_c
+}
+
+/// The fair turn's bound on `scenario`'s tier-budget shape, `n × T_c`: the
+/// one source the wait-bound oracle and the thief leg's cut read.
+fn tier_turn_bound_ns(scenario: &DurableScenario, shape: TierBudgetShape) -> u64 {
+    let namespaces = u64::from(shape.namespaces.get());
+    fair_turn_bound_ns(scenario.device.model_share, namespaces, scenario.step_ns_max)
 }
 
 /// The most tier bytes one MAINTAIN pass can draw, from the model: the
@@ -1854,6 +2371,7 @@ pub fn run_durable_scenario(scenario: &DurableScenario) -> DurableReport {
     let sealed = observer.seal();
     report.state_hash = sealed.state_hash;
     report.cap_rows_checked = sealed.census.rows_checked;
+    report.cap_rows_crossed = sealed.census.rows_crossed;
     report.violations.extend(sealed.census.violations);
     report
 }

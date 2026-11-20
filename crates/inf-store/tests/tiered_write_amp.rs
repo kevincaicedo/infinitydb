@@ -30,7 +30,7 @@
 use inf_log::flush::unlink_tier_file;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    MutationEffect, NsId, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
+    LogGeometry, MutationEffect, NsId, SegmentConfig, SegmentRotor, StagingConfig, StagingRing,
     TIER_FRAME_BYTES, TierFlush, TierFlushConfig, TierIoMode, create_cell_dirs, tier_extract,
     tier_frame_offset, tier_frame_span,
 };
@@ -91,6 +91,7 @@ struct Rig {
 
 impl Rig {
     fn new(dead_ratio_pct: u8) -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         // Seal in flush-slice quanta, so one barrier writes a full run of
         // frames instead of rewriting the same partial tail frame every
         // time (the S13 slice-budget finding — at a 4 KiB quantum the
@@ -109,6 +110,7 @@ impl Rig {
             demote,
             KEYS as usize * 2,
             KeyHasher::default(),
+            &census,
         )
         .expect("ring");
         table.set_compaction_config(CompactionConfig { dead_ratio_pct, slice_bytes: 1 << 20 });
@@ -121,21 +123,23 @@ impl Rig {
                 mode: TierIoMode::Buffered,
                 file_capacity: FILE_CAPACITY,
                 slice_bytes: FLUSH_SLICE,
+                record_len_max: 16 << 20,
             },
             0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
-        let rotor = SegmentRotor::create_fresh(
-            fs.clone(),
-            dirs.log,
+        let geometry = LogGeometry::new(
+            StagingConfig::default(),
             SegmentConfig { segment_bytes: 8 << 20, ..Default::default() },
         )
-        .expect("fresh log");
+        .expect("geometry");
+        let rotor = SegmentRotor::create_fresh(fs.clone(), dirs.log, geometry).expect("fresh log");
         Rig {
             table,
             fs,
             flush,
             rotor,
-            ring: StagingRing::new(StagingConfig::default()),
+            ring: StagingRing::new(geometry),
             relocated_bytes: 0,
             relocated_records: 0,
             frame_bytes: 0,

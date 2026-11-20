@@ -30,7 +30,7 @@ use inf_log::flush::{TierFileMeta, unlink_tier_file};
 use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
-    MutationEffect, NsId, StagingConfig, StagingRing, TIER_FRAME_BYTES, TierFlush, TierFlushConfig,
+    LogGeometry, MutationEffect, NsId, StagingRing, TIER_FRAME_BYTES, TierFlush, TierFlushConfig,
     TierIoMode, tier_extract, tier_frame_offset, tier_frame_span,
 };
 use inf_store::KeyHasher;
@@ -78,6 +78,7 @@ fn seeded(x: &mut u64) -> u64 {
 
 impl Rig {
     fn new(disk_budget: u64) -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         // A 256 KiB MAINTAIN quantum: sealing keeps pace with the fill,
         // so `tail − flushed` stays near the mutable target instead of
         // ballooning to the whole window — the admission projection then
@@ -98,6 +99,7 @@ impl Rig {
             demote,
             2048,
             KeyHasher::default(),
+            &census,
         )
         .expect("ring");
         table.set_compaction_config(CompactionConfig { dead_ratio_pct: 50, slice_bytes: 1 << 20 });
@@ -112,14 +114,16 @@ impl Rig {
                 mode: TierIoMode::Buffered,
                 file_capacity: 256 << 10,
                 slice_bytes: 1 << 20,
+                record_len_max: 16 << 20,
             },
             0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
         Rig {
             fs,
             table,
             flush,
-            ring: StagingRing::new(StagingConfig::default()),
+            ring: StagingRing::new(LogGeometry::default()),
             model: BTreeMap::new(),
             ckpt_id: 0,
         }
@@ -138,7 +142,7 @@ impl Rig {
 
     fn stage(&mut self, effect: &MutationEffect<'_>) {
         if self.table.stage_wal(&mut self.ring, effect).is_err() {
-            self.ring = StagingRing::new(StagingConfig::default());
+            self.ring = StagingRing::new(LogGeometry::default());
             self.table.stage_wal(&mut self.ring, effect).expect("a fresh ring has room");
         }
     }

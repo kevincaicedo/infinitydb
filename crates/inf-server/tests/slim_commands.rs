@@ -10,9 +10,9 @@ fn slim_serves_strings_and_refuses_documents() {
     let mut store = Keyspace::new(StoreConfig::default());
     let mut cx = ConnCx::try_default().expect("fixture cache allocation");
     let mut run = |argv: &[&[u8]]| {
-        let mut reply = Vec::new();
-        execute_slices(argv, &mut store, &mut cx, Nanos(1), &mut reply);
-        reply
+        let mut reply = inf_wire::OpenReply::new(Vec::new());
+        execute_slices(argv, &mut store, &mut cx, Nanos(1), reply.reply());
+        reply.finish().into_bytes()
     };
     assert_eq!(run(&[b"SET", b"k", b"v"]), b"+OK\r\n");
     assert_eq!(run(&[b"GET", b"k"]), b"$1\r\nv\r\n");

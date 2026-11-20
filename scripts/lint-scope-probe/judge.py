@@ -53,6 +53,24 @@ def slot(path):
     return path.startswith("inf_foundation::bounded::")
 
 
+def listing(path):
+    return path.startswith("inf_log::")
+
+
+# ADR-0209 D3, A1.2: every `std::env` entry, and libc's environment spellings
+# (`libc::` with `env` in the name; a `libc::` prefix alone would count the
+# clock ban's three libc entries too). The family is exactly 12: each of the 8
+# `std::env` entries has an exact-path plant, and RESOLVED_ONLY's four, which
+# a probe that names no third-party crate cannot plant (A1.1, a deviation from
+# ADR-0106 D7.5), are each in the config and resolve, and no plant names one.
+# A fifth libc environment entry has no plant, so it is red as any other.
+RESOLVED_ONLY = {"libc::getenv", "libc::setenv", "libc::unsetenv", "libc::putenv"}
+
+
+def environment(path):
+    return path.startswith("std::env::") or re.fullmatch(r"libc::\w*env\w*", path) is not None
+
+
 cfg = tomllib.loads(config.read_text())
 # Clippy's help for an unresolved entry is `allow-invalid = true`, which
 # silences it on every architecture: an inert entry would stay green
@@ -68,21 +86,30 @@ for key in ("disallowed-methods", "disallowed-types", "await-holding-invalid-typ
 # that carries one, held across an `await` by its plant (ADR-0144 A2): the
 # lint matches the outermost type of a live local, so each is listed and
 # each lands with its own plant (the lint-scopes gate requires the entry for
-# every public type of `bounded` with a lifetime parameter).
+# every public type of `bounded` with a lifetime parameter). A whole
+# directory listing is an `inf_log::` method of its own family (ADR-0202 D7).
 CENSUS = (("disallowed-methods", "disallowed_methods", filesystem, "filesystem", 37),
+          ("disallowed-methods", "disallowed_methods", listing, "listing", 3),
+          ("disallowed-methods", "disallowed_methods", environment, "environment", 12),
           ("disallowed-types", "disallowed_types", filesystem, "filesystem", 5),
           ("disallowed-types", "disallowed_types", container, "container", 3),
-          ("await-holding-invalid-types", "await_holding_invalid_type", slot, "slot type", 2))
+          ("await-holding-invalid-types", "await_holding_invalid_type", slot, "slot type", 11))
 for key, lint, family, label, count in CENSUS:
     paths = [row["path"] for row in cfg.get(key, []) if family(row["path"])]
     if len(paths) != count or len(set(paths)) != len(paths):
         errors.append(f"config needs {count} distinct {label} {key}, found {len(paths)}")
     witnesses = {path for code, path in plants.values()
                  if code == f"clippy::{lint}" and path and family(path)}
-    unstable = set(UNSTABLE) if lint == "disallowed_methods" else set()
+    unstable = {p for p in UNSTABLE if family(p)} if lint == "disallowed_methods" else set()
     for path in sorted(unstable - set(paths)):
         errors.append(f"unstable path {path} has no config entry")
-    for path in sorted(set(paths) - witnesses - unstable):
+    resolved_only = RESOLVED_ONLY if family is environment else set()
+    for path in sorted(resolved_only - set(paths)):
+        errors.append(f"resolved-only path {path} has no config entry")
+    for path in sorted(witnesses & resolved_only):
+        errors.append(f"plant path {path} names a resolved-only entry: libc's four take no plant "
+                      "in a probe that names no third-party crate (ADR-0209 A1)")
+    for path in sorted(set(paths) - witnesses - unstable - resolved_only):
         errors.append(f"config path {path} has no exact-path plant")
     for path in sorted(witnesses - set(paths)):
         errors.append(f"plant path {path} has no config entry")
@@ -141,9 +168,10 @@ for at, codes in sorted(seen.items()):
     if at not in plants and at not in controls:
         errors.append(f"{at}: unmarked diagnostic {sorted(codes)}")
 # nine decoder/enum, 41 stable APIs, two alias/UFCS bypasses, 11 containers,
-# two slot types across an await, three discarded publishes
-if len(plants) < 68:
-    errors.append(f"{len(plants)} plants; expected at least 68")
+# 11 slot types across an await, three discarded publishes, three whole
+# listings, eight std::env functions and two of their bypasses
+if len(plants) < 90:
+    errors.append(f"{len(plants)} plants; expected at least 90")
 if messages == 0:
     errors.append("clippy produced no diagnostics; the probe did not run")
 
@@ -215,7 +243,8 @@ if errors:
         print(f"lint-scopes probe: {disclosed[2:]}")
     sys.exit(1)
 print(f"lint-scopes probe OK: {len(plants)} exact lint/path plants, "
-      f"{len(controls)} clean controls; 36 stable filesystem methods, five filesystem types, "
-      f"three containers and two slot types across an await covered{disclosed}")
+      f"{len(controls)} clean controls; 36 stable filesystem methods, three whole listings, eight "
+      f"std::env functions (four libc environment entries resolved-only), five filesystem types, "
+      f"three containers and 11 slot types across an await covered{disclosed}")
 print("lint-scopes unstable probe OK: 1/1 pinned-stable refusal (E0658 fs_set_times); "
       "all 37 filesystem method bans retained")

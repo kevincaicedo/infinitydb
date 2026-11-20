@@ -1,0 +1,35 @@
+# The planted reds of scripts/check-fuzz-targets.sh (ADR-0198 D2). The gate
+# compiles this package in place on every run, with the flags it compiles
+# every fuzz workspace with: each plant must be refused for its own reason
+# and `control` must compile, or the gate could not see the shape it guards.
+# A workspace of its own and no fuzz manifest (no cargo-fuzz metadata). It
+# has no dependency, so it compiles offline; its lock is committed because
+# the gate passes --locked.
+[package]
+name = "fuzz-check-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# cargo-fuzz sets cfg(fuzzing) by default, so the gate sets it too: declared
+# here, plant_cfg's arm is compiled exactly when the gate sets it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[workspace]
+
+[[bin]]
+name = "plant_crate"
+path = "fuzz_targets/plant_crate.rs"
+
+[[bin]]
+name = "plant_warning"
+path = "fuzz_targets/plant_warning.rs"
+
+[[bin]]
+name = "plant_cfg"
+path = "fuzz_targets/plant_cfg.rs"
+
+[[bin]]
+name = "control"
+path = "fuzz_targets/control.rs"

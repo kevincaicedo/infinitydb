@@ -19,20 +19,25 @@
 //! began, beyond the turns already out, and position `q` is woken within
 //! `⌈q / 16⌉` turnovers.
 //!
-//! The counts are exact: `q` writers parked, `w` turns out. A turn settles
-//! its own count once, at its publish, its refusal or its drop, by one poll
-//! of its wait: a wake that had landed was a turn out, any other a parked
-//! writer. Only a drop passes a unit on.
+//! The counts are exact. `q`, the writers parked, is the wait list's own
+//! count of queued waits: it moves at the poll that queues a writer's wait
+//! and at that wait's wake or unlink, and the queue keeps no count of its
+//! own. `w` counts the turns out, wakes landed and not yet settled. A turn
+//! resolves only on a landed wake: a wait whose first poll found no node in
+//! the cell's pool is replaced, never read as a wake. A turn settles its own
+//! count once, at its publish, its refusal or its drop. Only a drop passes a
+//! unit on.
 
 use core::cell::Cell;
 use core::future::Future;
+use core::mem;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 use std::rc::Rc;
 
 use inf_log::limits::EXTENT_SEAL_WINDOW_ENTRIES;
-use inf_runtime::WaitList;
 use inf_runtime::gate::ListWait;
+use inf_runtime::{WaitList, WaitNodes};
 
 /// The window's units, as the queue counts them.
 const ENTRIES: usize = EXTENT_SEAL_WINDOW_ENTRIES as usize;
@@ -76,27 +81,31 @@ pub(crate) fn admit(open: bool, parked: usize, len: usize, turns_out: usize) -> 
 /// count when it drops.
 struct Queue {
     open: Cell<bool>,
-    /// `q`: writers parked whose wake has not landed.
-    parked: Cell<usize>,
     /// `w`: turns out — writers woken and not yet published or gone.
     turns_out: Cell<usize>,
+    /// The writers' waits; its own count of queued waits is `q`.
     list: WaitList<()>,
 }
 
 impl Queue {
-    /// Wakes the queue's head, if a writer is parked: its place becomes a
-    /// turn out. Returns whether a wake landed.
+    /// Wakes the queue's head, if a writer is queued: its place becomes a
+    /// turn out. A writer whose wait is on no list is not reached. Returns
+    /// whether a wake landed.
     fn wake_head(&self) -> bool {
-        if self.parked.get() == 0 {
+        if self.list.is_idle() {
             return false;
         }
         let landed = self.list.wake_one(());
-        debug_assert!(landed, "each parked writer is a live waiter of the list");
+        debug_assert!(landed, "the list's count of queued waits holds to its links");
         if landed {
-            self.parked.set(self.parked.get().saturating_sub(1));
             self.turns_out.set(self.turns_out.get().saturating_add(1));
         }
         landed
+    }
+
+    /// `q`: the writers whose waits are queued.
+    fn parked(&self) -> usize {
+        self.list.waiting()
     }
 }
 
@@ -112,14 +121,10 @@ pub(crate) struct ExtentWaiters {
 }
 
 impl ExtentWaiters {
-    /// An open window with nobody queued.
-    pub(crate) fn new() -> ExtentWaiters {
-        let queue = Queue {
-            open: Cell::new(true),
-            parked: Cell::new(0),
-            turns_out: Cell::new(0),
-            list: WaitList::new(),
-        };
+    /// An open window with nobody queued, its list on the cell's `nodes`.
+    pub(crate) fn new(nodes: &WaitNodes) -> ExtentWaiters {
+        let queue =
+            Queue { open: Cell::new(true), turns_out: Cell::new(0), list: WaitList::unit(nodes) };
         ExtentWaiters { queue: Rc::new(queue), parks: 0, turn_refused: 0 }
     }
 
@@ -127,16 +132,16 @@ impl ExtentWaiters {
     /// `len` entries.
     pub(crate) fn arrival(&self, len: usize) -> Arrival {
         let queue = &self.queue;
-        admit(queue.open.get(), queue.parked.get(), len, queue.turns_out.get())
+        admit(queue.open.get(), queue.parked(), len, queue.turns_out.get())
     }
 
-    /// Parks a writer at the queue's tail (`q + 1`): one park episode. The
-    /// writer awaits the turn, which resolves once a handout wakes it.
+    /// Parks a writer at the queue's tail: one park episode. The turn's wait
+    /// is made on no list; the poll that queues it counts the writer in `q`.
+    /// The writer awaits the turn, which resolves once a handout wakes it.
     pub(crate) fn park(&mut self) -> ExtentTurn {
         let queue = &self.queue;
-        queue.parked.set(queue.parked.get().saturating_add(1));
         self.parks = self.parks.saturating_add(1);
-        ExtentTurn { queue: Rc::clone(queue), wait: Some(queue.list.wait(())) }
+        ExtentTurn { queue: Rc::clone(queue), state: TurnState::Waiting(queue.list.wait(())) }
     }
 
     /// A turn found the window full, which `len + w ≤ 16` rules out:
@@ -172,7 +177,7 @@ impl ExtentWaiters {
         );
         let free = ENTRIES.saturating_sub(len).saturating_sub(turns_out);
         #[cfg(not(any(inf_canary_extent_window_no_wake, inf_canary_extent_window_wake_all)))]
-        let wakes = free.min(queue.parked.get());
+        let wakes = free.min(queue.parked());
         // Canary: the handout skips its wakes.
         #[cfg(inf_canary_extent_window_no_wake)]
         let wakes = {
@@ -183,7 +188,7 @@ impl ExtentWaiters {
         #[cfg(inf_canary_extent_window_wake_all)]
         let wakes = {
             let _ = free;
-            queue.parked.get()
+            queue.parked()
         };
         for _ in 0..wakes {
             if !queue.wake_head() {
@@ -194,7 +199,7 @@ impl ExtentWaiters {
 
     /// Writers parked now (`q`, cell scope).
     pub(crate) fn parked(&self) -> usize {
-        self.queue.parked.get()
+        self.queue.parked()
     }
 
     /// Turns out now (`w`, cell scope).
@@ -213,6 +218,17 @@ impl ExtentWaiters {
     }
 }
 
+/// A turn's phase: it resolves only on a landed wake, and settles once.
+enum TurnState {
+    /// Its wait, queued or not yet: the turn has not resolved.
+    Waiting(ListWait<()>),
+    /// Its wake landed and it resolved: it holds no wait, and is a turn out
+    /// until it settles.
+    Landed,
+    /// Its count settled: it settles nothing again.
+    Settled,
+}
+
 /// A blob writer's place in the window's order, from its park until it
 /// publishes or leaves (ADR-0163 D2): a place, not a unit — a writer whose
 /// wake has landed resolves its key once more and reserves with its turn.
@@ -223,8 +239,7 @@ impl ExtentWaiters {
 #[must_use = "a turn is a place in the window's order; dropping it leaves the queue"]
 pub(crate) struct ExtentTurn {
     queue: Rc<Queue>,
-    /// The turn's wait; `None` once the turn is spent on a publish.
-    wait: Option<ListWait<()>>,
+    state: TurnState,
 }
 
 impl ExtentTurn {
@@ -243,27 +258,37 @@ impl ExtentTurn {
         debug_assert!(landed, "a turn reserves only after its wake landed");
     }
 
-    /// Settles the turn's own count, once: a wake that had landed was a
-    /// turn out (`w − 1`), any other a parked writer (`q − 1`), whose wait
-    /// cancels in place. Returns whether the wake had landed; a settled
-    /// turn settles nothing again.
+    /// Settles the turn's own count, once. A landed turn was a turn out
+    /// (`w − 1`, with no poll). A waiting one is polled once: Ready is a
+    /// wake landed unseen (`w − 1`); Pending drops the wait, and a queued
+    /// one unlinks (`q − 1`, by the list). Returns whether a wake had
+    /// landed; a settled turn settles nothing again.
     fn settle(&mut self) -> bool {
-        let Some(mut wait) = self.wait.take() else { return false };
-        let queue = &self.queue;
-        let landed = landed(&mut wait);
-        if landed {
-            queue.turns_out.set(queue.turns_out.get().saturating_sub(1));
-        } else {
-            queue.parked.set(queue.parked.get().saturating_sub(1));
+        let queue = &*self.queue;
+        match mem::replace(&mut self.state, TurnState::Settled) {
+            TurnState::Waiting(mut wait) => {
+                let landed = landed(&mut wait);
+                if landed {
+                    queue.turns_out.set(queue.turns_out.get().saturating_sub(1));
+                }
+                // An unlanded wait unlinks at its drop; a landed one was
+                // polled done.
+                drop(wait);
+                landed
+            }
+            TurnState::Landed => {
+                queue.turns_out.set(queue.turns_out.get().saturating_sub(1));
+                true
+            }
+            TurnState::Settled => false,
         }
-        // An unlanded wait cancels in place; a landed one was polled done.
-        drop(wait);
-        landed
     }
 }
 
-/// One poll of a turn's wait: whether its wake has landed. A landed wait is
-/// left done, so dropping it passes nothing on.
+/// One poll of a turn's wait: whether its wake has landed. A turn's wait is
+/// never left starved between polls (its poll replaces one), so a Ready here
+/// is a landed wake. A landed wait is left done, so dropping it passes
+/// nothing on.
 fn landed(wait: &mut ListWait<()>) -> bool {
     let mut cx = Context::from_waker(Waker::noop());
     Pin::new(wait).poll(&mut cx).is_ready()
@@ -273,9 +298,24 @@ impl Future for ExtentTurn {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        match Pin::into_inner(self).wait.as_mut() {
-            Some(wait) => Pin::new(wait).poll(cx),
-            None => Poll::Ready(()),
+        let this = Pin::into_inner(self);
+        match &mut this.state {
+            TurnState::Waiting(wait) => match Pin::new(&mut *wait).poll(cx) {
+                Poll::Ready(()) => {
+                    this.state = TurnState::Landed;
+                    Poll::Ready(())
+                }
+                Poll::Pending => {
+                    // A starved wait woke its task and would answer Ready
+                    // with no wake: it is replaced by a new one, not polled,
+                    // so a Ready here is always a landed wake.
+                    if wait.starved() {
+                        *wait = this.queue.list.wait(());
+                    }
+                    Poll::Pending
+                }
+            },
+            TurnState::Landed | TurnState::Settled => Poll::Ready(()),
         }
     }
 }
@@ -329,13 +369,28 @@ mod tests {
         Pin::new(turn).poll(&mut cx).is_ready()
     }
 
+    /// An open window on a census and a pool of its own.
+    fn window() -> ExtentWaiters {
+        let (census, _mark) = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0));
+        let nodes = WaitNodes::build(crate::limits::TEST_WAIT_NODES, &census).expect("a pool");
+        ExtentWaiters::new(&nodes)
+    }
+
+    /// A writer parked and its turn polled once, as the writer's task polls
+    /// the turn in the step that parks it: not yet woken.
+    fn parked(waiters: &mut ExtentWaiters) -> ExtentTurn {
+        let mut turn = waiters.park();
+        assert!(!poll_turn(&mut turn), "engagement: a parked turn is not woken");
+        turn
+    }
+
     /// A handout wakes `min(16 − len − w, q)` writers from the head and no
     /// more, whatever the number parked; the woken are turns out.
     #[test]
     fn a_handout_wakes_at_most_the_free_units_from_the_head() {
-        let mut waiters = ExtentWaiters::new();
+        let mut waiters = window();
         assert!(waiters.close(), "the window starts open");
-        let mut turns: Vec<ExtentTurn> = (0..40).map(|_| waiters.park()).collect();
+        let mut turns: Vec<ExtentTurn> = (0..40).map(|_| parked(&mut waiters)).collect();
         assert_eq!((waiters.parked(), waiters.parks()), (40, 40));
         waiters.hand_out(4);
         assert_eq!((waiters.parked(), waiters.turns_out()), (28, 12));
@@ -351,8 +406,8 @@ mod tests {
     /// while it is closed; an unlanded one leaves the queue in place.
     #[test]
     fn a_leaving_turn_settles_its_count_and_passes_its_unit_on() {
-        let mut waiters = ExtentWaiters::new();
-        let mut turns: Vec<ExtentTurn> = (0..3).map(|_| waiters.park()).collect();
+        let mut waiters = window();
+        let mut turns: Vec<ExtentTurn> = (0..3).map(|_| parked(&mut waiters)).collect();
         waiters.hand_out(15);
         assert_eq!((waiters.parked(), waiters.turns_out()), (2, 1));
         let first = turns.remove(0);
@@ -371,8 +426,8 @@ mod tests {
     /// A spent turn is the window's entry now: `w − 1`, nothing passed on.
     #[test]
     fn a_spent_turn_passes_nothing_on() {
-        let mut waiters = ExtentWaiters::new();
-        let mut turns: Vec<ExtentTurn> = (0..2).map(|_| waiters.park()).collect();
+        let mut waiters = window();
+        let mut turns: Vec<ExtentTurn> = (0..2).map(|_| parked(&mut waiters)).collect();
         waiters.hand_out(15);
         let mut first = turns.remove(0);
         assert!(poll_turn(&mut first));
@@ -386,8 +441,8 @@ mod tests {
     /// handout instead of resolving into the same full window.
     #[test]
     fn a_refused_turn_settles_its_count_and_wakes_no_one() {
-        let mut waiters = ExtentWaiters::new();
-        let mut turns: Vec<ExtentTurn> = (0..2).map(|_| waiters.park()).collect();
+        let mut waiters = window();
+        let mut turns: Vec<ExtentTurn> = (0..2).map(|_| parked(&mut waiters)).collect();
         waiters.hand_out(15);
         let mut refused = turns.remove(0);
         assert!(poll_turn(&mut refused), "the head's wake landed");
@@ -395,5 +450,95 @@ mod tests {
         refused.settle_refused();
         assert_eq!((waiters.parked(), waiters.turns_out()), (1, 0), "w − 1, the queue in place");
         assert!(!poll_turn(&mut turns[0]), "no head woken into the full window");
+    }
+
+    /// A window on a pool of `cap` nodes, and the pool.
+    fn window_on(cap: inf_foundation::bounded::Cap) -> (ExtentWaiters, WaitNodes) {
+        let (census, _mark) = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0));
+        let nodes = WaitNodes::build(cap, &census).expect("a pool");
+        (ExtentWaiters::new(&nodes), nodes)
+    }
+
+    const ONE_NODE: inf_foundation::bounded::Cap = inf_foundation::bounded::Cap::entries::<1>(
+        "test-one-node",
+        inf_foundation::bounded::CapFill::Serving,
+    );
+
+    /// A turn on an empty pool (ADR-0177 D5): on a pool of one node, two turns
+    /// parked and polled; the first queues and the second's first poll finds
+    /// no node, so its wait is replaced and `q` counts the first alone. A
+    /// handout wakes the first; spent, it gives its node back, and the second
+    /// queues at its next poll. The second resolves only after the second
+    /// handout: a starved wait is never read as a wake.
+    #[test]
+    fn a_turn_resolves_only_on_a_landed_wake_when_the_pool_is_empty() {
+        let (mut waiters, nodes) = window_on(ONE_NODE);
+        let mut first = waiters.park();
+        let mut second = waiters.park();
+        assert!(!poll_turn(&mut first) && !poll_turn(&mut second), "both parked");
+        assert!(nodes.full() >= 1, "VACUOUS: no first poll found the pool empty");
+        assert_eq!((waiters.parked(), waiters.turns_out()), (1, 0), "q counts the queued one");
+        waiters.hand_out(0);
+        assert_eq!((waiters.parked(), waiters.turns_out()), (0, 1), "the head's wake landed");
+        assert!(poll_turn(&mut first), "the first resolves on its wake");
+        first.spend();
+        assert!(!poll_turn(&mut second), "the second queues on the freed node");
+        assert_eq!((waiters.parked(), waiters.turns_out()), (1, 0), "and q counts it");
+        assert!(!poll_turn(&mut second), "the second resolves on no starved wait");
+        waiters.hand_out(0);
+        assert!(poll_turn(&mut second), "the second handout wakes it");
+        second.spend();
+        assert_eq!((waiters.parked(), waiters.turns_out(), nodes.len()), (0, 0, 0));
+    }
+
+    /// A park and its poll apart: a turn parked and not polled is on no list,
+    /// so a handout does not reach it and `(q, w)` stays (0, 0); its poll
+    /// queues it, (1, 0), and the next handout wakes it.
+    #[test]
+    fn a_handout_reaches_a_parked_turn_only_after_its_poll() {
+        let mut waiters = window();
+        let mut turn = waiters.park();
+        waiters.hand_out(0);
+        assert_eq!((waiters.parked(), waiters.turns_out()), (0, 0), "no writer was queued");
+        assert!(!poll_turn(&mut turn), "its poll queues it, not woken");
+        assert_eq!((waiters.parked(), waiters.turns_out()), (1, 0));
+        waiters.hand_out(0);
+        assert!(poll_turn(&mut turn), "the next handout wakes it");
+        turn.spend();
+    }
+
+    /// A turn dropped while its wait is on no list (the arm's second turn,
+    /// dropped before a node frees): `q` and `w` do not move, settle's one
+    /// poll starves again, and the pool holds no node of it.
+    #[test]
+    fn a_turn_dropped_with_its_wait_on_no_list_moves_no_count() {
+        let (mut waiters, nodes) = window_on(ONE_NODE);
+        let mut first = waiters.park();
+        let mut second = waiters.park();
+        assert!(!poll_turn(&mut first) && !poll_turn(&mut second), "both parked");
+        let starved = nodes.full();
+        assert!(starved >= 1, "VACUOUS: the second's first poll found a node");
+        drop(second);
+        assert_eq!((waiters.parked(), waiters.turns_out()), (1, 0), "no count moved");
+        assert_eq!(nodes.full(), starved + 1, "settle's one poll starved again");
+        assert_eq!(nodes.len(), 1, "the pool holds the first's node alone");
+        drop(first);
+        assert_eq!((waiters.parked(), nodes.len()), (0, 0));
+    }
+
+    /// A spend at `w` = 2: two turns landed, one spent, `w` reads 1, where a
+    /// second settle would read 0, which the saturating count would hide at
+    /// `w` = 1.
+    #[test]
+    fn a_spend_settles_one_turn_out() {
+        let mut waiters = window();
+        let mut turns: Vec<ExtentTurn> = (0..2).map(|_| parked(&mut waiters)).collect();
+        waiters.hand_out(0);
+        assert_eq!(waiters.turns_out(), 2, "both woken");
+        let mut first = turns.remove(0);
+        assert!(poll_turn(&mut first));
+        first.spend();
+        assert_eq!(waiters.turns_out(), 1, "one spend settles one turn out");
+        drop(turns);
     }
 }

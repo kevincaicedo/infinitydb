@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! M4-S17 blob-extent crash rows (ADR-0061 D3/D5/D9) — carried at the
 //! node tier per `m4.toml`:
 //!
@@ -30,7 +34,7 @@ use inf_log::blob::{ExtentId, ExtentWriter, list_extent_ids, open_extent, unlink
 use inf_log::fs::SegmentFs;
 use inf_log::fs::mem::MemFs;
 use inf_log::{
-    CkptConfig, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentId, StagingConfig,
+    CkptConfig, LogGeometry, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentId,
     StagingRing, SyncIckWriter, TierFlushConfig, TierIoMode, decode_record, read_ick_hybrid,
     read_manifest, write_manifest,
 };
@@ -55,6 +59,7 @@ fn flush_config() -> TierFlushConfig {
         mode: TierIoMode::Buffered,
         file_capacity: 24 << 10,
         slice_bytes: PAGE,
+        record_len_max: 16 << 20,
     }
 }
 
@@ -63,12 +68,14 @@ fn demote() -> DemotionConfig {
 }
 
 fn table(origin: u64) -> TieredTable {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let space = AddressSpaceConfig {
         reserve_bytes: demote().ring_reserve_bytes().expect("valid"),
         page_bytes: PAGE as usize,
         life_origin: LogicalAddr::from_raw(origin).expect("48-bit"),
     };
-    let mut t = TieredTable::new(space, demote(), 256, KeyHasher::default()).expect("ring");
+    let mut t =
+        TieredTable::new(space, demote(), 256, KeyHasher::default(), &census).expect("ring");
     t.set_blob_config(inf_store::BlobConfig { threshold_bytes: 64, max_bytes: 1 << 20 });
     t
 }
@@ -287,7 +294,7 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
     let fs = MemFs::new();
     fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
     let mut t = table(0);
-    let mut ring = StagingRing::new(StagingConfig::default());
+    let mut ring = StagingRing::new(LogGeometry::default());
     let mut tail: Vec<u8> = Vec::new();
 
     // The referenced twin: extent → fdatasync → token → record + frame.
@@ -367,7 +374,12 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
     }
     writer.finish().expect("finish ick");
     t.end_ckpt_walk();
-    let flush = inf_log::TierFlush::new(fs.clone(), flush_config(), 0);
+    let flush = inf_log::TierFlush::new(
+        fs.clone(),
+        flush_config(),
+        0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+    );
     let manifest = Manifest {
         ckpt_id,
         begin_lsn,
@@ -401,6 +413,7 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
         demote(),
         256,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("recovery");
     assert!(recovered.extents_listed.contains(&orphan_id), "the listing saw the orphan");
@@ -418,7 +431,7 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
         |record| {
             let mut guard = parts.borrow_mut();
             let (ks, spill) = &mut *guard;
-            ks.apply_record(&record, NOW, ANCHOR, &mut **spill).map(|_| ())
+            inf_store::drive_record(ks, &record, NOW, ANCHOR, &mut **spill, u64::MAX).map(|_| ())
         },
         |section| {
             let mut guard = parts.borrow_mut();
@@ -444,7 +457,8 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
     let mut rest: &[u8] = &tail;
     while !rest.is_empty() {
         let (record, consumed) = decode_record(rest).expect("tail decodes");
-        ks.apply_record(&record, NOW, ANCHOR, &mut spill).expect("replays");
+        inf_store::drive_record(&mut ks, &record, NOW, ANCHOR, &mut spill, u64::MAX)
+            .expect("replays");
         rest = &rest[consumed..];
     }
     assert_eq!(ks.displace_register_len(), 0, "every marker met its mutation");
@@ -476,7 +490,8 @@ fn orphan_cut_reclaims_never_serves_and_the_referenced_twin_serves() {
     // quarantines the header-valid file on this boot (the bytes leave
     // the listing but survive the life) and unlinks the twin only on
     // the next boot's second verdict.
-    assert!(t.extent_sweep_seed(&recovered.extents_listed, &[]).is_empty(), "nothing to revive");
+    let listed = recovered.extents_listed.to_vec();
+    assert!(t.extent_sweep_seed(&listed, &[]).is_empty(), "nothing to revive");
     let work = t.extent_reclaim_work(0, 8);
     assert_eq!(
         work,
@@ -510,7 +525,7 @@ fn blob_unlink_failure_defers_nonfatally_and_the_retry_reclaims() {
     let fs = MemFs::new();
     fs.create_dir_all(Path::new(SHARD)).expect("shard dir");
     let mut t = table(0);
-    let mut ring = StagingRing::new(StagingConfig::default());
+    let mut ring = StagingRing::new(LogGeometry::default());
     let bytes = value(2 << 10, 3);
     let id = t.allocate_extent_id();
     let sealed = write_extent(&fs, id, &bytes);

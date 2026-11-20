@@ -1,10 +1,13 @@
 # cargo-fuzz crate for inf-foundation: the capped containers' op sequences
-# against std models (ADR-0151 D6; 300 s per slice, nightly hours). Standalone
-# workspace — built only by `cargo +nightly fuzz`.
+# against std models (ADR-0151 D6; 300 s per slice, nightly hours). A
+# workspace of its own, outside the root's, so its fuzzing features never
+# unify into a shipping build; `just check` compiles its targets on the
+# pinned toolchain and `cargo +nightly fuzz` runs them.
 [package]
 name = "inf-foundation-fuzz"
 version = "0.0.0"
 edition = "2024"
+license = "Apache-2.0"
 publish = false
 
 [package.metadata]

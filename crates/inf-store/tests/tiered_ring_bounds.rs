@@ -19,6 +19,9 @@
 //! - `default_blob_threshold_derives_from_the_ring` — the pre-fix default
 //!   (16 MiB regardless of the ring) is exactly what let F-L06-01 in.
 
+// nextest-stall-default: the store sits below the server plane, which alone
+// arms the tail stall (ADR-0053 D4): no write here waits on it.
+
 use inf_alloc::REGION_PAGE_BYTES;
 use inf_log::{FsyncClass, NsId};
 use inf_store::{
@@ -29,6 +32,7 @@ use inf_store::{
 /// An 8 MiB ring: `MEM-BUDGET 4mb` + the 1 MiB default slice, the
 /// smallest ring the lane's scenario named (`ring / 2` = 4 MiB).
 fn eight_mib_ring() -> TieredTable {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let demote = DemotionConfig::for_budget(4 << 20, REGION_PAGE_BYTES as u64);
     let reserve_bytes = demote.ring_reserve_bytes().expect("valid budget");
     assert_eq!(reserve_bytes, 8 << 20, "next_pow2(4 MiB + 1 MiB)");
@@ -41,6 +45,7 @@ fn eight_mib_ring() -> TieredTable {
         demote,
         64,
         KeyHasher::default(),
+        &census,
     )
     .expect("ring")
 }
@@ -150,6 +155,7 @@ fn blob_stall_probe_never_sizes_from_the_value() {
 /// is a genuine internal invariant again.
 #[test]
 fn sub_floor_budget_refuses_at_the_spec_gauntlet() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     for (budget, what) in
         [(64u64 << 10, "64kb"), (256 << 10, "256kb"), (1 << 20, "1mb"), (2 << 20, "2mb")]
     {
@@ -160,7 +166,7 @@ fn sub_floor_budget_refuses_at_the_spec_gauntlet() {
         let mut ks = Keyspace::new(StoreConfig::default());
         assert!(
             matches!(
-                ks.ns_create(tiered_spec(16, b"tiny", spec)),
+                ks.ns_create(tiered_spec(16, b"tiny", spec), &census),
                 Err(NsError::InvalidTierConfig(_))
             ),
             "{what}: the registry refuses typed"
@@ -172,7 +178,7 @@ fn sub_floor_budget_refuses_at_the_spec_gauntlet() {
     let spec = TierSpec::for_budget(3 << 20);
     assert!(spec.validate().is_ok());
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.ns_create(tiered_spec(16, b"small", spec)).expect("the floor budget materializes");
+    ks.ns_create(tiered_spec(16, b"small", spec), &census).expect("the floor budget materializes");
 }
 
 /// ADR-0102 D2: the default `BLOB-THRESHOLD` is a function of the ring
@@ -203,14 +209,17 @@ fn default_blob_threshold_derives_from_the_ring() {
 /// never a silent panic on the first large value.
 #[test]
 fn legacy_catalog_threshold_normalizes_at_seed() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut source = Keyspace::new(StoreConfig::default());
-    source.ns_create(tiered_spec(16, b"legacy", TierSpec::for_budget(4 << 20))).expect("create");
+    source
+        .ns_create(tiered_spec(16, b"legacy", TierSpec::for_budget(4 << 20)), &census)
+        .expect("create");
     let mut catalog = source.export_catalog(17, 0, 1);
     // Forge the pre-rule shape: the registry never admits it, so write
     // the entry directly.
     catalog.entries[0].tier.as_mut().expect("tiered").blob_threshold_bytes = 1 << 24;
     let mut ks = Keyspace::new(StoreConfig::default());
-    ks.seed_catalog(&catalog).expect("a legacy catalog boots");
+    ks.seed_catalog(&catalog, &census).expect("a legacy catalog boots");
     let seeded = ks.ns_get(b"legacy").expect("seeded").tier.expect("tiered");
     assert_eq!(seeded.blob_threshold_bytes, TierSpec::blob_threshold_max(8 << 20));
     assert_eq!(ks.seed_normalized_thresholds(), 1, "counted, never silent");

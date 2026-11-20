@@ -12,7 +12,7 @@ use inf_log::fs::mem::MemFs;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::{
     CkptConfig, Manifest, MutationEffect, NsId, RecordView, SegmentConfig, SegmentRotor,
-    StagingConfig, StagingRing, create_cell_dirs, segment_file_name, write_manifest,
+    StagingRing, create_cell_dirs, segment_file_name, write_manifest,
 };
 use inf_server::{DurableConfig, open_cell_log};
 use inf_store::{FsyncClass, KeyHasher, Keyspace, NsMode, NsSpec, StoreConfig, WallAnchor};
@@ -25,8 +25,10 @@ const SHARD: &str = "data/shard-0";
 fn cfg() -> DurableConfig {
     DurableConfig {
         data_dir: PathBuf::from("data"),
-        staging: StagingConfig::default(),
-        segment: SegmentConfig { segment_bytes: 64 << 10, ..Default::default() },
+        geometry: crash_matrix::geometry(SegmentConfig {
+            segment_bytes: 64 << 10,
+            ..Default::default()
+        }),
         ckpt: CkptConfig::default(),
         recover: Default::default(),
         flush_bound: 1,
@@ -38,17 +40,21 @@ fn cfg() -> DurableConfig {
 }
 
 fn keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     for (id, name) in [(FULL, &b"ledger"[..]), (EMPTY, &b"fresh"[..])] {
-        ks.ns_create(NsSpec {
-            id,
-            name: name.to_vec(),
-            mode: NsMode::Durable,
-            fsync: Some(FsyncClass::Always),
-            policy: None,
-            maxmemory: None,
-            tier: None,
-        })
+        ks.ns_create(
+            NsSpec {
+                id,
+                name: name.to_vec(),
+                mode: NsMode::Durable,
+                fsync: Some(FsyncClass::Always),
+                policy: None,
+                maxmemory: None,
+                tier: None,
+            },
+            &census,
+        )
         .expect("ns");
     }
     ks
@@ -61,8 +67,8 @@ fn build_shard(fs: &MemFs, populated: &[NsId]) {
     let config = cfg();
     let dirs = create_cell_dirs(fs, Path::new(SHARD)).expect("dirs");
     let mut rotor =
-        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.segment).expect("rotor");
-    let mut ring = StagingRing::new(config.staging);
+        SegmentRotor::create_fresh(fs.clone(), dirs.log.clone(), config.geometry).expect("rotor");
+    let mut ring = StagingRing::new(config.geometry);
     ring.stage(&MutationEffect::CkptBegin { ckpt_id: 1 }).expect("stage");
     rotor.maintain(0).expect("maintain");
     let slot = rotor.begin_frame(ring.pending_frame_len(), 0).expect("reserve");
@@ -112,6 +118,7 @@ fn build_shard(fs: &MemFs, populated: &[NsId]) {
 }
 
 fn boot(fs: &MemFs) -> inf_server::RecoverStats {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = keyspace();
     let (_rotor, stats, manifest) = open_cell_log(
         fs.clone(),
@@ -120,6 +127,7 @@ fn boot(fs: &MemFs) -> inf_server::RecoverStats {
         &cfg(),
         WallAnchor { internal_ms: 0, unix_ms: 1_750_000_000_000 },
         Nanos::from_millis(1),
+        &census,
     )
     .expect("boot");
     assert_eq!(manifest.map(|m| m.ckpt_id), Some(1));
