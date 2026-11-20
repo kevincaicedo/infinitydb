@@ -823,6 +823,13 @@ impl HeapEntry for WaitEntry {
 
 const _: () = assert!(size_of::<WaitEntry>() == 24, "a wait entry is 24 B");
 
+// The stand-in's entry is the product gate's, byte for byte, so the hook legs read the stride
+// the gate's entry array is built at; an entry that grows or shrinks fails this build.
+const _: () = assert!(
+    size_of::<WaitEntry>() == inf_runtime::WatermarkGate::ENTRY_BYTES,
+    "the bench's wait entry is the gate's"
+);
+
 /// The node words the hook and a wake write: the heap position the hook
 /// stores, and the state a wake marks.
 const NODE_POSITION: usize = 5;

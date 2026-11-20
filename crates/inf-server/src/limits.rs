@@ -549,20 +549,23 @@ pub const WAIT_NODES: Cap = Cap::entries::<WAIT_NODES_MAX>("wait-nodes", CapFill
 /// `CapError::Layout` when `T` passes [`WAIT_NODES_MAX`]; derived never.
 pub(crate) const fn wait_nodes(caps: &PlaneTaskCaps) -> Result<Cap, CapError> {
     let nodes = task_slots(caps);
-    // Canary: the pool is built over (1 + k) T nodes, k the fewest whose nodes' bytes pass
-    // ten times the idle-resident tool's 256 KiB control a cell, so the idle node's resident
-    // rise is one the tool gives a verdict on.
+    // Canary: the pool is built over (1 + k) T nodes, and the gate's entry array with it, k
+    // the fewest whose nodes' and entries' bytes pass ten times the idle-resident tool's
+    // 256 KiB control a cell, so the idle node's resident rise is one the tool gives a verdict
+    // on.
     #[cfg(inf_canary_wait_nodes_oversized)]
     let nodes = nodes * (1 + wait_nodes_oversized_k(nodes));
     Cap::derived(&WAIT_NODES, nodes)
 }
 
-/// The oversized-pool canary's `k` at `nodes`: the fewest counts of `nodes` whose node bytes
-/// pass ten times the idle-resident tool's 256 KiB control a cell, 2,621,440 B, at the stride
-/// the build reads.
+/// The oversized-pool canary's `k` at `nodes`: the fewest counts of `nodes` whose bytes, a
+/// node's slot and the watermark gate's entry each, pass ten times the idle-resident tool's
+/// 256 KiB control a cell, 2,621,440 B, at the strides the build reads. The entry array is
+/// built at the pool's cap (ADR-0177 D5), so the plant grows both.
 #[cfg(any(all(test, feature = "doc"), inf_canary_wait_nodes_oversized))]
 pub(crate) const fn wait_nodes_oversized_k(nodes: u32) -> u32 {
-    let stride = inf_runtime::WaitNodes::NODE_SLOT_BYTES as u64;
+    let stride =
+        (inf_runtime::WaitNodes::NODE_SLOT_BYTES + inf_runtime::WatermarkGate::ENTRY_BYTES) as u64;
     let per_count = nodes as u64 * stride;
     (WAIT_NODES_PLANT_FLOOR_BYTES / per_count + 1) as u32
 }

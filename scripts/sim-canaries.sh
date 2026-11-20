@@ -1460,13 +1460,14 @@ ordered_rows=(
   # same step (ADR-0177 D5). Planted, the drop leaves the node linked: the pool keeps it, and a
   # thousand drops on one key fill the pool and starve the first polls after them.
   "inf_canary_wait_drop_keeps_node crate-test inf-runtime lib a_wait_dropped_while_queued_leaves_no_entry wait-node-kept"
-  # The cell's wait nodes are resident from the pool's build (ADR-0177 D5, D8 with A1), inside
-  # the gate row's per-cell remainder. Planted, the pool is built over (1 + k) T nodes, k the
-  # fewest counts of T whose node bytes pass ten times the idle-resident tool's 256 KiB control
-  # a cell: the idle node's resident memory a cell rises by k x T x s_node, 17 x 2,825 x 56 B
-  # at 4 cells. The bytes are that product at the stride the bill's test reads; a stride that
-  # moves moves them with it.
-  "inf_canary_wait_nodes_oversized binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 2689400 --control-bytes-cell 262144 --plant-row wait-nodes"
+  # The cell's wait nodes and its watermark gate's entry array, one entry a node, are resident
+  # from the pool's build (ADR-0177 D5, D8 with A1), inside the gate row's per-cell remainder.
+  # Planted, the pool and its array are built over (1 + k) T, k the fewest counts of T whose
+  # node and entry bytes pass ten times the idle-resident tool's 256 KiB control a cell: the
+  # idle node's resident memory a cell rises by k x T x (s_node + s_entry), 12 x 2,825 x
+  # (56 + 24) B at 4 cells. The bytes are that product at the strides the bill's test reads; a
+  # stride that moves moves them with it.
+  "inf_canary_wait_nodes_oversized binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 2712000 --control-bytes-cell 262144 --plant-row wait-nodes"
   # A word resolves its slot by the generation bits it carries, the low bits of the occupant's
   # (ADR-0194 D6 with A2). Planted, the whole generation is compared with the field, and from
   # a slot's 2²³-th use its word reads Stale.
