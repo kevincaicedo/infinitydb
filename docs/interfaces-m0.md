@@ -166,6 +166,13 @@ impl Arena {
 > No wire, durable or token layout changes. The old signatures below do
 > not establish that the replacement is built.
 
+> **Accepted 2026-11-20, implementation open — ADR-0177 A2:**
+> `WatermarkGate`'s wake is budgeted. `advance(lsn)` moves the watermark
+> and wakes nothing; `wake_covered(budget)` wakes the queued waits at or
+> below it in LSN order, at most `budget` a call; `owes()` says whether a
+> covered wait may be left. The sketch line below, "advance(lsn) wakes
+> all ≤ lsn", does not establish that the replacement is built.
+
 > **Accepted 2026-10-19, built — ADR-0003 A1:** a standard
 > `Waker` is thread-safe. Its data names a `Sync` wake bridge whose only
 > atomics are its foreign lane's; on its own cell's thread a waker

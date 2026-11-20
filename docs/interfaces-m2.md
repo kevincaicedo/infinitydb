@@ -2186,6 +2186,16 @@ so promotion is free.
 > still dropped only with its task. Rows 2.1, 2.2 and 2.5 are unchanged.
 > The rows below do not establish that the replacement is built.
 
+> **Accepted 2026-11-20, implementation open — ADR-0177 A2:** this gate wakes
+> its queued waits FIFO by LSN, at most `ACK_WAKES_PER_TURN` (1,024 at
+> ADR-0177 A2) between two LOG steps of a cell: the first batch at the sync's
+> completion, each later one at the head of the durable cell's LOG step.
+> `advance` moves the watermark and wakes nothing (rows 2.1 and 2.2 are
+> unchanged); `wake_covered(budget)` wakes, and `owes()` reads whether a
+> covered wait may be left. The group-commit section's "wake FIFO by LSN
+> under the EXECUTE budget (wake storms drain across slices)" stands. The
+> rows below do not establish that the replacement is built.
+
 Wakes `always` response futures when the durability watermark reaches their
 record LSN. It *trusts* the LSN fed by `GroupCommit` (machine 1); its own
 job is monotonicity + correct FIFO wake.
