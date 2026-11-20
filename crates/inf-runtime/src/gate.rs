@@ -1192,10 +1192,14 @@ enum NodeState {
 /// A parked wait (ADR-0177 D5): its task's waker, its place on its one list
 /// or the watermark gate's heap, and its state. 48 B, a 56 B slot: the
 /// position sits in the padding the other fields leave.
+// In declaration order: the position just ahead of `next`, whose `None` is
+// a zero word at its start, so a list's publish writes the position's zero
+// and that `None` in one store, and the position costs a list wait no
+// instruction (ADR-0177 D5).
+#[repr(C)]
 struct WaitNode {
     waker: Option<Waker>,
     prev: Option<NodeId>,
-    next: Option<NodeId>,
     /// Its entry's index on the watermark gate's heap, which the heap's hook
     /// writes at every move, so a dropped wait removes its entry in one sift
     /// (ADR-0177 D5). A list's node has no entry, and nothing reads its
@@ -1205,6 +1209,7 @@ struct WaitNode {
         reason = "storage nothing reads yet: the gate's waits still queue in its B-tree"
     )]
     position: u32,
+    next: Option<NodeId>,
     state: NodeState,
 }
 
