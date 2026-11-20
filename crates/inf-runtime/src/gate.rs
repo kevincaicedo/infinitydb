@@ -1204,10 +1204,6 @@ struct WaitNode {
     /// writes at every move, so a dropped wait removes its entry in one sift
     /// (ADR-0177 D5). A list's node has no entry, and nothing reads its
     /// position.
-    #[expect(
-        dead_code,
-        reason = "storage nothing reads yet: the gate's waits still queue in its B-tree"
-    )]
     position: u32,
     next: Option<NodeId>,
     state: NodeState,
