@@ -89,8 +89,7 @@ const SLOTS_10000: Cap = Cap::entries::<10_000>("executor-ab-10000", CapFill::Se
 /// P's planted instructions per op: each row's bound plus one, the planted red its rule must
 /// refuse. Each row's bound is fixed before any count of the row is read, outside this file;
 /// each value copies that bound plus one and sets none of its own. The suspend rows' bounds
-/// differ by size, so each size has its own. The two list rows' bounds are not fixed yet: each
-/// holds 1 until its bound is, and no P leg of theirs is read before.
+/// differ by size, so each size has its own.
 const K_FAST_2500: u16 = 78;
 const K_DEFERRED_2500: u16 = 52;
 const K_FAST_10000: u16 = 89;
@@ -100,8 +99,8 @@ const K_SUSPEND_16384: u16 = 2;
 const K_SUSPEND_65536: u16 = 35;
 const K_KEYED_2496: u16 = 1_067;
 const K_KEYED_159744: u16 = 1_660;
-const K_WAIT_WAKE: u16 = 1;
-const K_WAIT_WAKE_KEYS_15: u16 = 1;
+const K_WAIT_WAKE: u16 = 110;
+const K_WAIT_WAKE_KEYS_15: u16 = 344;
 
 /// `NOPS` operand-free `nop`s: the count must read exactly `NOPS` more an op.
 #[inline(always)]
