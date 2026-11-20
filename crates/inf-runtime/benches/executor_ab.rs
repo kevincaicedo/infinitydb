@@ -27,6 +27,17 @@
 //!   the second parked in its place. The list takes a pool of a cell's wait nodes at 16 cells
 //!   (962), and the keyed list holds a cell's 15 peers there, its waits on the one four branches
 //!   deep.
+//! - `watermark-wait`, `watermark-wait-2825`: the watermark gate with one far wait parked, on a
+//!   pool of a cell's wait nodes at 16 cells (962) or at 4 cells (2,825, the default node): a
+//!   wait at the next LSN and its first poll, an advance to that LSN followed by `wake_covered`
+//!   at the durable cell's budget while the gate `owes()`, as that cell calls them, then the
+//!   wait's poll that reads it Ready, and its drop.
+//! - `heap-rising-<d>`, `heap-falling-<d>`, `d` 962, 2,825 or 16,384: a round of `d` watermark
+//!   waits on a pool of `d`, each made and polled once in rising or falling LSN order; an advance
+//!   to the round's middle LSN and one to its last, each followed by the wakes it owes as above;
+//!   then each wait polled Ready and dropped. Read a wait: `--ops` counts waits, a multiple of
+//!   the round, and a count the round does not divide exits 1 before the loop. P plants its `k`
+//!   a wait, each right after the wait's first poll returns.
 //!
 //! Each gate operation sits where the server places it. The fabric gate's `reserve` and
 //! `register` have one caller, `send_once`, with the request's stage an opaque call between
@@ -76,7 +87,7 @@ use inf_runtime::gate::ListWait;
 use inf_runtime::{
     CellExecutor, Delivery, ExecutorLayout, FabricAdmission, FabricGate, GateHold, GateUnits,
     GateWait, KeyedAdmission, KeyedGate, KeyedWait, PollImmediate, TaskAdmission, TaskClass,
-    TaskFactory, TaskId, WaitList, WaitNodes, Woken, park,
+    TaskFactory, TaskId, WaitList, WaitNodes, WaitPool, WatermarkGate, WatermarkWait, Woken, park,
 };
 
 /// The pad that puts a row's slot in the `conn` class's chunk: a future of about 2,900 B.
@@ -89,7 +100,9 @@ const SLOTS_10000: Cap = Cap::entries::<10_000>("executor-ab-10000", CapFill::Se
 /// P's planted instructions per op: each row's bound plus one, the planted red its rule must
 /// refuse. Each row's bound is fixed before any count of the row is read, outside this file;
 /// each value copies that bound plus one and sets none of its own. The suspend rows' bounds
-/// differ by size, so each size has its own.
+/// differ by size, so each size has its own. The eight watermark rows' bounds are not fixed yet:
+/// each holds 1 until its bound is, and no P leg of theirs is read before. A heap row's `k` is
+/// planted a wait.
 const K_FAST_2500: u16 = 78;
 const K_DEFERRED_2500: u16 = 52;
 const K_FAST_10000: u16 = 89;
@@ -101,6 +114,14 @@ const K_KEYED_2496: u16 = 1_067;
 const K_KEYED_159744: u16 = 1_660;
 const K_WAIT_WAKE: u16 = 110;
 const K_WAIT_WAKE_KEYS_15: u16 = 344;
+const K_WATERMARK_WAIT: u16 = 1;
+const K_WATERMARK_WAIT_2825: u16 = 1;
+const K_HEAP_RISING_962: u16 = 1;
+const K_HEAP_FALLING_962: u16 = 1;
+const K_HEAP_RISING_2825: u16 = 1;
+const K_HEAP_FALLING_2825: u16 = 1;
+const K_HEAP_RISING_16384: u16 = 1;
+const K_HEAP_FALLING_16384: u16 = 1;
 
 /// `NOPS` operand-free `nop`s: the count must read exactly `NOPS` more an op.
 #[inline(always)]
@@ -273,10 +294,22 @@ fn drive_deferred(cap: Cap, ops: u64, step: fn(&mut DeferredCell) -> usize) -> R
 /// its parked senders' list on a pool of a cell's wait nodes.
 fn fabric_gate(holders: Cap) -> Result<FabricGate<u64>, String> {
     let (census, _mark) = CapCensus::new(CellId(0));
-    let nodes =
-        WaitNodes::build(WAIT_NODES_962, &census).map_err(|e| format!("the row's pool: {e}"))?;
+    let nodes = WaitNodes::build(WAIT_NODES_962, &census)
+        .map_err(|e| format!("the row's pool: {e}"))?
+        .nodes;
     FabricGate::build(0, holders.entries_max(), Some(holders), &census, &nodes)
         .map_err(|e| format!("the row's fabric gate: {e}"))
+}
+
+/// A pool of `cap` wait nodes on a census of its own, the pool's one watermark gate on its
+/// seat, and the census's serve mark.
+fn watermark_gate(
+    cap: Cap,
+) -> Result<(WaitNodes, WatermarkGate, Rc<CapCensus>, ServeMark), String> {
+    let (census, serve_mark) = CapCensus::new(CellId(0));
+    let WaitPool { nodes, seat } =
+        WaitNodes::build(cap, &census).map_err(|e| format!("the row's pool: {e}"))?;
+    Ok((nodes, WatermarkGate::build(seat), census, serve_mark))
 }
 
 /// Delivers `value` to the fabric holder `key` names.
@@ -766,8 +799,9 @@ fn step_wait_wake_keys_15_planted<const K: u16>(cell: &mut KeyedListCell) -> boo
 /// The list rows' pool on a census of its own, and the census's serve mark.
 fn list_pool() -> Result<(WaitNodes, Rc<CapCensus>, ServeMark), String> {
     let (census, serve_mark) = CapCensus::new(CellId(0));
-    let nodes =
-        WaitNodes::build(WAIT_NODES_962, &census).map_err(|e| format!("the row's pool: {e}"))?;
+    let nodes = WaitNodes::build(WAIT_NODES_962, &census)
+        .map_err(|e| format!("the row's pool: {e}"))?
+        .nodes;
     Ok((nodes, census, serve_mark))
 }
 
@@ -816,6 +850,182 @@ fn drive_keyed_list(ops: u64, step: fn(&mut KeyedListCell) -> bool) -> Result<()
     }
     drive_list!(ListCell { nodes, list, key: PEER_KEY, parked: Some(parked) }, ops, step)?;
     expect("keys admitted while serving", u64::from(census.cap_assembly_violations()), 0)
+}
+
+// ---- The watermark rows ----------------------------------------------------------------------
+
+/// The watermark rows' other pools: a cell's wait nodes at 4 cells, the default node, and
+/// 16,384, the deepest heap row's round. The 962 of 16 cells is the list rows' pool.
+const WAIT_NODES_2825: Cap = Cap::entries::<2_825>("executor-ab-wait-nodes-2825", CapFill::Serving);
+const WAIT_NODES_16384: Cap =
+    Cap::entries::<16_384>("executor-ab-wait-nodes-16384", CapFill::Serving);
+
+/// The durable cell's wakes between two LOG steps (ADR-0177 A2.1): each advance is followed by
+/// `wake_covered` at this budget while the gate owes a wake, as that cell calls it.
+const WAKE_BUDGET: usize = 1_024;
+
+/// The far wait a mark row keeps parked: an LSN no op's advance reaches.
+const FAR_LSN: u64 = u64::MAX / 2;
+
+/// The wakes an advance leaves owed, as the durable cell takes them: `wake_covered` at its
+/// budget while the gate `owes()` (ADR-0177 A2.2).
+#[inline(always)]
+fn wake_owed(gate: &WatermarkGate) {
+    while gate.owes() {
+        gate.wake_covered(WAKE_BUDGET);
+    }
+}
+
+/// A mark row's owner: the pool, its gate, the LSN of the last op's wait and the far wait,
+/// parked throughout.
+struct MarkCell {
+    nodes: WaitNodes,
+    gate: WatermarkGate,
+    lsn: u64,
+    _far: WatermarkWait,
+}
+
+/// The mark rows' op: a wait at the next LSN and its first poll, which parks it; an advance to
+/// that LSN and the wakes it owes; the wait's poll that reads it Ready, and its drop. Answers
+/// whether each did as implied.
+#[inline(always)]
+fn mark_op(cell: &mut MarkCell) -> bool {
+    let mut cx = Context::from_waker(Waker::noop());
+    cell.lsn += 1;
+    let mut wait = cell.gate.wait_for(cell.lsn);
+    let pending = Pin::new(&mut wait).poll(&mut cx).is_pending();
+    cell.gate.advance(cell.lsn);
+    wake_owed(&cell.gate);
+    let ready = Pin::new(&mut wait).poll(&mut cx).is_ready();
+    drop(wait);
+    pending && ready
+}
+
+#[inline(never)]
+fn step_mark(cell: &mut MarkCell) -> bool {
+    mark_op(cell)
+}
+
+#[inline(never)]
+fn step_mark_planted<const K: u16>(cell: &mut MarkCell) -> bool {
+    plant::<K>();
+    mark_op(cell)
+}
+
+/// A mark row's ops on a pool of `cap`, its far wait parked before the cell serves, then what
+/// they left: every op as implied, the far wait alone queued, the watermark at the last op's
+/// LSN, no wake owed, the pool's nodes back at their count before the loop, and no first poll
+/// that found no node.
+fn drive_mark(cap: Cap, ops: u64, step: fn(&mut MarkCell) -> bool) -> Result<(), String> {
+    let (nodes, gate, _census, serve_mark) = watermark_gate(cap)?;
+    serve_mark.take();
+    let mut far = gate.wait_for(FAR_LSN);
+    if !Pin::new(&mut far).poll(&mut Context::from_waker(Waker::noop())).is_pending() {
+        return Err("engagement: the far wait did not park".into());
+    }
+    let mut cell = MarkCell { nodes, gate, lsn: 0, _far: far };
+    let start = cell.nodes.len();
+    let mut answered = 0u64;
+    for _ in 0..ops {
+        answered += u64::from(step(black_box(&mut cell)));
+    }
+    expect("mark ops answered as implied", answered, ops)?;
+    expect("waits queued after the loop", count(cell.gate.waiting()), 1)?;
+    expect("the watermark after the loop", cell.gate.watermark(), ops)?;
+    expect("wakes owed after the loop", u64::from(cell.gate.owes()), 0)?;
+    expect("the pool's nodes after the loop", u64::from(cell.nodes.len()), u64::from(start))?;
+    expect("first polls that found no node", cell.nodes.full(), 0)
+}
+
+/// The order a heap row's round makes its waits in.
+#[derive(Clone, Copy)]
+enum Order {
+    Rising,
+    Falling,
+}
+
+/// A heap row's owner: the pool, its gate, the LSN the next round starts above, the round's
+/// waits and their order, and the round's waits between their two polls, in an array reserved
+/// before the loop.
+struct RoundCell {
+    nodes: WaitNodes,
+    gate: WatermarkGate,
+    base: u64,
+    waits: u64,
+    order: Order,
+    pending: Vec<WatermarkWait>,
+}
+
+/// The heap rows' op, a round: each wait made and polled once in the round's order, which parks
+/// it, `WAIT_NOPS` planted after that poll returns; an advance to the round's middle LSN and one
+/// to its last, each followed by the wakes it owes; each wait polled Ready and dropped. Answers
+/// the waits parked at their first poll and read Ready at their second.
+#[inline(always)]
+fn round_op<const WAIT_NOPS: u16>(cell: &mut RoundCell) -> u64 {
+    let mut cx = Context::from_waker(Waker::noop());
+    let (base, waits) = (cell.base, cell.waits);
+    let mut answered = 0u64;
+    for index in 0..waits {
+        let lsn = match cell.order {
+            Order::Rising => base + 1 + index,
+            Order::Falling => base + waits - index,
+        };
+        let mut wait = cell.gate.wait_for(lsn);
+        answered += u64::from(Pin::new(&mut wait).poll(&mut cx).is_pending());
+        plant::<WAIT_NOPS>();
+        cell.pending.push(wait);
+    }
+    cell.gate.advance(base + waits / 2);
+    wake_owed(&cell.gate);
+    cell.gate.advance(base + waits);
+    wake_owed(&cell.gate);
+    for mut wait in cell.pending.drain(..) {
+        answered += u64::from(Pin::new(&mut wait).poll(&mut cx).is_ready());
+    }
+    cell.base = base + waits;
+    answered
+}
+
+#[inline(never)]
+fn step_round(cell: &mut RoundCell) -> u64 {
+    round_op::<0>(cell)
+}
+
+#[inline(never)]
+fn step_round_planted<const K: u16>(cell: &mut RoundCell) -> u64 {
+    round_op::<K>(cell)
+}
+
+/// A heap row's waits on a pool of `cap`, a round of as many: `ops` counts waits, refused
+/// before the loop when the round does not divide it. Then what the rounds left: every wait
+/// parked and read Ready, none queued, the watermark at the last round's last LSN, no wake
+/// owed, the pool's nodes back at their count before the loop, and no first poll that found no
+/// node.
+fn drive_round(
+    cap: Cap,
+    order: Order,
+    ops: u64,
+    step: fn(&mut RoundCell) -> u64,
+) -> Result<(), String> {
+    let waits = u64::from(cap.entries_max());
+    if !ops.is_multiple_of(waits) {
+        return Err(format!("--ops {ops}: a count of waits, a multiple of the round's {waits}"));
+    }
+    let (nodes, gate, _census, serve_mark) = watermark_gate(cap)?;
+    serve_mark.take();
+    let pending = Vec::with_capacity(cap.entries_max() as usize);
+    let mut cell = RoundCell { nodes, gate, base: 0, waits, order, pending };
+    let start = cell.nodes.len();
+    let mut answered = 0u64;
+    for _ in 0..ops / waits {
+        answered += step(black_box(&mut cell));
+    }
+    expect("waits parked and read Ready", answered, 2 * ops)?;
+    expect("waits queued after the loop", count(cell.gate.waiting()), 0)?;
+    expect("the watermark after the loop", cell.gate.watermark(), ops)?;
+    expect("wakes owed after the loop", u64::from(cell.gate.owes()), 0)?;
+    expect("the pool's nodes after the loop", u64::from(cell.nodes.len()), u64::from(start))?;
+    expect("first polls that found no node", cell.nodes.full(), 0)
 }
 
 // ---- The table and the driver ------------------------------------------------------------------
@@ -879,6 +1089,41 @@ const VARIANTS: &[(&str, Drive)] = &[
     ("b-wait-wake-keys-15", |ops| drive_keyed_list(ops, step_wait_wake_keys_15)),
     ("p-wait-wake-keys-15", |ops| {
         drive_keyed_list(ops, step_wait_wake_keys_15_planted::<K_WAIT_WAKE_KEYS_15>)
+    }),
+    ("b-watermark-wait", |ops| drive_mark(WAIT_NODES_962, ops, step_mark)),
+    ("p-watermark-wait", |ops| {
+        drive_mark(WAIT_NODES_962, ops, step_mark_planted::<K_WATERMARK_WAIT>)
+    }),
+    ("b-watermark-wait-2825", |ops| drive_mark(WAIT_NODES_2825, ops, step_mark)),
+    ("p-watermark-wait-2825", |ops| {
+        drive_mark(WAIT_NODES_2825, ops, step_mark_planted::<K_WATERMARK_WAIT_2825>)
+    }),
+    ("b-heap-rising-962", |ops| drive_round(WAIT_NODES_962, Order::Rising, ops, step_round)),
+    ("p-heap-rising-962", |ops| {
+        drive_round(WAIT_NODES_962, Order::Rising, ops, step_round_planted::<K_HEAP_RISING_962>)
+    }),
+    ("b-heap-falling-962", |ops| drive_round(WAIT_NODES_962, Order::Falling, ops, step_round)),
+    ("p-heap-falling-962", |ops| {
+        drive_round(WAIT_NODES_962, Order::Falling, ops, step_round_planted::<K_HEAP_FALLING_962>)
+    }),
+    ("b-heap-rising-2825", |ops| drive_round(WAIT_NODES_2825, Order::Rising, ops, step_round)),
+    ("p-heap-rising-2825", |ops| {
+        drive_round(WAIT_NODES_2825, Order::Rising, ops, step_round_planted::<K_HEAP_RISING_2825>)
+    }),
+    ("b-heap-falling-2825", |ops| drive_round(WAIT_NODES_2825, Order::Falling, ops, step_round)),
+    ("p-heap-falling-2825", |ops| {
+        let step = step_round_planted::<K_HEAP_FALLING_2825>;
+        drive_round(WAIT_NODES_2825, Order::Falling, ops, step)
+    }),
+    ("b-heap-rising-16384", |ops| drive_round(WAIT_NODES_16384, Order::Rising, ops, step_round)),
+    ("p-heap-rising-16384", |ops| {
+        let step = step_round_planted::<K_HEAP_RISING_16384>;
+        drive_round(WAIT_NODES_16384, Order::Rising, ops, step)
+    }),
+    ("b-heap-falling-16384", |ops| drive_round(WAIT_NODES_16384, Order::Falling, ops, step_round)),
+    ("p-heap-falling-16384", |ops| {
+        let step = step_round_planted::<K_HEAP_FALLING_16384>;
+        drive_round(WAIT_NODES_16384, Order::Falling, ops, step)
     }),
 ];
 

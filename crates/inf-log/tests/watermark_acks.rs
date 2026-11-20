@@ -22,7 +22,7 @@ use inf_foundation::CellId;
 use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_foundation::time::{Nanos, VirtualClock};
 use inf_log::{FsyncClass, LogGeometry, SegmentConfig, StagingConfig};
-use inf_runtime::{CellLoop, ExecutorLayout, LoopConfig, TaskAdmission, WatermarkGate};
+use inf_runtime::{CellLoop, ExecutorLayout, LoopConfig, TaskAdmission, WaitNodes, WatermarkGate};
 use support::{DurablePlane, IoMode, ScriptedDriver, test_dir};
 
 /// Deterministic xorshift64* (L7: no ambient randomness).
@@ -124,15 +124,18 @@ fn wake_storm_50k_drains_under_the_execute_budget() {
     const BUDGET: usize = 1024;
     /// The storm's waiters, all alive at once.
     const STORM: Cap = Cap::entries::<{ WAITERS as u32 }>("storm-waiters", CapFill::Serving);
+    /// The gate's pool: a wait node for each waiter (ADR-0177 D5).
+    const STORM_NODES: Cap = Cap::entries::<{ WAITERS as u32 }>("storm-nodes", CapFill::Serving);
     async fn storm_waiter(gate: WatermarkGate, lsn: u64, order: Rc<RefCell<Vec<u64>>>) {
-        gate.waiter(lsn).await;
+        gate.wait_for(lsn).await;
         order.borrow_mut().push(lsn);
     }
     let (census, _mark) = CapCensus::new(CellId(0));
     let mut layout = ExecutorLayout::new(&census);
     let class = layout.class(&storm_waiter, STORM).expect("the storm's class");
     let mut executor = layout.build().expect("no class refuses");
-    let gate = WatermarkGate::new();
+    let pool = WaitNodes::build(STORM_NODES, &census).expect("the storm's pool");
+    let gate = WatermarkGate::build(pool.seat);
     let order = Rc::new(RefCell::new(Vec::with_capacity(WAITERS as usize)));
     for lsn in 1..=WAITERS {
         let gate = gate.clone();
@@ -148,7 +151,7 @@ fn wake_storm_50k_drains_under_the_execute_budget() {
     assert_eq!(gate.waiting(), WAITERS as usize);
 
     // ONE fsync completion advances the watermark over all of them.
-    assert_eq!(gate.advance(WAITERS), WAITERS as usize);
+    gate.advance(WAITERS);
 
     let mut slices = 0;
     let mut polled_total = 0;

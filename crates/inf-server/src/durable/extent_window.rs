@@ -372,7 +372,8 @@ mod tests {
     /// An open window on a census and a pool of its own.
     fn window() -> ExtentWaiters {
         let (census, _mark) = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0));
-        let nodes = WaitNodes::build(crate::limits::TEST_WAIT_NODES, &census).expect("a pool");
+        let nodes =
+            WaitNodes::build(crate::limits::TEST_WAIT_NODES, &census).expect("a pool").nodes;
         ExtentWaiters::new(&nodes)
     }
 
@@ -455,7 +456,7 @@ mod tests {
     /// A window on a pool of `cap` nodes, and the pool.
     fn window_on(cap: inf_foundation::bounded::Cap) -> (ExtentWaiters, WaitNodes) {
         let (census, _mark) = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0));
-        let nodes = WaitNodes::build(cap, &census).expect("a pool");
+        let nodes = WaitNodes::build(cap, &census).expect("a pool").nodes;
         (ExtentWaiters::new(&nodes), nodes)
     }
 

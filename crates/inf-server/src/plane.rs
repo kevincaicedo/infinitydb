@@ -58,7 +58,7 @@ use inf_runtime::{CellExecutor, ExecutorLayout, GroupClass, TaskId, park};
 use inf_runtime::{
     CellPlane, Completion, CompletionResult, CompletionToken, Delivery, FabricAdmission,
     FabricGate, GatePermit, GateUnits, GateWait, IoClass, IoOp, Issue, LoopCx, OwnerPhase, RawFd,
-    TimerNotice, TimerOutcome, TimerSet, TokenClass, WaitList, WaitNodes,
+    TimerNotice, TimerOutcome, TimerSet, TokenClass, WaitList, WaitNodes, WaitPool, WatermarkSeat,
 };
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
@@ -153,7 +153,7 @@ use crate::control::{
     BoardSweep, CellIssuer, CheckpointEpoch, CkptFinalCredit, CkptQuota, ControlHandle,
     IssuerRefused, RecoveryBoard,
 };
-use crate::durable::{DrainHold, DurableCell, DurableConfig};
+use crate::durable::{DrainHold, DurableCell, DurableConfig, DurableOwners};
 #[cfg(feature = "doc")]
 use crate::exec::DocLogAdmission;
 use crate::exec::{
@@ -780,6 +780,11 @@ pub struct ServerPlane<
     /// `new` before the loop exists: the accept retry's, and the durable
     /// roles' until the durable plane takes them.
     timers: ServerTimers,
+    /// The seat of the cell's one ack gate (ADR-0177 D5), answered by the
+    /// pool's build and kept with the durable roles' owners: the durable
+    /// plane takes it with them and builds its gate on it. A cell whose
+    /// durable plane is never enabled keeps it unused.
+    ack_seat: Option<WatermarkSeat>,
     /// Accepted fds are TCP sockets (`infinityd`, the e2e harness): the
     /// plane sets `tcp-keepalive` on them (ADR-0123 D3). The DST models
     /// no TCP stack and leaves this off.
@@ -1035,7 +1040,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let mut executor = layout.build().map_err(PlaneBuildError::Executor)?;
         // The cell's wait nodes, one for each task slot, before any wait list (ADR-0177 D5).
         let node_cap = crate::limits::wait_nodes(&caps).map_err(PlaneBuildError::WaitNodes)?;
-        let wait_nodes = WaitNodes::build(node_cap, &census).map_err(PlaneBuildError::WaitNodes)?;
+        let WaitPool { nodes: wait_nodes, seat: ack_seat } =
+            WaitNodes::build(node_cap, &census).map_err(PlaneBuildError::WaitNodes)?;
         let store = seed.build(&census).map_err(PlaneBuildError::Seed)?;
         let (timer_set, timers) = ServerTimers::build(&census).map_err(PlaneBuildError::Timers)?;
         let parked = ParkedDeques::build(cell, cells, fabric.data_credits(), &census)
@@ -1161,6 +1167,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // MAX forces one push on the first MAINTAIN (boot-time config).
             config_pushed: u64::MAX,
             timers,
+            ack_seat: Some(ack_seat),
             tcp_transport: false,
             ckpt_epoch_seen: 0,
             early_fabric_flush: false,
@@ -1395,7 +1402,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// geometry (ADR-0191 D4).
     ///
     /// The durable plane takes the plane's three durable timer owners
-    /// (everysec, fill hold, group hold), which it holds for the cell's life.
+    /// (everysec, fill hold, group hold), which it holds for the cell's life,
+    /// and with them the seat its ack gate is built on (ADR-0177 D5).
     ///
     /// # Errors
     /// Checkpoint-directory scan failure (boot-time listing), with the
@@ -1409,8 +1417,14 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         rotor: SegmentRotor<F>,
         recovered: Option<crate::RecoveredManifest>,
     ) -> std::io::Result<()> {
-        let Some(owners) = self.timers.durable.take() else {
-            return Err(std::io::Error::other("the durable plane is enabled once"));
+        let owners = match (self.timers.durable.take(), self.ack_seat.take()) {
+            (Some(timers), Some(ack_seat)) => DurableOwners { timers, ack_seat },
+            // The owners and the seat are taken and handed back together: a
+            // second enable finds neither, and puts back what it took.
+            (timers, ack_seat) => {
+                (self.timers.durable, self.ack_seat) = (timers, ack_seat);
+                return Err(std::io::Error::other("the durable plane is enabled once"));
+            }
         };
         let shard_dir = cfg.data_dir.join(format!("shard-{cell_id}"));
         let ckpt_dir = shard_dir.join("ckpt");
@@ -1418,7 +1432,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         {
             Ok(ckpt) => ckpt,
             Err(err) => {
-                self.timers.durable = Some(owners);
+                self.timers.durable = Some(owners.timers);
+                self.ack_seat = Some(owners.ack_seat);
                 return Err(err);
             }
         };

@@ -18,9 +18,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use inf_alloc::BufferPool;
-use inf_foundation::FileOffset;
 use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_foundation::time::Nanos;
+use inf_foundation::{CellId, FileOffset};
 use inf_log::fs::{SegmentFs, StdSegmentFs};
 use inf_log::{
     FsyncClass, FsyncTicket, GroupCommit, LogGeometry, Lsn, MutationEffect, NsId, SegmentRotor,
@@ -30,7 +30,7 @@ use inf_runtime::{
     BackendDriver, Capabilities, CellExecutor, CellPlane, Completion, CompletionResult,
     CompletionToken, ExecutorLayout, IoOp, LoopCx, RawFd, Reserved, StableBytes, SubmitStats,
     TaskAdmission, TaskClass, TimerNotice, TimerOutcome, TimerOwner, TimerSet, TokenClass, Wait,
-    WatermarkGate, WriteBarrier,
+    WaitNodes, WatermarkGate, WriteBarrier,
 };
 
 /// Fresh per-test directory under the system temp dir (the pattern the S02
@@ -346,6 +346,9 @@ const NS: NsId = NsId(7);
 /// The fixture loop's `always` acks alive at once: a test host's cap.
 const FIXTURE_ACKS: Cap = Cap::entries::<65_536>("log-fixture-acks", CapFill::Serving);
 
+/// The fixture gate's pool: a wait node for each ack task (ADR-0177 D5).
+const FIXTURE_WAIT_NODES: Cap = Cap::entries::<65_536>("log-fixture-wait-nodes", CapFill::Serving);
+
 thread_local! {
     /// The ack class of the executor this thread's fixture loop was built with.
     static ACK_CLASS: core::cell::Cell<Option<TaskClass>> = const { core::cell::Cell::new(None) };
@@ -362,7 +365,7 @@ pub fn loop_executor(census: &Rc<CapCensus>) -> CellExecutor {
 
 /// One `always` record's ack: it waits for the watermark to cover its LSN, then records it.
 async fn ack_task(gate: WatermarkGate, lsn: Lsn, acks: Rc<RefCell<Vec<(Lsn, u64)>>>) {
-    gate.waiter(lsn.to_u64()).await;
+    gate.wait_for(lsn.to_u64()).await;
     let watermark = gate.watermark();
     assert!(watermark >= lsn.to_u64(), "S06 oracle: ack for {lsn} before the watermark covered it");
     acks.borrow_mut().push((lsn, watermark));
@@ -434,7 +437,12 @@ impl DurablePlane {
             commit: GroupCommit::new(
                 &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
             ),
-            gate: WatermarkGate::new(),
+            // The gate on its own pool's seat, on the harness's own census.
+            gate: WatermarkGate::build(
+                WaitNodes::build(FIXTURE_WAIT_NODES, &CapCensus::new(CellId(0)).0)
+                    .expect("the fixture's pool")
+                    .seat,
+            ),
             jobs: VecDeque::new(),
             jobs_per_iter: 8,
             staged_always: Vec::new(),

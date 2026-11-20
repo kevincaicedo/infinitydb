@@ -1215,15 +1215,18 @@ impl WaitNodes {
     pub const NODE_SLOT_BYTES: usize = NodeSlab::SLOT_BYTES;
 
     /// The pool of `cap` nodes on the cell's `census`, its row registered and
-    /// its slab built whole by steps before the cell serves.
+    /// its slab built whole by steps before the cell serves, answered with the
+    /// seat of its one [`WatermarkGate`] (ADR-0177 D5).
     ///
     /// # Errors
     /// `CapError` from the slab's build or its census row; a refused build
     /// retires its prefix first. Nothing is served.
-    pub fn build(cap: Cap, census: &Rc<CapCensus>) -> Result<WaitNodes, CapError> {
+    pub fn build(cap: Cap, census: &Rc<CapCensus>) -> Result<WaitPool, CapError> {
         let nodes = build_slab(NodeSlab::builder(cap, census)?)?;
         let pool = Pool { nodes: RefCell::new(nodes), full: Cell::new(0) };
-        Ok(WaitNodes { pool: Rc::new(pool) })
+        let nodes = WaitNodes { pool: Rc::new(pool) };
+        let seat = WatermarkSeat { nodes: nodes.clone() };
+        Ok(WaitPool { nodes, seat })
     }
 
     /// Nodes held by parked waits now (cell scope).
@@ -1250,6 +1253,25 @@ impl core::fmt::Debug for WaitNodes {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "WaitNodes {{ len: {}, full: {} }}", self.len(), self.full())
     }
+}
+
+/// A cell's pool as [`WaitNodes::build`] answers it: the handle every wait
+/// list of the cell takes, and the seat of the pool's one watermark gate.
+#[derive(Debug)]
+pub struct WaitPool {
+    /// The pool's handle; each wait list takes a clone.
+    pub nodes: WaitNodes,
+    /// The seat [`WatermarkGate::build`] consumes.
+    pub seat: WatermarkSeat,
+}
+
+/// The seat of a pool's one [`WatermarkGate`] (ADR-0177 D5): answered once,
+/// by the pool's build, and carrying its pool. It is move-only, with no
+/// `Clone`, and [`WatermarkGate::build`] consumes it, so a second gate on one
+/// pool does not type-check.
+#[derive(Debug)]
+pub struct WatermarkSeat {
+    nodes: WaitNodes,
 }
 
 // ---- WaitList ---------------------------------------------------------------
@@ -1882,20 +1904,21 @@ struct WatermarkInner {
 /// LSN-keyed gate: tasks wait for the durability watermark to reach their
 /// LSN; `advance` wakes every task at or below the new watermark (M2 group
 /// commit acks). A waiter at or below the current watermark is ready on its
-/// first poll.
+/// first poll. One gate a pool, built on the pool's seat (ADR-0177 D5).
 #[derive(Clone)]
 pub struct WatermarkGate {
     inner: Rc<WatermarkInner>,
 }
 
-impl Default for WatermarkGate {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl WatermarkGate {
-    pub fn new() -> WatermarkGate {
+    /// The pool's one gate, on its `seat`: never refused, built before the
+    /// cell serves (ADR-0177 D5).
+    #[must_use]
+    pub fn build(seat: WatermarkSeat) -> WatermarkGate {
+        // The waits queue in the B-tree, which takes no node, so the seat is
+        // consumed and its pool's handle dropped.
+        let WatermarkSeat { nodes } = seat;
+        drop(nodes);
         WatermarkGate {
             inner: Rc::new(WatermarkInner {
                 watermark: Cell::new(0),
@@ -1909,7 +1932,7 @@ impl WatermarkGate {
     }
 
     /// Wait until the watermark reaches `lsn`.
-    pub fn waiter(&self, lsn: u64) -> WatermarkWait {
+    pub fn wait_for(&self, lsn: u64) -> WatermarkWait {
         let waiter = Rc::new(Waiter {
             state: Cell::new(if self.inner.watermark.get() >= lsn {
                 WaiterState::Woken
@@ -1925,10 +1948,10 @@ impl WatermarkGate {
     }
 
     /// Advance the watermark (monotonic; lower values are no-ops) and wake
-    /// every waiter at or below it. Returns how many tasks were woken.
-    pub fn advance(&self, to: u64) -> usize {
+    /// every waiter at or below it.
+    pub fn advance(&self, to: u64) {
         if to <= self.inner.watermark.get() {
-            return 0;
+            return;
         }
         self.inner.watermark.set(to);
         let due = {
@@ -1936,17 +1959,30 @@ impl WatermarkGate {
             let still_waiting = waiters.split_off(&(to + 1));
             core::mem::replace(&mut *waiters, still_waiting)
         };
-        let mut woken = 0;
         for waiter in due.into_values().flatten() {
             if waiter.state.get() == WaiterState::Queued {
                 waiter.state.set(WaiterState::Woken);
                 if let Some(w) = waiter.waker.borrow_mut().take() {
                     w.wake();
                 }
-                woken += 1;
             }
         }
-        woken
+    }
+
+    /// Wakes the queued waits the watermark covers, in LSN order, at most
+    /// `budget` of them, and answers how many it woke (ADR-0177 A2.2). The
+    /// B-tree's `advance` wakes every wait it covers, so none is left: 0.
+    pub fn wake_covered(&self, budget: usize) -> usize {
+        let _ = budget;
+        0
+    }
+
+    /// Whether a covered wait may be left queued for
+    /// [`wake_covered`](Self::wake_covered) (ADR-0177 A2.2): never, while the
+    /// B-tree's `advance` wakes every wait it covers.
+    #[must_use]
+    pub fn owes(&self) -> bool {
+        false
     }
 
     /// Live waiters (tests + leak asserts).
@@ -1972,7 +2008,7 @@ impl core::fmt::Debug for WatermarkGate {
     }
 }
 
-/// Future returned by [`WatermarkGate::waiter`].
+/// Future returned by [`WatermarkGate::wait_for`].
 pub struct WatermarkWait {
     waiter: Rc<Waiter>,
     done: bool,
@@ -2020,7 +2056,7 @@ mod tests {
 
     /// A pool of wait nodes on `census`.
     fn wait_nodes(census: &Rc<CapCensus>) -> WaitNodes {
-        WaitNodes::build(TEST_WAIT_NODES, census).expect("the test pool")
+        WaitNodes::build(TEST_WAIT_NODES, census).expect("the test pool").nodes
     }
 
     /// A list of `keys` on a census and a pool of its own, and the pool.
@@ -2832,7 +2868,7 @@ mod tests {
         const NODES: u32 = 100;
         const POOL: Cap = Cap::entries::<NODES>("test-pool-model", CapFill::Serving);
         let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
-        let pool = WaitNodes::build(POOL, &census).expect("the test pool");
+        let pool = WaitNodes::build(POOL, &census).expect("the test pool").nodes;
         let row = census.row("test-pool-model").expect("the pool's census row");
         assert_eq!((row.entries_max, row.capacity_now), (NODES, NODES), "built whole");
         assert_eq!((pool.len(), pool.full()), (0, 0), "a new pool holds no node");
@@ -2884,7 +2920,7 @@ mod tests {
         const POOL: Cap = Cap::entries::<T>("test-pool-t", CapFill::Serving);
         for waits in [T - 1, T, T + 1] {
             let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
-            let nodes = WaitNodes::build(POOL, &census).expect("the test pool");
+            let nodes = WaitNodes::build(POOL, &census).expect("the test pool").nodes;
             let list = WaitList::keyed(&nodes, Some(TEST_LIST_KEYS), &census, [7u32])
                 .expect("the test list");
             let mut cx = Context::from_waker(Waker::noop());

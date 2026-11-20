@@ -464,7 +464,7 @@ const WAIT_KEYS: Cap = Cap::entries::<3>("alloc-wait-keys", CapFill::Assembly);
 #[test]
 fn no_allocator_call_after_build_across_waits_wakes_and_drops() {
     let (census, _serve_mark) = CapCensus::new(CellId(2));
-    let nodes = inf_runtime::WaitNodes::build(WAIT_POOL, &census).expect("the pool");
+    let nodes = inf_runtime::WaitNodes::build(WAIT_POOL, &census).expect("the pool").nodes;
     let unit = inf_runtime::WaitList::unit(&nodes);
     let keyed = inf_runtime::WaitList::keyed(&nodes, Some(WAIT_KEYS), &census, [1u32, 2, 3])
         .expect("the keyed list");

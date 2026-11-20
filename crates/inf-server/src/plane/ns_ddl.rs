@@ -1562,7 +1562,8 @@ mod tests {
     fn gate() -> RefCell<FabricGate<OwnedOutcome>> {
         let (census, _mark) = CapCensus::new(CellId(0));
         let nodes = inf_runtime::WaitNodes::build(crate::limits::TEST_WAIT_NODES, &census)
-            .expect("a test pool");
+            .expect("a test pool")
+            .nodes;
         let gate = FabricGate::<OwnedOutcome>::build(0, 8, Some(HOLDERS), &census, &nodes);
         RefCell::new(gate.expect("a test gate"))
     }

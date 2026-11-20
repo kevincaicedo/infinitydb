@@ -25,7 +25,8 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         let receipts = inf_foundation::grants::ReceiptBoard::writer(&board, 0).expect("cell 0");
         let cursor = DirectoryCursor::default();
         let grants = CellGrants { directory, receipts, cursor, writer: Some(writer) };
-        let nodes = WaitNodes::build(crate::limits::TEST_WAIT_NODES, &census).expect("a test pool");
+        let nodes =
+            WaitNodes::build(crate::limits::TEST_WAIT_NODES, &census).expect("a test pool").nodes;
         TierCell::new(fs, cell, shard_dir, census, nodes, Some(grants))
     }
 

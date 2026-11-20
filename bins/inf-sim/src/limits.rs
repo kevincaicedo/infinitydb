@@ -42,6 +42,13 @@ pub const STEEL_GETS: Cap = Cap::entries::<8>("steel-gets", CapFill::Serving);
 /// `pressure::run_pressure_scenario`. Crossing: as [`STEEL_GETS`].
 pub const PRESSURE_WRITERS: Cap = Cap::entries::<64>("pressure-writers", CapFill::Serving);
 
+/// The pressure leg's wait nodes, under its stall gate: one for each slot of
+/// [`PRESSURE_WRITERS`], each writer parking at most one wait (ADR-0177 D5).
+/// Owner: `pressure::build_world`. Crossing: a wait finds no node, which the
+/// leg's writer count never reaches.
+pub const PRESSURE_WAIT_NODES: Cap =
+    Cap::entries::<{ PRESSURE_WRITERS.entries_max() }>("pressure-wait-nodes", CapFill::Serving);
+
 /// Cold `GET`s the cold storm's executor holds at once: its one class.
 /// Owner: `coldstorm::run`, whose rounds keep at most this many in
 /// flight. Crossing: as [`STEEL_GETS`].

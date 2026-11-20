@@ -52,7 +52,9 @@ use inf_log::{
     TIER_FRAME_BYTES, TierFlush, TierFlushConfig, TierIoMode, tier_extract, tier_frame_offset,
     tier_frame_span,
 };
-use inf_runtime::{CellExecutor, ExecutorLayout, TaskAdmission, WatermarkGate, WatermarkWait};
+use inf_runtime::{
+    CellExecutor, ExecutorLayout, TaskAdmission, WaitNodes, WatermarkGate, WatermarkWait,
+};
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsId, StoreConfig,
     TieredLookup, TieredTable,
@@ -328,7 +330,7 @@ async fn write_until_done(world: &Rc<RefCell<World>>, key: &[u8], value: &[u8], 
                         world.wedge_from = Some(round_now + 2);
                     }
                     let wait = StallWait {
-                        gate: world.gate.waiter(target.to_raw()),
+                        gate: world.gate.wait_for(target.to_raw()),
                         now: Rc::clone(&world.now),
                         deadline_ns: started_ns + STALL_TIMEOUT_NS,
                         round_wakers: Rc::clone(&world.round_wakers),
@@ -510,12 +512,14 @@ fn build_world(leg: PressureLeg, seed: u64) -> Rc<RefCell<World>> {
         )
         .is_ok()
     );
+    let pool = WaitNodes::build(crate::limits::PRESSURE_WAIT_NODES, &census)
+        .expect("the leg's wait nodes");
     Rc::new(RefCell::new(World {
         ks,
         leg,
         shape,
         device_credit: 0,
-        gate: WatermarkGate::new(),
+        gate: WatermarkGate::build(pool.seat),
         now: Rc::new(Cell::new(0)),
         round_wakers: Rc::new(RefCell::new(Vec::new())),
         model: BTreeMap::new(),

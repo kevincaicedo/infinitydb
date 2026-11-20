@@ -34,7 +34,7 @@ use inf_log::{
 use inf_runtime::{
     Cancelled, ClassCounters, ClassSlice, CompletionToken, DeviceBudget, DeviceModel, IoClass,
     IoOp, Issue, LoopCx, OwnerPhase, SealPace, TimerArm, TimerOwner, TokenClass, WaitList,
-    WaitNodes, WatermarkGate, WriteBarrier,
+    WaitNodes, WatermarkGate, WatermarkSeat, WriteBarrier,
 };
 use inf_store::{CheckpointImage, IndexId, Keyspace, WallAnchor};
 
@@ -654,6 +654,14 @@ const _: () = assert!(
     "the ack map fits one deque allocation"
 );
 
+/// What the durable plane takes from its cell's plane once, at its build: the
+/// durable roles' timer owners (ADR-0154 D4) and the seat of the cell's one
+/// ack gate (ADR-0177 D5). The plane keeps both until then.
+pub(crate) struct DurableOwners {
+    pub(crate) timers: DurableTimers,
+    pub(crate) ack_seat: WatermarkSeat,
+}
+
 /// One cell's durable plane state (plane-owned; `inf-store` never sees it).
 pub(crate) struct DurableCell<F: SegmentFs> {
     pub staging: StagingRing,
@@ -781,7 +789,8 @@ impl<F: SegmentFs> DurableCell<F> {
     /// fail-stop every allocation of this constructor takes; its layout is
     /// a const assertion, and the census refuses only a cap name declared
     /// with a second value or fill, which any test's first boot shows. The
-    /// staging and extent-seal wait lists take the cell's `nodes`.
+    /// staging and extent-seal wait lists take the cell's `nodes`, and the
+    /// ack gate is built on the seat among its `owners`.
     pub(crate) fn new(
         cfg: &DurableConfig,
         rotor: SegmentRotor<F>,
@@ -789,8 +798,9 @@ impl<F: SegmentFs> DurableCell<F> {
         manifest: ManifestCell<F>,
         census: &Rc<CapCensus>,
         nodes: &WaitNodes,
-        timers: DurableTimers,
+        owners: DurableOwners,
     ) -> DurableCell<F> {
+        let DurableOwners { timers, ack_seat } = owners;
         let (geometry, flush_bound, fua_p50_us_probed, device, fill, group) =
             (cfg.geometry, cfg.flush_bound, cfg.fua_p50_us_probed, cfg.device, cfg.fill, cfg.group);
         // ADR-0031 D5/D6: frames sealed here stamp the recovery-derived
@@ -826,7 +836,7 @@ impl<F: SegmentFs> DurableCell<F> {
             staging,
             rotor,
             commit: GroupCommit::with_flush_bound(usize::from(flush_bound), census),
-            ack_gate: WatermarkGate::new(),
+            ack_gate: WatermarkGate::build(ack_seat),
             drained: WaitList::unit(nodes),
             extent_waiters: ExtentWaiters::new(nodes),
             ckpt,
@@ -959,7 +969,7 @@ impl<F: SegmentFs> DurableCell<F> {
     }
 
     /// Registers one gated `always` ack (counter only; the reply's pending
-    /// entry carries its seq, and the pump takes `ack_gate.waiter(seq)` when
+    /// entry carries its seq, and the pump takes `ack_gate.wait_for(seq)` when
     /// the entry is its front).
     pub fn note_gated_ack(&mut self) {
         self.acks_gated += 1;

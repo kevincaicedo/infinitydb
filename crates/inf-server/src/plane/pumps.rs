@@ -232,7 +232,7 @@ pub(super) async fn gated_pump<O: PlaneObserver + 'static, F: SegmentFs + Clone 
             park().await;
             continue;
         };
-        let wait = shared.durable.borrow().as_ref().map(|durable| durable.ack_gate.waiter(seq));
+        let wait = shared.durable.borrow().as_ref().map(|durable| durable.ack_gate.wait_for(seq));
         if let Some(wait) = wait {
             wait.await;
         }
