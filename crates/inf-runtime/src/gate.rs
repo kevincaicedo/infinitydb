@@ -1341,10 +1341,11 @@ fn rewake(pool: &Pool, id: NodeId, cx: &Context<'_>) {
 /// caller can name, so the list's ends stay out of the crate's API.
 mod lists {
     use core::cell::Cell;
+    use std::rc::Rc;
 
     use inf_foundation::bounded::{CappedMap, ExactKey};
 
-    use super::NodeId;
+    use super::{ListKey, NodeId, Pool};
 
     /// One key's FIFO: its two ends and its queued waits, each a cell, so a list
     /// reads and moves them with no borrow of the pool.
@@ -1370,22 +1371,26 @@ mod lists {
     /// The unit key's list keeps its one pair of ends in its own state, with no
     /// map: its ends' count is the list's count, one fact.
     impl Queues<()> for Ends {
-        #[inline]
+        // Folded always, as the keyed list's `ends` (ADR-0210 D1).
+        #[inline(always)]
         fn ends(&self, (): ()) -> Option<&Ends> {
             Some(self)
         }
 
-        #[inline]
+        // Folded always, as `ends` (ADR-0210 D1).
+        #[inline(always)]
         fn queued(&self) -> u32 {
             self.queued.get()
         }
 
-        #[inline]
+        // Folded always, as `ends` (ADR-0210 D1).
+        #[inline(always)]
         fn joined(&self, ends: &Ends) {
             ends.queued.set(ends.queued.get() + 1);
         }
 
-        #[inline]
+        // Folded always, as `ends` (ADR-0210 D1).
+        #[inline(always)]
         fn left(&self, ends: &Ends) {
             ends.queued.set(ends.queued.get() - 1);
         }
@@ -1400,58 +1405,99 @@ mod lists {
     }
 
     impl<K: ExactKey> Queues<K> for KeyedEnds<K> {
-        #[inline]
+        // Folded always: under the keys' bodies a hint alone left it a body
+        // (ADR-0210 D1).
+        #[inline(always)]
         fn ends(&self, key: K) -> Option<&Ends> {
             self.by_key.as_ref()?.get(key)
         }
 
-        #[inline]
+        // Folded always, as `ends` (ADR-0210 D1).
+        #[inline(always)]
         fn queued(&self) -> u32 {
             self.queued.get()
         }
 
-        #[inline]
+        // Folded always, as `ends` (ADR-0210 D1).
+        #[inline(always)]
         fn joined(&self, ends: &Ends) {
             ends.queued.set(ends.queued.get() + 1);
             self.queued.set(self.queued.get() + 1);
         }
 
-        #[inline]
+        // Folded always, as `ends` (ADR-0210 D1).
+        #[inline(always)]
         fn left(&self, ends: &Ends) {
             ends.queued.set(ends.queued.get() - 1);
             self.queued.set(self.queued.get() - 1);
         }
     }
+
+    /// What a list's handles share: the cell's pool and the list's ends.
+    pub struct List<K: ListKey> {
+        pub(super) pool: Rc<Pool>,
+        pub(super) queues: K::Queues,
+    }
 }
 
-use lists::{Ends, KeyedEnds, Queues};
+use lists::{Ends, KeyedEnds, List, Queues};
 
 /// A wait list's key: the unit key, whose list keeps its ends in its own
 /// state, or a key a capped map holds.
 pub trait ListKey: ExactKey {
     /// Where the list keeps its ends.
     type Queues: Queues<Self>;
+
+    // The list's two bodies, each a method of a non-generic impl: one compiled
+    // copy a key, in this crate, which every binary links (ADR-0210 D1).
+    /// [`ListWait`]'s poll at this key.
+    #[doc(hidden)]
+    fn poll_wait(wait: Pin<&mut ListWait<Self>>, cx: &mut Context<'_>) -> Poll<()>;
+
+    /// The wake of this key's head on `list`.
+    #[doc(hidden)]
+    fn wake_head_at(list: &List<Self>, key: Self) -> bool;
 }
 
 impl ListKey for () {
     type Queues = Ends;
+
+    // A body, never folded: the one copy at this key that the bench and the
+    // server both call (ADR-0210 D1).
+    #[inline(never)]
+    fn poll_wait(wait: Pin<&mut ListWait<Self>>, cx: &mut Context<'_>) -> Poll<()> {
+        wait.poll_in(cx)
+    }
+
+    // A body, never folded, as `poll_wait` (ADR-0210 D1).
+    #[inline(never)]
+    fn wake_head_at(list: &List<Self>, key: Self) -> bool {
+        list.wake_head_in(key)
+    }
 }
 
 macro_rules! keyed_list_key {
     ($($key:ty),*) => {$(
         impl ListKey for $key {
             type Queues = KeyedEnds<$key>;
+
+            // A body, never folded: the one copy at this key that the bench and
+            // the server both call (ADR-0210 D1).
+            #[inline(never)]
+            fn poll_wait(wait: Pin<&mut ListWait<Self>>, cx: &mut Context<'_>) -> Poll<()> {
+                wait.poll_in(cx)
+            }
+
+            // A body, never folded, as `poll_wait` (ADR-0210 D1).
+            #[inline(never)]
+            fn wake_head_at(list: &List<Self>, key: Self) -> bool {
+                list.wake_head_in(key)
+            }
         }
     )*};
 }
 
 keyed_list_key!(u8, u16, u32, u64, CellId);
-
-/// What a list's handles share: the cell's pool and the list's ends.
-struct List<K: ListKey> {
-    pool: Rc<Pool>,
-    queues: K::Queues,
-}
 
 /// Key-keyed FIFO wait list over the cell's pool (ADR-0177 D5): a wait takes
 /// a node at its first poll and gives it back at the poll that reads its
@@ -1604,13 +1650,19 @@ impl<K: ListKey> core::fmt::Debug for WaitList<K> {
 }
 
 impl<K: ListKey> List<K> {
-    /// Unlinks and wakes `key`'s head: the waker is taken in the access that
+    /// Unlinks and wakes `key`'s head; returns whether the key held one.
+    // Folded always: the body is its key's `wake_head_at` (ADR-0210 D1).
+    #[inline(always)]
+    fn wake_head(&self, key: K) -> bool {
+        K::wake_head_at(self, key)
+    }
+
+    /// [`List::wake_head`]'s body: the waker is taken in the access that
     /// marks the node woken, and the pool's borrow ends before `wake`, so a
     /// waker that reaches the pool finds it free.
-    // A body, never folded: folding it buys no instruction and moves
-    // `wake_one`'s frame, where both benches call it (ADR-0210 D1).
-    #[inline(never)]
-    fn wake_head(&self, key: K) -> bool {
+    // Folded always into its key's `wake_head_at`, its one body (ADR-0210 D1).
+    #[inline(always)]
+    fn wake_head_in(&self, key: K) -> bool {
         let waker = {
             let mut nodes = self.pool.nodes.borrow_mut();
             let Some(ends) = self.queues.ends(key) else { return false };
@@ -1664,6 +1716,23 @@ impl<K: ListKey> ListWait<K> {
     #[must_use]
     pub fn starved(&self) -> bool {
         matches!(self.state, ListState::Starved)
+    }
+
+    /// The wait's poll, the body of its `Future::poll`.
+    // Folded always into its key's `poll_wait`, its one body (ADR-0210 D1).
+    #[inline(always)]
+    fn poll_in(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = Pin::into_inner(self);
+        match this.state {
+            ListState::Queued(id) => this.poll_queued(id, cx),
+            ListState::Fresh => this.poll_first(cx),
+            // A starved wait resolves with no wake; a done one answers Ready
+            // again: no node and no count either way.
+            ListState::Starved | ListState::Done => {
+                this.state = ListState::Done;
+                Poll::Ready(())
+            }
+        }
     }
 
     /// The first poll: the wait takes a node and joins its key's tail.
@@ -1775,22 +1844,10 @@ impl<K: ListKey> ListWait<K> {
 impl<K: ListKey> Future for ListWait<K> {
     type Output = ();
 
-    // A body, never folded: about 2 KB a key type, called from every await
-    // site as both benches call it; left to the compiler, the server folded a
-    // copy into one caller the benches do not have (ADR-0210 D1).
-    #[inline(never)]
+    // Folded always: the body is its key's `poll_wait` (ADR-0210 D1).
+    #[inline(always)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = Pin::into_inner(self);
-        match this.state {
-            ListState::Queued(id) => this.poll_queued(id, cx),
-            ListState::Fresh => this.poll_first(cx),
-            // A starved wait resolves with no wake; a done one answers Ready
-            // again: no node and no count either way.
-            ListState::Starved | ListState::Done => {
-                this.state = ListState::Done;
-                Poll::Ready(())
-            }
-        }
+        K::poll_wait(self, cx)
     }
 }
 
