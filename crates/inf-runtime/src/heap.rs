@@ -111,7 +111,8 @@ impl<E: Copy> FixedArray<E> {
     /// The element at `index`. An index at or past the capacity panics, as
     /// a slice index does: an index is its owner's own position.
     #[must_use]
-    #[inline]
+    // Inlined always: out of line, each sift level called it where a bench folds it (ADR-0210 D1).
+    #[inline(always)]
     pub fn get(&self, index: u32) -> E {
         match &self.root {
             Root::Chunk(only) => only[index as usize],
@@ -128,7 +129,8 @@ impl<E: Copy> FixedArray<E> {
     }
 
     /// Sets the element at `index`, under [`Self::get`]'s rule.
-    #[inline]
+    // Inlined always, as `get` is: each sift level writes through it (ADR-0210 D1).
+    #[inline(always)]
     pub fn set(&mut self, index: u32, value: E) {
         let place = match &mut self.root {
             Root::Chunk(only) => &mut only[index as usize],
