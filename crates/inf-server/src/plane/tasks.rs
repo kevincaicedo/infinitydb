@@ -303,6 +303,23 @@ mod tests {
         chunks * chunk as u64 * stride as u64 + directories * 2_048
     }
 
+    /// One fixed array's resident bill at its build, as `inf_runtime::heap` lays it out: its
+    /// elements exact, in chunks of as many as one backing allocation holds; past one chunk, a
+    /// directory of 16 B chunk pointers, one a chunk; past one directory's chunks, as many as
+    /// one backing allocation of pointers holds, a top directory of 24 B directory headers, one
+    /// a directory (ADR-0177 D5).
+    #[cfg(feature = "doc")]
+    fn array_bill(capacity: u32, element: usize) -> u64 {
+        let backing = inf_foundation::limits::MAP_BACKING_ALLOCATION_BYTES_MAX;
+        let pointer = size_of::<Box<[u8]>>();
+        let header = size_of::<Vec<Box<[u8]>>>();
+        let chunks = u64::from(capacity).div_ceil((backing / element) as u64);
+        let chunks_directory = (backing / pointer) as u64;
+        let pointers = if chunks > 1 { chunks * pointer as u64 } else { 0 };
+        let headers = if chunks > chunks_directory { chunks.div_ceil(chunks_directory) } else { 0 };
+        u64::from(capacity) * element as u64 + pointers + headers * header as u64
+    }
+
     /// The `--plant-bytes-cell` value of `cfg`'s row in the canary table.
     #[cfg(feature = "doc")]
     fn plant_bytes(table: &str, cfg: &str) -> u64 {
@@ -409,9 +426,9 @@ mod tests {
             inf_foundation::limits::chunk_slots_for(node_bytes).expect("a wait node's chunk");
         let pool = slab_bill(nodes, node_bytes, node_chunk);
         // The watermark gate's entry array: one entry a node, built at the pool's cap in its
-        // steps and resident whole from them, `T x s_entry` (ADR-0177 D5).
+        // steps and resident whole from them, `T x s_entry` and its directories (ADR-0177 D5).
         let entry_bytes = inf_runtime::WatermarkGate::ENTRY_BYTES;
-        let entries = u64::from(nodes) * entry_bytes as u64;
+        let entries = array_bill(nodes, entry_bytes);
         println!(
             "the_idle_bill_and_its_plants_follow_the_strides: wait nodes T {nodes}, node \
              {node_bytes} B, c {node_chunk}, pool {pool} B a cell; entry {entry_bytes} B, \

@@ -558,7 +558,10 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
 }
 
 /// Steps a slab's build to its end; a refused build retires its prefix by
-/// steps before it answers.
+/// steps before it answers. Each build step allocates one chunk or one
+/// directory, and each retire step frees one, so each loop runs at most the
+/// slab's chunks and directories times: ⌈cap ÷ c⌉ chunks for its chunk of
+/// `c` slots, and the directories above them (ADR-0194 A1).
 fn build_slab<T>(
     mut builder: SlabBuilder<T, u32, WrapWithProof>,
 ) -> Result<CappedSlab<T, u32, WrapWithProof>, CapError> {
@@ -973,7 +976,10 @@ fn awaits<V>(state: &HolderState<V>) -> bool {
 }
 
 /// Steps a route map's build to its end; a refused build retires its
-/// prefix by steps before it answers.
+/// prefix by steps before it answers. Each build step allocates one chunk
+/// or one directory of one of the map's two stores, and each retire step
+/// frees one, so each loop runs at most both stores' chunks and directories
+/// times.
 fn build_routes(
     mut builder: MapBuilder<u64, SlotId<u32>>,
 ) -> Result<CappedMap<u64, SlotId<u32>>, CapError> {
@@ -992,7 +998,9 @@ fn build_routes(
 }
 
 /// Retires a built slab by steps: a build refused after its slab, a gate's
-/// or the wait pool's, frees what it built without a whole drop.
+/// or the wait pool's, frees what it built without a whole drop. Each step
+/// frees one chunk or one directory, so the loop runs at most the slab's
+/// chunks and directories times.
 fn retire_slab<T>(slab: CappedSlab<T, u32, WrapWithProof>) {
     let mut retiring = slab.retire();
     loop {
@@ -1369,8 +1377,10 @@ const fn entry_steps_max(capacity: u32) -> u64 {
 /// after its slab, before the cell serves (ADR-0177 D5): the array is fixed
 /// at the pool's cap, in chunks of at most 64 KiB, and allocates nothing
 /// once built. Every element is filled with a handle the pool minted and
-/// never published, which names no node: the heap reads only the entries it
-/// holds, each placed by a push, and never the fill.
+/// never published. The fill is never looked up: the heap reads only the
+/// entries it holds, each placed by a push. It names no node at boot; once
+/// its slot's generation wraps it may name a live one, which nothing reads.
+/// Nothing may use the fill as a "no node" sentinel.
 ///
 /// # Errors
 /// The array's `CapError`; a builder that asks for more steps than
@@ -1378,6 +1388,7 @@ const fn entry_steps_max(capacity: u32) -> u64 {
 /// `Layout`. Nothing is served either way.
 fn build_entries(nodes: &mut NodeSlab, capacity: u32) -> Result<FixedArray<WaitEntry>, CapError> {
     let fill = WaitEntry { lsn: 0, node: unpublished_node(nodes)? };
+    // A boot check: just minted, the fill names no node of the pool.
     debug_assert!(matches!(nodes.get(fill.node), Lookup::Stale), "the fill names no node");
     let mut builder = FixedArray::builder(capacity, fill)?;
     for _ in 0..entry_steps_max(capacity) {
@@ -1390,12 +1401,13 @@ fn build_entries(nodes: &mut NodeSlab, capacity: u32) -> Result<FixedArray<WaitE
     Err(CapError::Layout)
 }
 
-/// A handle of the pool that names no node: a named reservation dropped
-/// unpublished, so its slot is left free at its next generation and every
-/// lookup by the handle reads `Stale` (ADR-0194 D1 with A2). Nothing of the
-/// pool's counts or census row moves. A pool just built has a free slot, as
-/// its cap is at least one; were none free, the build is refused as
-/// `Layout` before the cell serves.
+/// A handle of the pool that names no node when it is minted: a named
+/// reservation dropped unpublished, so its slot is left free at its next
+/// generation (ADR-0194 D1 with A2). A lookup by it reads `Stale` until the
+/// slot's `u32` generation wraps back to the handle's, after which it may
+/// name that slot's occupant. Nothing of the pool's counts or census row
+/// moves. A pool just built has a free slot, as its cap is at least one;
+/// were none free, the build is refused as `Layout` before the cell serves.
 fn unpublished_node(nodes: &mut NodeSlab) -> Result<NodeId, CapError> {
     match nodes.reserve() {
         SlabReserved::Slot(slot) => Ok(slot.named().id()),
