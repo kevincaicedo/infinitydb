@@ -16,7 +16,7 @@ use inf_runtime::gate::{KeyedGate, KeyedWait, ListWait};
 use inf_runtime::{
     CellExecutor, CompletionToken, Delivery, ExecutorLayout, FabricAdmission, FabricGate, GateKey,
     IoGate, KeyedAdmission, PollImmediate, TaskAdmission, TaskClass, TaskId, TokenClass, WaitList,
-    WatermarkGate, Woken, park,
+    WaitNodes, WatermarkGate, Woken, park,
 };
 use proptest::prelude::*;
 
@@ -45,12 +45,40 @@ async fn fabric_wait<V>(gate: Rc<RefCell<FabricGate<V>>>, key: Rc<Cell<u64>>) ->
 fn fabric_gate<V>(units: u32) -> (Rc<RefCell<FabricGate<V>>>, Rc<Cell<u64>>) {
     let (census, _mark) = CapCensus::new(CellId(0));
     let holders = Cap::derived(&TEST_GATE_HOLDERS, units).expect("a test gate's holders");
-    let gate = FabricGate::build(0, units, Some(holders), &census).expect("a test gate");
+    let nodes = wait_nodes(&census);
+    let gate = FabricGate::build(0, units, Some(holders), &census, &nodes).expect("a test gate");
     (Rc::new(RefCell::new(gate)), Rc::new(Cell::new(0)))
 }
 
 /// The tests' gate holders' ceiling.
 const TEST_GATE_HOLDERS: Cap = Cap::entries::<64>("test-gate-holders", CapFill::Serving);
+
+/// The tests' pools of wait nodes: past any test's parked waits.
+const TEST_WAIT_NODES: Cap = Cap::entries::<64>("test-wait-nodes", CapFill::Serving);
+
+/// The tests' keyed lists' keys.
+const TEST_LIST_KEYS: Cap = Cap::entries::<8>("test-list-keys", CapFill::Assembly);
+
+/// A pool of [`TEST_WAIT_NODES`] on `census`.
+fn wait_nodes(census: &Rc<CapCensus>) -> WaitNodes {
+    WaitNodes::build(TEST_WAIT_NODES, census).expect("a test pool")
+}
+
+/// A wait list holding `keys`, on a census and a pool of its own.
+fn wait_list(keys: &[u32]) -> WaitList<u32> {
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let nodes = wait_nodes(&census);
+    WaitList::keyed(&nodes, Some(TEST_LIST_KEYS), &census, keys.iter().copied())
+        .expect("a test list")
+}
+
+/// A wait, polled once: a list wait is polled before any wake or count
+/// reads it, as every task polls the wait it makes.
+fn polled(mut wait: ListWait<u32>) -> ListWait<u32> {
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(Pin::new(&mut wait).poll(&mut cx).is_pending(), "engagement: the wait is queued");
+    wait
+}
 
 /// The tests' keyed gates' routes and holders: past any test's open waits.
 const TEST_KEYED_HOLDERS: Cap = Cap::entries::<256>("test-keyed-holders", CapFill::Serving);
@@ -246,7 +274,7 @@ fn io_gate_routes_by_completion_token() {
 #[test]
 fn waitlist_is_fifo_and_wake_one_wakes_exactly_one() {
     let mut ex = TestExecutor::new();
-    let list: WaitList<u32> = WaitList::new();
+    let list = wait_list(&[5]);
     let order = Rc::new(RefCell::new(Vec::new()));
     for i in 0..3u32 {
         let wait = list.wait(5);
@@ -272,9 +300,9 @@ fn waitlist_is_fifo_and_wake_one_wakes_exactly_one() {
 
 #[test]
 fn waitlist_drop_passes_the_baton() {
-    let list: WaitList<u32> = WaitList::new();
-    let first: ListWait<u32> = list.wait(1);
-    let _second = list.wait(1);
+    let list = wait_list(&[1]);
+    let first: ListWait<u32> = polled(list.wait(1));
+    let _second = polled(list.wait(1));
     assert!(list.wake_one(1), "wakes `first`");
     // `first` is dropped without observing its wake (timeout path): the
     // baton must pass to `second`, not vanish.
@@ -282,29 +310,30 @@ fn waitlist_drop_passes_the_baton() {
     assert_eq!(list.waiting(), 0, "second was woken by the baton pass");
 }
 
-/// `any_waiting` is `waiting() > 0` in every state of a queue: empty, a
-/// live waiter behind a cancelled one, cancelled entries only, and a woken
-/// waiter that has not run yet.
+/// A keyed list is idle exactly when no wait is queued on any key: a wait
+/// on one key keeps it busy, a dropped wait unlinks at once, so the wait
+/// behind it is the only one left, and a woken wait leaves its queue before
+/// its task runs.
 #[test]
-fn waitlist_any_waiting_is_true_exactly_when_a_live_waiter_is_queued() {
-    let list: WaitList<u32> = WaitList::new();
-    assert!(!list.any_waiting(), "an empty list");
-    let first = list.wait(1);
-    let second = list.wait(1);
-    let other_key = list.wait(2);
-    assert!(list.any_waiting());
-    // Cancelled in place: the entry stays queued until a wake skips it.
+fn waitlist_is_idle_exactly_when_no_wait_is_queued_on_any_key() {
+    let list = wait_list(&[1, 2, 3]);
+    assert!(list.is_idle(), "an empty list");
+    let first = polled(list.wait(1));
+    let second = polled(list.wait(1));
+    let other_key = polled(list.wait(2));
+    assert!(!list.is_idle(), "waits on two keys");
     drop(first);
-    assert_eq!(list.waiting(), 2);
-    assert!(list.any_waiting(), "a live waiter behind a cancelled entry");
+    assert_eq!(list.waiting(), 2, "the dropped wait unlinked at once");
+    assert!(!list.is_idle(), "the wait behind it is queued");
     drop(second);
+    assert!(!list.is_idle(), "another key's wait is queued");
     drop(other_key);
     assert_eq!(list.waiting(), 0);
-    assert!(!list.any_waiting(), "cancelled entries are not waiters");
-    let woken = list.wait(3);
+    assert!(list.is_idle(), "every dropped wait unlinked");
+    let woken = polled(list.wait(3));
     assert!(list.wake_one(3));
     assert_eq!(list.waiting(), 0);
-    assert!(!list.any_waiting(), "a woken waiter is no longer queued");
+    assert!(list.is_idle(), "a woken wait is no longer queued");
     drop(woken);
 }
 

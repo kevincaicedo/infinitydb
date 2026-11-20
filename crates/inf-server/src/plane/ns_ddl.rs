@@ -330,13 +330,13 @@ pub(super) async fn dispatch_ns<'u, O: PlaneObserver + 'static, F: SegmentFs + C
         match tiered::dispatch_tiered(shared, origin, ns, meta, argv, proto, gate).await {
             tiered::TieredReply::Done(reply) => pending.push_back(PendingReply::Done(reply)),
             tiered::TieredReply::Gated { reply, seq, gate: ClientAck } => {
-                let waiter = {
-                    let mut durable = shared.durable.borrow_mut();
-                    let cell = durable.as_mut().expect("tiered implies the durable plane");
-                    cell.note_gated_ack();
-                    cell.ack_gate.waiter(seq)
-                };
-                pending.push_back(PendingReply::Durable { waiter, reply });
+                shared
+                    .durable
+                    .borrow_mut()
+                    .as_mut()
+                    .expect("tiered implies the durable plane")
+                    .note_gated_ack();
+                pending.push_back(PendingReply::Durable { seq, reply });
             }
         }
         return true;
@@ -403,13 +403,8 @@ pub(super) async fn dispatch_ns<'u, O: PlaneObserver + 'static, F: SegmentFs + C
     }
     if let Some((seq, ClientAck)) = ApplyGate::client(NsApplyRead::new(meta, class)).settle(staged)
     {
-        let waiter = {
-            let mut durable = shared.durable.borrow_mut();
-            let cell = durable.as_mut().expect("staged above");
-            cell.note_gated_ack();
-            cell.ack_gate.waiter(seq)
-        };
-        pending.push_back(PendingReply::Durable { waiter, reply });
+        shared.durable.borrow_mut().as_mut().expect("staged above").note_gated_ack();
+        pending.push_back(PendingReply::Durable { seq, reply });
         return shared.with_conn(key, |_| ()).is_some();
     }
     pending.push_back(PendingReply::Done(reply));
@@ -1566,7 +1561,9 @@ mod tests {
     /// A gate of cell 0 with eight units.
     fn gate() -> RefCell<FabricGate<OwnedOutcome>> {
         let (census, _mark) = CapCensus::new(CellId(0));
-        let gate = FabricGate::<OwnedOutcome>::build(0, 8, Some(HOLDERS), &census);
+        let nodes = inf_runtime::WaitNodes::build(crate::limits::TEST_WAIT_NODES, &census)
+            .expect("a test pool");
+        let gate = FabricGate::<OwnedOutcome>::build(0, 8, Some(HOLDERS), &census, &nodes);
         RefCell::new(gate.expect("a test gate"))
     }
 

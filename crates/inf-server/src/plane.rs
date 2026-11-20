@@ -58,7 +58,7 @@ use inf_runtime::{CellExecutor, ExecutorLayout, GroupClass, TaskId, park};
 use inf_runtime::{
     CellPlane, Completion, CompletionResult, CompletionToken, Delivery, FabricAdmission,
     FabricGate, GatePermit, GateUnits, GateWait, IoClass, IoOp, Issue, LoopCx, OwnerPhase, RawFd,
-    TimerNotice, TimerOutcome, TimerSet, TokenClass, WaitList,
+    TimerNotice, TimerOutcome, TimerSet, TokenClass, WaitList, WaitNodes,
 };
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
@@ -421,6 +421,9 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// holds its waiter; each send borrows it for one synchronous step, and
     /// each reply's waiter for its life.
     gate: RefCell<FabricGate<OwnedOutcome>>,
+    /// The cell's wait nodes (ADR-0177 D5): every wait list of the cell
+    /// takes them, its durable and tiered cells' among them.
+    wait_nodes: WaitNodes,
     credit_waiters: WaitList<CellId>,
     observer: RefCell<O>,
     node: Rc<NodeInfo>,
@@ -534,7 +537,7 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     inbox_takes: Cell<u64>,
     /// The pumps whose `Peer` run-out found no take since its stamp, each
     /// waiting for PARSE's next take, which wakes them all.
-    reader_waiters: WaitList<u8>,
+    reader_waiters: WaitList<()>,
     /// How many pumps wait on `reader_waiters`: PARSE's guard, so a take
     /// with none waiting pays one load and one branch. A gauge, cell scope.
     reader_waiting: Cell<u64>,
@@ -942,6 +945,11 @@ pub enum PlaneBuildError {
     /// The fabric gate's holders were refused (ADR-0177 D4): `H` past its
     /// ceiling, or the allocator.
     Gate(inf_foundation::bounded::CapError),
+    /// The cell's wait nodes were refused (ADR-0177 D5).
+    WaitNodes(inf_foundation::bounded::CapError),
+    /// A keyed wait list's keys were refused (ADR-0177 D5): the cells past
+    /// their ceiling, the map's build, or a key past its cap.
+    Waiters(inf_runtime::KeysRefused),
 }
 
 /// The plane's fabric gate (ADR-0177 D4); under `fault-points` with its
@@ -952,14 +960,15 @@ fn build_gate(
     units: u32,
     holders: Option<inf_foundation::bounded::Cap>,
     census: &Rc<CapCensus>,
+    nodes: &WaitNodes,
 ) -> Result<FabricGate<OwnedOutcome>, inf_foundation::bounded::CapError> {
     #[cfg(feature = "fault-points")]
     if let Some(first) = config.gate_first_generation() {
-        return FabricGate::build_at_generation(origin, units, holders, census, first);
+        return FabricGate::build_at_generation(origin, units, holders, census, nodes, first);
     }
     #[cfg(not(feature = "fault-points"))]
     let _ = config;
-    FabricGate::build(origin, units, holders, census)
+    FabricGate::build(origin, units, holders, census, nodes)
 }
 
 impl core::fmt::Display for PlaneBuildError {
@@ -974,6 +983,8 @@ impl core::fmt::Display for PlaneBuildError {
             PlaneBuildError::Executor(refused) => write!(f, "{refused}"),
             PlaneBuildError::Assembly(refused) => write!(f, "{refused}"),
             PlaneBuildError::Gate(refused) => write!(f, "the fabric gate: {refused}"),
+            PlaneBuildError::WaitNodes(refused) => write!(f, "the wait nodes: {refused}"),
+            PlaneBuildError::Waiters(refused) => write!(f, "{refused}"),
         }
     }
 }
@@ -1022,13 +1033,43 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let tasks =
             PlaneTasks::register::<O, F>(&mut layout, &caps).map_err(PlaneBuildError::Tasks)?;
         let mut executor = layout.build().map_err(PlaneBuildError::Executor)?;
+        // The cell's wait nodes, one for each task slot, before any wait list (ADR-0177 D5).
+        let node_cap = crate::limits::wait_nodes(&caps).map_err(PlaneBuildError::WaitNodes)?;
+        let wait_nodes = WaitNodes::build(node_cap, &census).map_err(PlaneBuildError::WaitNodes)?;
         let store = seed.build(&census).map_err(PlaneBuildError::Seed)?;
         let (timer_set, timers) = ServerTimers::build(&census).map_err(PlaneBuildError::Timers)?;
         let parked = ParkedDeques::build(cell, cells, fabric.data_credits(), &census)
             .map_err(PlaneBuildError::Parked)?;
         let units = crate::limits::gate_units(&caps);
-        let gate = build_gate(&node.config.borrow(), cell.0, units, holders, &census)
+        let gate = build_gate(&node.config.borrow(), cell.0, units, holders, &census, &wait_nodes)
             .map_err(PlaneBuildError::Gate)?;
+        // The keyed lists, each key held from the build (ADR-0177 D5): the credit list's peers,
+        // and the one key the DDL and checkpoint pumps wait on.
+        let credit_keys = crate::limits::credit_waiter_keys(cells)
+            .map_err(|refused| PlaneBuildError::Waiters(inf_runtime::KeysRefused::Cap(refused)))?;
+        let peers = (0..cells).filter(|&peer| peer != cell.0).map(CellId);
+        // Canary: the credit list's build also holds the cell's own id.
+        #[cfg(inf_canary_credit_waiter_key_extra)]
+        let peers = peers.chain([cell]);
+        let credit_waiters = WaitList::keyed(&wait_nodes, credit_keys, &census, peers)
+            .map_err(PlaneBuildError::Waiters)?;
+        // Canary: the DDL list's build holds a second key.
+        #[cfg(inf_canary_ddl_waiter_key_extra)]
+        let ddl_keys_held = [0u8, 1];
+        #[cfg(not(inf_canary_ddl_waiter_key_extra))]
+        let ddl_keys_held = [0u8];
+        let ddl_keys = Some(crate::limits::DDL_WAITER_KEYS);
+        let ddl_waiters = WaitList::keyed(&wait_nodes, ddl_keys, &census, ddl_keys_held)
+            .map_err(PlaneBuildError::Waiters)?;
+        // Canary: the checkpoint list's build holds a second key.
+        #[cfg(inf_canary_ckpt_waiter_key_extra)]
+        let ckpt_keys_held = [0u8, 1];
+        #[cfg(not(inf_canary_ckpt_waiter_key_extra))]
+        let ckpt_keys_held = [0u8];
+        let ckpt_keys = Some(crate::limits::CKPT_WAITER_KEYS);
+        let ckpt_waiters = WaitList::keyed(&wait_nodes, ckpt_keys, &census, ckpt_keys_held)
+            .map_err(PlaneBuildError::Waiters)?;
+        let reader_waiters = WaitList::unit(&wait_nodes);
         node.cell.set(cell.0);
         node.cells.set(cells);
         node.cap_census.replace(Some(Rc::clone(&census)));
@@ -1048,7 +1089,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 fabric: RefCell::new(fabric),
                 conns: RefCell::new(ConnSlab::default()),
                 gate: RefCell::new(gate),
-                credit_waiters: WaitList::new(),
+                wait_nodes,
+                credit_waiters,
                 observer: RefCell::new(observer),
                 node,
                 now: Cell::new(Nanos(0)),
@@ -1079,12 +1121,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 tasks,
                 peer_pumps: core::cell::OnceCell::new(),
                 inbox_takes: Cell::new(0),
-                reader_waiters: WaitList::new(),
+                reader_waiters,
                 reader_waiting: Cell::new(0),
                 mark_rearms: RefCell::new(Vec::new()),
                 control: RefCell::new(None),
-                ddl_waiters: WaitList::new(),
-                ckpt_waiters: WaitList::new(),
+                ddl_waiters,
+                ckpt_waiters,
                 ddl_epoch_seen: Cell::new(0),
                 ddl_gen_seen: Cell::new(0),
                 ckpt_quota: RefCell::new(None),
@@ -1393,6 +1435,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             u32::from(cell_id),
             shard_dir.clone(),
             Rc::clone(&self.shared.census),
+            self.shared.wait_nodes.clone(),
             grants,
         ));
         let manifest = crate::ckpt::ManifestCell::new(
@@ -1406,8 +1449,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 begin_lsn: m.begin_lsn,
             }),
         );
-        *self.shared.durable.borrow_mut() =
-            Some(DurableCell::new(cfg, rotor, ckpt, manifest, &self.shared.census, owners));
+        let durable = DurableCell::new(
+            cfg,
+            rotor,
+            ckpt,
+            manifest,
+            &self.shared.census,
+            &self.shared.wait_nodes,
+            owners,
+        );
+        *self.shared.durable.borrow_mut() = Some(durable);
         Ok(())
     }
 
@@ -2089,6 +2140,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     #[cfg(feature = "fault-points")]
     pub fn gate_wrapped_takes(&self) -> u64 {
         self.shared.gate.borrow().wrapped_takes()
+    }
+
+    /// First polls that found the cell's wait pool empty or their list
+    /// without their key (`wait_nodes_full`): derived never (ADR-0177 D5).
+    pub fn wait_nodes_full(&self) -> u64 {
+        self.shared.wait_nodes.full()
     }
 
     /// The fabric gate's reserves that found every holder taken

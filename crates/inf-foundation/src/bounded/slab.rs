@@ -420,7 +420,7 @@ macro_rules! take_transition {
             foreign,
             // Inlined always: a body of its own where two steps of one slab
             // take, the walk would be inline where one poll does, and a
-            // bench would not be placed as the server is (ADR-0205 A2.1).
+            // bench would not be placed as the server is (ADR-0210 D1).
             #[inline(always)]
             || $slab.store.slot_chain_mut($id.index).map(|(slot, chain)| Vacate(slot, chain)),
             $id.generation,
@@ -610,7 +610,9 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
     /// occupant whose drop panics leaves the slab as this leaves it. A stale
     /// or foreign handle changes nothing. One canary moves the occupant out
     /// as `take` does and drops it off its slot.
-    #[inline]
+    // Inlined always: where the occupant has drop glue the server would call
+    // it and a bench's step folds it, two shapes of one code (ADR-0210 D1).
+    #[inline(always)]
     pub fn release(&mut self, id: SlotId<G>) -> Released {
         #[cfg(inf_canary_release_moves_occupant)]
         {
@@ -628,6 +630,10 @@ impl<T, G: Generation, P: GenerationPolicy, const CHUNK_SLOTS: usize>
             let foreign = self.foreign(&id);
             let lent = named(
                 foreign,
+                // Inlined always, as `take`'s is: left to the compiler, the
+                // server calls it where it folds `release`, and a bench's step
+                // folds both (ADR-0210 D1).
+                #[inline(always)]
                 || self.store.slot_chain_mut(id.index).map(|(slot, chain)| InPlace(slot, chain)),
                 id.generation,
             );
@@ -1059,7 +1065,7 @@ trait SlotBorrow<G> {
 /// `Stale`.
 // Folded into each operation, so a benchmark's step and the server's call
 // sites compile the lookup in one shape and a count read on the bench is the
-// server's code (ADR-0205 A2.1).
+// server's code (ADR-0210 D1).
 #[inline(always)]
 fn named<G, S: SlotBorrow<G>>(
     foreign: bool,

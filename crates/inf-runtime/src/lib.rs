@@ -71,8 +71,8 @@ pub use executor::{
 };
 pub use gate::{
     Cleanup, Delivery, DropValue, FabricAdmission, FabricGate, GateHold, GateKey, GatePermit,
-    GateUnits, GateWait, IoGate, KeyedAdmission, KeyedGate, KeyedPermit, KeyedWait, WaitList,
-    WatermarkGate, WatermarkWait,
+    GateUnits, GateWait, IoGate, KeyedAdmission, KeyedGate, KeyedPermit, KeyedWait, KeysRefused,
+    WaitList, WaitNodes, WatermarkGate, WatermarkWait,
 };
 pub use reactor::{
     CellLoop, CellPlane, IterStats, LoopConfig, LoopCx, ParkCeiling, ParkCeilingTooLong,

@@ -15,7 +15,10 @@ use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_foundation::limits::{GATE_KEY_GENERATION_BITS, GATE_KEY_INDEX_BITS};
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::Nanos;
-use inf_runtime::{Delivery, FabricAdmission, FabricGate, GateWait};
+use inf_runtime::{Delivery, FabricAdmission, FabricGate, GateWait, WaitNodes};
+
+/// The test gates' pool of wait nodes, which their parked senders' list takes.
+const WAIT_NODES: Cap = Cap::entries::<8>("test-wait-nodes", CapFill::Serving);
 
 /// Holders of the test's gate, and the requests each serves.
 const HOLDERS: u32 = 32;
@@ -27,8 +30,9 @@ const FIELD: u32 = 1 << GATE_KEY_GENERATION_BITS;
 fn every_value_reaches_its_own_wait_past_the_generation_field() {
     let (census, _mark) = CapCensus::new(CellId(2));
     let cap = Cap::entries::<{ HOLDERS }>("test-gate-holders", CapFill::Serving);
+    let nodes = WaitNodes::build(WAIT_NODES, &census).expect("the test pool");
     let gate = RefCell::new(
-        FabricGate::<u64>::build_at_generation(2, HOLDERS, Some(cap), &census, FIELD - 2)
+        FabricGate::<u64>::build_at_generation(2, HOLDERS, Some(cap), &census, &nodes, FIELD - 2)
             .expect("the test gate"),
     );
     let units = gate.borrow().units(HOLDERS).expect("every unit");
@@ -78,8 +82,9 @@ fn a_dropped_permit_at_the_last_generation_leaves_its_slot_at_the_first() {
     let generation = |key: u64| (key >> GATE_KEY_INDEX_BITS) & u64::from(FIELD - 1);
     let (census, _mark) = CapCensus::new(CellId(2));
     let cap = Cap::entries::<{ HOLDERS }>("test-gate-holders", CapFill::Serving);
+    let nodes = WaitNodes::build(WAIT_NODES, &census).expect("the test pool");
     let gate = RefCell::new(
-        FabricGate::<u64>::build_at_generation(2, HOLDERS, Some(cap), &census, u32::MAX)
+        FabricGate::<u64>::build_at_generation(2, HOLDERS, Some(cap), &census, &nodes, u32::MAX)
             .expect("the test gate"),
     );
     let units = gate.borrow().units(1).expect("one unit");

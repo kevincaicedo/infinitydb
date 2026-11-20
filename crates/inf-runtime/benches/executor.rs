@@ -151,9 +151,11 @@ fn bench_suspend_resume(c: &mut Criterion) {
 criterion_group!(benches, bench_fast_path, bench_suspend_resume);
 criterion_main!(benches);
 
-/// A gate of one unit over one holder, on a census of its own.
+/// A gate of one unit over one holder, on a census and a pool of wait nodes of its own.
 fn one_holder_gate() -> FabricGate<u64> {
     const HOLDERS: Cap = Cap::entries::<1>("bench-gate-holders", CapFill::Serving);
+    const WAIT_NODES: Cap = Cap::entries::<1>("bench-wait-nodes", CapFill::Serving);
     let (census, _mark) = CapCensus::new(CellId(0));
-    FabricGate::build(0, 1, Some(HOLDERS), &census).expect("the bench's gate")
+    let nodes = inf_runtime::WaitNodes::build(WAIT_NODES, &census).expect("the bench's pool");
+    FabricGate::build(0, 1, Some(HOLDERS), &census, &nodes).expect("the bench's gate")
 }

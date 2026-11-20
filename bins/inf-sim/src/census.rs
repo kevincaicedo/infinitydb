@@ -37,6 +37,11 @@
 //!   the orphans its peers' credits allow, an Orphaned holder waits for its
 //!   one late completion, and the cold gate's, while its cap is its product
 //!   and not its ceiling, cover every read its pool can hold.
+//! - **The wait pool's derived rule** (ADR-0177 D5): no wait's first poll
+//!   found the cell's pool empty or its list without its key
+//!   (`wait_nodes_full = 0`, token `wait-nodes-full`). Derived never: the
+//!   pool holds a node for every task slot, a task holds at most one parked
+//!   wait, and every list holds the keys its waits name from its build.
 //! - Liveness: a server cell has its timer owners' row, which its plane
 //!   builds before its loop exists, and on a node of more than one cell the
 //!   rows of its three per-origin deques (ADR-0177 D6: `ns-applies`,
@@ -102,6 +107,9 @@ pub(crate) struct CellFacts {
     /// The cold gate's reads refused for no free route or holder (0 on a
     /// cell with no cold engine).
     pub(crate) cold_gate_full: u64,
+    /// First polls that found the cell's wait pool empty or their list
+    /// without their key.
+    pub(crate) wait_nodes_full: u64,
 }
 
 /// The census verdict of one run: every cell of every life it judged.
@@ -256,6 +264,16 @@ fn gates_derived(cell: usize, facts: &CellFacts, violations: &mut Violations) {
             facts.cold_gate_full
         ));
     }
+    // Derived never: the pool holds a node for every task slot, a task holds
+    // at most one parked wait, and every list holds its waits' keys from its
+    // build (ADR-0177 D5).
+    if facts.wait_nodes_full > 0 {
+        violations.push(format!(
+            "WAIT POOL VIOLATION cell {cell}: wait-nodes-full — {} first poll(s) found no node \
+             or no key",
+            facts.wait_nodes_full
+        ));
+    }
 }
 
 /// The cap bound on one row: its high water above its cap is red.
@@ -306,6 +324,7 @@ mod tests {
             gate_full: 0,
             gate_stale: 0,
             cold_gate_full: 0,
+            wait_nodes_full: 0,
         }
     }
 
@@ -440,6 +459,7 @@ mod tests {
             (CellFacts { gate_full: 1, ..bare() }, "gate-full"),
             (CellFacts { gate_stale: 1, ..bare() }, "gate-stale"),
             (CellFacts { cold_gate_full: 1, ..bare() }, "cold-gate-full"),
+            (CellFacts { wait_nodes_full: 1, ..bare() }, "wait-nodes-full"),
         ];
         for (facts, token) in planted {
             let mut red = CensusVerdict::default();

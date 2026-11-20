@@ -31,14 +31,13 @@ fn any_file(_: &Path) -> bool {
 
 /// One connection sends 31 `always` writes at one step, delivered whole,
 /// while the device holds every barrier: the pump stages all 31 in one pass,
-/// and the cell then parks at most one watermark wait for them. Engagement,
+/// and the cell then parks exactly one watermark wait for them, its front's.
+/// Once the hold lifts, all 31 are acknowledged and no
+/// wait is left parked: no entry is stranded behind the front. Engagement,
 /// each else its `VACUOUS` line: the device held a frame barrier
 /// (`frame-barrier-unheld`), all 31 were appended (`writes-unstaged`), and no
 /// ack was read under the hold (`acked-under-hold`).
 #[test]
-#[ignore = "the pump takes a watermark wait for every always write it stages, so one \
-            connection's 31 writes staged in one pass under a held fsync park 31 waits; red \
-            until a pending entry carries its sequence"]
 fn a_task_waits_on_the_watermark_once_for_its_staged_writes() {
     let mut quiet = Quiet::boot(1, DurableScenario::SPIN_ITERS, 0);
     let mut setup = MiniClient::connect(&mut quiet.node, 0);
@@ -78,10 +77,24 @@ fn a_task_waits_on_the_watermark_once_for_its_staged_writes() {
     let acked = writer.recv(&mut quiet.node);
     assert_eq!(acked, None, "VACUOUS acked-under-hold: an ack was read before the hold lifted");
     let waits = quiet.node.plane(0).ack_waiters_for_sim();
-    assert!(
-        waits <= 1,
+    assert_eq!(
+        waits, 1,
         "wait-per-write: {waits} watermark waits are parked for one connection's {WRITES} \
-         always writes"
+         always writes, where its front's one is"
     );
     quiet.disk.hold_barriers(None);
+    let mut acked = 0;
+    for _ in 0..STEPS_MAX {
+        quiet.step();
+        while let Some(reply) = writer.recv(&mut quiet.node) {
+            assert_eq!(reply.as_slice(), b"+OK\r\n", "write {acked}'s ack");
+            acked += 1;
+        }
+        if acked == WRITES {
+            break;
+        }
+    }
+    assert_eq!(acked, WRITES, "stranded: {acked} of {WRITES} writes acknowledged after the hold");
+    let left = quiet.node.plane(0).ack_waiters_for_sim();
+    assert_eq!(left, 0, "{left} watermark waits are left parked after every ack");
 }

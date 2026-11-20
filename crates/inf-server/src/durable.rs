@@ -34,7 +34,7 @@ use inf_log::{
 use inf_runtime::{
     Cancelled, ClassCounters, ClassSlice, CompletionToken, DeviceBudget, DeviceModel, IoClass,
     IoOp, Issue, LoopCx, OwnerPhase, SealPace, TimerArm, TimerOwner, TokenClass, WaitList,
-    WatermarkGate, WriteBarrier,
+    WaitNodes, WatermarkGate, WriteBarrier,
 };
 use inf_store::{CheckpointImage, IndexId, Keyspace, WallAnchor};
 
@@ -780,13 +780,15 @@ impl<F: SegmentFs> DurableCell<F> {
     /// The ack map's backing refused by the allocator is the allocation
     /// fail-stop every allocation of this constructor takes; its layout is
     /// a const assertion, and the census refuses only a cap name declared
-    /// with a second value or fill, which any test's first boot shows.
+    /// with a second value or fill, which any test's first boot shows. The
+    /// staging and extent-seal wait lists take the cell's `nodes`.
     pub(crate) fn new(
         cfg: &DurableConfig,
         rotor: SegmentRotor<F>,
         ckpt: CkptCell<F>,
         manifest: ManifestCell<F>,
         census: &Rc<CapCensus>,
+        nodes: &WaitNodes,
         timers: DurableTimers,
     ) -> DurableCell<F> {
         let (geometry, flush_bound, fua_p50_us_probed, device, fill, group) =
@@ -825,8 +827,8 @@ impl<F: SegmentFs> DurableCell<F> {
             rotor,
             commit: GroupCommit::with_flush_bound(usize::from(flush_bound), census),
             ack_gate: WatermarkGate::new(),
-            drained: WaitList::new(),
-            extent_waiters: ExtentWaiters::new(),
+            drained: WaitList::unit(nodes),
+            extent_waiters: ExtentWaiters::new(nodes),
             ckpt,
             manifest,
             zero_window: AlignedBox::new(ZERO_FILL_SLICE_BYTES as usize),
@@ -956,8 +958,9 @@ impl<F: SegmentFs> DurableCell<F> {
         matches!(self.ckpt.phase, CkptPhase::Idle) && self.manifest.idle()
     }
 
-    /// Registers one gated `always` ack (counter only; the waiter itself
-    /// is `ack_gate.waiter(seq)` at the dispatch site).
+    /// Registers one gated `always` ack (counter only; the reply's pending
+    /// entry carries its seq, and the pump takes `ack_gate.waiter(seq)` when
+    /// the entry is its front).
     pub fn note_gated_ack(&mut self) {
         self.acks_gated += 1;
     }

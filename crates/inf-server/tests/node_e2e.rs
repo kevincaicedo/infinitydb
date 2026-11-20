@@ -7205,7 +7205,10 @@ fn lastsave_after_inf_ckpt_cell_wait_covers_the_fenced_checkpoint() {
     let dir = temp_data_dir("ckptlastsave");
     let node = Node::start_durable(2, &dir);
     let mut c = conn_on_cell(&node, 0);
-    // Mid-second, and past every earlier publication's second.
+    // Mid-second, and past every earlier publication's second: the send
+    // leaves at least 500 ms into a second after the start, so a node clock
+    // that runs up to 500 ms behind this one still stamps the fenced
+    // checkpoint in `sent_s` or later.
     let unix_ms = || {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -7213,11 +7216,14 @@ fn lastsave_after_inf_ckpt_cell_wait_covers_the_fenced_checkpoint() {
             .unwrap_or(0)
     };
     let start_s = unix_ms() / 1000;
-    while unix_ms() / 1000 == start_s || unix_ms() % 1000 >= 500 {
+    let sent_s = loop {
+        let now = unix_ms();
+        if now / 1000 != start_s && now % 1000 >= 500 {
+            break now / 1000;
+        }
         #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
         std::thread::sleep(Duration::from_millis(5));
-    }
-    let sent_s = unix_ms() / 1000;
+    };
     c.write_all(&cmd(&[b"INF.CKPT", b"CELL", b"1", b"WAIT"])).expect("write");
     read_exactly(&mut c, b"+OK\r\n");
     c.write_all(&cmd(&[b"LASTSAVE"])).expect("write");

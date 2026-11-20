@@ -397,9 +397,9 @@ pub(crate) const fn per_origin(ceiling: &Cap, data_credits: u32) -> Result<Cap, 
 /// with Redis's `maxclients` frame and a close, before anything ran.
 pub const CONN_TASKS: Cap = Cap::entries::<CONN_TASKS_MAX>("conn-tasks", CapFill::Serving);
 
-/// KE21's plant (E-store's F7): the `conn` class over `(1 + k) C` slots,
+/// The doubled-`conn` canary's plant: the class over `(1 + k) C` slots,
 /// `k = ⌈512 KiB ÷ (C × s)⌉` from the class's stride `s`, so its rise passes
-/// F7's 256 KiB whatever the stride.
+/// the idle-resident tool's 256 KiB control a cell whatever the stride.
 #[cfg(inf_canary_conn_slots_doubled)]
 pub(crate) fn conn_slots_doubled(cap: Cap, stride: usize) -> Result<Cap, CapError> {
     let share = u64::from(cap.entries_max());
@@ -507,6 +507,108 @@ pub(crate) const fn plane_task_caps(
     Ok(PlaneTaskCaps { conn, peers, compact: COMPACT_TASKS, shadow: SHADOW_TASKS })
 }
 
+/// Every task class's ceiling, as one cell of the most cells and the largest share holds them:
+/// the caps [`WAIT_NODES_MAX`] sums.
+const TASK_CEILINGS: PlaneTaskCaps = PlaneTaskCaps {
+    conn: CONN_TASKS,
+    peers: Some(PeerTaskCaps {
+        ns_apply: NS_APPLY_TASKS,
+        owner_pub: OWNER_PUB_TASKS,
+        gated: GATED_TASKS,
+    }),
+    compact: COMPACT_TASKS,
+    shadow: SHADOW_TASKS,
+};
+
+/// The task slots of a cell of `caps`: every class's cap, each named, so a class the struct
+/// gains is a compile error here and in [`TASK_CEILINGS`] until it is counted. Each cap is at
+/// most its ceiling, so the sum is at most [`WAIT_NODES_MAX`]'s, which the compiler evaluates.
+const fn task_slots(caps: &PlaneTaskCaps) -> u32 {
+    let PlaneTaskCaps { conn, peers, compact, shadow } = caps;
+    let mut slots = conn.entries_max() + compact.entries_max() + shadow.entries_max();
+    if let Some(PeerTaskCaps { ns_apply, owner_pub, gated }) = peers {
+        slots += ns_apply.entries_max() + owner_pub.entries_max() + gated.entries_max();
+    }
+    slots
+}
+
+/// Wait nodes one cell holds at most (ADR-0177 D5): one for each live task's one parked wait, so
+/// the task slots of every class at its ceiling. Unit: nodes per cell.
+pub const WAIT_NODES_MAX: u32 = task_slots(&TASK_CEILINGS);
+
+/// The cell's pool of wait nodes (ADR-0177 D5): `T`, one node for each task slot of the cell's
+/// classes, which every wait list of the cell takes. The ceiling of the derived cap
+/// ([`wait_nodes`]), census name `wait-nodes`, filled while serving. Unit: nodes per cell.
+/// Owner: the plane, which builds the pool before the cell serves. Crossing: derived never, as
+/// a task holds at most one parked wait.
+pub const WAIT_NODES: Cap = Cap::entries::<WAIT_NODES_MAX>("wait-nodes", CapFill::Serving);
+
+/// The pool of a cell of `caps` (ADR-0177 D5): its task slots, `T`.
+///
+/// # Errors
+/// `CapError::Layout` when `T` passes [`WAIT_NODES_MAX`]; derived never.
+pub(crate) const fn wait_nodes(caps: &PlaneTaskCaps) -> Result<Cap, CapError> {
+    let nodes = task_slots(caps);
+    // Canary: the pool is built over (1 + k) T nodes, k the fewest whose nodes' bytes pass
+    // ten times the idle-resident tool's 256 KiB control a cell, so the idle node's resident
+    // rise is one the tool gives a verdict on.
+    #[cfg(inf_canary_wait_nodes_oversized)]
+    let nodes = nodes * (1 + wait_nodes_oversized_k(nodes));
+    Cap::derived(&WAIT_NODES, nodes)
+}
+
+/// The oversized-pool canary's `k` at `nodes`: the fewest counts of `nodes` whose node bytes
+/// pass ten times the idle-resident tool's 256 KiB control a cell, 2,621,440 B, at the stride
+/// the build reads.
+#[cfg(any(all(test, feature = "doc"), inf_canary_wait_nodes_oversized))]
+pub(crate) const fn wait_nodes_oversized_k(nodes: u32) -> u32 {
+    let stride = inf_runtime::WaitNodes::NODE_SLOT_BYTES as u64;
+    let per_count = nodes as u64 * stride;
+    (WAIT_NODES_PLANT_FLOOR_BYTES / per_count + 1) as u32
+}
+
+/// The bytes a cell the oversized-pool canary must pass: ten times the idle-resident tool's
+/// 256 KiB control a cell, the least resident rise the tool separates from its control.
+#[cfg(any(all(test, feature = "doc"), inf_canary_wait_nodes_oversized))]
+pub(crate) const WAIT_NODES_PLANT_FLOOR_BYTES: u64 = 10 * 262_144;
+
+/// Keys one cell's credit wait list holds (ADR-0177 D5): one per peer, `cells − 1`, each held
+/// from the list's build, before the cell serves; a cell of a node of one cell holds none and
+/// builds no map. The ceiling of `cells − 1`, census name `credit-waiter-keys`, filled whole at
+/// assembly. Unit: keys per cell. Owner: the plane's credit list. Crossing: none while serving;
+/// a build past it ends the assembly with `credit-waiter-keys-full-at-assembly`.
+pub const CREDIT_WAITER_KEYS: Cap =
+    Cap::entries::<{ CELLS_MAX - 1 }>("credit-waiter-keys", CapFill::Assembly);
+
+/// Keys the DDL wait list holds (ADR-0177 D5): the one key its pumps wait on, held from the
+/// list's build. Census name `ddl-waiter-keys`, filled whole at assembly. Unit, owner and
+/// crossing: as [`CREDIT_WAITER_KEYS`], the plane's DDL list.
+pub const DDL_WAITER_KEYS: Cap = Cap::entries::<1>("ddl-waiter-keys", CapFill::Assembly);
+
+/// Keys the checkpoint wait list holds (ADR-0177 D5): the one key its pumps wait on, held from
+/// the list's build. Census name `ckpt-waiter-keys`, filled whole at assembly. Unit, owner and
+/// crossing: as [`CREDIT_WAITER_KEYS`], the plane's checkpoint list.
+pub const CKPT_WAITER_KEYS: Cap = Cap::entries::<1>("ckpt-waiter-keys", CapFill::Assembly);
+
+/// The credit list's keys of a node of `cells` cells: `cells − 1`, `None` at one cell.
+///
+/// # Errors
+/// `CapError::Layout` when the cells are 0 or above `CELLS_MAX`.
+pub(crate) const fn credit_waiter_keys(cells: u16) -> Result<Option<Cap>, CapError> {
+    match cells {
+        0 => Err(CapError::Layout),
+        1 => Ok(None),
+        cells => match Cap::derived(&CREDIT_WAITER_KEYS, cells as u32 - 1) {
+            Ok(cap) => Ok(Some(cap)),
+            Err(refused) => Err(refused),
+        },
+    }
+}
+
+/// A pool of wait nodes for a test's own gates and lists.
+#[cfg(test)]
+pub(crate) const TEST_WAIT_NODES: Cap = Cap::entries::<64>("test-wait-nodes", CapFill::Serving);
+
 /// Live holders one connection task may have on its cell's fabric gate
 /// (ADR-0177 D2, D4): its remote ops in flight. Replies that land out of
 /// order park in their holders until emitted, so this also bounds a
@@ -519,14 +621,16 @@ pub const GATE_UNITS_PER_CONN_TASK: u32 = 32;
 
 /// The units a cell's fabric gate issues to its tasks (ADR-0177 D2, D4):
 /// `Σ T_j × W_j`, 32 a `conn` slot and `cells − 1` for the `owner-pub`
-/// pump; the other classes send nothing.
+/// pump; the other classes send nothing. Every class is named, so a class
+/// the caps gain is a compile error here until its units are counted.
 pub(crate) const fn gate_units(caps: &PlaneTaskCaps) -> u32 {
-    let conn = caps.conn.entries_max() * GATE_UNITS_PER_CONN_TASK;
-    match &caps.peers {
+    let PlaneTaskCaps { conn, peers, compact: _, shadow: _ } = caps;
+    let conn = conn.entries_max() * GATE_UNITS_PER_CONN_TASK;
+    match peers {
         None => conn,
-        // The `owner-pub` pump's one unit per peer: the `ns-apply` class's
-        // `cells − 1` slots.
-        Some(peers) => conn + peers.ns_apply.entries_max(),
+        // The `owner-pub` pump's one unit per peer, its own slots aside: the
+        // `ns-apply` class's `cells − 1` slots. `gated` sends nothing.
+        Some(PeerTaskCaps { ns_apply, owner_pub: _, gated: _ }) => conn + ns_apply.entries_max(),
     }
 }
 

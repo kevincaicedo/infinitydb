@@ -72,7 +72,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> Shared<O, F> {
     pub(super) fn note_inbox_take(&self) {
         self.inbox_takes.set(self.inbox_takes.get().wrapping_add(1));
         if self.reader_waiting.get() > 0 {
-            self.reader_waiters.wake_all(0);
+            self.reader_waiters.wake_all(());
         }
     }
 

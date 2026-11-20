@@ -48,23 +48,26 @@ fn peer_index(cell: CellId, origin: CellId) -> usize {
 }
 
 impl PlaneTasks {
-    /// Registers the six classes on `layout`, each from the function item it runs.
+    /// Registers the six classes on `layout`, each from the function item it runs. Every
+    /// class's cap is named, so a class the caps gain is a compile error here until it is
+    /// registered.
     pub(super) fn register<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
         layout: &mut ExecutorLayout,
         caps: &PlaneTaskCaps,
     ) -> Result<PlaneTasks, CapError> {
+        let PlaneTaskCaps { conn: conn_cap, peers, compact, shadow } = caps;
         #[cfg(not(inf_canary_conn_slots_doubled))]
-        let conn = layout.class(&pump::<O, F>, caps.conn)?;
+        let conn = layout.class(&pump::<O, F>, *conn_cap)?;
         // Canary: the class is built over `(1 + k) C` slots, `k` from its own stride.
         #[cfg(inf_canary_conn_slots_doubled)]
         let conn = layout.class(
             &pump::<O, F>,
             crate::limits::conn_slots_doubled(
-                caps.conn,
+                *conn_cap,
                 ExecutorLayout::slot_shape(&pump::<O, F>).0,
             )?,
         )?;
-        let peers = match &caps.peers {
+        let peers = match peers {
             None => None,
             Some(PeerTaskCaps { ns_apply, owner_pub, gated }) => Some(PeerTasks {
                 ns_apply: (layout.class(&ns_apply_pump::<O, F>, *ns_apply)?, *ns_apply),
@@ -72,9 +75,9 @@ impl PlaneTasks {
                 gated: (layout.class(&gated_pump::<O, F>, *gated)?, *gated),
             }),
         };
-        let compact = (layout.class(&compact_pump::<O, F>, caps.compact)?, caps.compact);
-        let shadow = (layout.class(&shadow_pump::<O, F>, caps.shadow)?, caps.shadow);
-        Ok(PlaneTasks { conn: (conn, caps.conn), peers, compact, shadow })
+        let compact = (layout.class(&compact_pump::<O, F>, *compact)?, *compact);
+        let shadow = (layout.class(&shadow_pump::<O, F>, *shadow)?, *shadow);
+        Ok(PlaneTasks { conn: (conn, *conn_cap), peers, compact, shadow })
     }
 
     /// The `conn` tasks held (alive and Retired), the Retired among them, and
@@ -314,26 +317,43 @@ mod tests {
 
     /// `empty_idle_rss`'s bill at 4 cells and the default `maxclients`, recomputed from the
     /// strides the build reads (ADR-0177 D8 with A1): the fixed terms, each task class's
-    /// slab and the fabric gate's holders. The gate row's threshold and both `binary` canaries'
-    /// planted bytes (`conn` slots and gate holders doubled) are these strides' products, so a
-    /// stride that moves turns this red until the three move with it. The bill is the shipped
-    /// node's, built with its default features: a slim build's strides are its own.
+    /// slab and the fabric gate's holders. The gate row's threshold and the `binary` canaries'
+    /// planted bytes (`conn` slots and gate holders doubled, the wait nodes oversized) are these
+    /// strides' products, so a stride that moves turns this red until they move with it. The
+    /// pool of wait nodes' resident bill is computed beside the bill and sits in its per-cell
+    /// remainder, so it moves no threshold. The bill is the shipped node's, built with its
+    /// default features: a slim build's strides are its own.
     #[test]
     #[cfg(feature = "doc")]
     fn the_idle_bill_and_its_plants_follow_the_strides() {
         const CELLS: u16 = 4;
-        const MIB: f64 = 1_048_576.0;
+        const MIB_BYTES: u64 = 1_048_576;
+        const MIB: f64 = MIB_BYTES as f64;
+        // The row's fixed terms: pinned receive pools, mesh ring slots, the SQ and CQ, and the
+        // per-node remainder.
+        const RECEIVE_POOLS_BYTES: u64 = 64 * MIB_BYTES;
+        const MESH_RINGS_BYTES: u64 = 3 * MIB_BYTES;
+        const SQ_CQ_BYTES: u64 = 3 * MIB_BYTES / 2;
+        const REMAINDER_BYTES_NODE: u64 = 16 * MIB_BYTES;
+        // The row's per-cell remainder: 4 MiB a cell, 16 MiB at 4 cells, which holds the
+        // reserves its named terms do not, the wait pool among them (ADR-0177 D8).
+        const REMAINDER_BYTES_CELL: u64 = 4 * MIB_BYTES;
         let config = ConfigStore::default();
         let caps = crate::limits::plane_task_caps(config.boot_share(CELLS), CELLS)
             .expect("the default caps");
-        let peers = caps.peers.as_ref().expect("a cell with peers");
+        // Every class's cap is named, so a class the caps gain is a compile error here until
+        // the bill counts it.
+        let PlaneTaskCaps { conn, peers, compact, shadow } = &caps;
+        let Some(PeerTaskCaps { ns_apply, owner_pub, gated }) = peers else {
+            panic!("a cell with peers")
+        };
         let classes = [
-            (caps.conn, ExecutorLayout::slot_shape(&pump::<O, F>)),
-            (peers.ns_apply, ExecutorLayout::slot_shape(&ns_apply_pump::<O, F>)),
-            (peers.owner_pub, ExecutorLayout::slot_shape(&owner_pub_pump::<O, F>)),
-            (peers.gated, ExecutorLayout::slot_shape(&gated_pump::<O, F>)),
-            (caps.compact, ExecutorLayout::slot_shape(&compact_pump::<O, F>)),
-            (caps.shadow, ExecutorLayout::slot_shape(&shadow_pump::<O, F>)),
+            (*conn, ExecutorLayout::slot_shape(&pump::<O, F>)),
+            (*ns_apply, ExecutorLayout::slot_shape(&ns_apply_pump::<O, F>)),
+            (*owner_pub, ExecutorLayout::slot_shape(&owner_pub_pump::<O, F>)),
+            (*gated, ExecutorLayout::slot_shape(&gated_pump::<O, F>)),
+            (*compact, ExecutorLayout::slot_shape(&compact_pump::<O, F>)),
+            (*shadow, ExecutorLayout::slot_shape(&shadow_pump::<O, F>)),
         ];
         let tasks: u64 = classes
             .iter()
@@ -347,9 +367,11 @@ mod tests {
         let holder_chunk =
             inf_foundation::limits::chunk_slots_for(holder_bytes).expect("a holder's chunk");
         let gate = slab_bill(holders, holder_bytes, holder_chunk);
-        // Pinned receive pools 64 MiB, mesh ring slots 3 MiB, SQ and CQ 1.5 MiB, the per-cell
-        // remainder 16 MiB and the per-node remainder 16 MiB: the row's fixed terms.
-        let fixed = 100.5 * MIB;
+        let fixed = (RECEIVE_POOLS_BYTES
+            + MESH_RINGS_BYTES
+            + SQ_CQ_BYTES
+            + u64::from(CELLS) * REMAINDER_BYTES_CELL
+            + REMAINDER_BYTES_NODE) as f64;
         let bill = (fixed + (u64::from(CELLS) * (tasks + gate)) as f64) / MIB;
         let threshold = (bill * 100.0).ceil() / 100.0;
         println!(
@@ -378,5 +400,33 @@ mod tests {
         );
         let gate_plant = u64::from(holders) * holder_bytes as u64;
         assert_eq!(plant_bytes(canaries, "inf_canary_gate_holders_doubled"), gate_plant, "H x s_h");
+        // The pool's resident bill: its `T` nodes, every slot and directory written at its
+        // build, inside the row's per-cell remainder, which the threshold already counts.
+        let nodes = crate::limits::wait_nodes(&caps).expect("the default pool").entries_max();
+        let node_bytes = inf_runtime::WaitNodes::NODE_SLOT_BYTES;
+        let node_chunk =
+            inf_foundation::limits::chunk_slots_for(node_bytes).expect("a wait node's chunk");
+        let pool = slab_bill(nodes, node_bytes, node_chunk);
+        println!(
+            "the_idle_bill_and_its_plants_follow_the_strides: wait nodes T {nodes}, node \
+             {node_bytes} B, c {node_chunk}, pool {pool} B a cell"
+        );
+        assert!(
+            pool < REMAINDER_BYTES_CELL,
+            "the pool's {pool} B a cell pass the per-cell remainder, {REMAINDER_BYTES_CELL} B"
+        );
+        // The oversized-pool canary: the pool over (1 + k) T, k the fewest counts of T whose
+        // node bytes pass ten times the idle-resident tool's 256 KiB control a cell.
+        let k = crate::limits::wait_nodes_oversized_k(nodes);
+        let count_bytes = u64::from(nodes) * node_bytes as u64;
+        let pool_plant = u64::from(k) * count_bytes;
+        let floor = crate::limits::WAIT_NODES_PLANT_FLOOR_BYTES;
+        assert!(pool_plant > floor, "k x T x s_node passes ten controls");
+        assert!(pool_plant - count_bytes <= floor, "k is the fewest that does");
+        assert_eq!(
+            plant_bytes(canaries, "inf_canary_wait_nodes_oversized"),
+            pool_plant,
+            "k x T x s_node"
+        );
     }
 }

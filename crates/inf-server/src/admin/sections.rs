@@ -493,6 +493,9 @@ fn tripwires_section(
     // waiting holder, each derived never (ADR-0177 D4; cell scope).
     push(text, &format!("gate_full:{}", node.gate_full.get()));
     push(text, &format!("gate_stale:{}", node.gate_stale.get()));
+    // First polls that found the wait pool empty or no key, derived never
+    // (ADR-0177 D5; cell scope).
+    push(text, &format!("wait_nodes_full:{}", node.wait_nodes_full.get()));
     push(text, &format!("pubsub_delivered:{}", node.pubsub_delivered.get()));
     push(text, &format!("pubsub_state_bytes:{}", node.pubsub_state_bytes.get()));
     push(text, &format!("{}:{}", tw::WIRE_BUFFERS_BYTES, node.wire_buffers_bytes.get()));

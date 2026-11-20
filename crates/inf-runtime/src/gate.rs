@@ -7,7 +7,8 @@
 //!   [`GateUnits`] bound the holders it has out (ADR-0177 D4).
 //! - [`KeyedGate`] and [`IoGate`]: completions keyed by the caller's key (the
 //!   cold gate's logical id, a driver token), behind one holder each.
-//! - [`WaitList`]: key-keyed FIFO (M1 blocking ops: BLPOP, WAIT…).
+//! - [`WaitList`]: key-keyed FIFO (M1 blocking ops: BLPOP, WAIT…), taking
+//!   the cell's [`WaitNodes`] at its constructor.
 //! - [`WatermarkGate`]: LSN-keyed (M2 fsync-gated acks).
 //!
 //! A holder wakes exactly one task. Completion may arrive before the waiter
@@ -18,26 +19,18 @@
 
 use core::cell::{Cell, RefCell, RefMut};
 use core::future::Future;
-use core::hash::Hash;
 use core::marker::PhantomData;
 use core::num::NonZeroU64;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-#[allow(clippy::disallowed_types, reason = "container: E")]
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
-// Gate tables key by internally-generated integer tokens (fabric tokens,
-// completion tokens, cell ids) — never attacker-chosen input — so they use
-// the trusted-integer hasher: one folded multiply per lookup instead of
-// SipHash rounds. On the remote hot path every fabric op pays three table
-// operations (register, complete, waiter poll); the S21 cycle split
-// attributed ~2.2% of natural-leg cycles to `DefaultHasher` (M2.5 Phase H).
-use inf_foundation::BuildIntHasher;
+use inf_foundation::CellId;
 use inf_foundation::bounded::{
-    Admission, Built, Cap, CapCensus, CapError, CappedMap, CappedSlab, Lookup, LookupMut,
-    MapBuilder, MapBuilt, MapRetired, NamedReservation, Retiring, SlabBuilder, SlabReserved,
-    SlotId, SlotWord, Taken, WordLookup, WrapWithProof,
+    Admission, AssemblyFull, Built, Cap, CapCensus, CapError, CappedMap, CappedSlab, ExactKey,
+    Lookup, LookupMut, MapBuilder, MapBuilt, MapRetired, NamedReservation, Released, Retiring,
+    SlabBuilder, SlabReserved, SlotId, SlotWord, Taken, WordLookup, WrapWithProof,
 };
 use inf_foundation::limits::{GATE_KEY_GENERATION_BITS, GATE_KEY_INDEX_BITS};
 
@@ -340,7 +333,8 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
     /// The gate of cell `origin`, issuing at most `units_max` units, the
     /// holders its tasks may have waiting (`Σ T_j × W_j`), over `holders`
     /// slots, `H`, which add the orphans a peer's un-replied ops may hold
-    /// (ADR-0177 D4); `None` builds no holder at a node of one cell. Built
+    /// (ADR-0177 D4); `None` builds no holder at a node of one cell. Its
+    /// parked senders' list takes the cell's `nodes` (ADR-0177 D5). Built
     /// whole before the cell serves.
     ///
     /// # Errors
@@ -351,8 +345,9 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
         units_max: u32,
         holders: Option<Cap>,
         census: &Rc<CapCensus>,
+        nodes: &WaitNodes,
     ) -> Result<FabricGate<V, C>, CapError> {
-        FabricGate::build_with(origin, units_max, holders, census, |builder| builder)
+        FabricGate::build_with(origin, units_max, holders, census, nodes, |builder| builder)
     }
 
     /// [`build`](Self::build) with every holder slot free at
@@ -368,9 +363,10 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
         units_max: u32,
         holders: Option<Cap>,
         census: &Rc<CapCensus>,
+        nodes: &WaitNodes,
         first_generation: u32,
     ) -> Result<FabricGate<V, C>, CapError> {
-        FabricGate::build_with(origin, units_max, holders, census, |builder| {
+        FabricGate::build_with(origin, units_max, holders, census, nodes, |builder| {
             builder.first_generation(first_generation)
         })
     }
@@ -380,13 +376,14 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
         units_max: u32,
         holders: Option<Cap>,
         census: &Rc<CapCensus>,
+        nodes: &WaitNodes,
         configure: impl FnOnce(HolderBuilder<V>) -> HolderBuilder<V>,
     ) -> Result<FabricGate<V, C>, CapError> {
         let holders = match holders {
             None => None,
             Some(cap) => {
                 debug_assert!(cap.entries_max() >= units_max, "H counts every unit");
-                let slab = build_holders(configure(CappedSlab::builder(cap, census)?))?;
+                let slab = build_slab(configure(CappedSlab::builder(cap, census)?))?;
                 let word = GateWord::for_slab(&slab)?;
                 Some(FabricHolders {
                     slab,
@@ -402,7 +399,7 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
             units: Rc::new(UnitBook { issued: Cell::new(0), max: units_max }),
             stale: 0,
             full: 0,
-            room: WaitList::new(),
+            room: WaitList::unit(nodes),
             round_trips: LogHistogram::new(),
             _cleanup: PhantomData,
         })
@@ -559,11 +556,11 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
     }
 }
 
-/// Steps a holder slab's build to its end; a refused build retires its
-/// prefix by steps before it answers.
-fn build_holders<V>(
-    mut builder: SlabBuilder<Holder<V>, u32, WrapWithProof>,
-) -> Result<HolderSlab<V>, CapError> {
+/// Steps a slab's build to its end; a refused build retires its prefix by
+/// steps before it answers.
+fn build_slab<T>(
+    mut builder: SlabBuilder<T, u32, WrapWithProof>,
+) -> Result<CappedSlab<T, u32, WrapWithProof>, CapError> {
     loop {
         builder = match builder.step() {
             Built::More(next) => next,
@@ -852,7 +849,7 @@ impl<K: GateKey, V, C: Cleanup<V>> KeyedGate<K, V, C> {
     /// `CapError` from either build or the census; a refused route build
     /// retires the built holders by steps first.
     pub fn build(cap: Cap, census: &Rc<CapCensus>) -> Result<KeyedGate<K, V, C>, CapError> {
-        let holders = build_holders(CappedSlab::builder(cap, census)?)?;
+        let holders = build_slab(CappedSlab::builder(cap, census)?)?;
         let routes = match CappedMap::builder(cap, census).and_then(build_routes) {
             Ok(routes) => routes,
             Err(refused) => {
@@ -1167,7 +1164,646 @@ impl<K: GateKey, V, C: Cleanup<V>> Drop for KeyedWait<K, V, C> {
 /// seam exists from M0 so the executor contract is complete).
 pub type IoGate = KeyedGate<CompletionToken, CompletionResult>;
 
+// ---- WaitNodes ----------------------------------------------------------------
+
+/// A wait node's handle: its slot in the pool's slab.
+type NodeId = SlotId<u32>;
+
+/// The pool's slab (ADR-0177 D5, D7): a `u32` generation that wraps.
+type NodeSlab = CappedSlab<WaitNode, u32, WrapWithProof>;
+
+/// A queued node's state: on its list, or taken off it by a wake its wait
+/// has not read yet.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NodeState {
+    Queued,
+    Woken,
+}
+
+/// A parked wait (ADR-0177 D5): its task's waker, its place on its one list
+/// and its state. 48 B, a 56 B slot.
+struct WaitNode {
+    waker: Option<Waker>,
+    prev: Option<NodeId>,
+    next: Option<NodeId>,
+    state: NodeState,
+}
+
+const _: () = assert!(size_of::<WaitNode>() == 48, "a wait node is 48 B");
+
+/// What a pool's handles share: the slab and its counter.
+struct Pool {
+    nodes: RefCell<NodeSlab>,
+    /// First polls that found no node or no key (`wait_nodes_full`, cell
+    /// scope): derived never, a task holding at most one parked wait.
+    full: Cell<u64>,
+}
+
+/// The cell's wait nodes (ADR-0177 D5): one pool a cell, a capped slab of
+/// `T` nodes, one for each live task's one parked wait, on the cell's census
+/// under its cap's row and resident whole from its build. Every
+/// [`WaitList`] of the cell takes it at its constructor and links its waits
+/// through it; a clone is a handle on the same pool.
+#[derive(Clone)]
+pub struct WaitNodes {
+    pool: Rc<Pool>,
+}
+
+impl WaitNodes {
+    /// A node's slot bytes: the stride the idle bill counts the pool at, in
+    /// its chunks (ADR-0177 D8 with A1).
+    pub const NODE_SLOT_BYTES: usize = NodeSlab::SLOT_BYTES;
+
+    /// The pool of `cap` nodes on the cell's `census`, its row registered and
+    /// its slab built whole by steps before the cell serves.
+    ///
+    /// # Errors
+    /// `CapError` from the slab's build or its census row; a refused build
+    /// retires its prefix first. Nothing is served.
+    pub fn build(cap: Cap, census: &Rc<CapCensus>) -> Result<WaitNodes, CapError> {
+        let nodes = build_slab(NodeSlab::builder(cap, census)?)?;
+        let pool = Pool { nodes: RefCell::new(nodes), full: Cell::new(0) };
+        Ok(WaitNodes { pool: Rc::new(pool) })
+    }
+
+    /// Nodes held by parked waits now (cell scope).
+    #[must_use]
+    pub fn len(&self) -> u32 {
+        self.pool.nodes.borrow().len()
+    }
+
+    /// Whether no parked wait holds a node.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// First polls that found no node or no key (`wait_nodes_full`, cell
+    /// scope).
+    #[must_use]
+    pub fn full(&self) -> u64 {
+        self.pool.full.get()
+    }
+}
+
+impl core::fmt::Debug for WaitNodes {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "WaitNodes {{ len: {}, full: {} }}", self.len(), self.full())
+    }
+}
+
 // ---- WaitList ---------------------------------------------------------------
+
+/// A keyed [`WaitList`]'s refusal at its build, before the cell serves.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeysRefused {
+    /// The key map's build was refused.
+    Cap(CapError),
+    /// A key past the map's cap: the cap is short of its host's demand.
+    Full(AssemblyFull),
+}
+
+impl core::fmt::Display for KeysRefused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            KeysRefused::Cap(refused) => write!(f, "a wait list's keys: {refused}"),
+            KeysRefused::Full(refused) => write!(f, "{refused}"),
+        }
+    }
+}
+
+impl std::error::Error for KeysRefused {}
+
+/// The node `id` names, which its wait keeps live from its first poll to its
+/// release.
+// Inlined always, as `live_mut` and `release` are: each is called by more
+// than one of a row's terms, and as a body of its own it would hold several
+// terms' instructions under one name, where a listing reads a term by its
+// function.
+#[inline(always)]
+fn live(nodes: &NodeSlab, id: NodeId) -> &WaitNode {
+    match nodes.get(id) {
+        Lookup::Live(node) => node,
+        Lookup::Stale | Lookup::Vacant => unreachable!("a held wait node is live"),
+    }
+}
+
+/// [`live`], mutably.
+#[inline(always)]
+fn live_mut(nodes: &mut NodeSlab, id: NodeId) -> &mut WaitNode {
+    match nodes.get_mut(id) {
+        LookupMut::Live(node) => node,
+        LookupMut::Stale | LookupMut::Vacant => unreachable!("a held wait node is live"),
+    }
+}
+
+/// The one place a node returns to the pool. Its waker left it at its wake
+/// or in the access that unlinked it, so the release, which drops the node
+/// where it lies, runs no waker's drop under the slab's borrow.
+#[inline(always)]
+fn release(nodes: &mut NodeSlab, id: NodeId) {
+    debug_assert!(
+        matches!(nodes.get(id), Lookup::Live(node) if node.waker.is_none()),
+        "a node is released after its waker left it"
+    );
+    let released = nodes.release(id);
+    debug_assert_eq!(released, Released::Dropped, "a held wait node is live");
+}
+
+/// A first poll found no node or no key: counted, and the task wakes itself
+/// with the waker it cloned, the pool's borrow already ended.
+#[cold]
+#[inline(never)]
+fn starve(pool: &Pool, waker: Waker) {
+    pool.full.set(pool.full.get().saturating_add(1));
+    waker.wake();
+}
+
+/// A queued wait polled again by another waker: the new one is cloned before
+/// the pool is borrowed and stored only while the node is still queued; the
+/// one it replaces drops after the borrow ends.
+#[cold]
+#[inline(never)]
+fn rewake(pool: &Pool, id: NodeId, cx: &Context<'_>) {
+    let fresh = cx.waker().clone();
+    let stale = {
+        let mut nodes = pool.nodes.borrow_mut();
+        let node = live_mut(&mut nodes, id);
+        match node.state {
+            NodeState::Queued => node.waker.replace(fresh),
+            NodeState::Woken => Some(fresh),
+        }
+    };
+    drop(stale);
+}
+
+/// A list's storage, sealed: its items are `pub`, so `ListKey` names them, in a module no
+/// caller can name, so the list's ends stay out of the crate's API.
+mod lists {
+    use core::cell::Cell;
+
+    use inf_foundation::bounded::{CappedMap, ExactKey};
+
+    use super::NodeId;
+
+    /// One key's FIFO: its two ends and its queued waits, each a cell, so a list
+    /// reads and moves them with no borrow of the pool.
+    #[derive(Default, Debug)]
+    pub struct Ends {
+        pub(super) head: Cell<Option<NodeId>>,
+        pub(super) tail: Cell<Option<NodeId>>,
+        pub(super) queued: Cell<u32>,
+    }
+
+    /// A list's ends by key, and its count of queued waits.
+    pub trait Queues<K> {
+        /// The key's ends; `None` for a key the list does not hold.
+        fn ends(&self, key: K) -> Option<&Ends>;
+        /// Waits queued on the list, on every key: one load, with no borrow.
+        fn queued(&self) -> u32;
+        /// A wait joined `ends`' tail.
+        fn joined(&self, ends: &Ends);
+        /// A wait left `ends`: woken, or unlinked at its drop.
+        fn left(&self, ends: &Ends);
+    }
+
+    /// The unit key's list keeps its one pair of ends in its own state, with no
+    /// map: its ends' count is the list's count, one fact.
+    impl Queues<()> for Ends {
+        #[inline]
+        fn ends(&self, (): ()) -> Option<&Ends> {
+            Some(self)
+        }
+
+        #[inline]
+        fn queued(&self) -> u32 {
+            self.queued.get()
+        }
+
+        #[inline]
+        fn joined(&self, ends: &Ends) {
+            ends.queued.set(ends.queued.get() + 1);
+        }
+
+        #[inline]
+        fn left(&self, ends: &Ends) {
+            ends.queued.set(ends.queued.get() - 1);
+        }
+    }
+
+    /// A keyed list's ends: every key admitted before the cell serves, so a
+    /// lookup is a shared read and the map takes no borrow of its own; `None`
+    /// holds no key.
+    pub struct KeyedEnds<K: ExactKey> {
+        pub(super) queued: Cell<u32>,
+        pub(super) by_key: Option<CappedMap<K, Ends>>,
+    }
+
+    impl<K: ExactKey> Queues<K> for KeyedEnds<K> {
+        #[inline]
+        fn ends(&self, key: K) -> Option<&Ends> {
+            self.by_key.as_ref()?.get(key)
+        }
+
+        #[inline]
+        fn queued(&self) -> u32 {
+            self.queued.get()
+        }
+
+        #[inline]
+        fn joined(&self, ends: &Ends) {
+            ends.queued.set(ends.queued.get() + 1);
+            self.queued.set(self.queued.get() + 1);
+        }
+
+        #[inline]
+        fn left(&self, ends: &Ends) {
+            ends.queued.set(ends.queued.get() - 1);
+            self.queued.set(self.queued.get() - 1);
+        }
+    }
+}
+
+use lists::{Ends, KeyedEnds, Queues};
+
+/// A wait list's key: the unit key, whose list keeps its ends in its own
+/// state, or a key a capped map holds.
+pub trait ListKey: ExactKey {
+    /// Where the list keeps its ends.
+    type Queues: Queues<Self>;
+}
+
+impl ListKey for () {
+    type Queues = Ends;
+}
+
+macro_rules! keyed_list_key {
+    ($($key:ty),*) => {$(
+        impl ListKey for $key {
+            type Queues = KeyedEnds<$key>;
+        }
+    )*};
+}
+
+keyed_list_key!(u8, u16, u32, u64, CellId);
+
+/// What a list's handles share: the cell's pool and the list's ends.
+struct List<K: ListKey> {
+    pool: Rc<Pool>,
+    queues: K::Queues,
+}
+
+/// Key-keyed FIFO wait list over the cell's pool (ADR-0177 D5): a wait takes
+/// a node at its first poll and gives it back at the poll that reads its
+/// wake or at its drop. `wake_one` hands the key to its longest-waiting
+/// task, `wake_all` to every task it held as the call began.
+pub struct WaitList<K: ListKey> {
+    list: Rc<List<K>>,
+}
+
+impl WaitList<()> {
+    /// The unit key's list on the cell's `nodes`: no map, no build step, no
+    /// refusal.
+    #[must_use]
+    pub fn unit(nodes: &WaitNodes) -> WaitList<()> {
+        let list = List { pool: Rc::clone(&nodes.pool), queues: Ends::default() };
+        WaitList { list: Rc::new(list) }
+    }
+}
+
+impl<K: ListKey<Queues = KeyedEnds<K>>> WaitList<K> {
+    /// A keyed list on the cell's `nodes` that holds every key of `keys`,
+    /// in a map of `cap` on `census`, built and filled whole before the
+    /// cell serves (`CapFill::Assembly`). `None` builds no map: a list that
+    /// holds no key, at a node of one cell, which has no peer; a key given
+    /// with `None` is past a cap of none, and refused.
+    ///
+    /// # Errors
+    /// [`KeysRefused`]: the map's build refused, or a key past its cap
+    /// (`Full`, naming the cap's row, or `crate::limits::WAIT_LIST_KEYLESS`'s
+    /// with `None`). Nothing is served.
+    pub fn keyed(
+        nodes: &WaitNodes,
+        cap: Option<Cap>,
+        census: &Rc<CapCensus>,
+        keys: impl IntoIterator<Item = K>,
+    ) -> Result<WaitList<K>, KeysRefused> {
+        let by_key = match cap {
+            None => {
+                if keys.into_iter().next().is_some() {
+                    let keyless = crate::limits::WAIT_LIST_KEYLESS;
+                    return Err(KeysRefused::Full(AssemblyFull::new(keyless)));
+                }
+                None
+            }
+            Some(cap) => Some(keys_held(cap, census, keys)?),
+        };
+        let queues = KeyedEnds { queued: Cell::new(0), by_key };
+        let list = List { pool: Rc::clone(&nodes.pool), queues };
+        Ok(WaitList { list: Rc::new(list) })
+    }
+}
+
+/// A keyed list's map of `cap` on `census`, built by steps and filled with
+/// every key of `keys` before the cell serves.
+fn keys_held<K: ExactKey>(
+    cap: Cap,
+    census: &Rc<CapCensus>,
+    keys: impl IntoIterator<Item = K>,
+) -> Result<CappedMap<K, Ends>, KeysRefused> {
+    let mut builder = CappedMap::<K, Ends>::builder(cap, census).map_err(KeysRefused::Cap)?;
+    let mut by_key = loop {
+        builder = match builder.step() {
+            MapBuilt::More(next) => next,
+            MapBuilt::Live(map) => break map,
+            MapBuilt::Refused(mut retiring, refused) => loop {
+                retiring = match retiring.step() {
+                    MapRetired::More(next) => next,
+                    MapRetired::Done => return Err(KeysRefused::Cap(refused)),
+                };
+            },
+        };
+    };
+    for key in keys {
+        match by_key.admit(key) {
+            Admission::Vacant(slot) => slot.publish(Ends::default()),
+            Admission::Occupied(_) => {}
+            Admission::Full => return Err(KeysRefused::Full(AssemblyFull::new(cap))),
+        }
+    }
+    Ok(by_key)
+}
+
+impl<K: ListKey> WaitList<K> {
+    /// A wait on `key`. It joins the key's FIFO at its first poll and
+    /// resolves when a wake reaches it; dropped while queued it unlinks in
+    /// place, and dropped after an unread wake it passes the wake on, so a
+    /// wake is never silently lost.
+    // Folded always: neither binary holds a body of it, so the attribute holds
+    // that place against a neighbour's attribute (ADR-0210 D1).
+    #[inline(always)]
+    pub fn wait(&self, key: K) -> ListWait<K> {
+        ListWait { list: Rc::clone(&self.list), key, state: ListState::Fresh }
+    }
+
+    /// Wakes the longest-waiting task on `key`. Returns whether one was woken.
+    // Folded always: with its head's placement moved, a bench outlined it where
+    // the server folded it; one place in both (ADR-0210 D1).
+    #[inline(always)]
+    pub fn wake_one(&self, key: K) -> bool {
+        // A wake that meets an idle list reads the count and leaves: no
+        // borrow and no lookup.
+        if self.list.queues.queued() == 0 {
+            return false;
+        }
+        self.list.wake_head(key)
+    }
+
+    /// Wakes every task that waits on `key` as the call begins. Returns how
+    /// many. A wait that joins during the call, from a waker, stays queued.
+    pub fn wake_all(&self, key: K) -> usize {
+        let Some(ends) = self.list.queues.ends(key) else { return 0 };
+        let at_entry = ends.queued.get();
+        let mut woken = 0;
+        for _ in 0..at_entry {
+            if !self.list.wake_head(key) {
+                break;
+            }
+            woken += 1;
+        }
+        woken
+    }
+
+    /// Whether no wait is queued on any key: one load of the list's count,
+    /// with no borrow of the pool and no walk, so a caller whose wake almost
+    /// always meets an empty list reads this and skips the call.
+    #[must_use]
+    pub fn is_idle(&self) -> bool {
+        self.list.queues.queued() == 0
+    }
+
+    /// Waits queued across all keys (gauges, tests, leak asserts): the same
+    /// count.
+    #[must_use]
+    pub fn waiting(&self) -> usize {
+        self.list.queues.queued() as usize
+    }
+}
+
+impl<K: ListKey> Clone for WaitList<K> {
+    /// A shared handle: wake sites and waits share the list.
+    fn clone(&self) -> Self {
+        WaitList { list: Rc::clone(&self.list) }
+    }
+}
+
+impl<K: ListKey> core::fmt::Debug for WaitList<K> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "WaitList {{ waiting: {} }}", self.waiting())
+    }
+}
+
+impl<K: ListKey> List<K> {
+    /// Unlinks and wakes `key`'s head: the waker is taken in the access that
+    /// marks the node woken, and the pool's borrow ends before `wake`, so a
+    /// waker that reaches the pool finds it free.
+    // A body, never folded: folding it buys no instruction and moves
+    // `wake_one`'s frame, where both benches call it (ADR-0210 D1).
+    #[inline(never)]
+    fn wake_head(&self, key: K) -> bool {
+        let waker = {
+            let mut nodes = self.pool.nodes.borrow_mut();
+            let Some(ends) = self.queues.ends(key) else { return false };
+            let Some(head) = ends.head.get() else { return false };
+            let node = live_mut(&mut nodes, head);
+            let waker = node.waker.take();
+            node.state = NodeState::Woken;
+            let next = node.next;
+            ends.head.set(next);
+            match next {
+                Some(next) => live_mut(&mut nodes, next).prev = None,
+                None => ends.tail.set(None),
+            }
+            self.queues.left(ends);
+            waker
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        true
+    }
+}
+
+/// A list wait's phase.
+#[derive(Clone, Copy)]
+enum ListState {
+    /// Made, on no list: its first poll joins.
+    Fresh,
+    /// On its key's FIFO or woken off it, holding its node.
+    Queued(NodeId),
+    /// Its last poll found no node or no key and woke its task: the next
+    /// poll is Ready with no wake, which its caller reads through `starved`.
+    Starved,
+    Done,
+}
+
+/// Future returned by [`WaitList::wait`].
+pub struct ListWait<K: ListKey> {
+    list: Rc<List<K>>,
+    key: K,
+    state: ListState,
+}
+
+// No self-references: the wait's state lives in the pool and the list.
+impl<K: ListKey> Unpin for ListWait<K> {}
+
+impl<K: ListKey> ListWait<K> {
+    /// Whether this wait's last poll found no node or no key, so that its
+    /// next poll is Ready with no wake landed: a caller that counts on a wake
+    /// reads this before it trusts a Ready.
+    #[must_use]
+    pub fn starved(&self) -> bool {
+        matches!(self.state, ListState::Starved)
+    }
+
+    /// The first poll: the wait takes a node and joins its key's tail.
+    #[inline]
+    fn poll_first(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        // The clone runs before the pool is borrowed or a slot reserved, so
+        // nothing of the pool is live across a waker's call.
+        let waker = cx.waker().clone();
+        let list = &*self.list;
+        let mut nodes = list.pool.nodes.borrow_mut();
+        let Some(ends) = list.queues.ends(self.key) else {
+            drop(nodes);
+            return self.starved_by(waker);
+        };
+        let slot = match nodes.reserve() {
+            SlabReserved::Slot(slot) => slot,
+            SlabReserved::Full | SlabReserved::Exhausted => {
+                drop(nodes);
+                return self.starved_by(waker);
+            }
+        };
+        let tail = ends.tail.get();
+        let node =
+            WaitNode { waker: Some(waker), prev: tail, next: None, state: NodeState::Queued };
+        let id = slot.publish(node);
+        match tail {
+            Some(tail) => live_mut(&mut nodes, tail).next = Some(id),
+            None => ends.head.set(Some(id)),
+        }
+        ends.tail.set(Some(id));
+        list.queues.joined(ends);
+        drop(nodes);
+        self.state = ListState::Queued(id);
+        Poll::Pending
+    }
+
+    fn starved_by(&mut self, waker: Waker) -> Poll<()> {
+        starve(&self.list.pool, waker);
+        self.state = ListState::Starved;
+        Poll::Pending
+    }
+
+    /// A later poll: Ready once a wake took the node off its list.
+    #[inline]
+    fn poll_queued(&mut self, id: NodeId, cx: &mut Context<'_>) -> Poll<()> {
+        let pool = &*self.list.pool;
+        let mut nodes = pool.nodes.borrow_mut();
+        let node = live(&nodes, id);
+        match node.state {
+            NodeState::Woken => {
+                release(&mut nodes, id);
+                drop(nodes);
+                self.state = ListState::Done;
+                Poll::Ready(())
+            }
+            NodeState::Queued => {
+                let same = node.waker.as_ref().is_some_and(|held| held.will_wake(cx.waker()));
+                drop(nodes);
+                if !same {
+                    rewake(pool, id, cx);
+                }
+                Poll::Pending
+            }
+        }
+    }
+
+    /// A wait dropped while it holds its node. Queued, it unlinks in O(1)
+    /// and its waker leaves in that access, dropped once the borrow has
+    /// ended; woken and unread, it passes its wake to the key's next wait.
+    #[cold]
+    fn leave(&mut self, id: NodeId) {
+        let list = &*self.list;
+        // Canary: a wait dropped while queued leaves its node linked.
+        #[cfg(inf_canary_wait_drop_keeps_node)]
+        {
+            if live(&list.pool.nodes.borrow(), id).state == NodeState::Queued {
+                return;
+            }
+        }
+        let (waker, state) = {
+            let mut nodes = list.pool.nodes.borrow_mut();
+            let node = live_mut(&mut nodes, id);
+            let waker = node.waker.take();
+            let (state, prev, next) = (node.state, node.prev, node.next);
+            if state == NodeState::Queued {
+                let Some(ends) = list.queues.ends(self.key) else {
+                    unreachable!("a queued wait's key is its list's")
+                };
+                match prev {
+                    Some(prev) => live_mut(&mut nodes, prev).next = next,
+                    None => ends.head.set(next),
+                }
+                match next {
+                    Some(next) => live_mut(&mut nodes, next).prev = prev,
+                    None => ends.tail.set(prev),
+                }
+                list.queues.left(ends);
+            }
+            release(&mut nodes, id);
+            (waker, state)
+        };
+        drop(waker);
+        if state == NodeState::Woken && list.queues.queued() != 0 {
+            list.wake_head(self.key);
+        }
+    }
+}
+
+impl<K: ListKey> Future for ListWait<K> {
+    type Output = ();
+
+    // A body, never folded: about 2 KB a key type, called from every await
+    // site as both benches call it; left to the compiler, the server folded a
+    // copy into one caller the benches do not have (ADR-0210 D1).
+    #[inline(never)]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let this = Pin::into_inner(self);
+        match this.state {
+            ListState::Queued(id) => this.poll_queued(id, cx),
+            ListState::Fresh => this.poll_first(cx),
+            // A starved wait resolves with no wake; a done one answers Ready
+            // again: no node and no count either way.
+            ListState::Starved | ListState::Done => {
+                this.state = ListState::Done;
+                Poll::Ready(())
+            }
+        }
+    }
+}
+
+impl<K: ListKey> Drop for ListWait<K> {
+    fn drop(&mut self) {
+        match self.state {
+            ListState::Queued(id) => self.leave(id),
+            ListState::Fresh | ListState::Starved | ListState::Done => {}
+        }
+    }
+}
+
+// ---- WatermarkGate ----------------------------------------------------------
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum WaiterState {
@@ -1180,205 +1816,6 @@ struct Waiter {
     state: Cell<WaiterState>,
     waker: RefCell<Option<Waker>>,
 }
-
-/// Key-keyed FIFO wait list for blocking ops (M1+: BLPOP, XREAD BLOCK…).
-/// Multiple tasks may wait on one key; `wake_one` hands the key to the
-/// longest-waiting live task, `wake_all` to everyone.
-#[allow(
-    clippy::type_complexity,
-    reason = "an alias of a banned container is refused (ADR-0163 D2)"
-)]
-#[allow(clippy::disallowed_types, reason = "container: E")]
-pub struct WaitList<K: Eq + Hash + Copy> {
-    queues: Rc<RefCell<HashMap<K, VecDeque<Rc<Waiter>>, BuildIntHasher>>>,
-}
-
-impl<K: Eq + Hash + Copy> Default for WaitList<K> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<K: Eq + Hash + Copy> WaitList<K> {
-    #[allow(clippy::disallowed_types, reason = "container: E")]
-    pub fn new() -> WaitList<K> {
-        WaitList { queues: Rc::new(RefCell::new(HashMap::default())) }
-    }
-
-    /// Join the FIFO for `key`. The future resolves when a mutation wakes
-    /// this waiter; dropping it (timeout, disconnect) cancels in place and
-    /// — if the wake already landed — passes the baton to the next waiter,
-    /// so a wake is never silently lost.
-    pub fn wait(&self, key: K) -> ListWait<K> {
-        let waiter =
-            Rc::new(Waiter { state: Cell::new(WaiterState::Queued), waker: RefCell::new(None) });
-        self.queues.borrow_mut().entry(key).or_default().push_back(Rc::clone(&waiter));
-        ListWait { queues: Rc::clone(&self.queues), key, waiter, done: false }
-    }
-
-    /// Wake the longest-waiting live task on `key`. Returns whether one was
-    /// woken.
-    pub fn wake_one(&self, key: K) -> bool {
-        wake_one_in(&self.queues, key)
-    }
-
-    /// Wake every task waiting on `key`. Returns how many.
-    pub fn wake_all(&self, key: K) -> usize {
-        let Some(queue) = self.queues.borrow_mut().remove(&key) else { return 0 };
-        let mut woken = 0;
-        for waiter in queue {
-            if waiter.state.get() == WaiterState::Queued {
-                waiter.state.set(WaiterState::Woken);
-                if let Some(w) = waiter.waker.borrow_mut().take() {
-                    w.wake();
-                }
-                woken += 1;
-            }
-        }
-        woken
-    }
-
-    /// Whether the list holds no entry on any key, live or cancelled:
-    /// `wake_one` would then find no one and change nothing, so a caller
-    /// whose wake almost always meets an empty list reads this and skips the
-    /// call. One read of the queues under a shared borrow. A cancelled entry
-    /// counts: the wake that clears it must still run.
-    fn is_idle(&self) -> bool {
-        self.queues.borrow().is_empty()
-    }
-
-    /// Whether any live waiter is queued, on any key: the emptiness test,
-    /// which stops at the first one where [`waiting`](Self::waiting) counts
-    /// them all. It passes over only the cancelled entries queued ahead of
-    /// that waiter.
-    pub fn any_waiting(&self) -> bool {
-        self.queues
-            .borrow()
-            .values()
-            .flat_map(|q| q.iter())
-            .any(|w| w.state.get() == WaiterState::Queued)
-    }
-
-    /// Live waiters across all keys (gauges, tests, leak asserts): a walk
-    /// of every queued entry. Cancelled entries pending lazy cleanup are
-    /// not counted.
-    pub fn waiting(&self) -> usize {
-        self.queues
-            .borrow()
-            .values()
-            .flat_map(|q| q.iter())
-            .filter(|w| w.state.get() == WaiterState::Queued)
-            .count()
-    }
-}
-
-impl<K: Eq + Hash + Copy> Clone for WaitList<K> {
-    /// Shared handle: mutation sites and waiting futures share the queues.
-    fn clone(&self) -> Self {
-        WaitList { queues: Rc::clone(&self.queues) }
-    }
-}
-
-impl<K: Eq + Hash + Copy> core::fmt::Debug for WaitList<K> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "WaitList {{ waiting: {} }}", self.waiting())
-    }
-}
-
-#[allow(
-    clippy::type_complexity,
-    reason = "an alias of a banned container is refused (ADR-0163 D2)"
-)]
-#[allow(clippy::disallowed_types, reason = "container: E")]
-fn wake_one_in<K: Eq + Hash + Copy>(
-    queues: &Rc<RefCell<HashMap<K, VecDeque<Rc<Waiter>>, BuildIntHasher>>>,
-    key: K,
-) -> bool {
-    let mut map = queues.borrow_mut();
-    // Hot-path guard: credit wakes probe this per fabric reply and the list
-    // is empty unless a sender actually ran out of credits — skip the hash.
-    if map.is_empty() {
-        return false;
-    }
-    let Some(queue) = map.get_mut(&key) else { return false };
-    // Skip lazily-cancelled entries.
-    let woken = loop {
-        match queue.pop_front() {
-            None => break None,
-            Some(w) if w.state.get() == WaiterState::Cancelled => continue,
-            Some(w) => break Some(w),
-        }
-    };
-    if queue.is_empty() {
-        map.remove(&key);
-    }
-    drop(map);
-    match woken {
-        None => false,
-        Some(waiter) => {
-            waiter.state.set(WaiterState::Woken);
-            if let Some(w) = waiter.waker.borrow_mut().take() {
-                w.wake();
-            }
-            true
-        }
-    }
-}
-
-/// Future returned by [`WaitList::wait`].
-#[allow(
-    clippy::type_complexity,
-    reason = "an alias of a banned container is refused (ADR-0163 D2)"
-)]
-#[allow(clippy::disallowed_types, reason = "container: E")]
-pub struct ListWait<K: Eq + Hash + Copy> {
-    queues: Rc<RefCell<HashMap<K, VecDeque<Rc<Waiter>>, BuildIntHasher>>>,
-    key: K,
-    waiter: Rc<Waiter>,
-    done: bool,
-}
-
-// No self-references — state lives behind the shared `Rc` queues.
-impl<K: Eq + Hash + Copy> Unpin for ListWait<K> {}
-
-impl<K: Eq + Hash + Copy> Future for ListWait<K> {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let this = Pin::into_inner(self);
-        match this.waiter.state.get() {
-            WaiterState::Woken => {
-                this.done = true;
-                Poll::Ready(())
-            }
-            WaiterState::Queued => {
-                *this.waiter.waker.borrow_mut() = Some(cx.waker().clone());
-                Poll::Pending
-            }
-            WaiterState::Cancelled => panic!("ListWait polled after cancellation"),
-        }
-    }
-}
-
-impl<K: Eq + Hash + Copy> Drop for ListWait<K> {
-    fn drop(&mut self) {
-        if self.done {
-            return;
-        }
-        match self.waiter.state.get() {
-            // Still queued: cancel in place; `wake_one` skips us lazily.
-            WaiterState::Queued => self.waiter.state.set(WaiterState::Cancelled),
-            // Woken but never observed (e.g. timed out in the same
-            // iteration): pass the baton so the wake is not lost.
-            WaiterState::Woken => {
-                wake_one_in(&self.queues, self.key);
-            }
-            WaiterState::Cancelled => {}
-        }
-    }
-}
-
-// ---- WatermarkGate ----------------------------------------------------------
 
 struct WatermarkInner {
     watermark: Cell<u64>,
@@ -1519,11 +1956,47 @@ mod tests {
     use inf_foundation::bounded::CapFill;
     use inf_foundation::rng::Entropy;
 
+    /// The tests' pools of wait nodes.
+    const TEST_WAIT_NODES: Cap = Cap::entries::<64>("test-wait-nodes", CapFill::Serving);
+    /// The tests' keyed lists' keys.
+    const TEST_LIST_KEYS: Cap = Cap::entries::<8>("test-list-keys", CapFill::Assembly);
+
+    /// A pool of wait nodes on `census`.
+    fn wait_nodes(census: &Rc<CapCensus>) -> WaitNodes {
+        WaitNodes::build(TEST_WAIT_NODES, census).expect("the test pool")
+    }
+
+    /// A list of `keys` on a census and a pool of its own, and the pool.
+    fn pooled_list<K: ListKey<Queues = KeyedEnds<K>>>(
+        keys: impl IntoIterator<Item = K>,
+    ) -> (WaitList<K>, WaitNodes) {
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
+        let nodes = wait_nodes(&census);
+        let list =
+            WaitList::keyed(&nodes, Some(TEST_LIST_KEYS), &census, keys).expect("the test list");
+        (list, nodes)
+    }
+
+    /// A list of `keys` on a census and a pool of its own.
+    fn keyed_list<K: ListKey<Queues = KeyedEnds<K>>>(
+        keys: impl IntoIterator<Item = K>,
+    ) -> WaitList<K> {
+        pooled_list(keys).0
+    }
+
+    /// One poll of `wait` on a waker that does nothing: whether it is Ready.
+    fn polled<K: ListKey>(wait: &mut ListWait<K>) -> bool {
+        Pin::new(wait).poll(&mut Context::from_waker(Waker::noop())).is_ready()
+    }
+
     /// A fabric gate of 8 holders on a census of its own, at cell 1.
     fn fabric_gate(units: u32) -> RefCell<FabricGate<u64>> {
         let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
         let holders = Cap::entries::<8>("test-gate-holders", CapFill::Serving);
-        RefCell::new(FabricGate::build(1, units, Some(holders), &census).expect("the test gate"))
+        let nodes = wait_nodes(&census);
+        RefCell::new(
+            FabricGate::build(1, units, Some(holders), &census, &nodes).expect("the test gate"),
+        )
     }
 
     /// One registered wait on `gate` under `units`, and the key its request
@@ -1881,31 +2354,33 @@ mod tests {
         }
     }
 
-    /// An idle list holds no entry, live or cancelled: the read a gated wake
-    /// rests on. A queued waiter ends it, and so does the entry a dropped
-    /// waiter leaves behind: were that entry idle, the wake that clears it
-    /// would never run. A wake that takes the last entry makes the list idle
-    /// again.
+    /// A list is idle exactly when it holds no waiter: the read a gated wake
+    /// rests on. A wait made and not yet polled is on no list; its first poll
+    /// queues it, and its drop unlinks it at once, so no entry outlives its
+    /// wait. A wake that takes the last waiter makes the list idle again.
     #[test]
-    fn a_list_is_idle_only_with_no_entry_live_or_cancelled() {
-        let list = WaitList::<u64>::new();
+    fn a_list_is_idle_exactly_when_it_holds_no_waiter() {
+        let list = keyed_list([7u64]);
         assert!(list.is_idle(), "a new list");
-        let left = list.wait(7);
+        let mut left = list.wait(7);
+        assert!(list.is_idle(), "a wait not yet polled is on no list");
+        assert!(!polled(&mut left), "engagement: the first poll queues it");
         assert!(!list.is_idle(), "a queued waiter");
         drop(left);
-        assert_eq!(list.waiting(), 0, "engagement: the waiter cancelled in place");
-        assert!(!list.is_idle(), "a cancelled entry is the list's until a wake clears it");
-        assert!(!list.wake_one(7), "engagement: no live waiter to wake");
-        assert!(list.is_idle(), "the wake cleared the cancelled entry");
-        let _woken = list.wait(7);
+        assert_eq!(list.waiting(), 0, "engagement: the dropped waiter unlinked");
+        assert!(list.is_idle(), "a dropped waiter leaves nothing behind");
+        assert!(!list.wake_one(7), "no waiter to wake");
+        let mut woken = list.wait(7);
+        assert!(!polled(&mut woken), "engagement: queued");
         assert!(list.wake_one(7), "engagement: the waiter is woken");
         assert!(list.is_idle(), "the woken waiter left its queue");
+        assert!(polled(&mut woken), "and reads its wake");
     }
 
     /// The gate's one wake step (ADR-0177 D4). On an idle room it wakes no
     /// one and the room stays idle. With senders parked it wakes the
-    /// longest-parked one, once, and no other. A sender that left is cleared
-    /// by the next step, which wakes no one.
+    /// longest-parked one, once, and no other. A sender that left unlinked
+    /// at its drop, so the next step finds the room idle and wakes no one.
     #[test]
     fn the_room_step_wakes_one_parked_sender_and_no_one_on_an_idle_room() {
         let gate = fabric_gate(1);
@@ -1918,9 +2393,9 @@ mod tests {
         assert_eq!(first.woken(), (1, true), "room-wake-lost: the step, a sender parked");
         assert_eq!(second.woken(), (0, false), "one sender a step");
         drop(second);
-        assert!(!room.is_idle(), "engagement: the sender that left is still queued");
+        assert!(room.is_idle(), "the sender that left unlinked at its drop");
         wake_room(&room);
-        assert!(room.is_idle(), "the step cleared the sender that left");
+        assert!(room.is_idle(), "a step on the idle room changes nothing");
         assert_eq!(first.wakes.0.load(std::sync::atomic::Ordering::Relaxed), 1, "and woke no one");
     }
 
@@ -2039,7 +2514,7 @@ mod tests {
     /// dropped before any value. A dropped wait takes its route in the same
     /// step (ADR-0177 D4), so the hold reads no wait, the gate keeps no route
     /// and a gate of 8 never fills. Planted, the drop leaves the route and
-    /// the holder with its waker (KE12).
+    /// the holder with its waker.
     #[test]
     fn a_dropped_keyed_wait_leaves_no_route() {
         const WAITS: u64 = 1_000;
@@ -2245,26 +2720,296 @@ mod tests {
         assert!(model.full > 0, "VACUOUS: the gate never filled");
     }
 
-    /// 1,000 waits on one key, each polled once, so it is queued with its
-    /// waker stored, then dropped before any wake. A wait's entry is its
-    /// future's, so its drop unlinks it and the list is empty after the
-    /// last (ADR-0177 D5). At HEAD a dropped wait is only marked cancelled,
-    /// and its entry stays queued until a later wake of the key reaches it.
+    /// 1,000 waits on one key, each polled once, so it is queued on its node
+    /// with its waker stored, then dropped before any wake; then 1,000 more,
+    /// each the head a wake reaches and a poll reads, with the next queued
+    /// behind it; then one woken and dropped unread. A wait's node is its
+    /// future's, so a drop while queued unlinks it and gives the node back, a
+    /// poll that reads its wake gives it back, and a drop after an unread
+    /// wake passes the wake to the key's next wait (ADR-0177 D5): the pool is
+    /// back at no node, no first poll starved, and the baton reached the wait
+    /// behind.
     #[test]
-    #[ignore = "a wait dropped while queued is marked cancelled and stays in its key's queue \
-                until a later wake of that key walks past it, so a key nobody wakes keeps every \
-                dropped entry; red until a wait's node is unlinked by its own drop"]
     fn a_wait_dropped_while_queued_leaves_no_entry() {
         const WAITS: usize = 1_000;
-        let list: WaitList<u32> = WaitList::new();
-        let mut cx = Context::from_waker(Waker::noop());
+        let (list, nodes) = pooled_list([7u32]);
         for _ in 0..WAITS {
             let mut wait = list.wait(7);
-            assert!(Pin::new(&mut wait).poll(&mut cx).is_pending(), "engagement: queued");
+            assert!(!polled(&mut wait), "engagement: queued");
             drop(wait);
         }
+        assert_eq!(nodes.len(), 0, "wait-node-kept: a dropped wait's node is not the pool's");
+        assert_eq!(nodes.full(), 0, "wait-node-kept: a first poll found the pool empty");
         assert_eq!(list.waiting(), 0, "no dropped wait is a live waiter");
-        let entries: usize = list.queues.borrow().values().map(|queue| queue.len()).sum();
-        assert_eq!(entries, 0, "{entries} entries stay queued after {WAITS} waits were dropped");
+        let mut behind = list.wait(7);
+        assert!(!polled(&mut behind), "engagement: a wait behind the woken ones");
+        for _ in 0..WAITS {
+            let mut woken = list.wait(7);
+            assert!(!polled(&mut woken), "engagement: queued");
+            // `behind` is the head: the wake reaches it and its poll reads
+            // it, and the new wait is the head after it, for the next pass.
+            assert!(list.wake_one(7), "engagement: the head is woken");
+            assert!(polled(&mut behind), "the head's wake landed");
+            behind = woken;
+        }
+        drop(behind);
+        assert_eq!((list.waiting(), nodes.len()), (0, 0), "every node back in the pool");
+        let mut first = list.wait(7);
+        let mut second = list.wait(7);
+        assert!(!polled(&mut first) && !polled(&mut second), "engagement: two queued");
+        assert!(list.wake_one(7), "engagement: the first is woken");
+        drop(first);
+        assert!(polled(&mut second), "the unread wake passed to the next wait, once");
+        assert_eq!((list.waiting(), nodes.len()), (0, 0), "the baton took no node");
+    }
+
+    /// The pool is one capped slab of its cap's nodes, its row on the census
+    /// and every slot built before anything serves, and it holds nodes as a
+    /// model of its live handles does: a seeded run of takes and releases,
+    /// a take answered by a free slot below the cap and refused at it, a
+    /// release by any live handle, and the pool's `len` the model's count
+    /// after every step. Oracle: the model's own vector; the census row
+    /// reads the cap's crossings and its high water.
+    #[test]
+    fn the_pool_holds_its_nodes_as_its_model_does() {
+        const NODES: u32 = 100;
+        const POOL: Cap = Cap::entries::<NODES>("test-pool-model", CapFill::Serving);
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
+        let pool = WaitNodes::build(POOL, &census).expect("the test pool");
+        let row = census.row("test-pool-model").expect("the pool's census row");
+        assert_eq!((row.entries_max, row.capacity_now), (NODES, NODES), "built whole");
+        assert_eq!((pool.len(), pool.full()), (0, 0), "a new pool holds no node");
+        let mut live: Vec<NodeId> = Vec::new();
+        let mut rng = inf_foundation::rng::SplitMix64::new(0x706F_6F6C_0000_00E4);
+        let mut refused = 0u32;
+        for _ in 0..10_000 {
+            let mut nodes = pool.pool.nodes.borrow_mut();
+            // Two takes for each release, so the run reaches the cap.
+            if !rng.next_u64().is_multiple_of(3) {
+                match nodes.reserve() {
+                    SlabReserved::Slot(slot) => {
+                        let node = WaitNode {
+                            waker: None,
+                            prev: None,
+                            next: None,
+                            state: NodeState::Queued,
+                        };
+                        live.push(slot.publish(node));
+                    }
+                    SlabReserved::Full => {
+                        assert_eq!(live.len(), NODES as usize, "refused only at the cap");
+                        refused += 1;
+                    }
+                    SlabReserved::Exhausted => panic!("a wrapping slab never retires a slot"),
+                }
+            } else if !live.is_empty() {
+                let at = usize::try_from(rng.next_u64() % live.len() as u64).expect("an index");
+                let id = live.swap_remove(at);
+                assert_eq!(nodes.release(id), inf_foundation::bounded::Released::Dropped);
+            }
+            drop(nodes);
+            assert_eq!(pool.len() as usize, live.len(), "the pool's len is the model's count");
+        }
+        assert!(refused > 0, "engagement: the run reached the cap");
+        let row = census.row("test-pool-model").expect("the pool's census row");
+        assert_eq!(row.high_water, NODES, "the high water is the cap");
+        assert_eq!(row.crossings, u64::from(refused), "each refusal is one crossing");
+        assert_eq!(pool.full(), 0, "no first poll ran, so none starved");
+    }
+
+    /// A whole-list wake wakes every queued wait of its key, and the pool bounds them: with
+    /// `T − 1` and `T` waits each takes a node and each is woken; the wait past `T` takes no
+    /// node, its first poll counted (`wait_nodes_full`) and its task woken by itself, and the
+    /// wake reaches the `T` that hold one.
+    #[test]
+    fn a_whole_list_wake_wakes_every_queued_wait_and_no_more_than_the_pool_holds() {
+        const T: u32 = 8;
+        const POOL: Cap = Cap::entries::<T>("test-pool-t", CapFill::Serving);
+        for waits in [T - 1, T, T + 1] {
+            let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
+            let nodes = WaitNodes::build(POOL, &census).expect("the test pool");
+            let list = WaitList::keyed(&nodes, Some(TEST_LIST_KEYS), &census, [7u32])
+                .expect("the test list");
+            let mut cx = Context::from_waker(Waker::noop());
+            let mut parked: Vec<ListWait<u32>> = (0..waits).map(|_| list.wait(7)).collect();
+            for wait in &mut parked {
+                assert!(Pin::new(wait).poll(&mut cx).is_pending(), "a first poll parks");
+            }
+            let queued = waits.min(T);
+            assert_eq!(
+                list.wake_all(7),
+                queued as usize,
+                "{waits} waits: the wake reaches {queued}"
+            );
+            assert_eq!(nodes.full(), u64::from(waits - queued), "{waits} waits: starved past T");
+            let mut read = 0;
+            for wait in &mut parked {
+                read += usize::from(Pin::new(wait).poll(&mut cx).is_ready());
+            }
+            assert_eq!(read, waits as usize, "{waits} waits: every wait resolves");
+            assert_eq!(nodes.len(), 0, "{waits} waits: every node back in the pool");
+        }
+    }
+
+    thread_local! {
+        /// What a re-entrant waker runs when woken: the test's own step, on
+        /// the cell's thread, which a `Send` waker cannot hold itself.
+        static ON_WAKE: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    /// A waker whose wake runs [`ON_WAKE`]'s step, inside the list's call.
+    struct Reentrant;
+
+    impl std::task::Wake for Reentrant {
+        fn wake(self: std::sync::Arc<Self>) {
+            ON_WAKE.with(|step| {
+                if let Some(step) = step.borrow_mut().as_mut() {
+                    step();
+                }
+            });
+        }
+    }
+
+    /// One poll of `wait` on the re-entrant waker: whether it is Ready.
+    fn polled_reentrant<K: ListKey>(wait: &mut ListWait<K>) -> bool {
+        let waker = Waker::from(std::sync::Arc::new(Reentrant));
+        Pin::new(wait).poll(&mut Context::from_waker(&waker)).is_ready()
+    }
+
+    /// A waker that reaches the pool inside `wake`: each wake
+    /// first-polls a new wait on another list of the same pool, at
+    /// `wake_one` and at `wake_all`. The wake runs after the pool's borrow
+    /// has ended, so no borrow panics and each new wait queues on its list.
+    #[test]
+    fn a_waker_that_reaches_the_pool_inside_its_wake_finds_it_free() {
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
+        let nodes = wait_nodes(&census);
+        let list = WaitList::keyed(&nodes, Some(TEST_LIST_KEYS), &census, [7u32]).expect("list");
+        let other = Rc::new(WaitList::unit(&nodes));
+        let made: Rc<RefCell<Vec<ListWait<()>>>> = Rc::new(RefCell::new(Vec::new()));
+        let (step_other, step_made) = (Rc::clone(&other), Rc::clone(&made));
+        ON_WAKE.with(|step| {
+            *step.borrow_mut() = Some(Box::new(move || {
+                let mut wait = step_other.wait(());
+                assert!(!polled(&mut wait), "the new wait queues");
+                step_made.borrow_mut().push(wait);
+            }));
+        });
+        let mut first = list.wait(7);
+        let mut second = list.wait(7);
+        let mut third = list.wait(7);
+        for wait in [&mut first, &mut second, &mut third] {
+            assert!(!polled_reentrant(wait), "engagement: queued on the re-entrant waker");
+        }
+        assert!(list.wake_one(7), "wake_one ran its waker");
+        assert_eq!(list.wake_all(7), 2, "wake_all ran both");
+        ON_WAKE.with(|step| step.borrow_mut().take());
+        assert_eq!(other.waiting(), 3, "each waker's new wait queued on its list");
+        assert_eq!(nodes.len(), 6, "three woken and three queued, each on its node");
+    }
+
+    /// A waker that waits again on its own key inside `wake_all`: two waits on
+    /// one key, each waker making and polling a new wait on that key. The
+    /// call wakes the two its key held as it began, and the two new waits
+    /// stay queued.
+    #[test]
+    fn a_whole_list_wake_wakes_the_count_its_key_held_as_it_began() {
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
+        let nodes = wait_nodes(&census);
+        let list =
+            Rc::new(WaitList::keyed(&nodes, Some(TEST_LIST_KEYS), &census, [7u32]).expect("list"));
+        let made: Rc<RefCell<Vec<ListWait<u32>>>> = Rc::new(RefCell::new(Vec::new()));
+        let (step_list, step_made) = (Rc::clone(&list), Rc::clone(&made));
+        ON_WAKE.with(|step| {
+            *step.borrow_mut() = Some(Box::new(move || {
+                let mut wait = step_list.wait(7);
+                assert!(!polled(&mut wait), "the new wait queues behind");
+                step_made.borrow_mut().push(wait);
+            }));
+        });
+        let mut first = list.wait(7);
+        let mut second = list.wait(7);
+        assert!(!polled_reentrant(&mut first) && !polled_reentrant(&mut second), "queued");
+        assert_eq!(list.wake_all(7), 2, "the count at its entry, not the waits it made");
+        ON_WAKE.with(|step| step.borrow_mut().take());
+        assert_eq!(list.waiting(), 2, "the two new waits stay queued");
+        assert!(polled(&mut first) && polled(&mut second), "the two read their wakes");
+        assert_eq!(made.borrow().len(), 2, "engagement: each waker waited again");
+    }
+
+    /// `is_idle` takes no borrow of the pool and walks nothing: called under
+    /// a held `borrow_mut` of the pool, and the room's
+    /// wake step on an idle room under it, neither panics, and each answers
+    /// what the count gives.
+    #[test]
+    fn is_idle_reads_the_count_under_a_held_borrow_of_the_pool() {
+        let gate = fabric_gate(1);
+        let room = gate.borrow().room.clone();
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
+        let nodes = wait_nodes(&census);
+        let list = WaitList::keyed(&nodes, Some(TEST_LIST_KEYS), &census, [7u32]).expect("list");
+        let mut queued = list.wait(7);
+        assert!(!polled(&mut queued), "engagement: one wait queued");
+        let held = nodes.pool.nodes.borrow_mut();
+        assert!(!list.is_idle(), "the count, read under the held borrow");
+        drop(held);
+        let pool = Rc::clone(&room.list.pool);
+        let held = pool.nodes.borrow_mut();
+        assert!(room.is_idle(), "the idle room, read under the held borrow");
+        wake_room(&room);
+        drop(held);
+    }
+
+    /// A wait made and dropped before its first poll takes no node and moves
+    /// no count; a wait woken and dropped unread passes its wake to the next
+    /// one, once, so the wait behind that one stays queued; 1,000 of each on
+    /// one key leave the pool empty, and a wait polled after its Ready answers
+    /// Ready again, with no node and no count.
+    #[test]
+    fn unpolled_and_unread_drops_and_a_poll_after_ready_take_no_node() {
+        const WAITS: usize = 1_000;
+        let (list, nodes) = pooled_list([7u32]);
+        for _ in 0..WAITS {
+            drop(list.wait(7));
+        }
+        assert_eq!((list.waiting(), nodes.len(), nodes.full()), (0, 0, 0), "nothing was taken");
+        let mut batons = 0;
+        for _ in 0..WAITS {
+            let mut woken = list.wait(7);
+            let mut next = list.wait(7);
+            let mut last = list.wait(7);
+            assert!(
+                !polled(&mut woken) && !polled(&mut next) && !polled(&mut last),
+                "engagement: three queued"
+            );
+            assert!(list.wake_one(7), "engagement: the head is woken");
+            drop(woken);
+            assert_eq!(list.waiting(), 1, "the baton woke one wait behind, not two");
+            batons += usize::from(polled(&mut next));
+            assert!(polled(&mut next), "a poll after Ready is Ready again");
+            drop(last);
+        }
+        assert_eq!(batons, WAITS, "each unread wake passed once");
+        assert_eq!((list.waiting(), nodes.len(), nodes.full()), (0, 0, 0), "the pool is empty");
+    }
+
+    /// A keyed list built with no map holds no key: its build with a key is
+    /// refused past a cap of none, naming the keyless row, and with none it
+    /// builds, and a wait on any key takes no node: its first poll starves
+    /// (`wait_nodes_full`) and its next is Ready with no wake, which
+    /// `starved` reads.
+    #[test]
+    fn a_keyless_list_refuses_a_key_and_starves_every_wait() {
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
+        let nodes = wait_nodes(&census);
+        let refused = WaitList::keyed(&nodes, None, &census, [1u32]).map(drop);
+        let keyless = AssemblyFull::new(crate::limits::WAIT_LIST_KEYLESS);
+        assert_eq!(refused, Err(KeysRefused::Full(keyless)), "a key past a cap of none");
+        let list = WaitList::<u32>::keyed(&nodes, None, &census, []).expect("no key builds");
+        let mut wait = list.wait(1);
+        assert!(!polled(&mut wait), "the first poll starves");
+        assert!(wait.starved(), "and says so");
+        assert_eq!((nodes.len(), nodes.full(), list.waiting()), (0, 1, 0), "no node, counted");
+        assert!(polled(&mut wait), "the next poll is Ready with no wake");
     }
 }
