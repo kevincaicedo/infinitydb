@@ -1539,11 +1539,17 @@ impl<K: ListKey> WaitList<K> {
     /// resolves when a wake reaches it; dropped while queued it unlinks in
     /// place, and dropped after an unread wake it passes the wake on, so a
     /// wake is never silently lost.
+    // Folded always: neither binary holds a body of it, so the attribute holds
+    // that place against a neighbour's attribute (ADR-0210 D1).
+    #[inline(always)]
     pub fn wait(&self, key: K) -> ListWait<K> {
         ListWait { list: Rc::clone(&self.list), key, state: ListState::Fresh }
     }
 
     /// Wakes the longest-waiting task on `key`. Returns whether one was woken.
+    // Folded always: with its head's placement moved, a bench outlined it where
+    // the server folded it; one place in both (ADR-0210 D1).
+    #[inline(always)]
     pub fn wake_one(&self, key: K) -> bool {
         // A wake that meets an idle list reads the count and leaves: no
         // borrow and no lookup.
@@ -1601,7 +1607,9 @@ impl<K: ListKey> List<K> {
     /// Unlinks and wakes `key`'s head: the waker is taken in the access that
     /// marks the node woken, and the pool's borrow ends before `wake`, so a
     /// waker that reaches the pool finds it free.
-    #[inline]
+    // A body, never folded: folding it buys no instruction and moves
+    // `wake_one`'s frame, where both benches call it (ADR-0210 D1).
+    #[inline(never)]
     fn wake_head(&self, key: K) -> bool {
         let waker = {
             let mut nodes = self.pool.nodes.borrow_mut();
@@ -1767,6 +1775,10 @@ impl<K: ListKey> ListWait<K> {
 impl<K: ListKey> Future for ListWait<K> {
     type Output = ();
 
+    // A body, never folded: about 2 KB a key type, called from every await
+    // site as both benches call it; left to the compiler, the server folded a
+    // copy into one caller the benches do not have (ADR-0210 D1).
+    #[inline(never)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = Pin::into_inner(self);
         match this.state {
