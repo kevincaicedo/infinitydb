@@ -319,10 +319,11 @@ fn several_covering_syncs_in_one_turn_wake_at_most_the_budget() {
     assert_eq!(quiet.node.plane(0).ack_waiters_for_sim(), 0, "a wait left after every ack");
 }
 
-/// EG12's schedule for one sync covering `k` waits at a budget of `b` (ADR-0177 A2.2), from
-/// the loop's step order: R, the turn that reaps the covering completion, wakes the reap's
-/// batch and the LOG step's; each later turn runs the batch the turn before it woke, writes
-/// its acks, and its LOG step wakes the next; a written ack is read the turn after.
+/// The loop's schedule for one sync covering `k` waits at a budget of `b` (ADR-0177 A2.2),
+/// derived from the loop's step order: R, the turn that reaps the covering completion, wakes
+/// the reap's batch and the LOG step's; each later turn runs the batch the turn before it
+/// woke, writes its acks, and its LOG step wakes the next; a written ack is read the turn
+/// after.
 #[derive(Clone, Copy, Debug)]
 struct Schedule {
     k: usize,
@@ -423,7 +424,7 @@ fn bound_point(schedule: Schedule) -> BoundRead {
             let (got, acks) = (read.waiting, read.acks);
             failed.push(format!(
                 "wakes-schedule: ({k}, {b}) turn {turn} read {got} queued and {acks} acks, \
-                 where EG12 has {waiting} and {held}"
+                 where the schedule has {waiting} and {held}"
             ));
         }
     }
@@ -452,17 +453,18 @@ fn bound_point(schedule: Schedule) -> BoundRead {
     }
 }
 
-/// More covered acks than one budget leave a batch a turn, and a cell owing a wake never
-/// parks (ADR-0177 A2.2; EG11, EG12): the bound row at (9, 2) and (9, 4), `b` not dividing
-/// `k`, and at (8, 4), `b` dividing it, each against EG12's one function of (k, b). Oracle:
-/// after every turn from the lift, `waiting()` and the acks the client holds as EG12 has them
+/// More covered acks than one budget leave a batch a turn, as the loop's schedule has them,
+/// and a cell owing a wake never parks, since it has a ready task at its idle decision
+/// (ADR-0177 A2.2): the bound row at (9, 2) and (9, 4), `b` not dividing `k`, and at (8, 4),
+/// `b` dividing it, each against `Schedule`, the one function of (k, b). Oracle: after every
+/// turn from the lift, `waiting()` and the acks the client holds as the schedule has them
 /// (`wakes-schedule`), and no turn parked while the turn before it left the gate owing
 /// (`parked-owing`), by the park instrument and `owes()` between steps; every point's failed
 /// clauses in one assertion, read before any engagement. Engagement, else its `VACUOUS`
 /// line: one sync covered all k (`one-sync-unread`), a turn read owing and the LOG steps that
-/// left wakes owed as EG12 counts them (`owing-turn-unread`). Control: the cell parks once
-/// the last ack is read, so the instrument reads a park in this run. R is the device's, and
-/// judges nothing: D, its turns from the lift, is printed.
+/// left wakes owed as the schedule counts them (`owing-turn-unread`). Control: the cell parks
+/// once the last ack is read, so the instrument reads a park in this run. R is the device's,
+/// and judges nothing: D, its turns from the lift, is printed.
 #[test]
 fn acks_past_the_budget_follow_the_loops_schedule_and_an_owing_cell_never_parks() {
     let points = [Schedule { k: 9, b: 2 }, Schedule { k: 9, b: 4 }, Schedule { k: 8, b: 4 }];
@@ -481,7 +483,7 @@ fn acks_past_the_budget_follow_the_loops_schedule_and_an_owing_cell_never_parks(
         assert!(
             read.owing_turns > 0 && read.deferred == expected,
             "VACUOUS owing-turn-unread: ({k}, {b}) read {} turns owing and {} LOG steps that \
-             left wakes owed, where EG12 counts {expected}",
+             left wakes owed, where the schedule counts {expected}",
             read.owing_turns,
             read.deferred
         );
