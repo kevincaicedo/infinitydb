@@ -2050,11 +2050,22 @@ mod covered {
     #[derive(Clone, Copy)]
     pub(super) struct Covered(());
 
+    /// The compare's two sides by name: both are LSNs, and swapped, the compare would answer
+    /// covered for a wait above the watermark.
+    #[derive(Clone, Copy)]
+    pub(super) struct WatermarkCompare {
+        /// The LSN the wait waits for.
+        pub(super) lsn: u64,
+        /// The gate's watermark at the compare.
+        pub(super) watermark: u64,
+    }
+
     impl Covered {
         /// The compare: `lsn` at or below `watermark`, inclusive, with no `+ 1`.
         // Inlined always, as each of the gate's own steps is: one caller's frame each.
         #[inline(always)]
-        pub(super) fn by_watermark(lsn: u64, watermark: u64) -> Option<Covered> {
+        pub(super) fn by_watermark(compare: WatermarkCompare) -> Option<Covered> {
+            let WatermarkCompare { lsn, watermark } = compare;
             // Canary: the compare answers covered for any LSN.
             let covered = cfg!(inf_canary_ack_wait_covered_early) || lsn <= watermark;
             covered.then_some(Covered(()))
@@ -2072,7 +2083,7 @@ mod covered {
     }
 }
 
-use covered::Covered;
+use covered::{Covered, WatermarkCompare};
 
 /// The gate's state, which its handles and its waits share.
 struct WatermarkInner {
@@ -2188,9 +2199,10 @@ impl WatermarkGate {
                 let mut heap = inner.heap.borrow_mut();
                 let mut nodes = inner.nodes.pool.nodes.borrow_mut();
                 let watermark = inner.watermark.get();
-                let covered = heap
-                    .peek()
-                    .filter(|entry| Covered::by_watermark(entry.lsn, watermark).is_some());
+                let covered = heap.peek().filter(|entry| {
+                    let compare = WatermarkCompare { lsn: entry.lsn, watermark };
+                    Covered::by_watermark(compare).is_some()
+                });
                 let Some(entry) = covered else {
                     inner.owed.set(false);
                     return woken;
@@ -2300,7 +2312,8 @@ impl WatermarkWait {
     #[inline(always)]
     fn poll_first(&mut self, lsn: u64, cx: &mut Context<'_>) -> Poll<Covered> {
         let inner = &*self.gate.inner;
-        if let Some(covered) = Covered::by_watermark(lsn, inner.watermark.get()) {
+        let compare = WatermarkCompare { lsn, watermark: inner.watermark.get() };
+        if let Some(covered) = Covered::by_watermark(compare) {
             return Poll::Ready(covered);
         }
         // The clone runs before either borrow, so nothing of the gate is live across a

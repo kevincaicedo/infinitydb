@@ -98,10 +98,18 @@ fn shuffle<V>(items: &mut [V], seed: u64) {
     }
 }
 
-/// Wait `id`'s LSN in a case of `n`: 10, 20, … and the last at `u64::MAX`, so an advance can
-/// land below every wait, at one, between two and on the largest LSN there is.
-fn lsn_of(id: u32, n: u32) -> u64 {
-    if id + 1 == n { u64::MAX } else { 10 * (u64::from(id) + 1) }
+/// A wait of a case: its id and the case's count of waits, by name, since both are `u32`.
+#[derive(Clone, Copy)]
+struct CaseWait {
+    id: u32,
+    count: u32,
+}
+
+/// A wait's LSN in its case: 10, 20, … and the last at `u64::MAX`, so an advance can land
+/// below every wait, at one, between two and on the largest LSN there is.
+fn lsn_of(wait: CaseWait) -> u64 {
+    let CaseWait { id, count } = wait;
+    if id + 1 == count { u64::MAX } else { 10 * (u64::from(id) + 1) }
 }
 
 /// A call's budget against `c`, the waits its advance covers: the limit's edges, each at
@@ -142,7 +150,7 @@ fn run_case(n: u32, order: Order, budget: Budget) {
     let mut waits: BTreeMap<u32, WatermarkWait> = BTreeMap::new();
     let mut queued: BTreeMap<u64, u32> = BTreeMap::new();
     for id in ordered(n, order) {
-        let lsn = lsn_of(id, n);
+        let lsn = lsn_of(CaseWait { id, count: n });
         let mut wait = gate.wait_for(lsn);
         assert_eq!(poll(&mut wait, id), Poll::Pending, "{name}: wait {id} above the watermark");
         waits.insert(id, wait);
