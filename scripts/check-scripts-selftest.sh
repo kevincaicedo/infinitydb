@@ -5682,6 +5682,17 @@ for dir in "$root/crates/fake/target" "$root/crates/fake/src/out"; do
 done
 expect green "lint-scopes: a directory holding CACHEDIR.TAG is left out, whatever its name" \
     ls_run "$root"
+# A walk that fails fails the audit, never a shorter audit: a directory under crates/ that
+# the walk cannot read is the scope error.
+if [ "$(id -u)" -ne 0 ]; then
+root=$(ls_root ls-unreadable)
+mkdir -p "$root/crates/fake/src/locked"
+printf '%s\n' "$ls_fs_allow" >"$root/crates/fake/src/locked/bad.rs"
+fx_lock "$root/crates/fake/src/locked"
+expect_red_because "lint-scopes: a directory the walk cannot read fails the audit" \
+    "LINT-SCOPES SCOPE ERROR: source_files" ls_run "$root"
+fx_unlock
+fi
 }
 
 group_lint_scopes_table() {
