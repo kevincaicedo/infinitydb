@@ -130,7 +130,8 @@ impl Arena {
 > (an erased class id, no `Closed`), but for `ExecutorProgress`, which is
 > not built: `run_ready` returns one count, the ready entries it took,
 > polls and reclaims together, each charged against the slice budget. The
-> gate part is not built, and the gate signatures below are the old shape.
+> gate part is built as the same note amends it; `IoGate` takes no
+> cleanup parameter: its fixed cleanup is the default, `DropValue`.
 
 > **Accepted 2026-09-22, implementation open — ADR-0151:** fixed storage
 > and bounded cell maps narrows `KeyedGate` keys to the runtime's sealed,
@@ -167,9 +168,12 @@ impl Arena {
 > pool; `WaitList`'s keys, FIFO, `wake_one`, `wake_all` and baton are
 > unchanged, and no type joins the suspension primitives sketched below.
 > No wire, durable or token layout changes. Built: D2's task classes,
-> `reserve`'s four answers, `wake(TaskId)` and `park()`, and D7's
-> generation policy for task slots. Of D5, the wait lists are built. A
-> cell builds one `WaitNodes` pool before it serves: `T` nodes,
+> `reserve`'s four answers, `wake(TaskId)` and `park()`; D4's fabric gate,
+> with its units, minted keys and orphaned holders, and the keyed gates'
+> holds, `has_waiter` deleted; and D7's generation policies. A keyed
+> gate's key is a `GateKey`, its exact `u64` word: `u64`,
+> `CompletionToken` or the cold gate's `LogicalId`. Of D5, the wait lists
+> are built. A cell builds one `WaitNodes` pool before it serves: `T` nodes,
 > one for each task slot of its classes, on its census (row
 > `wait-nodes`), and each of its `WaitList`s takes the pool at its
 > constructor. A wait takes its node at its first poll, not at
@@ -185,9 +189,9 @@ impl Arena {
 > `INFO tripwires`, wakes its task and is Ready at its next poll with no
 > wake landed: `ListWait::starved()` says so, and a caller that counts
 > on a wake waits again. `WatermarkGate` on the pool is not yet built. The
-> executor's lines below, `park()`'s, `WaitList`'s and `WaitNodes`' are as
-> built; the other old signatures below do not establish that the
-> replacement is built.
+> executor's and the gate module's lines below are as built but
+> `WatermarkGate`'s, which does not establish that the replacement is
+> built.
 
 > **Accepted 2026-11-20, implementation open — ADR-0177 A2:**
 > `WatermarkGate`'s wake is budgeted. `advance(lsn)` moves the watermark
@@ -329,7 +333,9 @@ impl Arena {
 > below). The driver contract is untouched: a merged read is one ordinary `TierRead` whose
 > window fits one pool buffer (the `ReadFixed` upgrade applies only to a
 > registered pool).
-> `KeyedGate` gains `has_waiter` (drain-side stale-intent skip). No
+> `KeyedGate` gained `has_waiter` (drain-side stale-intent skip);
+> `waiting(&GateHold)`, asked through the queued intent's hold, has
+> replaced it (ADR-0177 D4, above). No
 > `IoOp`/`CompletionResult`/`TokenClass` layout change.
 >
 > **Amended 2026-09-30 (ADR-0167 D3):** `enqueue`
@@ -539,9 +545,18 @@ impl<F: Future<Output = ()> + 'static> TaskPermit<'_, F> {
 }
 pub fn park() -> Park;      // a leaf future: suspends once, stores no waker, woken by wake(id)
 // Suspension primitives (typed, the only ways to suspend: the `gate` module and park() above):
-pub struct KeyedGate<K, V>;        // single-waiter primitive; complete() may precede first poll
-pub type FabricGate<V> = KeyedGate<u64, V>;   // token-keyed; V = fabric reply payload
-                                              // (inf-fabric is ABOVE this crate in the DAG)
+// A gate's holders are fixed at its build; a value no waiter takes goes to its fixed Cleanup,
+// and complete() answers Delivered or Orphan. One waiter a key; complete() may precede first poll.
+pub struct KeyedGate<K: GateKey, V, C: Cleanup<V> = DropValue>;  // the caller's key (ADR-0177 D4)
+    // build(cap, &census): routes and holders of cap; reserve(key) -> Granted(permit) | Duplicate
+    // | Full; permit.register() -> wait, or register_held() -> (wait, GateHold); waiting(&hold);
+    // release(hold); complete(key, value)
+pub struct FabricGate<V, C: Cleanup<V> = DropValue>;  // mints its key; V = fabric reply payload
+    // build(origin, units_max, holders, &census, &nodes); units(n) -> Option<GateUnits>;
+    // reserve(&units) -> Granted(permit) | NoUnit | Full; permit.key() is the request's
+    // FabricToken word; permit.register(&gate, sent) -> GateWait; complete(&gate, key, value,
+    // now); a wait dropped before its value leaves its holder Orphaned until the reply
+    // (inf-fabric is ABOVE this crate in the DAG)
 pub type IoGate = KeyedGate<CompletionToken, CompletionResult>;  // M7 seam, exists at M0
 pub struct WaitList<K: ListKey>;   // key-keyed FIFO; wake_one/wake_all; baton-pass on drop;
                                    // unit(&nodes) or keyed(&nodes, cap, &census, keys)
