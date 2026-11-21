@@ -380,11 +380,11 @@ struct BoundRead {
     control_parks: usize,
 }
 
-/// The bound row at `(k, b)`: `k` writers under one held barrier on `Quiet`'s seed at
-/// `spin_iters: 0`, where an idle cell parks at once; the lift, then each turn read to R and
-/// `⌈k / b⌉ + 2` turns past it. The clauses are collected, never asserted here.
-fn bound_point(k: usize, b: usize) -> BoundRead {
-    let schedule = Schedule { k, b };
+/// The bound row at `schedule`'s (k, b): `k` writers under one held barrier on `Quiet`'s seed
+/// at `spin_iters: 0`, where an idle cell parks at once; the lift, then each turn read to R
+/// and `⌈k / b⌉ + 2` turns past it. The clauses are collected, never asserted here.
+fn bound_point(schedule: Schedule) -> BoundRead {
+    let Schedule { k, b } = schedule;
     let boot = QuietBoot { seed: 0xC0FFEE, cells: 1, spin_iters: 0, watched: 0, wakes: wakes(b) };
     let (mut quiet, mut writers) = held_writers(boot, k);
     let start = stats(&quiet);
@@ -465,8 +465,8 @@ fn bound_point(k: usize, b: usize) -> BoundRead {
 /// judges nothing: D, its turns from the lift, is printed.
 #[test]
 fn acks_past_the_budget_follow_the_loops_schedule_and_an_owing_cell_never_parks() {
-    let reads: Vec<BoundRead> =
-        [(9, 2), (9, 4), (8, 4)].into_iter().map(|(k, b)| bound_point(k, b)).collect();
+    let points = [Schedule { k: 9, b: 2 }, Schedule { k: 9, b: 4 }, Schedule { k: 8, b: 4 }];
+    let reads: Vec<BoundRead> = points.into_iter().map(bound_point).collect();
     let failed: Vec<&str> =
         reads.iter().flat_map(|read| read.failed.iter().map(String::as_str)).collect();
     assert!(failed.is_empty(), "{} clauses failed: {}", failed.len(), failed.join("; "));
