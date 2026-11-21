@@ -546,6 +546,31 @@ expect green "fx_unlock: the path outside the work directory keeps its mode" \
     test ! -r "$work/fx-outside"
 fx_unlock
 fi
+# A path holding a `..` component leaves $work whatever its prefix: fx_lock, fx_unlock and fx_git
+# refuse it, and the file outside keeps its mode (the lib sourced alone, its work directory
+# beside that file).
+mkdir -p "$work/fx-dot/in"
+git init -q "$work/fx-dot/repo"
+: >"$work/fx-dot/outside"
+expect_red_because "fx_lock: a path holding a .. component is refused" \
+    "fx_lock: '$work/fx-dot/in/../outside' is not a fixture path under" \
+    bash -c '. "$1"; work=$2; fx_lock "$3"' fx "$SCRIPT_DIR/selftest-lib.sh" "$work/fx-dot/in" \
+    "$work/fx-dot/in/../outside"
+expect_red_because "fx_git: a root holding a .. component is refused" \
+    "fx_git: '$work/fx-dot/in/../repo' is not a fixture directory under" \
+    bash -c '. "$1"; work=$2; fx_git "$3" status' fx "$SCRIPT_DIR/selftest-lib.sh" \
+    "$work/fx-dot/in" "$work/fx-dot/in/../repo"
+if [ "$(id -u)" -ne 0 ]; then
+expect green "fx_lock: the file outside a refused .. path keeps its mode" test -r "$work/fx-dot/outside"
+fx_lock "$work/fx-dot/outside"
+expect_output "fx_unlock: a recorded path holding a .. component is named, not unlocked" \
+    "fx_unlock: '$work/fx-dot/in/../outside' is not a fixture path under" \
+    bash -c '. "$1"; work=$2; FX_LOCKED="$3"; fx_unlock' fx "$SCRIPT_DIR/selftest-lib.sh" \
+    "$work/fx-dot/in" "$work/fx-dot/in/../outside"
+expect green "fx_unlock: the file outside a refused .. path keeps its mode" \
+    test ! -r "$work/fx-dot/outside"
+fx_unlock
+fi
 }
 
 group_stage() {
