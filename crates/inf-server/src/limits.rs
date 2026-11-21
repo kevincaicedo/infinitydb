@@ -831,8 +831,10 @@ mod tests {
     /// The `.rs` files under `trees` but `aside`, sorted, walked with a stack of directories,
     /// and how many times the walk met `aside`. A directory is a build's output, and skipped,
     /// only when it holds `CACHEDIR.TAG`, the cache-directory tag Cargo writes at the root of
-    /// each target directory it makes; a name never skips one, so a source directory named
-    /// `target` at any depth is read.
+    /// each target directory it makes, as a regular file: a link of that name tags nothing, as
+    /// `find -type f` reads it in `scripts/source-files.sh`, whose rule this walk keeps itself
+    /// because the test has no shell in its path. A name never skips a directory, so a source
+    /// directory named `target` at any depth is read.
     #[allow(clippy::disallowed_methods, reason = "test-only: reads each directory's cache tag")]
     fn rust_sources(
         mut trees: Vec<std::path::PathBuf>,
@@ -842,7 +844,8 @@ mod tests {
         while let Some(dir) = trees.pop() {
             for (path, is_dir) in listed(&dir) {
                 if is_dir {
-                    if !path.join("CACHEDIR.TAG").is_file() {
+                    let tag = std::fs::symlink_metadata(path.join("CACHEDIR.TAG"));
+                    if !tag.is_ok_and(|tag| tag.file_type().is_file()) {
                         trees.push(path);
                     }
                 } else if path == aside {
@@ -858,9 +861,10 @@ mod tests {
 
     /// The walk's build-output rule, on a scratch tree: a directory named `target` that holds
     /// no `CACHEDIR.TAG` is read, so its source is met; one named `target` that holds the tag,
-    /// and one under another name that holds it, are skipped, so neither's source is; the
-    /// `aside` file is met once and left out. A rule that skips by the name `target` leaves the
-    /// untagged directory's source unread, and this test red.
+    /// and one under another name that holds it, are skipped, so neither's source is; one whose
+    /// `CACHEDIR.TAG` is a link to a tag is read, since a link tags nothing; the `aside` file is
+    /// met once and left out. A rule that skips by the name `target` leaves the untagged
+    /// directory's source unread, and one that follows the link leaves the linked one's.
     #[test]
     #[allow(clippy::disallowed_methods, reason = "test-only: builds the walk's scratch tree")]
     fn the_tie_walk_skips_a_tagged_directory_and_reads_an_untagged_target() {
@@ -869,17 +873,19 @@ mod tests {
         let member = root.join("member");
         let untagged = member.join("target");
         let (tagged, tagged_other) = (member.join("nested/target"), member.join("out"));
-        for dir in [&untagged, &tagged, &tagged_other] {
+        let linked = member.join("linked");
+        for dir in [&untagged, &tagged, &tagged_other, &linked] {
             std::fs::create_dir_all(dir)
                 .unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
         }
         let tag = "Signature: 8a477f597d28d172789f06886806bc55\n";
-        let read = untagged.join("read.rs");
+        let (read, read_linked) = (untagged.join("read.rs"), linked.join("read.rs"));
         let aside = member.join("aside.rs");
         let files = [
             (tagged.join("CACHEDIR.TAG"), tag),
             (tagged_other.join("CACHEDIR.TAG"), tag),
             (read.clone(), ""),
+            (read_linked.clone(), ""),
             (tagged.join("skipped.rs"), ""),
             (tagged_other.join("skipped.rs"), ""),
             (aside.clone(), ""),
@@ -888,9 +894,12 @@ mod tests {
             std::fs::write(file, contents)
                 .unwrap_or_else(|error| panic!("{}: {error}", file.display()));
         }
+        std::os::unix::fs::symlink(tagged.join("CACHEDIR.TAG"), linked.join("CACHEDIR.TAG"))
+            .unwrap_or_else(|error| panic!("the linked tag: {error}"));
         let (sources, met) = rust_sources(vec![member], &aside);
         let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(sources, [read], "the walk's sources, where the untagged target's one alone");
+        let want = [read_linked, read];
+        assert_eq!(sources, want, "the walk's sources, where the untagged and the linked ones");
         assert_eq!(met, 1, "the walk met the aside file {met} times, where once");
     }
 
