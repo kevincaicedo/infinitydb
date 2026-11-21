@@ -88,9 +88,10 @@
 # schedules by them. A run-alone filter in none of the forms is a scope error
 # there, as a missing or unreadable config is.
 set -euo pipefail
-cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 
-exec python3 -I - "$@" <<'PY'
+INF_SCRIPT_DIR="$SCRIPT_DIR" exec python3 -I - "$@" <<'PY'
 import json
 import os
 import re
@@ -98,6 +99,9 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+
+sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
+from source_files import WalkError, listing
 
 NAME = "nextest-config"
 CONFIG = Path(".config/nextest.toml")
@@ -779,7 +783,11 @@ for path in scanned:
                 "is not read: a marker is a comment line of its own, `// nextest-<kind>: <reason>`")
 
 # ---- D4: the install step ---------------------------------------------------------
-workflows = sorted(Path(".github/workflows").glob("*.y*ml"))
+# A workflow directory the walk cannot read is a scope error, never an empty one.
+try:
+    workflows = listing(".github/workflows", "*.y*ml") if Path(".github/workflows").is_dir() else []
+except WalkError as err:
+    scope_error(str(err))
 if not workflows:
     scope_error("no workflow under .github/workflows")
 installs = nextest_jobs = 0

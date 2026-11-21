@@ -39,6 +39,8 @@ cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 ARMING="$SCRIPT_DIR/fault-arming.awk"
 STRIP="$SCRIPT_DIR/strip-test-modules.awk"
 [ -f "$ARMING" ] && [ -f "$STRIP" ] || { echo "FAULT SCOPE ERROR: helper awk missing next to $0"; exit 2; }
+# shellcheck source=source-files.sh
+. "$SCRIPT_DIR/source-files.sh"
 
 work=$(mktemp -d)
 [ -n "$work" ] && [ -d "$work" ] || { echo "FAULT SCOPE ERROR: mktemp failed"; exit 2; }
@@ -46,11 +48,41 @@ trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
 
 fail=0
 
+# Every listing is read whole before its loop, so a walk that fails fails the gate: the crate
+# directories (tree_dirs, which fails on one it cannot search), each directory's files, and each
+# file a grep reads.
+# dirs_of <sub> <top>: sets `dirs` to the directories tree_dirs lists, or fails the gate.
+dirs_of() {
+    dirs=$(tree_dirs "$1" "$2") || {
+        echo "FAULT SCOPE ERROR: the directories under $2/ are unknown (scripts/source-files.sh, above)"
+        exit 2
+    }
+}
+# files_of <dir>: sets `listing` to the .rs files under <dir>, sorted, or fails the gate.
+files_of() {
+    listing=$(find "$1" -name '*.rs' | sort) || {
+        echo "FAULT SCOPE ERROR: the walk of $1 failed, so its files are unread"
+        exit 2
+    }
+}
+# names <pattern> <file>: grep -q, where a file grep cannot read (its status 2) fails the gate
+# instead of reading as a file that does not name the pattern.
+names() {
+    local status=0
+    grep -q "$1" "$2" || status=$?
+    case $status in
+    0 | 1) return "$status" ;;
+    *) echo "FAULT SCOPE ERROR: $2 cannot be read, so it is unscanned"; exit 2 ;;
+    esac
+}
+dirs_of src crates
+src_dirs=$dirs
+
 # ---- 1. declaration modules, parsed exhaustively ------------------------
 DECLS=()
-for decl in crates/*/src/fault.rs; do
-    [ -e "$decl" ] && DECLS+=("$decl")
-done
+while IFS= read -r dir; do
+    [ -n "$dir" ] && [ -e "$dir/fault.rs" ] && DECLS+=("$dir/fault.rs")
+done <<<"$src_dirs"
 if [ "${#DECLS[@]}" -eq 0 ]; then
     echo "FAULT SCOPE ERROR: no declaration modules found (crates/*/src/fault.rs) from $(pwd)"
     exit 1
@@ -127,15 +159,17 @@ done
 # would be a simulator prop, not a product fault point.
 prod_files=0
 : >"$work/fired"
-for dir in crates/*/src; do
-    [ -d "$dir" ] || continue
+while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    files_of "$dir"
     while IFS= read -r f; do
+        [ -n "$f" ] || continue
         case "$f" in */src/fault.rs) continue ;; esac
-        grep -q 'fault::' "$f" || continue
+        names 'fault::' "$f" || continue
         prod_files=$((prod_files + 1))
         awk -f "$STRIP" "$f" | awk -f "$ARMING" | awk '$1=="FIRE"{print $3}' >>"$work/fired"
-    done < <(find "$dir" -name '*.rs' | sort)
-done
+    done <<<"$listing"
+done <<<"$src_dirs"
 
 # Exercisers: crate tests trees, workspace test crates, the DST scenarios,
 # and the test-only modules inside crate sources.
@@ -144,24 +178,37 @@ exer_files=0
 scan_arm() { # <file> <zone>
     awk -f "$ARMING" "$1" | awk -v z="$2" '$1=="ARM"{print $3 " " z}' >>"$work/armed"
 }
-for dir in crates/*/tests tests/*/src tests/*/tests bins/inf-sim/src; do
-    [ -d "$dir" ] || continue
+dirs_of tests crates
+exer_dirs=$dirs
+dirs_of src tests
+exer_dirs="$exer_dirs
+$dirs"
+dirs_of tests tests
+exer_dirs="$exer_dirs
+$dirs
+bins/inf-sim/src"
+while IFS= read -r dir; do
+    [ -n "$dir" ] && [ -d "$dir" ] || continue
     zone=$(printf '%s' "$dir" | sed 's|^bins/inf-sim/src$|dst|; s|^crates/.*/tests$|crate-tests|; s|^tests/.*|workspace-tests|')
+    files_of "$dir"
     while IFS= read -r f; do
-        grep -q 'fault' "$f" || continue
+        [ -n "$f" ] || continue
+        names 'fault' "$f" || continue
         exer_files=$((exer_files + 1))
         scan_arm "$f" "$zone"
-    done < <(find "$dir" -name '*.rs' | sort)
-done
-for dir in crates/*/src; do
-    [ -d "$dir" ] || continue
+    done <<<"$listing"
+done <<<"$exer_dirs"
+while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    files_of "$dir"
     while IFS= read -r f; do
-        grep -q 'fault::arm' "$f" || continue
+        [ -n "$f" ] || continue
+        names 'fault::arm' "$f" || continue
         exer_files=$((exer_files + 1))
         awk -v mode=testonly -f "$STRIP" "$f" >"$work/testonly.rs"
         scan_arm "$work/testonly.rs" "unit-tests"
-    done < <(find "$dir" -name '*.rs' | sort)
-done
+    done <<<"$listing"
+done <<<"$src_dirs"
 sort -u "$work/armed" -o "$work/armed"
 sort -u "$work/fired" -o "$work/fired"
 

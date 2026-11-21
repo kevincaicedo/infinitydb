@@ -27,6 +27,9 @@ class GateFixtures(unittest.TestCase):
             # Confine the pre-fix gate's shared path to this fixture.
             source = source.replace("/tmp/inf-metadata.json", str(self.root / "legacy-metadata.json"))
             self.write(f"scripts/{name}", source)
+        # The inventory's walk (scripts/source_files.py) beside the gate copy, as in the tree.
+        for name in ["source_files.py", "source-files.sh"]:
+            shutil.copy(SCRIPTS / name, self.root / "scripts" / name)
         self.env = dict(os.environ, INF_CHECK_ROOT=str(self.root))
 
     def write(self, name, text):

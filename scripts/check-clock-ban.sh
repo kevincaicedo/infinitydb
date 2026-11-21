@@ -54,11 +54,22 @@ fi
 
 # ---- 2. no shadow config ------------------------------------------------
 shadows=0
-for cfg in crates/*/clippy.toml crates/*/.clippy.toml bins/*/clippy.toml bins/*/.clippy.toml tests/*/clippy.toml tests/*/.clippy.toml; do
-    [ -e "$cfg" ] || continue
-    echo "CLOCK-BAN violation: $cfg shadows the workspace clippy.toml (clippy stops at the nearest config — every ban vanishes for that crate)"
-    shadows=$((shadows + 1))
-    fail=1
+# Each top's crate directories come from tree_dirs (scripts/source-files.sh), which fails on one
+# it cannot search: a shadow config inside it would go unseen.
+for top in crates bins tests; do
+    crate_dirs=$(tree_dirs . "$top") || {
+        echo "CLOCK-BAN SCOPE ERROR: the directories under $top/ are unknown (scripts/source-files.sh, above)"
+        exit 2
+    }
+    for name in clippy.toml .clippy.toml; do
+        while IFS= read -r dir; do
+            cfg="$dir/$name"
+            [ -n "$dir" ] && [ -e "$cfg" ] || continue
+            echo "CLOCK-BAN violation: $cfg shadows the workspace clippy.toml (clippy stops at the nearest config — every ban vanishes for that crate)"
+            shadows=$((shadows + 1))
+            fail=1
+        done <<<"$crate_dirs"
+    done
 done
 
 # ---- 3. source membership; the sole allow audit is check-lint-scopes.sh ----

@@ -6,19 +6,34 @@
 # the tree — so a file over the bar splits into a subfolder, never into a
 # smaller test module.
 #
-# Scope: crates/*/src and bins/*/src. A missing directory or an empty file
-# set is a failure, not a skip (ADR-0106 D2).
+# Scope: crates/*/src and bins/*/src. A missing directory, an empty file
+# set or a directory the walk cannot read (scripts/source_files.py) is a
+# failure, not a skip (ADR-0106 D2).
 
 set -euo pipefail
-STRIP="${INF_STRIP_AWK:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/strip-test-modules.awk}"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+STRIP="${INF_STRIP_AWK:-$SCRIPT_DIR/strip-test-modules.awk}"
 cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
 LIMIT="${INF_FILE_LINES_MAX:-3000}"
 
-INF_STRIP_AWK="$STRIP" INF_FILE_LINES_MAX="$LIMIT" python3 - <<'PY'
+INF_SCRIPT_DIR="$SCRIPT_DIR" INF_STRIP_AWK="$STRIP" INF_FILE_LINES_MAX="$LIMIT" python3 - <<'PY'
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
+from source_files import WalkError, subdirectories, tree_listing
+
+
+def walked(listed, *args):
+    """A walk's listing, or the scope error: a directory the walk cannot read fails the gate."""
+    try:
+        return listed(*args)
+    except WalkError as err:
+        print(f"FILE-LENGTH SCOPE ERROR: {err}")
+        sys.exit(2)
+
 
 strip = os.environ["INF_STRIP_AWK"]
 limit = int(os.environ["INF_FILE_LINES_MAX"])
@@ -30,11 +45,11 @@ for root in roots:
     if not root.is_dir():
         errors.append(f"FILE-LENGTH SCOPE: missing {root}")
         continue
-    for crate in sorted(root.iterdir()):
+    for crate in walked(subdirectories, root):
         source = crate / "src"
         if not source.is_dir():
             continue
-        rust = sorted(source.rglob("*.rs"))
+        rust = walked(tree_listing, source, "*.rs")
         if not rust:
             errors.append(f"FILE-LENGTH SCOPE: empty {source}")
             continue

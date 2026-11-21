@@ -1,5 +1,7 @@
-# source-files.sh, sourced: the rule for leaving a build's output out of a walk of the source
-# trees. Every gate script's walk that leaves a directory out as a build's output reads it, the
+# source-files.sh, sourced: the gates' walks of the source trees, each failing closed on what it
+# cannot read (below, each function's own rule); tree_dirs lists a tree's crate directories, and
+# source_files holds the rule for leaving a build's output out of a walk of the source trees.
+# Every gate script's walk that leaves a directory out as a build's output reads it, the
 # shell gates by calling source_files and the Python gates through scripts/source_files.py, so
 # each leaves out exactly the directories the others do; a walk that leaves nothing out (one
 # that reads only src/ and tests/ directories, where Cargo writes no output) has no use for it.
@@ -57,4 +59,47 @@ source_files() {
                     if (!skipped) print path[i]
                 }
             }'
+}
+
+# tree_dirs <sub> <top>...: prints <top>/<entry>/<sub> for each directory <entry> directly under
+# each <top> whose <sub> is a directory, one a line, in glob order; <sub> `.` prints each
+# <top>/<entry>. A <top> that is not a directory adds nothing. It is the one way a gate lists the
+# crate directories of a tree: a glob such as `crates/*/src` probes <sub> inside each entry, and
+# a probe inside a directory the walk cannot search reads the refusal as absence, so the entry
+# would drop out of the walk unseen. It fails closed, `SOURCE-FILES SCOPE ERROR` on stderr,
+# status 2 and nothing on stdout, on a <top> it cannot read, an entry it cannot search, or an
+# entry whose name holds a newline, which a listing of one path a line cannot carry.
+tree_dirs() {
+    local sub=$1 top entry found='' newline='
+'
+    shift
+    for top in "$@"; do
+        [ -d "$top" ] || continue
+        if [ ! -r "$top" ] || [ ! -x "$top" ]; then
+            echo "SOURCE-FILES SCOPE ERROR: $top cannot be read, so its directories are unknown" >&2
+            return 2
+        fi
+        for entry in "$top"/*/; do
+            [ -d "$entry" ] || continue
+            entry=${entry%/}
+            case $entry in
+            *"$newline"*)
+                echo "SOURCE-FILES SCOPE ERROR: a directory under $top holds a newline, which a" \
+                    "listing of one path a line cannot carry" >&2
+                return 2
+                ;;
+            esac
+            if [ ! -x "$entry" ]; then
+                echo "SOURCE-FILES SCOPE ERROR: $entry cannot be searched, so whether it holds" \
+                    "$sub is unknown" >&2
+                return 2
+            fi
+            if [ "$sub" = . ]; then
+                found="$found$entry$newline"
+            elif [ -d "$entry/$sub" ]; then
+                found="$found$entry/$sub$newline"
+            fi
+        done
+    done
+    printf '%s' "$found"
 }

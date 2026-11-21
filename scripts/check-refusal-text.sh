@@ -37,21 +37,28 @@ work=$(mktemp -d)
 [ -n "$work" ] && [ -d "$work" ] || { echo "refusal-text: mktemp failed" >&2; exit 2; }
 trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
 
+# The listing is read whole before its loops, so a walk that fails fails the gate.
+listing=$(find "$DIR" -name '*.rs' | sort) || {
+    echo "REFUSAL-TEXT SCOPE ERROR: the walk of $DIR failed, so its files are unread"
+    exit 2
+}
 testfiles=""
 while IFS= read -r f; do
+    [ -n "$f" ] || continue
     while read -r key value; do
         [ "$key" = "modfile" ] || continue
         testfiles="$testfiles
 $(dirname "$f")/$value.rs
 $(dirname "$f")/$value/mod.rs"
     done < <(awk -v mode=report -f "$STRIP" "$f")
-done < <(find "$DIR" -name '*.rs' | sort)
+done <<<"$listing"
 
 fail=0
 files=0
 lines=0
 modfiles=0
 while IFS= read -r f; do
+    [ -n "$f" ] || continue
     case "$testfiles" in *"
 $f"*)
         modfiles=$((modfiles + 1))
@@ -78,7 +85,7 @@ $f"*)
         echo "REFUSAL-TEXT violation (a refusal class suffix outside inf_wire::Refusal): $f:$row"
         fail=1
     done <<< "$out"
-done < <(find "$DIR" -name '*.rs' | sort)
+done <<<"$listing"
 
 if [ "$files" -eq 0 ]; then
     echo "REFUSAL-TEXT SCOPE ERROR: no production .rs files under $DIR"

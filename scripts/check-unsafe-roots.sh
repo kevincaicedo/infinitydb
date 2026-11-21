@@ -14,19 +14,34 @@
 # block. The compiler refuses new unsafe outside an allowed item, and
 # `check-safety-inventory.sh` refuses a named module SAFETY.md omits.
 #
-# Scope is asserted (ADR-0106): missing directories, zero roots, or a
-# crate directory without a root are failures, never skips.
+# Scope is asserted (ADR-0106): missing directories, zero roots, a crate
+# directory without a root, or a directory the walk cannot read
+# (scripts/source_files.py) are failures, never skips.
 
 set -euo pipefail
-cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 
 # The unsafe exception list (ADR-0121) — crate name → the
 # roots that carry `deny`. Overridable for the self-test's fixtures.
 LEAVES="${INF_UNSAFE_LEAVES-inf-simd inf-alloc inf-fabric inf-runtime inf-doc inf-server inf-probe inf-sim}"
 
-INF_UNSAFE_LEAVES="$LEAVES" python3 - <<'PY'
+INF_SCRIPT_DIR="$SCRIPT_DIR" INF_UNSAFE_LEAVES="$LEAVES" python3 - <<'PY'
 import os, re, sys
 from pathlib import Path
+
+sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
+from source_files import WalkError, listing, subdirectories, tree_listing
+
+
+def walked(listed, *args):
+    """A walk's listing, or the scope error: a directory the walk cannot read fails the gate."""
+    try:
+        return listed(*args)
+    except WalkError as err:
+        print(f"UNSAFE ROOTS SCOPE ERROR: {err}")
+        sys.exit(2)
+
 
 leaves = set(os.environ["INF_UNSAFE_LEAVES"].split())
 attr = re.compile(r"^\s*#!\[(forbid|deny)\(unsafe_code\)\]\s*$", re.M)
@@ -41,15 +56,15 @@ for top in [Path("crates"), Path("bins"), Path("tests")]:
     if not top.is_dir():
         errors.append(f"UNSAFE ROOTS SCOPE: missing {top}")
         continue
-    for crate in sorted(top.iterdir()):
+    for crate in walked(subdirectories, top):
         src = crate / "src"
-        if not crate.is_dir() or not (crate / "Cargo.toml").is_file():
+        if not (crate / "Cargo.toml").is_file():
             continue  # not a workspace member (a fixture's excluded dir, a scratch dir)
         if not src.is_dir():
             errors.append(f"UNSAFE ROOTS SCOPE: {crate} has a manifest and no src/")
             continue
         crate_roots = [p for p in [src / "lib.rs", src / "main.rs"] if p.is_file()]
-        crate_roots += sorted((src / "bin").glob("*.rs")) if (src / "bin").is_dir() else []
+        crate_roots += walked(listing, src / "bin", "*.rs") if (src / "bin").is_dir() else []
         if not crate_roots:
             errors.append(f"UNSAFE ROOTS SCOPE: {crate} has a manifest and no crate root")
             continue
@@ -86,7 +101,7 @@ for top in [Path("crates"), Path("bins"), Path("tests")]:
                 declared.add(m.group(3))
                 if crate.name not in leaves:
                     errors.append(f"UNSAFE ALLOW OUTSIDE THE LEAF LIST: {root}:{i + 1} (crate {crate.name})")
-        for file in sorted(src.rglob("*.rs")):
+        for file in walked(tree_listing, src, "*.rs"):
             if file in crate_roots:
                 continue
             lines = file.read_text().split("\n")
