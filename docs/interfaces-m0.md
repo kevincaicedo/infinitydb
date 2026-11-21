@@ -126,8 +126,11 @@ impl Arena {
 > slots). Failure: a construction refusal releases partial backing and
 > takes part in the all-cells boot barrier, and task-identity exhaustion
 > is a typed refusal before any effect, never a wrap (ADR-0149 D1–D3). The
-> signatures below are the implemented shape; the replacement above is not
-> built.
+> executor's replacement is built as the ADR-0177 note below amends it
+> (an erased class id, no `Closed`), but for `ExecutorProgress`, which is
+> not built: `run_ready` returns one count, the ready entries it took,
+> polls and reclaims together, each charged against the slice budget. The
+> gate part is not built, and the gate signatures below are the old shape.
 
 > **Accepted 2026-09-22, implementation open — ADR-0151:** fixed storage
 > and bounded cell maps narrows `KeyedGate` keys to the runtime's sealed,
@@ -163,8 +166,10 @@ impl Arena {
 > `WatermarkGate` take one wait node per parked task from a per-cell
 > pool; `WaitList`'s keys, FIFO, `wake_one`, `wake_all` and baton are
 > unchanged, and no type joins the suspension primitives sketched below.
-> No wire, durable or token layout changes. Of D5, the wait lists are
-> built. A cell builds one `WaitNodes` pool before it serves: `T` nodes,
+> No wire, durable or token layout changes. Built: D2's task classes,
+> `reserve`'s four answers, `wake(TaskId)` and `park()`, and D7's
+> generation policy for task slots. Of D5, the wait lists are built. A
+> cell builds one `WaitNodes` pool before it serves: `T` nodes,
 > one for each task slot of its classes, on its census (row
 > `wait-nodes`), and each of its `WaitList`s takes the pool at its
 > constructor. A wait takes its node at its first poll, not at
@@ -180,8 +185,9 @@ impl Arena {
 > `INFO tripwires`, wakes its task and is Ready at its next poll with no
 > wake landed: `ListWait::starved()` says so, and a caller that counts
 > on a wake waits again. `WatermarkGate` on the pool is not yet built. The
-> `WaitList` and `WaitNodes` lines below are as built; the other old
-> signatures below do not establish that the replacement is built.
+> executor's lines below, `park()`'s, `WaitList`'s and `WaitNodes`' are as
+> built; the other old signatures below do not establish that the
+> replacement is built.
 
 > **Accepted 2026-11-20, implementation open — ADR-0177 A2:**
 > `WatermarkGate`'s wake is budgeted. `advance(lsn)` moves the watermark
@@ -496,25 +502,43 @@ pub trait BackendDriver {
 }
 // impls: KqueueDriver (macOS dev tier) · UringDriver (linux + --features uring) · SimDriver (inf-sim)
 
-// Executor (ADR-0003 A1): !Send futures, bridge wakers (no atomics on the owner lane), slab tasks.
-// NOTE: the original sketch (`poll_immediate -> PollImmediate<F>` returning
-// the future on Pending) was unsound — a !Unpin future cannot move after its
-// first poll. The shipped shape places the future into stable storage BEFORE
-// the first poll and promotes in place; Ready still allocates nothing (reused
-// scratch buffer + recycled header, no task slot).
+// Executor (ADR-0003 A1, ADR-0177 D2): !Send futures, bridge wakers (no atomics on the owner
+// lane), one fixed slab a task class, built before the cell serves. A permit's future is placed
+// in its class's spare slot before its first poll, polled where it lies and dropped there: Ready
+// at the first poll keeps no task, and a slot a waker still names is held Retired until that
+// waker's last drop, then reclaimed by run_ready. A slot whose u64 generation is spent retires
+// for good; a class with no slot left answers Exhausted, the cell's fail-stop (ADR-0177 D7).
+pub struct ExecutorLayout;                  // a cell's classes, each slab on the cell's census
 pub struct CellExecutor;
-pub struct TaskId;                          // {slot, generation}; stale ids detectable
+pub struct TaskClass;                       // erased and Copy; reserve checks its slab's instance
+pub struct TaskId;                          // {class, slot, generation}; stale ids detectable
+pub enum TaskAdmission<'a, F> { Granted(TaskPermit<'a, F>), Full, Exhausted, Foreign }
 pub enum PollImmediate { Completed, Suspended(TaskId) }
+pub enum Woken { Queued, AlreadyRunnable, Stale }
+impl ExecutorLayout {
+    pub fn new(census: &Rc<CapCensus>) -> ExecutorLayout;
+    /// The factory is read for its future's type and never called.
+    pub fn class<Args, Fac: TaskFactory<Args>>(&mut self, factory: &Fac, cap: Cap)
+        -> Result<TaskClass, CapError>;
+    pub fn build(self) -> Result<CellExecutor, ExecutorInitError>;
+}
 impl CellExecutor {
-    pub fn new(capacity: usize) -> Self;
-    /// Fast path: poll in place once; Completed ⇒ no slot, no malloc, no waker kept.
-    pub fn poll_immediate<F: Future<Output = ()> + 'static>(&mut self, fut: F) -> PollImmediate;
-    pub fn spawn_local<F: Future<Output = ()> + 'static>(&mut self, fut: F) -> TaskId;
-    pub fn run_ready(&mut self, budget: usize) -> usize;   // tasks polled this slice
-    pub fn live_tasks(&self) -> usize;                     // slab occupancy (leak assert)
+    pub fn reserve<F: Future<Output = ()> + 'static>(&mut self, class: TaskClass)
+        -> TaskAdmission<'_, F>;
+    pub fn wake(&mut self, id: TaskId) -> Woken;          // the owner's wake, by id
+    pub fn run_ready(&mut self, budget: usize) -> usize;  // entries taken: polls and reclaims
+    pub fn has_ready(&self) -> bool;
+    pub fn live_tasks(&self) -> usize;
     pub fn is_live(&self, id: TaskId) -> bool;
 }
-// Suspension primitives (typed, the only ways to suspend — `gate` module):
+// A permit borrows its executor: used in the step that reserved it, never across an await.
+impl<F: Future<Output = ()> + 'static> TaskPermit<'_, F> {
+    /// Fast path: poll once in place; Completed ⇒ no task kept, the slot stays the spare.
+    pub fn poll_immediate(self, make: impl FnOnce() -> F) -> PollImmediate;
+    pub fn spawn_local(self, make: impl FnOnce() -> F) -> TaskId;   // polled by run_ready
+}
+pub fn park() -> Park;      // a leaf future: suspends once, stores no waker, woken by wake(id)
+// Suspension primitives (typed, the only ways to suspend: the `gate` module and park() above):
 pub struct KeyedGate<K, V>;        // single-waiter primitive; complete() may precede first poll
 pub type FabricGate<V> = KeyedGate<u64, V>;   // token-keyed; V = fabric reply payload
                                               // (inf-fabric is ABOVE this crate in the DAG)
