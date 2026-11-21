@@ -376,6 +376,9 @@ pub struct DurableStats {
     /// LOG steps that left the ack gate owing a wake (ADR-0177 A2.2): a storm's turns past its
     /// first, and at most one stale step a storm. Cell scope.
     pub ack_wakes_deferred: u64,
+    /// Durability fsync completions that covered a record: the group-formation histogram's
+    /// samples, one a covering completion. Cell scope.
+    pub fsync_groups: u64,
     pub pending_log_bytes: u64,
     pub last_durable_lsn: u64,
     pub watermark_lag_lsn: u64,
@@ -1146,6 +1149,9 @@ impl<F: SegmentFs> DurableCell<F> {
     /// among them (ADR-0177 A2.2).
     pub fn seal_log(&mut self, cx: &mut LoopCx<'_>) {
         self.ack_wakes_left = self.ack_wakes_per_turn.get() as usize;
+        // Canary: the LOG step wakes no batch, so the acks past a sync's
+        // first batch stay queued.
+        #[cfg(not(inf_canary_ack_wakes_log_batch_skipped))]
         self.wake_acks();
         self.ack_wakes_deferred += u64::from(self.ack_gate.owes());
         if self.failed {
@@ -1574,6 +1580,12 @@ impl<F: SegmentFs> DurableCell<F> {
                 self.group_round_target = self.last_seq.saturating_sub(self.acked_seq);
                 self.acked_seq = seq;
                 self.ack_gate.advance(seq);
+                // Canary: the sync's batch takes a full budget whatever the
+                // turn has left.
+                #[cfg(inf_canary_ack_wakes_allowance_ignored)]
+                {
+                    self.ack_wakes_left = self.ack_wakes_per_turn.get() as usize;
+                }
                 self.wake_acks();
             }
         }
@@ -1777,6 +1789,7 @@ impl<F: SegmentFs> DurableCell<F> {
             records_appended: self.records_appended,
             acks_gated: self.acks_gated,
             ack_wakes_deferred: self.ack_wakes_deferred,
+            fsync_groups: self.group_hist_records.count(),
             pending_log_bytes: self.commit.pending_log_bytes(),
             last_durable_lsn: durable,
             watermark_lag_lsn: queued.saturating_sub(durable),

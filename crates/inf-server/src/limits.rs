@@ -711,21 +711,19 @@ mod tests {
         assert_eq!(budget, 1_024, "the budget the limit's doc reads its batch time at");
     }
 
-    /// Every copy of the wake budget in a bench or a test: the crates below this one cannot
-    /// reach the limit, so a bench or test of theirs keeps its own `WAKE_BUDGET`. Every `.rs`
-    /// file under `benches/` and `tests/` of each package in the workspace's `crates/` and
-    /// `bins/` is read, and one that names `WAKE_BUDGET` declares it once, as a literal equal
-    /// to the limit: a copy joins the tie by its name, with no list of files to extend. A copy
-    /// that drifts, is declared twice, `pub`, commented out or not a literal is red here, and
-    /// so is a scan that finds no copy.
+    /// Every copy of the wake budget in the workspace: the crates below this one cannot reach
+    /// the limit, so a source of theirs keeps its own `WAKE_BUDGET`. Every `.rs` file of each
+    /// workspace member's tree, as the root manifest's `members` name them, is read (a build's
+    /// `target` directory and this file, whose planted strings name it, aside), and one that
+    /// names `WAKE_BUDGET` declares it once, as a literal equal to the limit: a copy joins the
+    /// tie by its name wherever it sits, a test module under `src/` among them, with no list of
+    /// files to extend. A copy that drifts, is declared twice, `pub`, commented out or not a
+    /// literal is red here, and so is a walk that finds no copy.
     #[test]
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "test-only: reads the workspace's bench and test sources"
-    )]
-    fn every_bench_and_test_copy_of_the_wake_budget_is_the_limit() {
+    #[allow(clippy::disallowed_methods, reason = "test-only: reads the workspace members' sources")]
+    fn every_copy_of_the_wake_budget_in_the_workspace_is_the_limit() {
         let limit = u64::from(ACK_WAKES_PER_TURN.get());
-        let sources = bench_and_test_sources();
+        let sources = member_sources();
         let mut copies = 0_usize;
         for path in &sources {
             let source = std::fs::read_to_string(path)
@@ -767,50 +765,81 @@ mod tests {
         source.contains("WAKE_BUDGET").then(|| declared_wake_budget(source))
     }
 
-    /// Every `.rs` file under `benches/` and `tests/` of each package in the workspace's
-    /// `crates/` and `bins/`, walked with a stack of directories, sorted. A directory that
-    /// cannot be listed fails the test, so the scan never skips a tree it was meant to read.
+    /// The workspace members the root manifest's one `members = [...]` line names: a literal
+    /// path, or a `dir/*` glob for each directory under `dir` that holds a `Cargo.toml`. Any
+    /// other glob, or no such line, fails the test, so the walk never reads less than the
+    /// workspace without saying so.
     #[allow(
         clippy::disallowed_methods,
-        clippy::disallowed_types,
-        reason = "test-only: lists the workspace's bench and test directories"
+        reason = "test-only: reads the workspace's root manifest and lists its member globs"
     )]
-    fn bench_and_test_sources() -> Vec<std::path::PathBuf> {
-        use std::path::{Path, PathBuf};
-        let listed = |dir: &Path| -> Vec<(PathBuf, bool)> {
-            let entries =
-                std::fs::read_dir(dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
-            entries
-                .map(|entry| {
-                    let entry = entry.unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
-                    let kind = entry.file_type().unwrap_or_else(|error| panic!("{error}"));
-                    (entry.path(), kind.is_dir())
-                })
-                .collect()
-        };
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut trees = Vec::new();
-        for family in ["crates", "bins"] {
-            for (package, is_dir) in listed(&root.join(family)) {
-                for tree in ["benches", "tests"] {
-                    let dir = package.join(tree);
-                    if is_dir && dir.is_dir() {
-                        trees.push(dir);
-                    }
+    fn workspace_members(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml"))
+            .unwrap_or_else(|error| panic!("the root manifest: {error}"));
+        let line = manifest
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("members = ["))
+            .expect("the root manifest's one-line `members = [...]`");
+        let globs = line.strip_suffix(']').expect("the members on one line");
+        let mut members = Vec::new();
+        for glob in globs.split(',').map(str::trim).filter(|glob| !glob.is_empty()) {
+            let glob = glob.trim_matches('"');
+            let Some(parent) = glob.strip_suffix("/*") else {
+                assert!(!glob.contains('*'), "a members glob the walk does not read: {glob}");
+                members.push(root.join(glob));
+                continue;
+            };
+            for (path, is_dir) in listed(&root.join(parent)) {
+                if is_dir && path.join("Cargo.toml").is_file() {
+                    members.push(path);
                 }
             }
         }
-        assert!(!trees.is_empty(), "no bench or test directory under {}", root.display());
-        let mut files = Vec::new();
+        assert!(!members.is_empty(), "the root manifest names no member");
+        members
+    }
+
+    /// Each entry of `dir` and whether it is a directory; a directory that cannot be listed
+    /// fails the test.
+    #[allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "test-only: lists the workspace members' directories"
+    )]
+    fn listed(dir: &std::path::Path) -> Vec<(std::path::PathBuf, bool)> {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+        entries
+            .map(|entry| {
+                let entry = entry.unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+                let kind = entry.file_type().unwrap_or_else(|error| panic!("{error}"));
+                (entry.path(), kind.is_dir())
+            })
+            .collect()
+    }
+
+    /// Every `.rs` file of each workspace member's whole tree, walked with a stack of
+    /// directories and sorted: a `target` directory, a build's output, aside, and this file,
+    /// whose planted strings name the budget, which the walk must meet exactly once.
+    fn member_sources() -> Vec<std::path::PathBuf> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let this_file = root.join(file!());
+        let mut trees = workspace_members(&root);
+        let (mut files, mut skipped) = (Vec::new(), 0);
         while let Some(dir) = trees.pop() {
             for (path, is_dir) in listed(&dir) {
                 if is_dir {
-                    trees.push(path);
+                    if path.file_name().is_none_or(|name| name != "target") {
+                        trees.push(path);
+                    }
+                } else if path == this_file {
+                    skipped += 1;
                 } else if path.extension().is_some_and(|extension| extension == "rs") {
                     files.push(path);
                 }
             }
         }
+        assert_eq!(skipped, 1, "the walk met {} {skipped} times, where once", this_file.display());
         files.sort();
         files
     }

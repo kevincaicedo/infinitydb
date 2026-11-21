@@ -39,6 +39,18 @@ const SEED: u64 = 0xC0FFEE;
 /// Scheduler steps a wait may take before the test calls it stalled.
 pub(super) const STEPS_MAX: u32 = 20_000;
 
+/// How a [`Quiet`] node boots: named, so no call site passes five positional values.
+pub(super) struct QuietBoot {
+    /// The scenario's, the disk's and the scheduler's seed.
+    pub(super) seed: u64,
+    pub(super) cells: u16,
+    pub(super) spin_iters: u32,
+    /// The cell whose reactor the instrument reads.
+    pub(super) watched: u16,
+    /// The durable cells' ack wakes between two LOG steps (ADR-0177 A2.1).
+    pub(super) wakes: core::num::NonZeroU32,
+}
+
 /// A quiet durable node: recovered, no writers, one client per test.
 pub(super) struct Quiet {
     pub(super) node: Node,
@@ -55,17 +67,31 @@ pub(super) struct Quiet {
 }
 
 impl Quiet {
-    /// Boots a `cells`-cell node and watches cell `watched`.
+    /// Boots a `cells`-cell node and watches cell `watched`, at the instrument's seed and the
+    /// node's wake budget.
     pub(super) fn boot(cells: u16, spin_iters: u32, watched: u16) -> Quiet {
+        let wakes = inf_server::limits::ACK_WAKES_PER_TURN;
+        Quiet::boot_with(QuietBoot { seed: SEED, cells, spin_iters, watched, wakes })
+    }
+
+    /// Boots the node `options` name: its seed's scenario, disk and scheduler, its durable
+    /// cells waking at most `wakes` acks between two LOG steps.
+    pub(super) fn boot_with(options: QuietBoot) -> Quiet {
+        let QuietBoot { seed, cells, spin_iters, watched, wakes } = options;
         assert!(watched < cells, "the watched cell is on the node");
         let clock = Rc::new(VirtualClock::new(Nanos(1)));
-        let disk = build_disk(SEED, Some(&StallConfig::write_reorder()));
-        let scenario = DurableScenario { cells, spin_iters, ..DurableScenario::m2_durable(SEED) };
+        let disk = build_disk(seed, Some(&StallConfig::write_reorder()));
+        let scenario = DurableScenario {
+            cells,
+            spin_iters,
+            ack_wakes_per_turn: wakes,
+            ..DurableScenario::m2_durable(seed)
+        };
         let observer = TraceObserver::default();
         let node = boot(&scenario, PathBuf::from("node"), &disk, &clock, &observer).expect("boot");
         let mut quiet = Quiet {
             node,
-            rng: SplitMix64::new(SEED),
+            rng: SplitMix64::new(seed),
             clock,
             disk,
             step_ns_max: scenario.step_ns_max,

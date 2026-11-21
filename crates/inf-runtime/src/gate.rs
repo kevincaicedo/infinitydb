@@ -2088,6 +2088,29 @@ struct WatermarkInner {
     nodes: WaitNodes,
 }
 
+impl WatermarkInner {
+    /// The heap's entries: the queued waits, covered ones not yet woken among them.
+    #[inline]
+    fn waiting(&self) -> usize {
+        self.heap.borrow().len() as usize
+    }
+}
+
+/// A watermark gate's count, read-only ([`WatermarkGate::waiting_view`]): it holds the gate's
+/// state alive and answers [`waiting`](Self::waiting) alone.
+pub struct WaitingView {
+    inner: Rc<WatermarkInner>,
+}
+
+impl WaitingView {
+    /// Waits queued on the gate, as [`WatermarkGate::waiting`] reads them.
+    #[must_use]
+    #[inline]
+    pub fn waiting(&self) -> usize {
+        self.inner.waiting()
+    }
+}
+
 /// The durability watermark's gate (ADR-0177 D5 with A2): a task waits for the watermark to
 /// reach its LSN. A wait at or below the watermark is Ready at its first poll, with no node
 /// and no borrow; one above it takes a node of the pool and an entry of the gate's minimum
@@ -2210,7 +2233,16 @@ impl WatermarkGate {
     #[must_use]
     #[inline]
     pub fn waiting(&self) -> usize {
-        self.inner.heap.borrow().len() as usize
+        self.inner.waiting()
+    }
+
+    /// A read-only view of the gate's count, which keeps the gate's state alive past every
+    /// handle and every wait: a test reads through it what a teardown left queued. It can
+    /// wake, advance and wait on nothing.
+    #[must_use]
+    #[inline]
+    pub fn waiting_view(&self) -> WaitingView {
+        WaitingView { inner: Rc::clone(&self.inner) }
     }
 
     /// The heap's hook: an entry a sift places at `index` has its node's position stored,

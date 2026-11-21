@@ -78,6 +78,8 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_ack_wait_drop_keeps_entry)',
     'cfg(inf_canary_ack_wait_no_position)',
     'cfg(inf_canary_ack_wait_no_sift)',
+    'cfg(inf_canary_ack_wakes_allowance_ignored)',
+    'cfg(inf_canary_ack_wakes_log_batch_skipped)',
     'cfg(inf_canary_alias_blind)',
     'cfg(inf_canary_alias_no_rehash)',
     'cfg(inf_canary_barrier_hold_standalone_only)',

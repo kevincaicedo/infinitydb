@@ -1797,6 +1797,20 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.shared.durable.borrow().as_ref().map_or(0, |cell| cell.ack_gate.waiting())
     }
 
+    /// Whether this cell's durability watermark gate owes a wake (a covered `always` ack may
+    /// be left queued; false on a cell with no durable plane), for the simulator's loop-tier
+    /// tests: used only between scheduler steps.
+    pub fn ack_wakes_owed_for_sim(&self) -> bool {
+        self.shared.durable.borrow().as_ref().is_some_and(|cell| cell.ack_gate.owes())
+    }
+
+    /// A read-only view of this cell's durability watermark waits (`None` on a cell with no
+    /// durable plane), which outlives the cell: the simulator reads through it what a
+    /// teardown left queued. Used only between scheduler steps.
+    pub fn ack_waiting_view_for_sim(&self) -> Option<inf_runtime::WaitingView> {
+        self.shared.durable.borrow().as_ref().map(|cell| cell.ack_gate.waiting_view())
+    }
+
     /// Cold-read members this cell's turns have yet to visit (its cold
     /// host's pending delivery; 0 on a cell with no cold host), for the
     /// simulator's park test: used only between scheduler steps.
