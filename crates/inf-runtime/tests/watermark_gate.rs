@@ -12,6 +12,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::mem::ManuallyDrop;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -240,6 +241,11 @@ enum Fate {
     Kept,
 }
 
+/// The drop row's waits by id, each dropped only where the row drops it: a failed assertion
+/// unwinds past the rest undropped, so a gate it found broken is not driven again by their
+/// drops, and one failure stays one panic.
+type Held = BTreeMap<u32, (Fate, ManuallyDrop<WatermarkWait>)>;
+
 /// 1,000 waits of each fate at shuffled LSNs, so the queued drops remove entries from every
 /// depth of the heap and the covered ones from its covered prefix: after the drops and the
 /// wakes past them all, `waiting()` and the pool read 0, and every kept wait was woken once
@@ -251,21 +257,22 @@ fn every_drop_leaves_the_heap_and_the_pool_at_once() {
     let (gate, nodes) = gate(DROPS);
     let mut lsns: Vec<u64> = (1..=5 * u64::from(EACH)).collect();
     shuffle(&mut lsns, 0xD80_95E7);
-    let mut waits: BTreeMap<u32, (Fate, WatermarkWait)> = BTreeMap::new();
+    let mut waits: Held = BTreeMap::new();
     for (id, lsn) in (0u32..).zip(&lsns) {
         let fate = fates[(id % 5) as usize];
         let mut wait = gate.wait_for(*lsn);
         if fate != Fate::Unpolled {
             assert_eq!(poll(&mut wait, id), Poll::Pending, "wait {id} queued");
         }
-        waits.insert(id, (fate, wait));
+        waits.insert(id, (fate, ManuallyDrop::new(wait)));
     }
-    let drop_all = |waits: &mut BTreeMap<u32, (Fate, WatermarkWait)>, fate: Fate| {
+    let drop_all = |waits: &mut Held, fate: Fate| {
         let mut ids: Vec<u32> =
             waits.iter().filter(|(_, w)| w.0 == fate).map(|(id, _)| *id).collect();
         shuffle(&mut ids, u64::from(fate as u8));
         for id in ids {
-            drop(waits.remove(&id));
+            let (_, wait) = waits.remove(&id).expect("a held wait");
+            drop(ManuallyDrop::into_inner(wait));
         }
     };
     drop_all(&mut waits, Fate::Unpolled);
@@ -291,7 +298,9 @@ fn every_drop_leaves_the_heap_and_the_pool_at_once() {
     for (id, (_, wait)) in &mut waits {
         assert_eq!(poll(wait, *id), Poll::Ready(()), "kept wait {id} read its wake");
     }
-    waits.clear();
+    for (_, (_, wait)) in std::mem::take(&mut waits) {
+        drop(ManuallyDrop::into_inner(wait));
+    }
     assert_eq!((gate.waiting(), nodes.len()), (0, 0), "the heap and the pool empty");
     assert_eq!(nodes.full(), 0, "no first poll found the pool empty");
 }
