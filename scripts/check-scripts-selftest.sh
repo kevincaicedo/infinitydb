@@ -3762,8 +3762,9 @@ builds_lane() { # <name> <row>…: a fixture checkout with the lane, its rows, a
     dir="$work/$1"
     shift
     mkdir -p "$dir/scripts" "$dir/.config"
+    # The nextest gate lists its workflows through scripts/source_files.py, beside it as in the tree.
     cp "$SCRIPT_DIR/sim-canaries.sh" "$SCRIPT_DIR/target-root.sh" "$SCRIPT_DIR/check-nextest-config.sh" \
-        "$dir/scripts/"
+        "$SCRIPT_DIR/source_files.py" "$dir/scripts/"
     printf '%s\n' "$@" >"$dir/rows"
     printf '%s\n' '[profile.default]' 'leak-timeout = { period = "100ms", result = "fail" }' \
         >"$dir/.config/nextest.toml"
