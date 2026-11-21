@@ -47,6 +47,8 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 # shellcheck source=probe-target.sh
 . "$SCRIPT_DIR/probe-target.sh"
+# shellcheck source=source-files.sh
+. "$SCRIPT_DIR/source-files.sh"
 SCAN="$SCRIPT_DIR/asm-waker-scan.awk"
 PROBE_SRC="$SCRIPT_DIR/waker-atomics-probe"
 
@@ -468,7 +470,9 @@ census_named=
 for dir in crates bins tests; do
     [ -d "$dir" ] || { echo "WAKER SCOPE ERROR: the census's directory $dir/ is missing"; exit 2; }
 done
-census_read=$(find crates bins tests -name '*.rs' -type f -not -path '*/target/*' | wc -l | tr -d ' ')
+# The census reads every .rs file but a build's output, a directory holding CACHEDIR.TAG.
+source_files '*.rs' crates bins tests >"$work/census-sources"
+census_read=$(wc -l <"$work/census-sources" | tr -d ' ')
 [ "$census_read" -gt 0 ] || { echo "WAKER SCOPE ERROR: the census read no .rs file"; exit 2; }
 while IFS= read -r file; do
     # Through a file: under pipefail, `grep -q` closing the pipe early would fail awk's write.
@@ -476,7 +480,7 @@ while IFS= read -r file; do
     if grep -q 'RawWakerVTable' "$work/code-only.rs"; then
         census_named="$census_named $file"
     fi
-done < <(grep -rl --include='*.rs' --exclude-dir=target RawWakerVTable crates bins tests || true)
+done < <(tr '\n' '\0' <"$work/census-sources" | xargs -0 grep -l RawWakerVTable || true)
 census_entries=
 for entry in "${CENSUS_ENTRIES[@]}"; do
     file=${entry%%|*}

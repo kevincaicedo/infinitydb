@@ -2640,6 +2640,40 @@ for shipping in infinityd inf; do
         env -u INF_CHECK_ROOT PATH="$work/ship-cargo:$PATH" SHIP_PLANT= \
         SHIP_PLANT_ONE="$shipping/inf-server:fault-points" $SHIP
 done
+
+# A build's output is a directory holding Cargo's CACHEDIR.TAG, never one named `target`
+# (scripts/source-files.sh): a violating manifest under an untagged `target` is read and red;
+# one under a tagged directory, `target` or another name, is left out, the clean one scanned.
+IFS= read -r -d '' ship_clean <<'EOF' || true
+[package]
+name = "fake"
+
+[dependencies]
+inf-foundation = { workspace = true }
+EOF
+IFS= read -r -d '' ship_normal <<'EOF' || true
+[package]
+name = "fake"
+
+[dependencies]
+inf-foundation = { workspace = true, features = ["fault-points"] }
+EOF
+root=$(printf '%s' "$ship_clean" | manifest ship-target-untagged)
+mkdir -p "$root/crates/fake/target"
+printf '%s' "$ship_normal" >"$root/crates/fake/target/Cargo.toml"
+expect_red_because "shipping: a manifest under a directory named target with no tag is read" \
+    "SHIPPING-FEATURE violation: crates/fake/target/Cargo.toml" env INF_CHECK_ROOT="$root" $SHIP
+root=$(printf '%s' "$ship_clean" | manifest ship-target-tagged)
+mkdir -p "$root/crates/fake/target/debug" "$root/crates/out"
+for dir in "$root/crates/fake/target" "$root/crates/out"; do
+    printf 'Signature: 8a477f597d28d172789f06886806bc55\n' >"$dir/CACHEDIR.TAG"
+done
+printf '%s' "$ship_normal" >"$root/crates/fake/target/debug/Cargo.toml"
+printf '%s' "$ship_normal" >"$root/crates/out/Cargo.toml"
+expect green "shipping: a directory holding CACHEDIR.TAG is left out, whatever its name" \
+    env INF_CHECK_ROOT="$root" $SHIP
+expect_output "shipping: the tagged directories' manifests are not scanned" "1 manifests scanned" \
+    env INF_CHECK_ROOT="$root" $SHIP
 }
 
 # ------------------------------------------------ planted-bug canary driver
@@ -4497,7 +4531,8 @@ expect_output "waker probe: the arm64 Linux shape is 8 plants red, 3 controls gr
 expect green "waker probe: the arm64 Linux shape passes" env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 # The controls are exact: a probe copy with both control lines deleted is red.
 mkdir -p "$work/wk/scripts"
-cp scripts/check-waker-atomics.sh scripts/asm-waker-scan.awk scripts/probe-target.sh "$work/wk/scripts/"
+cp scripts/check-waker-atomics.sh scripts/asm-waker-scan.awk scripts/probe-target.sh \
+    scripts/source-files.sh "$work/wk/scripts/"
 cp -R scripts/waker-atomics-probe "$work/wk/scripts/"
 sed -i.bak '/WAKER-PROBE: expect-clean/d; /WAKER-PROBE: expect-unscanned/d' \
     "$work/wk/scripts/waker-atomics-probe/src/lib.rs"
@@ -4597,6 +4632,28 @@ root=$(census_root unnamed)
 printf '// RawWakerVTable, in a comment only\n' >"$root/crates/inf-runtime/src/executor.rs"
 expect_red_because "waker census: an entry that names the vtable type nowhere is red" \
     "WAKER CENSUS: crates/inf-runtime/src/executor.rs is an entry that names RawWakerVTable nowhere" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+# A build's output is a directory holding Cargo's CACHEDIR.TAG, never one named `target`
+# (scripts/source-files.sh): a file naming the vtable type under an untagged `target` is read,
+# counted and red; under a tagged directory, `target` or another name, it is neither.
+root=$(census_root target-untagged)
+mkdir -p "$root/crates/x/target"
+printf 'pub static W: core::task::RawWakerVTable = w();\n' >"$root/crates/x/target/lib.rs"
+expect_red_because "waker census: a file under a directory named target with no tag is read" \
+    "WAKER CENSUS: crates/x/target/lib.rs names RawWakerVTable outside the census's entries" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+expect_output "waker census: the untagged target's file is counted" "census: 3 .rs files read" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+root=$(census_root target-tagged)
+mkdir -p "$root/crates/x/target/debug" "$root/crates/out"
+for dir in "$root/crates/x/target" "$root/crates/out"; do
+    printf 'Signature: 8a477f597d28d172789f06886806bc55\n' >"$dir/CACHEDIR.TAG"
+    printf 'pub static W: core::task::RawWakerVTable = w();\n' >"$dir/w.rs"
+done
+expect green "waker census: a directory holding CACHEDIR.TAG is left out, whatever its name" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+expect_output "waker census: the tagged directories' files are not counted" \
+    "census: 2 .rs files read" \
     env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
 }
 
