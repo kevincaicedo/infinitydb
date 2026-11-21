@@ -47,7 +47,12 @@ manifests=()
 for dir in crates bins tests; do
     [ -d "$dir" ] || continue
     # A build's output, a directory holding CACHEDIR.TAG, holds no manifest of the workspace.
-    while IFS= read -r f; do manifests+=("$f"); done < <(source_files Cargo.toml "$dir" | sort)
+    # The listing is read whole before the loop, so a walk that fails fails the fence.
+    listing=$(source_files Cargo.toml "$dir" | sort) || {
+        echo "SHIPPING-FEATURE SCOPE ERROR: the walk of $dir/ failed, so its manifests are unread"
+        exit 1
+    }
+    while IFS= read -r f; do [ -z "$f" ] || manifests+=("$f"); done <<<"$listing"
 done
 if [ "${#manifests[@]}" -eq 0 ]; then
     echo "SHIPPING-FEATURE SCOPE ERROR: no Cargo.toml under crates/, bins/ or tests/ from $(pwd)"

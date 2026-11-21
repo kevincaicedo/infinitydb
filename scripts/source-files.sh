@@ -9,13 +9,31 @@
 # out each directory that holds CACHEDIR.TAG and everything beneath it. The tag is the cache
 # directory tag Cargo writes at the root of every target directory it makes, so it marks a
 # build's output; a directory is never left out by its name, and a source directory named
-# `target` at any depth is read. A tag file itself is never printed. One find and one awk, so
-# no process runs per directory. A <dir> that does not exist fails the find, and the caller's
-# pipefail sees it.
+# `target` at any depth is read. A tag file itself is never printed. One walk of find and one
+# awk, so no process runs per directory, and one more find for the refusal below.
+#
+# It fails closed, returning non-zero with nothing printed on stdout: when find fails (a missing
+# <dir>, a directory it cannot read: find's own message is on stderr), or when a matched path
+# or a tag's path holds a newline, which a listing of one path a line cannot carry (it would
+# read as two names that do not exist): `SOURCE-FILES SCOPE ERROR` on stderr, status 2.
+# A caller sees that status only through a call form that reads it: `listing=$(source_files …)`
+# or `source_files … >file` under `set -e` (or with `|| …`); a pipeline under pipefail. Inside
+# `< <(…)`, or on a pipeline's left side without pipefail, the status is lost and a failed walk
+# reads as a short listing.
 source_files() {
-    local name=$1
+    local name=$1 newline='
+' found
     shift
-    find "$@" -type f \( -name CACHEDIR.TAG -o -name "$name" \) -print |
+    found=$(find "$@" -type f \( -name CACHEDIR.TAG -o -name "$name" \) -path "*$newline*" -print) ||
+        return
+    if [ -n "$found" ]; then
+        echo "SOURCE-FILES SCOPE ERROR: a path under $* holds a newline, which a listing of" \
+            "one path a line cannot carry" >&2
+        return 2
+    fi
+    found=$(find "$@" -type f \( -name CACHEDIR.TAG -o -name "$name" \) -print) || return
+    [ -n "$found" ] || return 0
+    printf '%s\n' "$found" |
         awk '
             { path[NR] = $0 }
             /(^|\/)CACHEDIR\.TAG$/ {

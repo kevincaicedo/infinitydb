@@ -2,8 +2,9 @@
 
 The rule of which directories a walk leaves out (one that holds Cargo's CACHEDIR.TAG, never one
 by its name) lives once, in that helper; this module runs it and reads its lines, so a Python
-gate reads exactly the files a shell gate reads. The helper's non-zero exit raises WalkError
-with the exit and the helper's message, never a short listing.
+gate reads exactly the files a shell gate reads. The helper fails closed (a find that fails, a
+path holding a newline), and so does this: its non-zero exit raises WalkError with the exit and
+the helper's message, never a short listing.
 """
 
 import subprocess

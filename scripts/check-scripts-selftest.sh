@@ -2674,6 +2674,23 @@ expect green "shipping: a directory holding CACHEDIR.TAG is left out, whatever i
     env INF_CHECK_ROOT="$root" $SHIP
 expect_output "shipping: the tagged directories' manifests are not scanned" "1 manifests scanned" \
     env INF_CHECK_ROOT="$root" $SHIP
+# The walk fails closed (scripts/source-files.sh): a manifest whose path holds a newline would
+# read as two names that do not exist, so the walk refuses it; a directory the walk cannot read
+# fails the fence. Each is red, never "OK" over a short listing.
+root=$(printf '%s' "$ship_clean" | manifest ship-newline)
+mkdir -p "$root/crates/"$'two\nlines'
+printf '%s' "$ship_normal" >"$root/crates/"$'two\nlines'"/Cargo.toml"
+expect_red_because "shipping: a manifest whose path holds a newline is refused" \
+    "SOURCE-FILES SCOPE ERROR" env INF_CHECK_ROOT="$root" $SHIP
+if [ "$(id -u)" -ne 0 ]; then
+root=$(printf '%s' "$ship_clean" | manifest ship-unreadable)
+mkdir -p "$root/crates/locked"
+printf '%s' "$ship_normal" >"$root/crates/locked/Cargo.toml"
+fx_lock "$root/crates/locked"
+expect_red_because "shipping: a directory the walk cannot read fails the fence" \
+    "SHIPPING-FEATURE SCOPE ERROR: the walk of crates/ failed" env INF_CHECK_ROOT="$root" $SHIP
+fx_unlock
+fi
 }
 
 # ------------------------------------------------ planted-bug canary driver
@@ -4655,6 +4672,32 @@ expect green "waker census: a directory holding CACHEDIR.TAG is left out, whatev
 expect_output "waker census: the tagged directories' files are not counted" \
     "census: 2 .rs files read" \
     env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+# The census fails closed (scripts/source-files.sh): a file whose path holds a newline is
+# refused, and a directory the walk cannot read, or a listed file grep cannot read, fails it,
+# never leaving that file unnamed.
+root=$(census_root newline)
+mkdir -p "$root/crates/"$'two\nlines'
+printf 'pub static W: core::task::RawWakerVTable = w();\n' >"$root/crates/"$'two\nlines'"/w.rs"
+expect_red_because "waker census: a file whose path holds a newline is refused" \
+    "SOURCE-FILES SCOPE ERROR" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+if [ "$(id -u)" -ne 0 ]; then
+root=$(census_root unreadable-dir)
+mkdir -p "$root/crates/locked"
+printf 'pub static W: core::task::RawWakerVTable = w();\n' >"$root/crates/locked/w.rs"
+fx_lock "$root/crates/locked"
+expect_red_because "waker census: a directory the walk cannot read fails the census" \
+    "WAKER SCOPE ERROR: the census's walk failed" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+fx_unlock
+root=$(census_root unreadable-file)
+printf 'pub static W: core::task::RawWakerVTable = w();\n' >"$root/crates/x/src/w.rs"
+fx_lock "$root/crates/x/src/w.rs"
+expect_red_because "waker census: a listed file grep cannot read fails the census" \
+    "WAKER SCOPE ERROR: the census could not read every listed file" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+fx_unlock
+fi
 }
 
 # ------------------------------------------------------- fault points (D9)
@@ -5013,7 +5056,8 @@ expect red "line-width: tests/ is in scope" env INF_CHECK_ROOT="$root" $LINEW
 [ -n "$root" ] && [ -d "$root/tests" ] && rm -rf "$root/tests"
 expect red "line-width: a missing tests/ is a scope error" env INF_CHECK_ROOT="$root" $LINEW
 # The gate reads scripts/source-files.sh's walk: a file under a directory named target with no
-# tag is read; a directory holding Cargo's CACHEDIR.TAG is left out, whatever its name.
+# tag is read; a directory holding Cargo's CACHEDIR.TAG is left out, whatever its name; and a
+# directory the walk cannot read fails the gate.
 lw_wide=$(printf '// %s\n' "$(printf 'x%.0s' $(seq 1 98))")
 root=$(style_root lw-target)
 printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
@@ -5032,6 +5076,16 @@ expect green "line-width: a directory holding CACHEDIR.TAG is left out, whatever
     env INF_CHECK_ROOT="$root" $LINEW
 expect_output "line-width: the tagged directories' files are not counted" \
     "line-width OK: 3 files" env INF_CHECK_ROOT="$root" $LINEW
+if [ "$(id -u)" -ne 0 ]; then
+root=$(style_root lw-unreadable)
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+mkdir -p "$root/crates/fake/src/locked"
+printf 'fn g() {}\n' >"$root/crates/fake/src/locked/g.rs"
+fx_lock "$root/crates/fake/src/locked"
+expect_red_because "line-width: a directory the walk cannot read fails the gate" \
+    "LINE-WIDTH SCOPE: source_files" env INF_CHECK_ROOT="$root" $LINEW
+fx_unlock
+fi
 }
 
 # ------------------------------------------------------------ lint-ratchet

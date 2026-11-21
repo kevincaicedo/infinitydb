@@ -470,17 +470,29 @@ census_named=
 for dir in crates bins tests; do
     [ -d "$dir" ] || { echo "WAKER SCOPE ERROR: the census's directory $dir/ is missing"; exit 2; }
 done
-# The census reads every .rs file but a build's output, a directory holding CACHEDIR.TAG.
-source_files '*.rs' crates bins tests >"$work/census-sources"
+# The census reads every .rs file but a build's output, a directory holding CACHEDIR.TAG; a
+# walk that fails fails the census.
+source_files '*.rs' crates bins tests >"$work/census-sources" || {
+    echo "WAKER SCOPE ERROR: the census's walk failed, so its files are unread"
+    exit 2
+}
 census_read=$(wc -l <"$work/census-sources" | tr -d ' ')
 [ "$census_read" -gt 0 ] || { echo "WAKER SCOPE ERROR: the census read no .rs file"; exit 2; }
+# Every listed file is read: grep's no-match (1) names nothing, and its error (2), a file it
+# cannot read, fails the census instead of leaving that file unnamed.
+tr '\n' '\0' <"$work/census-sources" |
+    xargs -0 sh -c 'grep -l RawWakerVTable "$@"; [ "$?" -le 1 ] || exit 255' sh \
+    >"$work/census-named" || {
+    echo "WAKER SCOPE ERROR: the census could not read every listed file"
+    exit 2
+}
 while IFS= read -r file; do
     # Through a file: under pipefail, `grep -q` closing the pipe early would fail awk's write.
     awk -f "$work/code-only.awk" "$file" >"$work/code-only.rs"
     if grep -q 'RawWakerVTable' "$work/code-only.rs"; then
         census_named="$census_named $file"
     fi
-done < <(tr '\n' '\0' <"$work/census-sources" | xargs -0 grep -l RawWakerVTable || true)
+done <"$work/census-named"
 census_entries=
 for entry in "${CENSUS_ENTRIES[@]}"; do
     file=${entry%%|*}
