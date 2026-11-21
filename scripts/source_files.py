@@ -49,12 +49,24 @@ def source_files(name, *dirs):
     return [Path(line) for line in lines]
 
 
+def shown(args):
+    """git's command line for a message: the path after -C shown by its last component, so the
+    subcommand and its first options are never cut away however long the work path is; the
+    whole line held to 120 characters."""
+    words, after_c = ["git"], False
+    for arg in args:
+        words.append(f".../{os.path.basename(arg.rstrip('/'))}" if after_c and "/" in arg else arg)
+        after_c = arg == "-C"
+    text = " ".join(words)
+    return text if len(text) <= 120 else text[:117] + "..."
+
+
 def git_listing(*args, ok=(0,)):
     """`git <args>`'s stdout, as bytes: a listing that reads the work tree (ls-files --cached
     --others, grep --untracked). It raises WalkError when git cannot run, exits with a status
     outside `ok`, or writes anything to stderr: git warns and exits 0 on a directory it cannot
     open, and its listing is then short."""
-    what = " ".join(("git",) + args)[:80]
+    what = shown(args)
     try:
         done = subprocess.run(["git", *args], capture_output=True, check=False)
     except OSError as err:

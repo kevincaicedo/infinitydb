@@ -113,10 +113,20 @@ tree_dirs() {
 # `SOURCE-FILES SCOPE ERROR` and git's first 300 characters on stderr, and the caller discards
 # what was printed. Git's stdout stays a stream, so a -z listing keeps its NUL bytes.
 git_listing() {
-    local err status=0
+    local err status=0 shown=git arg after_c=0
     { err=$(git "$@" 2>&1 >&3 3>&-); } 3>&1 || status=$?
     if [ -n "$err" ]; then
-        echo "SOURCE-FILES SCOPE ERROR: git $(printf '%s ' "$@" | cut -c1-80)wrote to stderr" \
+        # The path after -C is shown by its last component, so the subcommand is never cut away
+        # however long the work path is.
+        for arg in "$@"; do
+            if [ "$after_c" = 1 ]; then
+                case $arg in */*) arg=".../$(basename "$arg")" ;; esac
+            fi
+            after_c=0
+            [ "$arg" != -C ] || after_c=1
+            shown="$shown $arg"
+        done
+        echo "SOURCE-FILES SCOPE ERROR: $(printf '%s' "$shown" | cut -c1-120) wrote to stderr" \
             "(exit $status), so its listing is not whole: $(printf '%s' "$err" | tr '\n' ' ' |
                 cut -c1-300)" >&2
         return 2

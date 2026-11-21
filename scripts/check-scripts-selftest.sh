@@ -43,8 +43,9 @@ unset CARGO_TARGET_DIR
 # readonly, whose own status replaces it; a `for` over a glob of crates/, bins/ or tests/, which
 # probes inside each entry (tree_dirs lists them); a command substitution inside an arithmetic
 # expansion, whose failure ends the enclosing loop with no errexit, so the scan reads as cut
-# short and green. The Python forms: pathlib's glob and rglob and an os.walk with no onerror,
-# which skip a directory they cannot read; iterdir, os.listdir and os.scandir outside
+# short and green (in `$((…))`, `((…))` or `let`). The Python forms: pathlib's glob and rglob,
+# and an os.walk, os.fwalk or Path.walk with no error hook (or one set to None), which skip a
+# directory they cannot read; iterdir, os.listdir and os.scandir outside
 # scripts/source_files.py, which raise on the directory itself but leave its loop to probe each
 # entry, and a probe (is_dir, is_file) reads a refusal as absence. In either language, a git
 # listing (ls-files, grep, status) not run by git_listing, which fails on the warning git gives,
@@ -71,7 +72,8 @@ walk_forms() {
             gitsub = "(ls-files|grep|status)"
             gitcmd = "(^|[;&|({!]|[$][(]|then[ \t]|do[ \t]|else[ \t])[ \t]*git" gitopts "[ \t]+" gitsub "([ \t]|$)"
             gitarg = "[\"'\'']" gitsub "[\"'\'']"
-            arithsub = "[$][(][(][^)]*[$][(]"
+            arithsub = "([$][(][(]|(^|[^$])[(][(])[^)]*[$][(]|(^|[ \t;])let[ \t].*[$][(]"
+            pywalk = "os[.]f?walk[(]|[A-Za-z0-9_)\\]][.]walk[(]"
             found = 0
         }
         /^[ \t]*#/ { next }
@@ -84,8 +86,8 @@ walk_forms() {
             else if ($0 ~ forloop && $0 ~ treeglob) form = "a for over a tree glob, which probes inside each entry"
             else if ($0 ~ globbing) form = "a glob, which skips a directory it cannot read"
             else if ($0 ~ dirloop) form = "a directory listing whose loop probes each entry, a refusal read as absence (scripts/source_files.py stats them)"
-            else if ($0 ~ /os[.]walk[(]/ && $0 !~ /onerror=/) form = "an os.walk with no onerror, which skips a directory it cannot read"
-            else if ($0 ~ arithsub) form = "a command substitution inside $((…)), whose failure ends the loop with no errexit"
+            else if ($0 ~ pywalk && ($0 !~ /on_?error=/ || $0 ~ /on_?error=None/)) form = "an os.walk, os.fwalk or Path.walk with no error hook, which skips a directory it cannot read"
+            else if ($0 ~ arithsub) form = "a command substitution inside $((…)), ((…)) or let, whose failure ends the loop with no errexit"
             else if ($0 ~ gitcmd) form = "a git listing not run by git_listing"
             else if ($0 ~ gitarg && $0 ~ /git/ && $0 !~ /git_listing/) form = "a git listing not run by git_listing"
             if (form != "") { print FILENAME ":" FNR ": " form ": " $0; found++ }
@@ -181,7 +183,12 @@ for wf_line in \
     'done < <(git --no-pager ls-files -co)' \
     'git -c core.quotepath=off ls-files -z >"$work/listed.z"' \
     'done <<<"$(find crates -name '"'*.rs'"')"' \
-    '    local listed=$(find "$dir" -name '"'*.rs'"' | sort) || exit 2'
+    '    local listed=$(find "$dir" -name '"'*.rs'"' | sort) || exit 2' \
+    '    for here, dirs, files in Path(top).walk():' \
+    '    for here, dirs, files in os.fwalk(top):' \
+    '    for here, dirs, files in os.walk(top, onerror=None):' \
+    '    let "lines += $(wc -l < "$f")"' \
+    '    (( lines += $(wc -l < "$f") ))'
 do
     wf_n=$((wf_n + 1))
     cp "$SCRIPT_DIR/check-refusal-text.sh" "$work/walk-form-$wf_n.sh"
@@ -192,6 +199,7 @@ done
 cp "$SCRIPT_DIR/check-refusal-text.sh" "$work/walk-form-ok.sh"
 printf '%s\n' '# done < <(find "$DIR" -name x)' '    for here, dirs, files in os.walk(top, onerror=unreadable):' \
     'git_listing ls-files -z -- x >"$work/x" || scope_error "git ls-files failed"' \
+    '    for here, dirs, files in Path(top).walk(on_error=unreadable):' \
     '    listed = walked(git_listing, "-C", top, "ls-files", "-z", "-co")' \
     'is `git grep -nIzF --untracked`, one -e a name' \
     '    listing=$(find "$dir" -name '"'*.rs'"' | sort) || {' 'local dirs listing found=0' \
@@ -650,10 +658,10 @@ group_stage() {
 # its own beside a copy of the stage and its take. Every run unsets the job
 # pool the self-test may inherit, so its width is the one planted, unless the
 # case plants a pool of its own.
-stg_dir() { # <name>: a scripts directory holding the stage and its take
+stg_dir() { # <name>: a scripts directory holding the stage and its take, the whole scripts/
     local dir="$work/stg-$1/scripts"
     mkdir -p "$dir"
-    cp "$SCRIPT_DIR/check-stage.sh" "$SCRIPT_DIR/job_token.py" "$dir/"
+    cp -R "$SCRIPT_DIR/." "$dir/"
     echo "$dir"
 }
 stg_gate() { # <dir> <name> <line…>: the executable gate check-<name>.sh holding those lines
@@ -998,6 +1006,15 @@ fx_held() {
     fx_lock "$root/$dir" 400
     expect_red_because "$label" "$why" env INF_CHECK_ROOT="$root" "$@"
     fx_unlock
+}
+# fx_scripts_copy <name>: the whole scripts/ directory copied to $work/<name>, so a copy of a gate
+# reads every file the gate reads: a list of them would leave each copy dying on the next
+# import, and every planted red it carries red for that reason.
+fx_scripts_copy() {
+    [ -n "$1" ] && [ -n "$work" ] || { echo "fx_scripts_copy: empty name or work dir" >&2; exit 2; }
+    rm -rf "${work:?}/${1:?}"
+    mkdir -p "$work/$1"
+    cp -R "$SCRIPT_DIR/." "$work/$1/"
 }
 
 # fx_root_key <dir>: the target-root key of a checkout at <dir>, the first 16
@@ -5888,9 +5905,7 @@ for rt_var in "$(cd "$root" && pwd -P)/target" target "$work/rt-link/target"; do
 done
 rt_mutant() { # <name> <sed expression> <CARGO_TARGET_DIR or ''> <what the copy does>
     local dir="$work/rt-gate-$1"
-    rm -rf "${dir:?}"
-    mkdir -p "$dir"
-    cp "$SCRIPT_DIR/lint_scope_table.py" "$SCRIPT_DIR/target-root.sh" "$dir/"
+    fx_scripts_copy "rt-gate-$1"
     sed "$2" "$RATCHET" >"$dir/check-lint-ratchet.sh"
     chmod +x "$dir/check-lint-ratchet.sh"
     if cmp -s "$RATCHET" "$dir/check-lint-ratchet.sh"; then
@@ -5905,6 +5920,13 @@ rt_mutant() { # <name> <sed expression> <CARGO_TARGET_DIR or ''> <what the copy 
     rt_call_run "$dir/check-lint-ratchet.sh" "$root" >/dev/null 2>&1 || true
     expect red "lint-ratchet: the calls' check is red on a gate that $4" rt_calls_ok "$root.calls" "$rt_own"
 }
+# The copy unmutated is green on both checks: a canary red on every copy would prove nothing.
+fx_scripts_copy rt-gate-null
+rt_call_run "$work/rt-gate-null/check-lint-ratchet.sh" "$root" >/dev/null 2>&1 || true
+expect green "lint-ratchet: the calls' check is green on an unmutated copy of the gate" \
+    rt_calls_ok "$root.calls" "$rt_own"
+expect green "lint-ratchet: the refusal's check is green on an unmutated copy of the gate" \
+    rt_refused "$work/rt-gate-null/check-lint-ratchet.sh" "$rt_target"
 RT_KEPT='^    TARGET_DIR=$(target_root_kept lint-ratchet)$'
 rt_mutant shared "s|$RT_KEPT|    TARGET_DIR=\$TARGET_ROOT|" '' "shares the recipe's target directory"
 RT_SETUP='^    target_root_setup "$(pwd -P)" ||$'
@@ -8299,19 +8321,10 @@ done
 # turns the case red. Each copy runs on the argv root, its calls cleared,
 # with CARGO_TARGET_DIR unset or set to the fourth argument.
 FZ_MROOT=$root
-# fz_gate_copy <name>: the whole scripts/ directory copied to $work/<name>, so a copy of the gate
-# reads every file the gate reads: a list of them would leave each copy dying on the next
-# import, and every canary red for that reason.
-fz_gate_copy() {
-    [ -n "$1" ] && [ -n "$work" ] || { echo "fz_gate_copy: empty name or work dir" >&2; exit 2; }
-    rm -rf "${work:?}/${1:?}"
-    mkdir -p "$work/$1"
-    cp -R "$SCRIPT_DIR/." "$work/$1/"
-}
 fz_mutant() { # <name> <sed expression> <what the copy does> [<CARGO_TARGET_DIR>]
     local dir want=$FZ_OWN
     dir="$work/fz-gate-$1"
-    fz_gate_copy "fz-gate-$1"
+    fx_scripts_copy "fz-gate-$1"
     fz_sed "$2" "$dir/check-fuzz-targets.sh"
     chmod +x "$dir/check-fuzz-targets.sh"
     if cmp -s "$SCRIPT_DIR/check-fuzz-targets.sh" "$dir/check-fuzz-targets.sh"; then
@@ -8329,7 +8342,7 @@ fz_mutant() { # <name> <sed expression> <what the copy does> [<CARGO_TARGET_DIR>
         fz_calls_ok "$FZ_MROOT.stub" "$want"
 }
 # The copy unmutated is green: a canary red on every copy would prove nothing.
-fz_gate_copy fz-gate-null
+fx_scripts_copy fz-gate-null
 rm -f "${FZ_MROOT:?}.stub/calls"
 fz_argv_run "$work/fz-gate-null/check-fuzz-targets.sh" "$FZ_MROOT" >/dev/null 2>&1 || true
 expect green "fuzz-targets: the call's check is green on an unmutated copy of the gate" \
@@ -8819,7 +8832,7 @@ expect green "fuzz-targets: the probe builds in a directory of its own each run,
     fz_probe_per_run "$root" "$FZ_PKEPT"
 fz_probe_mutant() { # <name> <sed expression> <what the copy does>
     local dir="$work/fz-probe-gate-$1" FUZZ
-    fz_gate_copy "fz-probe-gate-$1"
+    fx_scripts_copy "fz-probe-gate-$1"
     fz_sed "$2" "$dir/check-fuzz-targets.sh"
     chmod +x "$dir/check-fuzz-targets.sh"
     if cmp -s "$SCRIPT_DIR/check-fuzz-targets.sh" "$dir/check-fuzz-targets.sh"; then
@@ -8831,7 +8844,7 @@ fz_probe_mutant() { # <name> <sed expression> <what the copy does>
         fz_probe_per_run "$root" "$FZ_PKEPT"
 }
 # The copy unmutated is green, as the call's copy is.
-fz_gate_copy fz-probe-gate-null
+fx_scripts_copy fz-probe-gate-null
 fz_probe_null() (
     FUZZ="$work/fz-probe-gate-null/check-fuzz-targets.sh"
     fz_probe_per_run "$root" "$FZ_PKEPT"
@@ -9644,9 +9657,9 @@ esac
 EOF
 printf '%s' "$body" >"$TR_BIN/cargo"
 chmod +x "$TR_BIN/cargo"
-tr_checkout() { # <dir>: a fixture checkout holding the helper
+tr_checkout() { # <dir>: a fixture checkout holding the helper, among the whole scripts/
     mkdir -p "$1/scripts"
-    cp "$SCRIPT_DIR/target-root.sh" "$1/scripts/target-root.sh"
+    cp -R "$SCRIPT_DIR/." "$1/scripts/"
 }
 tr_phys() { (cd "$1" && pwd -P); }
 tr_key() { fx_root_key "$1"; }
