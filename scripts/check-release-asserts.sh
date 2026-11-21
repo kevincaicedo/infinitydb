@@ -74,6 +74,11 @@ for dir in "${DIRS[@]}"; do
     testfiles=""
     while IFS= read -r f; do
         [ -n "$f" ] || continue
+        # A file the gate cannot read fails it here, before any read whose status is lost.
+        [ -f "$f" ] && [ -r "$f" ] || {
+            echo "RELEASE-ASSERT SCOPE ERROR: $f cannot be read, so it is unscanned"
+            exit 2
+        }
         while read -r key value; do
             [ "$key" = "modfile" ] || continue
             testfiles="$testfiles
@@ -92,8 +97,10 @@ $f"*) continue ;; esac
             continue
         fi
         files=$((files + 1))
-        lines=$((lines + $(wc -l < "$f")))
-        stripped=$((stripped + $(printf '%s\n' "$report" | awk '$1 == "stripped" { print $2 }')))
+        n=$(wc -l <"$f") || { echo "RELEASE-ASSERT SCOPE ERROR: $f cannot be counted"; exit 2; }
+        s=$(printf '%s\n' "$report" | awk '$1 == "stripped" { print $2 }')
+        lines=$((lines + n))
+        stripped=$((stripped + s))
         awk -f "$STRIP" "$f" | awk -f "$CENSUS" | awk -F'\t' -v f="$f" '{ print f "\t" $1 "\t" $2 }' >> "$work/sites"
     done <<<"$listing"
 done

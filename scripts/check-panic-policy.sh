@@ -63,6 +63,11 @@ for dir in "${DIRS[@]}"; do
     testfiles=""
     while IFS= read -r f; do
         [ -n "$f" ] || continue
+        # A file the gate cannot read fails it here, before any read whose status is lost.
+        [ -f "$f" ] && [ -r "$f" ] || {
+            echo "PANIC-POLICY SCOPE ERROR: $f cannot be read, so it is unscanned"
+            exit 2
+        }
         while read -r key value; do
             [ "$key" = "modfile" ] || continue
             testfiles="$testfiles

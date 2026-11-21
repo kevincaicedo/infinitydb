@@ -42,7 +42,8 @@ unset CARGO_TARGET_DIR
 # and a `for` over a glob of crates/, bins/ or tests/, which probes inside each entry
 # (tree_dirs lists them). The Python forms: pathlib's glob, rglob and iterdir, os.listdir and
 # os.scandir, and an os.walk with no onerror: scripts/source_files.py holds the forms that
-# fail closed. In either language, a git listing (ls-files, grep, status) not run by
+# fail closed. A command substitution inside an arithmetic expansion: an expansion error ends the
+# enclosing loop with no errexit, so the scan reads as cut short and green. In either language, a git listing (ls-files, grep, status) not run by
 # git_listing, which fails on the stderr warning git gives, with exit 0, for a directory it
 # cannot open: a shell command line that runs git, or a Python line that passes the
 # subcommand as a string and does not name git_listing. Written for BSD awk: bracket classes,
@@ -60,6 +61,7 @@ walk_forms() {
             gitsub = "(ls-files|grep|status)"
             gitcmd = "(^|[;&|({!]|[$][(]|then[ \t]|do[ \t]|else[ \t])[ \t]*git([ \t]+-C[ \t]+[^ \t]+)?[ \t]+" gitsub "([ \t]|$)"
             gitarg = "[\"'\'']" gitsub "[\"'\'']"
+            arithsub = "[$][(][(][^)]*[$][(]"
             found = 0
         }
         /^[ \t]*#/ { next }
@@ -70,6 +72,7 @@ walk_forms() {
             else if ($0 ~ forloop && $0 ~ treeglob) form = "a for over a tree glob, which probes inside each entry"
             else if ($0 ~ listing) form = "a listing that reads an unreadable directory as empty"
             else if ($0 ~ /os[.]walk[(]/ && $0 !~ /onerror=/) form = "an os.walk with no onerror"
+            else if ($0 ~ arithsub) form = "a command substitution inside $((…)), whose failure ends the loop with no errexit"
             else if ($0 ~ gitcmd) form = "a git listing not run by git_listing"
             else if ($0 ~ gitarg && $0 ~ /git/ && $0 !~ /git_listing/) form = "a git listing not run by git_listing"
             if (form != "") { print FILENAME ":" FNR ": " form ": " $0; found++ }
@@ -157,7 +160,8 @@ for wf_line in \
     'git ls-files -z --cached --others --exclude-standard -- '"'*.rs'"' >"$work/listed.z" ||' \
     'top=$(git -C . status --porcelain)' \
     '    listed = subprocess.run(["git", "ls-files", "-co", "-z"], capture_output=True)' \
-    '    grep = git(top, "grep", "-nIzF", "--untracked", "--", ".")'
+    '    grep = git(top, "grep", "-nIzF", "--untracked", "--", ".")' \
+    '    lines=$((lines + $(wc -l < "$f")))'
 do
     wf_n=$((wf_n + 1))
     cp "$SCRIPT_DIR/check-refusal-text.sh" "$work/walk-form-$wf_n.sh"
@@ -1139,6 +1143,10 @@ root=$(fixture deny-locked-crate <<<'pub fn ok() {}')
 fx_walk_lock "deny-list: a crate directory the walk cannot search fails the gate" \
     "DENY-LIST SCOPE ERROR: the cell crate set is unknown" \
     "$root" crates/locked src/lib.rs "$deny_sleep" $DENY
+root=$(fixture deny-locked-file <<<'pub fn ok() {}')
+fx_walk_lock "deny-list: a listed file the gate cannot read fails the gate" \
+    "DENY-LIST SCOPE ERROR: crates/fake/src/z.rs cannot be read" \
+    "$root" crates/fake/src/z.rs '' "$deny_sleep" $DENY
 }
 
 # --------------------------------------------------------------- panic policy
@@ -1223,6 +1231,10 @@ root=$(fixture panic-locked-crate <<<'pub fn ok() {}')
 fx_walk_lock "panic-policy: a crate directory the walk cannot search fails the gate" \
     "PANIC-POLICY SCOPE ERROR: the cell crate set is unknown" \
     "$root" crates/locked src/lib.rs 'pub fn t(v: Option<u8>) -> u8 { v.unwrap() }' $PANIC
+root=$(fixture panic-locked-file <<<'pub fn ok() {}')
+fx_walk_lock "panic-policy: a listed file the gate cannot read fails the gate" \
+    "PANIC-POLICY SCOPE ERROR: crates/fake/src/z.rs cannot be read" \
+    "$root" crates/fake/src/z.rs '' 'pub fn t(v: Option<u8>) -> u8 { v.unwrap() }' $PANIC
 }
 
 # ------------------------------------------------------------ reply outcome
@@ -1808,6 +1820,12 @@ root=$(ro_fixture rolocked <<<"pub fn ok() {}")
 fx_walk_lock "reply-outcome: a directory the walk cannot read fails the gate" \
     "REPLY-OUTCOME SCOPE ERROR: the walk of crates/inf-server/src failed" \
     "$root" crates/inf-server/src/locked bad.rs "pub fn t(b: &[u8]) -> bool { b.first() == Some(&b'-') }" \
+    $REPLY
+# A listed file the gate cannot read fails it, never a scan cut short after lib.rs.
+root=$(ro_fixture rolockedfile <<<"pub fn ok() {}")
+fx_walk_lock "reply-outcome: a listed file the gate cannot read fails the gate" \
+    "REPLY-OUTCOME SCOPE ERROR: crates/inf-server/src/z.rs cannot be read" \
+    "$root" crates/inf-server/src/z.rs '' "pub fn t(b: &[u8]) -> bool { b.first() == Some(&b'-') }" \
     $REPLY
 }
 
@@ -2639,6 +2657,12 @@ fx_walk_lock "refusal-text: a directory the walk cannot read fails the gate" \
     "REFUSAL-TEXT SCOPE ERROR: the walk of crates/inf-server/src failed" \
     "$root" crates/inf-server/src/locked bad.rs 'pub const E: &str = "ERR planted limit reached";' \
     $REFUSAL
+# A listed file the gate cannot read fails it, never a scan cut short where its count failed: the
+# file sorts after lib.rs, so a cut scan has read one file and would print OK.
+root=$(rt_fixture rtlockedfile <<<'pub fn ok() {}')
+fx_walk_lock "refusal-text: a listed file the gate cannot read fails the gate" \
+    "REFUSAL-TEXT SCOPE ERROR: crates/inf-server/src/z.rs cannot be read" \
+    "$root" crates/inf-server/src/z.rs '' 'pub const E: &str = "ERR planted limit reached";' $REFUSAL
 }
 
 # ---------------------------------------------------------------- run-sweep
@@ -4631,6 +4655,14 @@ EOF
             crates/locked src/lib.rs 'pub fn t() { assert!(true, "planted"); }' $RELEASE
     fi
 done
+# A listed file the gate cannot read fails it, never a census cut short after lib.rs.
+root=$(fixture ra-locked-file <<<'pub fn ok(n: u64) -> u64 { assert!(n > 0, "n is positive"); n }')
+inventory "$root" <<'EOF'
+I	1	crates/fake/src/lib.rs	assert	n is positive	own argument check
+EOF
+fx_walk_lock "release-asserts: a listed file the gate cannot read fails the gate" \
+    "RELEASE-ASSERT SCOPE ERROR: crates/fake/src/z.rs cannot be read" "$root" crates/fake/src/z.rs '' \
+    'pub fn t() { assert!(true, "planted"); }' $RELEASE
 }
 
 # ---------------------------------------------------------------- clock ban
@@ -5353,6 +5385,13 @@ root=$(fsync_fixture fs-locked-crate <<<'pub fn ok() -> u64 { 1 }')
 fx_walk_lock "fsync-fail-stop: a crate directory the walk cannot search fails the gate" \
     "FSYNC SCOPE ERROR: the directories under bins/ are unknown" \
     "$root" bins/locked src/main.rs "$fs_discard" $FSYNC
+# A listed file the gate cannot read fails it, never a scan cut short: a binary's file, which only
+# the site scan reads, after its main.rs.
+root=$(fsync_fixture fs-locked-file <<<'pub fn ok() -> u64 { 1 }')
+mkdir -p "$root/bins/x/src"
+printf 'fn main() {}\n' >"$root/bins/x/src/main.rs"
+fx_walk_lock "fsync-fail-stop: a listed file the gate cannot read fails the gate" \
+    "FSYNC SCOPE ERROR: bins/x/src/z.rs cannot be read" "$root" bins/x/src/z.rs '' "$fs_discard" $FSYNC
 }
 
 # ------------------------------------------------- unsafe roots (batch 44)

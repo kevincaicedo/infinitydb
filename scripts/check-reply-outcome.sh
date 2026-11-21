@@ -124,6 +124,11 @@ listing=$(find "$DIR" -name '*.rs' | sort) || {
 testfiles=""
 while IFS= read -r f; do
     [ -n "$f" ] || continue
+    # A file the gate cannot read fails it here, before any read whose status is lost.
+    [ -f "$f" ] && [ -r "$f" ] || {
+        echo "REPLY-OUTCOME SCOPE ERROR: $f cannot be read, so it is unscanned"
+        exit 2
+    }
     while read -r key value; do
         [ "$key" = "modfile" ] || continue
         testfiles="$testfiles
@@ -156,7 +161,8 @@ $f"*)
         continue
     fi
     files=$((files + 1))
-    lines=$((lines + $(wc -l < "$f")))
+    n=$(wc -l <"$f") || { echo "REPLY-OUTCOME SCOPE ERROR: $f cannot be counted"; exit 2; }
+    lines=$((lines + n))
     rel=${f#"$DIR"/}
     scanned="$scanned$rel|"
     rows=""

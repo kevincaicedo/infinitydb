@@ -81,6 +81,11 @@ while IFS= read -r dir; do
     files_of "$dir"
     while IFS= read -r f; do
         [ -n "$f" ] || continue
+        # A file the gate cannot read fails it here, before any read whose status is lost.
+        [ -f "$f" ] && [ -r "$f" ] || {
+            echo "FSYNC SCOPE ERROR: $f cannot be read, so it is unscanned"
+            exit 2
+        }
         awk -f "$NOCOMMENT" "$f" | awk '
             /^[[:space:]]*(pub[[:space:]]+)?enum[[:space:]]+[A-Za-z0-9_]+/ {
                 n = $0
@@ -155,8 +160,14 @@ while IFS= read -r dir; do
     files_of "$dir"
     while IFS= read -r f; do
         [ -n "$f" ] || continue
+        # A file the gate cannot read fails it here, before any read whose status is lost.
+        [ -f "$f" ] && [ -r "$f" ] || {
+            echo "FSYNC SCOPE ERROR: $f cannot be read, so it is unscanned"
+            exit 2
+        }
         files=$((files + 1))
-        lines=$((lines + $(wc -l <"$f")))
+        n=$(wc -l <"$f") || { echo "FSYNC SCOPE ERROR: $f cannot be counted"; exit 2; }
+        lines=$((lines + n))
         # `use` / `pub use` statements are blanked: an import or a
         # re-export names the typed error, it can never catch one.
         awk -f "$STRIP" "$f" | awk -f "$NOCOMMENT" | awk '
