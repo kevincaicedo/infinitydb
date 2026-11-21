@@ -173,9 +173,9 @@ if top is None or Path(top.strip()).resolve() != base:
         "Markdown set is git's"
     )
 else:
-    listing = walked(git_listing, "-C", str(root), "ls-files", "-z", "--cached", "--others",
+    git_files = walked(git_listing, "-C", str(root), "ls-files", "-z", "--cached", "--others",
                      "--exclude-standard").decode(errors="replace")
-    published = {p for p in listing.split("\0") if p and walked(present, root / p)}
+    published = {p for p in git_files.split("\0") if p and walked(present, root / p)}
     published |= {str(d) for p in published for d in PurePosixPath(p).parents}
     for name in sorted(p for p in published if p.lower().endswith(".md")):
         md_files += 1
