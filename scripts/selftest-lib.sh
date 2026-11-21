@@ -187,8 +187,9 @@ fx_only() {
     ! grep -n 'git -C "\$' "$1" | grep -v -e ' init -q$' -e '^[0-9]*:    git -C "\$root" "\$@"$'
 }
 
-# fx_lock <path>: a fixture path under $work (fx_under) set to mode 000, for
-# a case whose gate must fail on what it cannot read, and recorded: fx_unlock
+# fx_lock <path> [<mode>]: a fixture path under $work (fx_under) set to mode
+# 000 (or <mode>: 400 makes a directory readable but not searchable), for a
+# case whose gate must fail on what it cannot read, and recorded: fx_unlock
 # gives every recorded path under $work its owner's access back and names any
 # other, and the group's EXIT trap
 # calls it before it removes $work, which a directory at 000 would refuse.
@@ -205,7 +206,7 @@ fx_lock() {
     fx_under "$1" || { echo "fx_lock: '$1' is not a fixture path under $work" >&2; exit 2; }
     FX_LOCKED="$FX_LOCKED$1
 "
-    chmod 000 "$1" || { echo "fx_lock: chmod 000 $1 failed" >&2; exit 2; }
+    chmod "${2:-000}" "$1" || { echo "fx_lock: chmod ${2:-000} $1 failed" >&2; exit 2; }
 }
 fx_unlock() {
     local path

@@ -3036,6 +3036,11 @@ expect green "source walks: tree_dirs prints nothing when it fails" sw_dirs_sile
 expect_red_because "source walks: subdirectories fails on a directory it cannot search" \
     "WalkError: crates/b cannot be searched" sw_py subdirs crates
 fx_unlock
+# A top it can list but not search: each entry's probe would answer False, the walk empty.
+fx_lock "$sw/crates" 400
+expect_red_because "source walks: subdirectories fails on a top it can list but not search" \
+    "WalkError: crates/[^ ]* cannot be read (Permission denied)" sw_py subdirs crates
+fx_unlock
 fx_lock "$sw/crates"
 expect_red_because "source walks: tree_dirs fails on a top it cannot read" \
     "SOURCE-FILES SCOPE ERROR: crates cannot be read" sw_dirs "" src crates
@@ -5513,6 +5518,16 @@ root=$(unsafe_fixture si-locked-crate safe 'pub fn f() {}')
 fx_walk_lock "safety-inventory: a crate directory the walk cannot search fails the gate" \
     "SAFETY INVENTORY SCOPE ERROR: crates/locked cannot be searched" "$root" \
     crates/locked src/lib.rs 'pub unsafe fn f() {}' $INVENTORY
+# A top it can list but not search (bins/ at 0400) fails the gate: its unsafe file is unread.
+if [ "$(id -u)" -ne 0 ]; then
+root=$(unsafe_fixture si-unsearchable-top safe 'pub fn f() {}')
+mkdir -p "$root/bins/x/src"
+printf 'pub unsafe fn f() {}\n' >"$root/bins/x/src/lib.rs"
+fx_lock "$root/bins" 400
+expect_red_because "safety-inventory: a top the walk can list but not search fails the gate" \
+    "SAFETY INVENTORY SCOPE ERROR: bins/x cannot be read" env INF_CHECK_ROOT="$root" $INVENTORY
+fx_unlock
+fi
 }
 
 # --------------------------------------------- style limits (ADR-0125, batch 64)
@@ -5611,6 +5626,15 @@ printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
 fx_walk_lock "file-length: a crate directory the walk cannot search fails the gate" \
     "FILE-LENGTH SCOPE ERROR: crates/locked cannot be searched" "$root" \
     crates/locked src/lib.rs 'fn g() {}' $FILELEN
+# A top it can list but not search (bins/ at 0400) fails the gate, never a walk of crates/ alone.
+if [ "$(id -u)" -ne 0 ]; then
+root=$(style_root fl-unsearchable-top)
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+fx_lock "$root/bins" 400
+expect_red_because "file-length: a top the walk can list but not search fails the gate" \
+    "FILE-LENGTH SCOPE ERROR: bins/fake cannot be read" env INF_CHECK_ROOT="$root" $FILELEN
+fx_unlock
+fi
 }
 
 # ------------------------------------------------------------ lint-ratchet

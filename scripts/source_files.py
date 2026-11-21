@@ -21,6 +21,7 @@ included, a link listed and never followed into), so a gate's file set does not 
 
 import fnmatch
 import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -95,12 +96,21 @@ def tree_listing(top, pattern):
 
 def subdirectories(top):
     """The directories directly under `top` (a link to one included), sorted, each one the walk
-    can search: a probe inside one it cannot search reads the refusal as absence, so such an
-    entry would drop out of a crate loop unseen. scripts/source-files.sh's tree_dirs keeps this
-    rule for the shell gates."""
+    can search. Each entry is stat-ed: a probe such as `is_dir()` answers False for an entry it
+    cannot stat (one under a `top` it can list but not search), so a crate loop would drop it
+    unseen. Only an entry that is gone (a dangling link) is skipped; any other stat error, and an
+    entry it cannot search, raises WalkError. scripts/source-files.sh's tree_dirs keeps this rule
+    for the shell gates."""
     found = []
     for entry in listing(top):
-        if entry.is_dir():
+        try:
+            mode = os.stat(entry).st_mode
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as err:
+            raise WalkError(f"{entry} cannot be read ({err.strerror}), so what it is is "
+                            "unknown") from err
+        if stat.S_ISDIR(mode):
             if not os.access(entry, os.X_OK):
                 raise WalkError(f"{entry} cannot be searched, so what it holds is unknown")
             found.append(entry)
