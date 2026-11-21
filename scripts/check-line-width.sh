@@ -7,17 +7,23 @@
 # found 141 lines over with the formatter green. This gate counts
 # characters, not bytes, on every Rust file the workspace builds.
 #
-# Scope: every *.rs under crates/, bins/ and tests/. A missing directory
-# or an empty file set is a failure, not a skip (ADR-0106 D2).
+# Scope: every *.rs under crates/, bins/ and tests/ but a build's output, a
+# directory holding Cargo's CACHEDIR.TAG (scripts/source-files.sh, read
+# through scripts/source_files.py). A missing directory, a walk that fails or
+# an empty file set is a failure, not a skip (ADR-0106 D2).
 
 set -euo pipefail
-cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 LIMIT="${INF_LINE_WIDTH_MAX:-100}"
 
-INF_LINE_WIDTH_MAX="$LIMIT" python3 - <<'PY'
+INF_LINE_WIDTH_MAX="$LIMIT" INF_SCRIPT_DIR="$SCRIPT_DIR" python3 -B - <<'PY'
 import os
 import sys
 from pathlib import Path
+
+sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
+from source_files import WalkError, source_files
 
 limit = int(os.environ["INF_LINE_WIDTH_MAX"])
 roots = [Path("crates"), Path("bins"), Path("tests")]
@@ -27,7 +33,11 @@ for root in roots:
     if not root.is_dir():
         errors.append(f"LINE-WIDTH SCOPE: missing {root}")
         continue
-    rust = sorted(p for p in root.rglob("*.rs") if "target" not in p.parts)
+    try:
+        rust = sorted(source_files("*.rs", str(root)))
+    except WalkError as err:
+        errors.append(f"LINE-WIDTH SCOPE: {err}")
+        continue
     if not rust:
         errors.append(f"LINE-WIDTH SCOPE: no Rust files under {root}")
         continue

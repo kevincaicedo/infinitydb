@@ -123,6 +123,7 @@ from pathlib import Path
 sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
 import fuzz_targets
 import lint_scope_table as scope_table
+from source_files import WalkError, source_files
 from lint_scope_table import FN, attribute_end
 
 EXEMPTIONS = os.environ["INF_EXEMPTIONS"]
@@ -639,17 +640,23 @@ for file in sorted(production_files & set(test_module_files)):
                   "(a crate root, the file of a `mod` with no test-only attribute, or an `include!`'s) — "
                   "its scope is not established")
 
-# ---- D2: the suppression audit
+# ---- D2: the suppression audit, over every .rs of the trees but a fuzz workspace's (its
+# targets' scopes are the table's, below) and a build's output, a directory holding Cargo's
+# CACHEDIR.TAG (scripts/source-files.sh's walk): never a directory left out by the name target.
 files, exempt_sites = 0, []
 for top in ("crates", "bins", "tests"):
     if not os.path.isdir(top):
         continue
-    for dirpath, dirnames, names in os.walk(top):
-        dirnames[:] = sorted(d for d in dirnames if d not in ("target", "fuzz"))
-        for name in sorted(names):
-            if name.endswith(".rs"):
-                files += 1
-                audit(Path(dirpath) / name, exempt_sites)
+    try:
+        listed = source_files("*.rs", top)
+    except WalkError as err:
+        print(f"LINT-SCOPES SCOPE ERROR: {err}")
+        sys.exit(1)
+    for path in sorted(listed):
+        if "fuzz" in path.parts[:-1]:
+            continue
+        files += 1
+        audit(path, exempt_sites)
 
 # ---- D2/D3: the scope table — every fuzz target is named by a row, every
 # row's target and file exist, and the source reflects the table exactly:

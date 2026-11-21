@@ -1,4 +1,8 @@
-# source-files.sh, sourced: the gates' one walk of the source trees.
+# source-files.sh, sourced: the one rule for leaving a build's output out of a walk of the source
+# trees. Every gate walk that leaves a directory out as a build's output reads it, the shell
+# gates by calling source_files and the Python gates through scripts/source_files.py, so each
+# leaves out exactly the directories the others do; a walk that leaves nothing out (one that
+# reads only src/ and tests/ directories, where Cargo writes no output) has no use for it.
 #
 # source_files <name-pattern> <dir>...: prints every regular file whose name matches
 # <name-pattern> (a find -name pattern) under each <dir>, one a line, in find's order, leaving

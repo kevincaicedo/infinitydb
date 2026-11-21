@@ -5012,6 +5012,26 @@ printf '// %s\n' "$(printf 'z%.0s' $(seq 1 120))" >"$root/tests/t/t.rs"
 expect red "line-width: tests/ is in scope" env INF_CHECK_ROOT="$root" $LINEW
 [ -n "$root" ] && [ -d "$root/tests" ] && rm -rf "$root/tests"
 expect red "line-width: a missing tests/ is a scope error" env INF_CHECK_ROOT="$root" $LINEW
+# The gate reads scripts/source-files.sh's walk: a file under a directory named target with no
+# tag is read; a directory holding Cargo's CACHEDIR.TAG is left out, whatever its name.
+lw_wide=$(printf '// %s\n' "$(printf 'x%.0s' $(seq 1 98))")
+root=$(style_root lw-target)
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+mkdir -p "$root/crates/fake/src/target"
+printf '%s\n' "$lw_wide" >"$root/crates/fake/src/target/wide.rs"
+expect_red_because "line-width: a file under a directory named target with no tag is read" \
+    "LINE-WIDTH violation: crates/fake/src/target/wide.rs" env INF_CHECK_ROOT="$root" $LINEW
+root=$(style_root lw-tagged)
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+for dir in "$root/crates/fake/target" "$root/crates/fake/src/out"; do
+    mkdir -p "$dir"
+    printf 'Signature: 8a477f597d28d172789f06886806bc55\n' >"$dir/CACHEDIR.TAG"
+    printf '%s\n' "$lw_wide" >"$dir/wide.rs"
+done
+expect green "line-width: a directory holding CACHEDIR.TAG is left out, whatever its name" \
+    env INF_CHECK_ROOT="$root" $LINEW
+expect_output "line-width: the tagged directories' files are not counted" \
+    "line-width OK: 3 files" env INF_CHECK_ROOT="$root" $LINEW
 }
 
 # ------------------------------------------------------------ lint-ratchet
@@ -5581,6 +5601,24 @@ expect_output "lint-scopes: every allow is listed on the OK line" "allow: crates
 pub fn f() {}" >/dev/null
     echo "$root"
 )"
+# The suppression audit reads scripts/source-files.sh's walk: a file under a directory named
+# target with no tag is audited and its whole-function filesystem allow red; under a directory
+# holding Cargo's CACHEDIR.TAG, whatever its name, it is left out.
+ls_fs_allow='#[allow(clippy::disallowed_methods, reason = "boot: filesystem setup")]
+pub fn f() {}'
+root=$(ls_root ls-target-untagged)
+mkdir -p "$root/crates/fake/src/target"
+printf '%s\n' "$ls_fs_allow" >"$root/crates/fake/src/target/bad.rs"
+expect_red_because "lint-scopes: a file under a directory named target with no tag is audited" \
+    "crates/fake/src/target/bad.rs" ls_run "$root"
+root=$(ls_root ls-target-tagged)
+for dir in "$root/crates/fake/target" "$root/crates/fake/src/out"; do
+    mkdir -p "$dir"
+    printf 'Signature: 8a477f597d28d172789f06886806bc55\n' >"$dir/CACHEDIR.TAG"
+    printf '%s\n' "$ls_fs_allow" >"$dir/bad.rs"
+done
+expect green "lint-scopes: a directory holding CACHEDIR.TAG is left out, whatever its name" \
+    ls_run "$root"
 }
 
 group_lint_scopes_table() {
