@@ -5076,6 +5076,15 @@ expect green "line-width: a directory holding CACHEDIR.TAG is left out, whatever
     env INF_CHECK_ROOT="$root" $LINEW
 expect_output "line-width: the tagged directories' files are not counted" \
     "line-width OK: 3 files" env INF_CHECK_ROOT="$root" $LINEW
+# The listing is split on newlines alone, as the helper writes it: a name holding a carriage
+# return is one file, read and counted, not two names that do not exist.
+root=$(style_root lw-carriage-return)
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+printf 'fn g() {}\n' >"$root/crates/fake/src/"$'a\rb.rs'
+expect green "line-width: a file whose name holds a carriage return is read" \
+    env INF_CHECK_ROOT="$root" $LINEW
+expect_output "line-width: the carriage-return file is counted once" \
+    "line-width OK: 4 files" env INF_CHECK_ROOT="$root" $LINEW
 if [ "$(id -u)" -ne 0 ]; then
 root=$(style_root lw-unreadable)
 printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
