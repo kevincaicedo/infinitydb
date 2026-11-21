@@ -1,6 +1,6 @@
 //! The executor's A/B by instructions (L4, ADR-0211): the cell executor's task paths, each on
 //! two legs, from one binary. A row's verdict is the product's count less the same row's count
-//! on a second build of this same source at the slice's base, each in its own clean checkout.
+//! on a second build of this same source at the change's base, each in its own clean checkout.
 //!
 //! - B: the product, `inf_runtime::CellExecutor` through its task classes.
 //! - P: B's operation with a planted body of `k` instructions inside its step, `k` the row's
@@ -288,7 +288,7 @@ fn drive_deferred(cap: Cap, ops: u64, step: fn(&mut DeferredCell) -> usize) -> R
     Ok(())
 }
 
-// ---- The slice's interface ----------------------------------------------------------------------
+// ---- The gates the rows build -------------------------------------------------------------------
 
 /// The fabric gate of one origin over `holders` slots, every unit its holders bound issuable,
 /// its parked senders' list on a pool of a cell's wait nodes.

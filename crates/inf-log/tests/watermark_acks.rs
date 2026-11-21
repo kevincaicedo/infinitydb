@@ -3,13 +3,13 @@
     clippy::disallowed_types,
     reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
 )]
-//! M2-S06 integration: `always` acks gate on the durability watermark.
+//! `always` acks gate on the durability watermark (ADR-0177 D5).
 //! The oracle — **no response leaves the cell before the watermark covers
 //! its LSN** — is asserted inside every ack future (support harness) and
-//! swept here across seeded random completion schedules; the wake-storm AC
-//! is proven at the executor level (bounded drain under the EXECUTE
-//! budget). The full sim-tier oracle (power cuts, 10k seeds) binds at
-//! M2-S18/S19 on the sim disk.
+//! swept here across seeded random completion schedules; one fsync's wake
+//! storm is bounded at the mechanism tier (the gate wakes a budget a turn,
+//! ADR-0177 A2). The full sim-tier oracle (power cuts, 10k seeds) is the
+//! simulator's durable scenario on its simulated disk.
 
 mod support;
 
@@ -114,13 +114,13 @@ fn no_ack_before_covering_fsync_across_random_schedules() {
     }
 }
 
-/// S06 wake-storm AC (mechanism tier, ADR-0177 A2): one fsync completion
+/// The wake storm at the mechanism tier (ADR-0177 A2): one fsync completion
 /// covers 50,000 gated futures. `advance` wakes none; the gate wakes them a
 /// budget at a time, as the durable cell's LOG steps call it, each turn one
 /// `wake_covered` and one EXECUTE pass at the same 1,024, so the storm leaves
 /// over 49 turns, in LSN order, no call past its budget and no turn's pass
-/// past EXECUTE's. The wall-clock p99.9 < 2 ms row binds on the reference box
-/// (S22).
+/// past EXECUTE's. The wall-clock bound, foreground p99.9 < 2 ms through the
+/// storm, is measured on the reference box, not here.
 #[test]
 fn wake_storm_50k_drains_a_budget_a_turn() {
     const WAITERS: u64 = 50_000;

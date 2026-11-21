@@ -20,7 +20,7 @@ io-uring = { workspace = true, optional = true }
 
 [features]
 uring = ["dep:io-uring"]
-# M0-S19 A/B artifact only: compiles the always-on tripwire counters out to
+# For the tripwires' A/B only: compiles the always-on tripwire counters out to
 # prove they cost nothing; the iteration count stays, the cold turn's epoch
 # (ADR-0181 A1.3). Never enabled in shipping builds.
 no-tripwires = []
@@ -43,7 +43,7 @@ libc.workspace = true
 # The capped containers' allocation census (tests/bounded_alloc.rs) counts
 # through inf-alloc's allocator, so inf-foundation stays dependency-free.
 inf-alloc = { workspace = true, features = ["test-counting-allocator"] }
-# M4-S04 steel thread: the integration vertical crosses store/log/alloc.
+# The integration tests cross store, log and alloc in one vertical path.
 # Dev-only — tests may cross layers (dep-dag exemption).
 inf-store.workspace = true
 inf-log.workspace = true
@@ -78,14 +78,14 @@ name = "executor_ab"
 harness = false
 test = false
 
-# M0-S04 echo gate (Linux + uring only; skipped without the feature).
+# The io_uring echo gate (Linux + uring only; skipped without the feature).
 [[bench]]
 name = "uring_echo"
 harness = false
 test = false
 required-features = ["uring"]
 
-# M2-S05/S06 group-commit rehearsal: LogWrite + linked fdatasync rows with
+# Group commit on a real device: LogWrite + linked fdatasync rows with
 # fsync latency histograms (dev tier; gate values bind on the reference box).
 [[bench]]
 name = "log_fsync"
@@ -96,21 +96,21 @@ required-features = ["uring"]
 [lints]
 workspace = true
 
-# M2-S07 buffered vs O_DIRECT A/B (Linux + uring only).
+# The log's buffered vs O_DIRECT A/B (Linux + uring only).
 [[bench]]
 name = "log_io_tier"
 harness = false
 test = false
 required-features = ["uring"]
 
-# M4-S09 tier-file I/O mode A/B (ADR-0054; Linux + uring only).
+# The tier file's I/O mode A/B (ADR-0054; Linux + uring only).
 [[bench]]
 name = "tier_io_mode"
 harness = false
 test = false
 required-features = ["uring"]
 
-# M4-S10 cold-read shaping: coalescing A/B + saturation (ADR-0055).
+# Cold-read shaping: the coalescing A/B and saturation (ADR-0055).
 [[bench]]
 name = "cold_shaping"
 harness = false

@@ -1198,7 +1198,7 @@ enum NodeState {
 // the pinned toolchain: `SlotId` is not `repr(C)`, so its niche is the
 // compiler's to place, and a toolchain that moves it splits the store in
 // two, one instruction a list wait that no test sees. The executor bench's
-// `wait-wake` rows read it, at the slice's pair and at any toolchain bump.
+// `wait-wake` rows count it, so a toolchain bump that splits it reads there.
 #[repr(C)]
 struct WaitNode {
     waker: Option<Waker>,
