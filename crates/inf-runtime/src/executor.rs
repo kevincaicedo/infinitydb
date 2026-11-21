@@ -1600,14 +1600,15 @@ impl CellExecutor {
     /// is not a poll). It first delivers the foreign wakes queued on the remote stack.
     pub fn run_ready(&mut self, budget: usize) -> ExecutorProgress {
         self.drain_remote();
-        // One count bounds the pass and the reclaim arm counts its own, so the poll path keeps
-        // the loop it had when it counted entries alone.
-        let mut taken = 0;
+        // The pass counts down what is left of its budget and the reclaim arm counts its own, so
+        // the loop holds two counts, as it did when it counted up to `budget`: `budget` itself is
+        // read only after it.
+        let mut left = budget;
         let mut slots_reclaimed = 0;
-        while taken < budget {
+        while left > 0 {
             // SAFETY: the executor holds its array, on this thread.
             let Some(header) = (unsafe { pop_ready(self.array) }) else { break };
-            taken += 1;
+            left -= 1;
             // SAFETY: the executor holds its headers: open, on this thread.
             let state = unsafe { owner(header) }.state.get();
             match state {
@@ -1630,8 +1631,9 @@ impl CellExecutor {
                 }
             }
         }
-        // Each reclaim was counted as an entry taken, so the rest of the entries are the polls.
-        let progress = ExecutorProgress { tasks_polled: taken - slots_reclaimed, slots_reclaimed };
+        // Each reclaim spent one unit of the budget, so the rest of what was spent is the polls.
+        let tasks_polled = budget - left - slots_reclaimed;
+        let progress = ExecutorProgress { tasks_polled, slots_reclaimed };
         debug_assert!(progress.entries() <= budget, "the pass takes at most its budget");
         progress
     }
