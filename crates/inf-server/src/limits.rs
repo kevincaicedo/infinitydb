@@ -714,11 +714,11 @@ mod tests {
     /// Every copy of the wake budget in the workspace: the crates below this one cannot reach
     /// the limit, so a source of theirs keeps its own `WAKE_BUDGET`. Every `.rs` file of each
     /// workspace member's tree, as the root manifest's `members` name them, is read (a build's
-    /// `target` directory and this file, whose planted strings name it, aside), and one that
-    /// names `WAKE_BUDGET` declares it once, as a literal equal to the limit: a copy joins the
-    /// tie by its name wherever it sits, a test module under `src/` among them, with no list of
-    /// files to extend. A copy that drifts, is declared twice, `pub`, commented out or not a
-    /// literal is red here, and so is a walk that finds no copy.
+    /// output, by Cargo's `CACHEDIR.TAG`, and this file, whose planted strings name it, aside),
+    /// and one that names `WAKE_BUDGET` declares it once, as a literal equal to the limit: a
+    /// copy joins the tie by its name wherever it sits, a test module under `src/` among them,
+    /// with no list of files to extend. A copy that drifts, is declared twice, `pub`, commented
+    /// out or not a literal is red here, and so is a walk that finds no copy.
     #[test]
     #[allow(clippy::disallowed_methods, reason = "test-only: reads the workspace members' sources")]
     fn every_copy_of_the_wake_budget_in_the_workspace_is_the_limit() {
@@ -818,30 +818,80 @@ mod tests {
             .collect()
     }
 
-    /// Every `.rs` file of each workspace member's whole tree, walked with a stack of
-    /// directories and sorted: a `target` directory, a build's output, aside, and this file,
-    /// whose planted strings name the budget, which the walk must meet exactly once.
+    /// Every `.rs` file of each workspace member's whole tree but this file, whose planted
+    /// strings name the budget, and which the walk must meet exactly once.
     fn member_sources() -> Vec<std::path::PathBuf> {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let this_file = root.join(file!());
-        let mut trees = workspace_members(&root);
-        let (mut files, mut skipped) = (Vec::new(), 0);
+        let (files, met) = rust_sources(workspace_members(&root), &this_file);
+        assert_eq!(met, 1, "the walk met {} {met} times, where once", this_file.display());
+        files
+    }
+
+    /// The `.rs` files under `trees` but `aside`, sorted, walked with a stack of directories,
+    /// and how many times the walk met `aside`. A directory is a build's output, and skipped,
+    /// only when it holds `CACHEDIR.TAG`, the cache-directory tag Cargo writes at the root of
+    /// each target directory it makes; a name never skips one, so a source directory named
+    /// `target` at any depth is read.
+    #[allow(clippy::disallowed_methods, reason = "test-only: reads each directory's cache tag")]
+    fn rust_sources(
+        mut trees: Vec<std::path::PathBuf>,
+        aside: &std::path::Path,
+    ) -> (Vec<std::path::PathBuf>, usize) {
+        let (mut files, mut met) = (Vec::new(), 0);
         while let Some(dir) = trees.pop() {
             for (path, is_dir) in listed(&dir) {
                 if is_dir {
-                    if path.file_name().is_none_or(|name| name != "target") {
+                    if !path.join("CACHEDIR.TAG").is_file() {
                         trees.push(path);
                     }
-                } else if path == this_file {
-                    skipped += 1;
+                } else if path == aside {
+                    met += 1;
                 } else if path.extension().is_some_and(|extension| extension == "rs") {
                     files.push(path);
                 }
             }
         }
-        assert_eq!(skipped, 1, "the walk met {} {skipped} times, where once", this_file.display());
         files.sort();
-        files
+        (files, met)
+    }
+
+    /// The walk's build-output rule, on a scratch tree: a directory named `target` that holds
+    /// no `CACHEDIR.TAG` is read, so its source is met; one named `target` that holds the tag,
+    /// and one under another name that holds it, are skipped, so neither's source is; the
+    /// `aside` file is met once and left out. A rule that skips by the name `target` leaves the
+    /// untagged directory's source unread, and this test red.
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "test-only: builds the walk's scratch tree")]
+    fn the_tie_walk_skips_a_tagged_directory_and_reads_an_untagged_target() {
+        let root = std::env::temp_dir().join(format!("inf-limits-tie-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let member = root.join("member");
+        let untagged = member.join("target");
+        let (tagged, tagged_other) = (member.join("nested/target"), member.join("out"));
+        for dir in [&untagged, &tagged, &tagged_other] {
+            std::fs::create_dir_all(dir)
+                .unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+        }
+        let tag = "Signature: 8a477f597d28d172789f06886806bc55\n";
+        let read = untagged.join("read.rs");
+        let aside = member.join("aside.rs");
+        let files = [
+            (tagged.join("CACHEDIR.TAG"), tag),
+            (tagged_other.join("CACHEDIR.TAG"), tag),
+            (read.clone(), ""),
+            (tagged.join("skipped.rs"), ""),
+            (tagged_other.join("skipped.rs"), ""),
+            (aside.clone(), ""),
+        ];
+        for (file, contents) in &files {
+            std::fs::write(file, contents)
+                .unwrap_or_else(|error| panic!("{}: {error}", file.display()));
+        }
+        let (sources, met) = rust_sources(vec![member], &aside);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(sources, [read], "the walk's sources, where the untagged target's one alone");
+        assert_eq!(met, 1, "the walk met the aside file {met} times, where once");
     }
 
     /// The value of the one `const WAKE_BUDGET: <type> = <digits>;` line of `source`.
