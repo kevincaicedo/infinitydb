@@ -1600,9 +1600,8 @@ impl CellExecutor {
     /// is not a poll). It first delivers the foreign wakes queued on the remote stack.
     pub fn run_ready(&mut self, budget: usize) -> ExecutorProgress {
         self.drain_remote();
-        // The pass counts down what is left of its budget and the reclaim arm counts its own, so
-        // the loop holds two counts, as it did when it counted up to `budget`: `budget` itself is
-        // read only after it.
+        // The loop carries only `left` and `slots_reclaimed`; `budget` stays out of it, read once
+        // after, so a poll updates one count and reloads nothing per entry.
         let mut left = budget;
         let mut slots_reclaimed = 0;
         while left > 0 {
@@ -1634,7 +1633,10 @@ impl CellExecutor {
         // Each reclaim spent one unit of the budget, so the rest of what was spent is the polls.
         let tasks_polled = budget - left - slots_reclaimed;
         let progress = ExecutorProgress { tasks_polled, slots_reclaimed };
-        debug_assert!(progress.entries() <= budget, "the pass takes at most its budget");
+        debug_assert!(
+            left == 0 || !self.ready_linked(),
+            "a pass ends on its budget or on an empty ready list"
+        );
         progress
     }
 
@@ -1729,9 +1731,15 @@ impl CellExecutor {
     /// after `run_ready`, a reclaim, or a foreign wake on the remote stack, which the next
     /// `run_ready` delivers.
     pub fn has_ready(&self) -> bool {
+        self.ready_linked() || self.stack_ref().pending()
+    }
+
+    /// Whether the ready list links a header: an activation or a reclaim, the remote stack aside.
+    #[inline]
+    fn ready_linked(&self) -> bool {
         // SAFETY: the executor holds its array.
         let head = unsafe { self.array.as_ref() };
-        head.ready_head.get() != NO_HEADER || self.stack_ref().pending()
+        head.ready_head.get() != NO_HEADER
     }
 
     /// Whether `id` still names a live task (slots are recycled; stale ids compare against the
