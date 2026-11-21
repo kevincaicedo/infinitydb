@@ -586,6 +586,37 @@ expect green "fx_unlock: the file outside a refused .. path keeps its mode" \
     test ! -r "$work/fx-dot/outside"
 fx_unlock
 fi
+# A link under $work to a path outside it leaves $work too, whether it is the path's parent or
+# the path itself: each helper resolves the path physically and refuses it, and the file
+# outside keeps its mode (the lib sourced alone, its work directory beside the targets).
+mkdir -p "$work/fx-link/in" "$work/fx-link/out"
+git init -q "$work/fx-link/repo"
+: >"$work/fx-link/out/f"
+ln -s ../out "$work/fx-link/in/dir"
+ln -s ../out/f "$work/fx-link/in/file"
+ln -s ../repo "$work/fx-link/in/repo"
+fx_link() { # <code> <path>: the lib sourced alone, $work at fx-link/in, <code> run on <path>
+    bash -c '. "$1"; work=$2; path=$3; eval "$4"' fx "$SCRIPT_DIR/selftest-lib.sh" \
+        "$work/fx-link/in" "$2" "$1"
+}
+expect_red_because "fx_lock: a path under a link to a directory outside \$work is refused" \
+    "fx_lock: '$work/fx-link/in/dir/f' is not a fixture path under" fx_link 'fx_lock "$path"' \
+    "$work/fx-link/in/dir/f"
+expect_red_because "fx_lock: a link to a file outside \$work is refused" \
+    "fx_lock: '$work/fx-link/in/file' is not a fixture path under" fx_link 'fx_lock "$path"' \
+    "$work/fx-link/in/file"
+expect_red_because "fx_git: a link to a repository outside \$work is refused" \
+    "fx_git: '$work/fx-link/in/repo' is not a fixture directory under" fx_link 'fx_git "$path" status' \
+    "$work/fx-link/in/repo"
+if [ "$(id -u)" -ne 0 ]; then
+expect green "fx_lock: the file behind a refused link keeps its mode" test -r "$work/fx-link/out/f"
+fx_lock "$work/fx-link/out/f"
+expect_output "fx_unlock: a recorded path under a link out of \$work is named, not unlocked" \
+    "fx_unlock: '$work/fx-link/in/dir/f' is not a fixture path under" \
+    fx_link 'FX_LOCKED="$path"; fx_unlock' "$work/fx-link/in/dir/f"
+expect green "fx_unlock: the file behind a refused link keeps its mode" test ! -r "$work/fx-link/out/f"
+fx_unlock
+fi
 }
 
 group_stage() {

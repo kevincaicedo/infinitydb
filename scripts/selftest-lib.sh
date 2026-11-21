@@ -148,18 +148,28 @@ expect_red_because() {
     fi
 }
 
-# fx_under <path>: true for a path under $work holding no `..` component.
-# The match is textual, so without the second test `$work/../x` would pass
-# `"$work"/?*` and name a path outside every fixture.
+# fx_under <path>: true for a path under $work that holds no `..` component,
+# ends in no `/`, is no link itself, and whose parent, read physically
+# (`cd -P`, `pwd -P`), lies under $work read the same way. A textual match
+# alone admits `$work/../x`, and `$work/link/x` for a link under $work to a
+# directory outside it, which chmod and git -C would follow.
 fx_under() {
+    local parent top
+    [ -n "$work" ] || return 1
     case $1 in "$work"/?*) ;; *) return 1 ;; esac
     case /$1/ in */../*) return 1 ;; esac
+    case $1 in */) return 1 ;; esac
+    [ ! -L "$1" ] || return 1
+    parent=$(cd -P "${1%/*}" 2>/dev/null && pwd -P) || return 1
+    top=$(cd -P "$work" 2>/dev/null && pwd -P) || return 1
+    case $parent/ in "$top"/*) ;; *) return 1 ;; esac
 }
 # fx_git <root> <git args…>: git in a fixture repository only. `git -C ""`
 # runs in the current directory, and a root that is not its own repository
 # lets git walk up to an enclosing one, the developer's engine branch: a root
-# that is empty, outside $work (fx_under: a `..` component leaves it) or
-# without its own `.git` is refused before git runs (the rule every
+# that is empty, outside $work (fx_under, read physically: a `..` component
+# or a link under $work leaves it) or without its own `.git` is refused
+# before git runs (the rule every
 # destructive command on a variable keeps). `init`
 # creates that `.git`, so it alone runs bare, on a root its guarded
 # constructor made.
