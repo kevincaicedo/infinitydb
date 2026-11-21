@@ -163,8 +163,25 @@ impl Arena {
 > `WatermarkGate` take one wait node per parked task from a per-cell
 > pool; `WaitList`'s keys, FIFO, `wake_one`, `wake_all` and baton are
 > unchanged, and no type joins the suspension primitives sketched below.
-> No wire, durable or token layout changes. The old signatures below do
-> not establish that the replacement is built.
+> No wire, durable or token layout changes. Of D5, the wait lists are
+> built. A cell builds one `WaitNodes` pool before it serves: `T` nodes,
+> one for each task slot of its classes, on its census (row
+> `wait-nodes`), and each of its `WaitList`s takes the pool at its
+> constructor. A wait takes its node at its first poll, not at
+> `wait(key)`, so a key's FIFO is in first-poll order, and returns it at
+> the poll that reads its wake or at its drop; dropped while queued, it
+> unlinks in O(1). `WaitList::unit` keeps the unit key's one pair of ends
+> in its own state, with no map and no refusal. `WaitList::keyed` holds
+> every key it serves in a capped map filled at its build and admits none
+> after: a refused map, or a cap short of its keys, answers `KeysRefused`
+> before the cell serves. A list's keys are the unit key, `u8`, `u16`,
+> `u32`, `u64` and `CellId` (ADR-0151 D1). A first poll that finds no
+> free node, or no entry for its key, counts `wait_nodes_full` in
+> `INFO tripwires`, wakes its task and is Ready at its next poll with no
+> wake landed: `ListWait::starved()` says so, and a caller that counts
+> on a wake waits again. `WatermarkGate` on the pool is not yet built. The
+> `WaitList` and `WaitNodes` lines below are as built; the other old
+> signatures below do not establish that the replacement is built.
 
 > **Accepted 2026-11-20, implementation open — ADR-0177 A2:**
 > `WatermarkGate`'s wake is budgeted. `advance(lsn)` moves the watermark
@@ -502,8 +519,12 @@ pub struct KeyedGate<K, V>;        // single-waiter primitive; complete() may pr
 pub type FabricGate<V> = KeyedGate<u64, V>;   // token-keyed; V = fabric reply payload
                                               // (inf-fabric is ABOVE this crate in the DAG)
 pub type IoGate = KeyedGate<CompletionToken, CompletionResult>;  // M7 seam, exists at M0
-pub struct WaitList<K>;            // key-keyed FIFO; wake_one/wake_all; baton-pass on drop
+pub struct WaitList<K: ListKey>;   // key-keyed FIFO; wake_one/wake_all; baton-pass on drop;
+                                   // unit(&nodes) or keyed(&nodes, cap, &census, keys)
+                                   // -> Result<_, KeysRefused>; a ListWait reads starved()
 pub struct WatermarkGate;          // LSN-keyed; advance(lsn) wakes all ≤ lsn
+// Not a suspension primitive: the cell's wait-node pool, taken by every WaitList (ADR-0177 D5).
+pub struct WaitNodes;              // build(cap, &census) -> Result<_, CapError>; T nodes a cell
 
 // Reactor loop skeleton: the 10 steps with budgets + always-on iteration histogram.
 pub trait CellPlane {
