@@ -120,7 +120,7 @@ fn no_ack_before_covering_fsync_across_random_schedules() {
 /// `wake_covered` and one EXECUTE pass at the same 1,024, so the storm leaves
 /// over 49 turns, in LSN order, no call past its budget and no turn's pass
 /// past EXECUTE's. The wall-clock bound, foreground p99.9 < 2 ms through the
-/// storm, is measured on the reference box, not here.
+/// storm, binds on the reference box; this test reads no time.
 #[test]
 fn wake_storm_50k_drains_a_budget_a_turn() {
     const WAITERS: u64 = 50_000;
