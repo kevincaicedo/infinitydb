@@ -528,6 +528,20 @@ expect_red_because "fx_lock: an empty work directory is refused" "fx_lock: no wo
 expect green "fx_lock: the refused path keeps its mode" test -r "$work/fx-victim"
 expect_red_because "fx_unlock: an empty work directory is refused" "fx_unlock: no work directory" \
     bash -c '. "$1"; FX_LOCKED="$2"; fx_unlock' fx "$SCRIPT_DIR/selftest-lib.sh" "$work/fx-victim"
+# fx_unlock gives access back only to a recorded path under $work: one outside it, here a path
+# beside the work directory of the lib sourced alone, is named and keeps its mode.
+if [ "$(id -u)" -ne 0 ]; then
+mkdir -p "$work/fx-own"
+: >"$work/fx-outside"
+fx_lock "$work/fx-outside"
+expect_output "fx_unlock: a recorded path outside the work directory is named, not unlocked" \
+    "fx_unlock: '$work/fx-outside' is not a fixture path under $work/fx-own" \
+    bash -c '. "$1"; work=$2; FX_LOCKED="$3"; fx_unlock' fx "$SCRIPT_DIR/selftest-lib.sh" \
+    "$work/fx-own" "$work/fx-outside"
+expect green "fx_unlock: the path outside the work directory keeps its mode" \
+    test ! -r "$work/fx-outside"
+fx_unlock
+fi
 }
 
 group_stage() {
