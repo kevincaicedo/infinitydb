@@ -34,32 +34,42 @@ unset CARGO_TARGET_DIR
 # shellcheck source=selftest-lib.sh
 . "$SCRIPT_DIR/selftest-lib.sh"
 
-# walk_forms <file>…: each line of the gates' scripts that lists a tree in a form that reads a
-# directory it cannot read as an empty one, as `<file>:<line>: <form>: <text>`, and status 1;
-# with none, a count line and status 0. Comment lines are not code. The shell forms: a walk
-# (find, git ls-files, a recursive grep, ls, or the helpers source_files, tree_dirs and
-# cell_crate_dirs) inside `< <(…)` or as a `for` word list, where nothing reads its status;
-# and a `for` over a glob of crates/, bins/ or tests/, which probes inside each entry
-# (tree_dirs lists them). The Python forms: pathlib's glob, rglob and iterdir, os.listdir and
-# os.scandir, and an os.walk with no onerror: scripts/source_files.py holds the forms that
-# fail closed. A command substitution inside an arithmetic expansion: an expansion error ends the
-# enclosing loop with no errexit, so the scan reads as cut short and green. In either language, a git listing (ls-files, grep, status) not run by
-# git_listing, which fails on the stderr warning git gives, with exit 0, for a directory it
-# cannot open: a shell command line that runs git, or a Python line that passes the
-# subcommand as a string and does not name git_listing. Written for BSD awk: bracket classes,
-# no interval braces.
+# walk_forms <file>…: each line of the gates' scripts that lists a tree in a form whose failure
+# reads as a shorter scan, as `<file>:<line>: <form>: <text>`, and status 1; with none, a count
+# line and status 0. Comment lines are not code. A walk is find, git ls-files (git's global
+# options before it), grep with -r in any flag group, ls, or the helpers source_files, tree_dirs
+# and cell_crate_dirs. The shell forms, each losing the walk's status: a walk anywhere inside
+# `< <(…)` or `<<<"$(…)"`, in a `for` word list, or assigned by local, export, declare or
+# readonly, whose own status replaces it; a `for` over a glob of crates/, bins/ or tests/, which
+# probes inside each entry (tree_dirs lists them); a command substitution inside an arithmetic
+# expansion, whose failure ends the enclosing loop with no errexit, so the scan reads as cut
+# short and green. The Python forms: pathlib's glob and rglob and an os.walk with no onerror,
+# which skip a directory they cannot read; iterdir, os.listdir and os.scandir outside
+# scripts/source_files.py, which raise on the directory itself but leave its loop to probe each
+# entry, and a probe (is_dir, is_file) reads a refusal as absence. In either language, a git
+# listing (ls-files, grep, status) not run by git_listing, which fails on the warning git gives,
+# with exit 0, for a directory it cannot open: a shell command line that runs git, or a Python
+# line that passes the subcommand as a string and does not name git_listing. Written for BSD
+# awk: bracket classes, no interval braces.
 walk_forms() {
     awk '
         BEGIN {
-            walker = "(find|git([ \t]+-C[ \t]+[^ \t]+)?[ \t]+ls-files|grep[ \t]+-[A-Za-z]*[rR][A-Za-z]*|ls"
+            gitopts = "([ \t]+-[Cc][ \t]+[^ \t]+|[ \t]+--[a-z-]+(=[^ \t]+)?|[ \t]+-[A-Za-z])*"
+            grepr = "grep([ \t]+-[A-Za-z]+)*[ \t]+(-[A-Za-z]*[rR][A-Za-z]*|--recursive|--dereference-recursive)"
+            walker = "(find|git" gitopts "[ \t]+ls-files|" grepr "|ls"
             walker = walker "|source_files|tree_dirs|cell_crate_dirs)([ \t;|)]|$)"
-            procsub = "<[ \t]*<[(][ \t]*" walker
-            wordlist = "(^|[ \t;])in[ \t]+([$][(]|`)[ \t]*" walker
+            # A walk anywhere after the opening parenthesis: first, or after a word boundary.
+            inside = "([^)`]*[ \t;&|(!])?" walker
+            procsub = "<[ \t]*<[(]" inside
+            herestr = "<<<[ \t]*\"?[$][(]" inside
+            wordlist = "(^|[ \t;])in[ \t]+([$][(]|`)" inside
+            declared = "(^|[ \t;])(local|export|declare|readonly)([ \t]+-[A-Za-z]+)*[ \t]+[A-Za-z_][A-Za-z0-9_]*=\"?[$][(]" inside
             forloop = "(^|[ \t;])for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in[ \t]"
             treeglob = "(^|[ \t\"'\''])(crates|bins|tests)/[^ \t;]*[*]"
-            listing = "[.]r?glob[(]|glob[.]i?glob[(]|[.]iterdir[(]|os[.]listdir[(]|os[.]scandir[(]"
+            globbing = "[.]r?glob[(]|glob[.]i?glob[(]"
+            dirloop = "[.]iterdir[(]|os[.]listdir[(]|os[.]scandir[(]"
             gitsub = "(ls-files|grep|status)"
-            gitcmd = "(^|[;&|({!]|[$][(]|then[ \t]|do[ \t]|else[ \t])[ \t]*git([ \t]+-C[ \t]+[^ \t]+)?[ \t]+" gitsub "([ \t]|$)"
+            gitcmd = "(^|[;&|({!]|[$][(]|then[ \t]|do[ \t]|else[ \t])[ \t]*git" gitopts "[ \t]+" gitsub "([ \t]|$)"
             gitarg = "[\"'\'']" gitsub "[\"'\'']"
             arithsub = "[$][(][(][^)]*[$][(]"
             found = 0
@@ -68,10 +78,13 @@ walk_forms() {
         {
             form = ""
             if ($0 ~ procsub) form = "a walk inside < <(…), its status lost"
+            else if ($0 ~ herestr) form = "a walk inside <<<\"$(…)\", its status lost"
             else if ($0 ~ wordlist) form = "a walk as a for word list, its status lost"
+            else if ($0 ~ declared) form = "a walk assigned by local, export, declare or readonly, whose status replaces its own"
             else if ($0 ~ forloop && $0 ~ treeglob) form = "a for over a tree glob, which probes inside each entry"
-            else if ($0 ~ listing) form = "a listing that reads an unreadable directory as empty"
-            else if ($0 ~ /os[.]walk[(]/ && $0 !~ /onerror=/) form = "an os.walk with no onerror"
+            else if ($0 ~ globbing) form = "a glob, which skips a directory it cannot read"
+            else if ($0 ~ dirloop) form = "a directory listing whose loop probes each entry, a refusal read as absence (scripts/source_files.py stats them)"
+            else if ($0 ~ /os[.]walk[(]/ && $0 !~ /onerror=/) form = "an os.walk with no onerror, which skips a directory it cannot read"
             else if ($0 ~ arithsub) form = "a command substitution inside $((…)), whose failure ends the loop with no errexit"
             else if ($0 ~ gitcmd) form = "a git listing not run by git_listing"
             else if ($0 ~ gitarg && $0 ~ /git/ && $0 !~ /git_listing/) form = "a git listing not run by git_listing"
@@ -161,7 +174,14 @@ for wf_line in \
     'top=$(git -C . status --porcelain)' \
     '    listed = subprocess.run(["git", "ls-files", "-co", "-z"], capture_output=True)' \
     '    grep = git(top, "grep", "-nIzF", "--untracked", "--", ".")' \
-    '    lines=$((lines + $(wc -l < "$f")))'
+    '    lines=$((lines + $(wc -l < "$f")))' \
+    'done < <(LC_ALL=C find crates -name '"'*.rs'"' | sort)' \
+    'done < <(cd "$DIR" && find . -name '"'*.rs'"')' \
+    'done < <(grep -n -r Mutex crates)' \
+    'done < <(git --no-pager ls-files -co)' \
+    'git -c core.quotepath=off ls-files -z >"$work/listed.z"' \
+    'done <<<"$(find crates -name '"'*.rs'"')"' \
+    '    local listed=$(find "$dir" -name '"'*.rs'"' | sort) || exit 2'
 do
     wf_n=$((wf_n + 1))
     cp "$SCRIPT_DIR/check-refusal-text.sh" "$work/walk-form-$wf_n.sh"
@@ -173,7 +193,9 @@ cp "$SCRIPT_DIR/check-refusal-text.sh" "$work/walk-form-ok.sh"
 printf '%s\n' '# done < <(find "$DIR" -name x)' '    for here, dirs, files in os.walk(top, onerror=unreadable):' \
     'git_listing ls-files -z -- x >"$work/x" || scope_error "git ls-files failed"' \
     '    listed = walked(git_listing, "-C", top, "ls-files", "-z", "-co")' \
-    'is `git grep -nIzF --untracked`, one -e a name' >>"$work/walk-form-ok.sh"
+    'is `git grep -nIzF --untracked`, one -e a name' \
+    '    listing=$(find "$dir" -name '"'*.rs'"' | sort) || {' 'local dirs listing found=0' \
+    >>"$work/walk-form-ok.sh"
 expect green "self-test: a comment, an os.walk with onerror, git_listing and prose are not refused" \
     walk_forms "$work/walk-form-ok.sh"
 }
