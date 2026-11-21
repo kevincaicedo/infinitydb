@@ -791,8 +791,50 @@ impl<V, C: Cleanup<V>> Drop for GateWait<'_, V, C> {
 
 // ---- KeyedGate (the cold gate, IoGate) ---------------------------------------
 
-/// A key a [`KeyedGate`] routes by: its exact word (ADR-0151 D1).
-pub trait GateKey: Copy {
+/// The closed set of gate keys (ADR-0151 D1): a type outside this crate cannot name the
+/// supertrait, so it cannot implement [`GateKey`]. A type joins the set here, with the proof that
+/// its word is its whole representation.
+mod sealed {
+    pub trait Sealed {}
+    /// The word itself.
+    impl Sealed for u64 {}
+    /// `{class:8, slot:24, gen:32}`, all 64 bits, as the driver carries it.
+    impl Sealed for super::CompletionToken {}
+    /// Its token, all 64 bits: the even word of its pair.
+    impl Sealed for crate::cold::LogicalId {}
+}
+
+/// A key a [`KeyedGate`] routes by: its exact word (ADR-0151 D1). The word is the key's whole
+/// 64-bit representation, so two keys with one word are one key, and the route map compares it
+/// with constant work as the foundation's 64-bit exact key, never through a hash or a caller's
+/// comparison. The set is sealed: `u64`, a driver's [`CompletionToken`] and the cold gate's
+/// [`LogicalId`](crate::LogicalId), each a lossless adapter of its own word.
+///
+/// A key type of another crate is refused:
+///
+/// ```compile_fail,E0277
+/// use inf_runtime::GateKey;
+/// #[derive(Copy, Clone)]
+/// struct Hashed(u64);
+/// impl GateKey for Hashed {
+///     fn word(self) -> u64 {
+///         self.0
+///     }
+/// }
+/// ```
+///
+/// Its twin, keys of the set read through the trait from another crate, compiles:
+///
+/// ```
+/// use inf_runtime::{CompletionToken, GateKey, TokenClass};
+/// fn word_of<K: GateKey>(key: K) -> u64 {
+///     key.word()
+/// }
+/// let token = CompletionToken::new(TokenClass::TierRead, 7, 9);
+/// assert_eq!(word_of(token), token.as_u64());
+/// assert_eq!(word_of(u64::MAX), u64::MAX);
+/// ```
+pub trait GateKey: sealed::Sealed + Copy {
     /// The key's word; two keys with one word are one key.
     fn word(self) -> u64;
 }
