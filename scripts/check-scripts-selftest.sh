@@ -3937,9 +3937,9 @@ builds_lane() { # <name> <row>…: a fixture checkout with the lane, its rows, a
     dir="$work/$1"
     shift
     mkdir -p "$dir/scripts" "$dir/.config"
-    # The nextest gate lists its workflows through scripts/source_files.py, beside it as in the tree.
-    cp "$SCRIPT_DIR/sim-canaries.sh" "$SCRIPT_DIR/target-root.sh" "$SCRIPT_DIR/check-nextest-config.sh" \
-        "$SCRIPT_DIR/source_files.py" "$dir/scripts/"
+    # The whole scripts/ directory, so the lane and every gate it runs read what they read in the
+    # tree: a list of the files would leave the copy dying on the next import.
+    cp -R "$SCRIPT_DIR/." "$dir/scripts/"
     printf '%s\n' "$@" >"$dir/rows"
     printf '%s\n' '[profile.default]' 'leak-timeout = { period = "100ms", result = "fail" }' \
         >"$dir/.config/nextest.toml"
@@ -5049,9 +5049,9 @@ expect_output "waker probe: the arm64 Linux shape is 8 plants red, 3 controls gr
 expect green "waker probe: the arm64 Linux shape passes" env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 # The controls are exact: a probe copy with both control lines deleted is red.
 mkdir -p "$work/wk/scripts"
-cp scripts/check-waker-atomics.sh scripts/asm-waker-scan.awk scripts/probe-target.sh \
-    scripts/source-files.sh "$work/wk/scripts/"
-cp -R scripts/waker-atomics-probe "$work/wk/scripts/"
+# The whole scripts/ directory, the probe among it: a list of the files the gate reads would
+# leave the copy dying on the next one.
+cp -R scripts/. "$work/wk/scripts/"
 sed -i.bak '/WAKER-PROBE: expect-clean/d; /WAKER-PROBE: expect-unscanned/d' \
     "$work/wk/scripts/waker-atomics-probe/src/lib.rs"
 expect_red_because "waker probe: a probe whose controls were deleted is red" \
