@@ -1,4 +1,4 @@
-//! The waker's A/B by instructions (L4, ADR-0003 A1.5, ADR-0210): four waker paths of the cell
+//! The waker's A/B by instructions (L4, ADR-0003 A1.5, ADR-0211): four waker paths of the cell
 //! executor, each on two legs, from one binary.
 //!
 //! - B: the product, `inf_runtime::CellExecutor`.

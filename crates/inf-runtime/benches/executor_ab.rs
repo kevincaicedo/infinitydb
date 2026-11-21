@@ -1,4 +1,4 @@
-//! The executor's A/B by instructions (L4, ADR-0210): the cell executor's task paths, each on
+//! The executor's A/B by instructions (L4, ADR-0211): the cell executor's task paths, each on
 //! two legs, from one binary. A row's verdict is the product's count less the same row's count
 //! on a second build of this same source at the slice's base, each in its own clean checkout.
 //!

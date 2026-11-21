@@ -71,7 +71,7 @@ name = "waker_ab"
 harness = false
 test = false
 
-# The executor's A/B by instructions (ADR-0210): each row a task path of the
+# The executor's A/B by instructions (ADR-0211): each row a task path of the
 # cell executor, one binary, `--variant <leg>-<row> --ops <n>`.
 [[bench]]
 name = "executor_ab"
