@@ -604,7 +604,10 @@ fn an_iteration_that_only_reclaims_polls_nothing_and_does_not_park() {
         let reclaim = lp.run_iteration(&mut plane).expect("iteration");
         assert!(plane.linked, "lever {remote_first_execute}: the clone's drop linked a reclaim");
         assert!(!lp.executor().has_ready(), "lever {remote_first_execute}: the reclaim was taken");
-        assert!(!reclaim.parked, "lever {remote_first_execute}: the reclaim's iteration spun, it did not park");
+        assert!(
+            !reclaim.parked,
+            "lever {remote_first_execute}: the reclaim's iteration spun, it did not park"
+        );
         assert_eq!(reclaim.polled, 0, "lever {remote_first_execute}: a reclaim is not a poll");
         assert_eq!(
             *plane.calls.borrow(),
