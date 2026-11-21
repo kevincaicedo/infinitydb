@@ -210,7 +210,11 @@ def git_listing(root):
                                            "--exclude-standard").decode()
     except source_files.WalkError as err:
         raise CensusError(str(err)) from err
-    return {p for p in listing.split("\0") if p and os.path.isfile(os.path.join(root, p))}
+    # A listed file is kept when it is there (present: one it cannot stat raises, never gone).
+    try:
+        return {p for p in listing.split("\0") if p and source_files.present(os.path.join(root, p))}
+    except source_files.WalkError as err:
+        raise CensusError(str(err)) from err
 
 
 def glob_match(directory, pattern):

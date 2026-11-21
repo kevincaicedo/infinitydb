@@ -182,25 +182,39 @@ while IFS= read -r -d '' path; do
 done <"$work/listed.z"
 LC_ALL=C sort -u "$work/listed" >"$work/listed.sorted"
 
-# Partition: excluded, gone from the work tree, scanned.
+# Gone from the work tree is git's own word, `ls-files --deleted`: a test of the path here would
+# read a file it cannot stat (one under a directory it can list but not search) as gone, and git
+# writes `cannot lstat` for that file, which git_listing turns into the scope error.
+git_listing ls-files -z --deleted -- '*.rs' >"$work/deleted.z" ||
+    scope_error "git ls-files --deleted failed or wrote to stderr in $(pwd -P) (scripts/source-files.sh, above)"
+tr '\0' '\n' <"$work/deleted.z" >"$work/deleted"
+# The first file read by its name, not by NR == FNR, which an empty first file would fool.
+awk 'FILENAME == ARGV[1] { gone[$0] = 1; next } { print (($0 in gone) ? "gone " : "kept ") $0 }' \
+    "$work/deleted" "$work/listed.sorted" >"$work/tagged"
+# Partition: excluded, gone from the work tree, scanned; a listed file that is not gone and that
+# the gate cannot read fails the scan.
 : >"$work/round"
 : >"$work/excluded"
 gone=0
 listed=0
-while IFS= read -r path; do
+while IFS= read -r row; do
+    tag=${row%% *}
+    path=${row#* }
     skip=0
     for dir in $EXCLUDED; do
         case $path in "$dir"/*) skip=1 ;; esac
     done
     if [ "$skip" -eq 1 ]; then
         printf '%s\n' "$path" >>"$work/excluded"
-    elif [ ! -f "$path" ]; then
+    elif [ "$tag" = gone ]; then
         gone=$((gone + 1))
-    else
+    elif [ -f "$path" ] && [ -r "$path" ]; then
         listed=$((listed + 1))
         printf '%s\n' "$path" >>"$work/round"
+    else
+        scope_error "$path is listed and not gone, and the gate cannot read it"
     fi
-done <"$work/listed.sorted"
+done <"$work/tagged"
 [ "$listed" -gt 0 ] || scope_error "no *.rs file to scan in $(pwd -P): an empty scan is no verdict"
 
 # The `#[path]` targets a round's blanked lines name: includer, line, the

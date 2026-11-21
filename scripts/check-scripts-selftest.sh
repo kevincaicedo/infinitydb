@@ -959,6 +959,24 @@ fx_walk_lock() {
     expect_red_because "$label" "$why" env INF_CHECK_ROOT="$root" "$@"
     fx_unlock
 }
+# fx_held <label> <why> <root> <dir> <file> <line> <gate…>: a file git tracks, under a directory
+# the gate can list but not search. <line> goes into <dir>/<file> under the fixture repository
+# <root>, which commits that file alone; <dir> is set to 0400 (fx_lock), and the gate, run as
+# <gate…> with INF_CHECK_ROOT=<root>, is red naming <why>. Git lists the file and warns nothing,
+# and a test of it there answers "not there", so a gate that reads that as gone from the work
+# tree reads green. Skipped as root, which reads through mode 0400.
+fx_held() {
+    local label=$1 why=$2 root=$3 dir=$4 file=$5 line=$6
+    shift 6
+    [ "$(id -u)" -ne 0 ] || return 0
+    mkdir -p "$root/$dir"
+    printf '%s\n' "$line" >"$root/$dir/$file"
+    fx_git "$root" add -- "$dir/$file"
+    fx_git "$root" -c user.name=t -c user.email=t@t commit -q -m held
+    fx_lock "$root/$dir" 400
+    expect_red_because "$label" "$why" env INF_CHECK_ROOT="$root" "$@"
+    fx_unlock
+}
 
 # fx_root_key <dir>: the target-root key of a checkout at <dir>, the first 16
 # hex digits of SHA-256 of its physical path, read by coreutils' sha256sum or
@@ -2588,6 +2606,11 @@ mkdir -p "$NS_ROOT/bins/inf-bench/src" "$NS_ROOT/bins/inf-compare/src"
 expect_red_because "node-spawn: every listed file empty, the blanker reading no line, is a scope error" \
     "SCOPE ERROR: the blanker read no line" ns "$NS_ROOT"
 NS_ROOT="$NSW/base"
+# A tracked file under a directory the gate can list but not search is not gone from the work
+# tree: git's own `--deleted` listing fails on it, and the scan with it.
+fx_held "node-spawn: a tracked file the gate cannot stat is a scope error, not a path gone" \
+    "NODE-SPAWN SCOPE ERROR: git ls-files --deleted failed or wrote to stderr" "$NS_ROOT" \
+    crates/fx/tests/held plant.rs 'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");' "$NS"
 }
 
 # ------------------------------------------------------------ refusal text
@@ -5879,6 +5902,11 @@ cp -R "$doc_root" "$work/doc-git-locked"
 fx_walk_lock "docs: an untracked directory git cannot open fails the gate" \
     "DOC SCOPE ERROR: git -C .* ls-files .* wrote to stderr" "$work/doc-git-locked" docs/locked \
     x.md '[gone](missing.md)' $DOCS
+# A tracked Markdown file the gate cannot stat fails it, never an unpublished file.
+cp -R "$doc_root" "$work/doc-held"
+fx_held "docs: a tracked file the gate cannot stat fails the gate" \
+    "DOC SCOPE ERROR: .*/docs/held/x.md cannot be read" "$work/doc-held" docs/held x.md \
+    '[gone](missing.md)' $DOCS
 expect_output "docs: the OK line states the published-link scope" \
     "published links: 1 relative links in 3 Markdown files" env INF_CHECK_ROOT="$doc_root" $DOCS
 printf '[gone](missing.md)\n' >>"$doc_root/docs/ARCHITECTURE.md"
@@ -8290,6 +8318,11 @@ fz_red "C1: no [[bin]] row in any fuzz manifest is a scope error" \
 root=$(fz_root git-locked)
 fx_walk_lock "fuzz-targets: an untracked directory git cannot open fails the census" \
     "FUZZ-TARGETS SCOPE ERROR: git -C . ls-files .* wrote to stderr" "$root" tools/x Cargo.toml \
+    "$(printf '[package]\nname = "x"\nversion = "0.0.0"')" "$FUZZ" --matrix nightly
+# A tracked manifest the census cannot stat fails it, never a file gone from the work tree.
+root=$(fz_root held)
+fx_held "fuzz-targets: a tracked file the census cannot stat fails it" \
+    "FUZZ-TARGETS SCOPE ERROR: ./tools/x/Cargo.toml cannot be read" "$root" tools/x Cargo.toml \
     "$(printf '[package]\nname = "x"\nversion = "0.0.0"')" "$FUZZ" --matrix nightly
 root=$(fz_root c2)
 mkdir -p "$root/tools/x"
@@ -11140,6 +11173,11 @@ fx_walk_lock "nextest-config: an untracked directory git cannot open fails the g
     "SCOPE ERROR: git cannot list the sources (git ls-files .* wrote to stderr" "$NC_DIR" \
     crates/fx/tests/support/locked lock.rs \
     'static WAKE: std::sync::Condvar = std::sync::Condvar::new();' "$NC"
+# A tracked source the gate cannot stat fails it, never a file gone from the work tree.
+nc_tree
+fx_held "nextest-config: a tracked source the gate cannot stat fails the gate" \
+    "SCOPE ERROR: git lists a source it cannot read" "$NC_DIR" crates/fx/tests/support/held \
+    lock.rs 'static WAKE: std::sync::Condvar = std::sync::Condvar::new();' "$NC"
 }
 
 selftest_main "$SCRIPT_DIR/check-scripts-selftest.sh" "$@"

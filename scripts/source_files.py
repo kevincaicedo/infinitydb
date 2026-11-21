@@ -94,6 +94,21 @@ def tree_listing(top, pattern):
     return sorted(found)
 
 
+def present(path):
+    """True for a regular file at `path` (a link to one included), False when nothing is there
+    (ENOENT, ENOTDIR) or it is no regular file. Any other stat error raises WalkError: a test such
+    as `is_file()` answers False for a file it cannot stat (one under a directory it can list but
+    not search), so a file a git listing names would read as gone from the work tree."""
+    try:
+        mode = os.stat(path).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as err:
+        raise WalkError(f"{path} cannot be read ({err.strerror}), so whether it is there is "
+                        "unknown") from err
+    return stat.S_ISREG(mode)
+
+
 def subdirectories(top):
     """The directories directly under `top` (a link to one included), sorted, each one the walk
     can search. Each entry is stat-ed: a probe such as `is_dir()` answers False for an entry it

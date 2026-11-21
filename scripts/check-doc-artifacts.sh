@@ -16,7 +16,7 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import unquote
 
 sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
-from source_files import WalkError, git_listing, listing
+from source_files import WalkError, git_listing, listing, present
 
 root = Path.cwd()
 errors = []
@@ -175,7 +175,7 @@ if top is None or Path(top.strip()).resolve() != base:
 else:
     listing = walked(git_listing, "-C", str(root), "ls-files", "-z", "--cached", "--others",
                      "--exclude-standard").decode(errors="replace")
-    published = {p for p in listing.split("\0") if p and (root / p).is_file()}
+    published = {p for p in listing.split("\0") if p and walked(present, root / p)}
     published |= {str(d) for p in published for d in PurePosixPath(p).parents}
     for name in sorted(p for p in published if p.lower().endswith(".md")):
         md_files += 1

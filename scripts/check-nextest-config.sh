@@ -101,7 +101,7 @@ import tomllib
 from pathlib import Path
 
 sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
-from source_files import WalkError, git_listing, listing
+from source_files import WalkError, git_listing, listing, present
 
 NAME = "nextest-config"
 CONFIG = Path(".config/nextest.toml")
@@ -473,7 +473,12 @@ try:
                          "tests").decode().split("\0")
 except WalkError as err:
     scope_error(f"git cannot list the sources ({err})")
-rust_files = sorted(Path(name) for name in listed if name.endswith(".rs") and Path(name).is_file())
+# A listed file is kept when it is there (present: a file it cannot stat is a scope error, not
+# a file gone from the work tree).
+try:
+    rust_files = sorted(Path(name) for name in listed if name.endswith(".rs") and present(name))
+except WalkError as err:
+    scope_error(f"git lists a source it cannot read ({err})")
 if not rust_files:
     scope_error("git lists no .rs file under crates/, bins/ or tests/")
 
