@@ -114,14 +114,21 @@ fn no_ack_before_covering_fsync_across_random_schedules() {
     }
 }
 
-/// S06 wake-storm AC (mechanism tier): one fsync completion releasing 50k
-/// gated futures is O(N) ready-queue appends drained across iterations
-/// under the EXECUTE budget — never one unbounded burst. The wall-clock
-/// p99.9 < 2 ms row binds on the reference box (S22).
+/// S06 wake-storm AC (mechanism tier, ADR-0177 A2): one fsync completion
+/// covers 50,000 gated futures. `advance` wakes none; the gate wakes them a
+/// budget at a time, as the durable cell's LOG steps call it, each turn one
+/// `wake_covered` and one EXECUTE pass at the same 1,024, so the storm leaves
+/// over 49 turns, in LSN order, no call past its budget and no turn's pass
+/// past EXECUTE's. The wall-clock p99.9 < 2 ms row binds on the reference box
+/// (S22).
 #[test]
-fn wake_storm_50k_drains_under_the_execute_budget() {
+fn wake_storm_50k_drains_a_budget_a_turn() {
     const WAITERS: u64 = 50_000;
+    /// A turn's EXECUTE pass and its wakes: the loop's default budget, which
+    /// the durable cell's wake budget may not pass.
     const BUDGET: usize = 1024;
+    /// The turns the storm takes: one a budget of waits.
+    const TURNS: usize = WAITERS.div_ceil(BUDGET as u64) as usize;
     /// The storm's waiters, all alive at once.
     const STORM: Cap = Cap::entries::<{ WAITERS as u32 }>("storm-waiters", CapFill::Serving);
     /// The gate's pool: a wait node for each waiter (ADR-0177 D5).
@@ -152,22 +159,29 @@ fn wake_storm_50k_drains_under_the_execute_budget() {
 
     // ONE fsync completion advances the watermark over all of them.
     gate.advance(WAITERS);
+    assert_eq!(executor.run_ready(BUDGET), 0, "advance itself woke a wait");
+    assert!(gate.owes(), "the advance owes the storm's wakes");
 
-    let mut slices = 0;
+    let mut turns = 0;
     let mut polled_total = 0;
-    loop {
-        let polled = executor.run_ready(BUDGET);
-        if polled == 0 {
+    // One turn more than the storm needs: a gate still owing after it fails below.
+    for _ in 0..=TURNS {
+        if !gate.owes() {
             break;
         }
-        assert!(polled <= BUDGET, "EXECUTE budget violated by a wake storm");
+        let woken = gate.wake_covered(BUDGET);
+        assert!(woken <= BUDGET, "a call woke {woken}, past its budget");
+        let polled = executor.run_ready(BUDGET);
+        assert_eq!(polled, woken, "turn {turns}: the pass runs the batch it woke");
         polled_total += polled;
-        slices += 1;
+        turns += usize::from(woken > 0);
     }
+    assert!(!gate.owes(), "wakes still owed after {TURNS} turns");
+    assert_eq!(turns, TURNS, "the storm leaves a budget a turn");
     assert_eq!(polled_total, WAITERS as usize, "every gated future resumed");
-    assert_eq!(slices, WAITERS.div_ceil(BUDGET as u64) as usize, "drain spread across slices");
+    assert_eq!(gate.waiting(), 0, "no wait left on the gate");
     assert_eq!(executor.live_tasks(), 0, "no leaked tasks after the storm");
-    // FIFO by LSN: the gate wakes in BTreeMap (LSN) order and the ready
+    // FIFO by LSN: the gate wakes in its heap's (LSN) order and the ready
     // queue preserves it.
     let order = order.borrow();
     assert!(order.windows(2).all(|w| w[0] < w[1]), "wake order must be FIFO by LSN");

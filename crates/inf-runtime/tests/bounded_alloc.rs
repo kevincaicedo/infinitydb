@@ -457,14 +457,18 @@ fn a_refused_map_build_step_retires_its_prefix_by_steps() {
 const WAIT_POOL: Cap = Cap::entries::<64>("alloc-wait-nodes", CapFill::Serving);
 const WAIT_KEYS: Cap = Cap::entries::<3>("alloc-wait-keys", CapFill::Assembly);
 
-/// The wait lists on the cell's pool (ADR-0177 D5): zero allocator calls after the pool's and
-/// the keyed list's build across waits made and polled, woken one at a time and whole, read,
-/// dropped while queued and dropped after an unread wake (the baton), on a unit list and a
-/// keyed one. A wait's node is the pool's, never an allocation of its own.
+/// The wait lists and the watermark gate on the cell's pool (ADR-0177 D5): zero allocator calls
+/// after the pool's, the gate's and the keyed list's build across waits made and polled, woken
+/// one at a time and whole, read, dropped while queued and dropped after an unread wake (the
+/// baton), on a unit list and a keyed one; and across watermark waits queued, advanced over,
+/// woken by a budgeted call and read, dropped while queued, and covered at their first poll. A
+/// wait's node is the pool's and its entry the gate's array, never an allocation of its own.
 #[test]
 fn no_allocator_call_after_build_across_waits_wakes_and_drops() {
     let (census, _serve_mark) = CapCensus::new(CellId(2));
-    let nodes = inf_runtime::WaitNodes::build(WAIT_POOL, &census).expect("the pool").nodes;
+    let pool = inf_runtime::WaitNodes::build(WAIT_POOL, &census).expect("the pool");
+    let nodes = pool.nodes;
+    let gate = inf_runtime::WatermarkGate::build(pool.seat);
     let unit = inf_runtime::WaitList::unit(&nodes);
     let keyed = inf_runtime::WaitList::keyed(&nodes, Some(WAIT_KEYS), &census, [1u32, 2, 3])
         .expect("the keyed list");
@@ -490,9 +494,21 @@ fn no_allocator_call_after_build_across_waits_wakes_and_drops() {
         assert!(std::pin::Pin::new(&mut fourth).poll(&mut cx).is_pending());
         drop(fourth);
         assert_eq!(keyed.wake_all(key), 0, "no wait is left on the key");
+        // A watermark wait queued and woken, one dropped while queued, one covered at once.
+        let lsn = 2 * i + 2;
+        let mut parked = gate.wait_for(lsn);
+        let mut dropped = gate.wait_for(lsn + 1);
+        assert!(std::pin::Pin::new(&mut parked).poll(&mut cx).is_pending());
+        assert!(std::pin::Pin::new(&mut dropped).poll(&mut cx).is_pending());
+        drop(dropped);
+        gate.advance(lsn);
+        assert_eq!(gate.wake_covered(4), 1, "the parked wait alone is covered");
+        ready += u64::from(std::pin::Pin::new(&mut parked).poll(&mut cx).is_ready());
+        ready += u64::from(std::pin::Pin::new(&mut gate.wait_for(lsn)).poll(&mut cx).is_ready());
     }
     assert_eq!(ALLOC.thread_allocations(), before, "an allocator call after the build");
-    assert_eq!(ready, 2 * CHURN, "every woken wait read its wake");
+    assert_eq!(ready, 4 * CHURN, "every woken wait read its wake");
+    assert_eq!(gate.waiting(), 0, "no watermark wait is left on the gate");
     assert_eq!(nodes.len(), 0, "every node back in the pool");
 }
 

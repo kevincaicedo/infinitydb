@@ -1480,6 +1480,7 @@ fn cell_main(
             group: inf_server::GroupHoldConfig {
                 window: inf_foundation::time::Nanos::from_micros(args.flush_group_window_us),
             },
+            ack_wakes_per_turn: inf_server::limits::ACK_WAKES_PER_TURN,
         };
         durable = Some((cfg, std::sync::Arc::clone(control)));
     }

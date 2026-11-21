@@ -1197,6 +1197,22 @@ rows=(
 # touch different lines and merge without a conflict.
 historical_rows=294
 ordered_rows=(
+  # A first poll's compare is the watermark gate's proof of coverage: Ready only when the
+  # watermark is at or above the wait's LSN (ADR-0177 D5). Planted, the compare answers covered
+  # for any LSN, and a wait above the watermark is Ready at its first poll.
+  "inf_canary_ack_wait_covered_early crate-test inf-runtime test:watermark_gate the_gate_wakes_exactly_the_models_covered_waits_in_lsn_order above the watermark"
+  # A queued watermark wait's drop removes its entry from the gate's heap at its node's position
+  # (ADR-0177 D5). Planted, the drop skips the removal, and the next sift or pop that places the
+  # dead entry finds its node released.
+  "inf_canary_ack_wait_drop_keeps_entry crate-test inf-runtime test:watermark_gate every_drop_leaves_the_heap_and_the_pool_at_once a held wait node is live"
+  # The heap's hook stores each placed entry's position in its node, so a queued drop removes
+  # its own entry (ADR-0177 D5). Planted, the store is skipped, and a drop removes the entry at
+  # a position that names another.
+  "inf_canary_ack_wait_no_position crate-test inf-runtime test:watermark_gate every_drop_leaves_the_heap_and_the_pool_at_once a queued node's position names its entry"
+  # A pushed watermark entry sifts to its place by LSN, so the heap's minimum is the least
+  # queued LSN (ADR-0177 D5). Planted, every entry orders as one and none moves: in falling
+  # order an advance leaves a covered wait under a higher minimum.
+  "inf_canary_ack_wait_no_sift crate-test inf-runtime test:watermark_gate the_gate_wakes_exactly_the_models_covered_waits_in_lsn_order woke other than the model"
   # A barrier hold keeps every barrier on the files it names: a standalone sync, a write's
   # linked sync and a write-through write, each whole until the hold lifts. Planted,
   # hold_barriers keeps standalone syncs alone, and the frame barriers complete while held.

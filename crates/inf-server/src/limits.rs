@@ -1,5 +1,7 @@
 //! Runtime bounds owned by the server. Every crossing names its behavior here.
 
+use core::num::NonZeroU32;
+
 use inf_foundation::bounded::{Cap, CapError, CapFill};
 use inf_foundation::time::Nanos;
 
@@ -45,6 +47,18 @@ pub const ACK_MAP_ENTRIES: u32 = inf_log::limits::REORDER_WINDOW_FRAMES;
 /// The ack map's cap: `ACK_MAP_ENTRIES` entries under the census name
 /// `ack-map`, filled while the cell serves.
 pub const ACK_MAP: Cap = Cap::entries::<ACK_MAP_ENTRIES>("ack-map", CapFill::Serving);
+
+/// Watermark waits one cell's durable plane wakes between two of its LOG steps (ADR-0177
+/// A2.1): the first batch at a sync's completion, each later one at the head of the LOG step,
+/// one call of the ack gate's `wake_covered` each, drawn from one count the LOG step refills.
+/// Its reason is a batch's time, a sift a wake: 1,024 woken read 0.13 to 0.41 ms with up to
+/// 50,000 waits queued. At least one by its type, as a zero budget would strand every
+/// acknowledgment; at most the loop's default `exec_budget`, as waking more than one EXECUTE
+/// pass polls runs no task sooner (a test holds both). The durable config carries it, so a
+/// test may lower it. Unit: waits between two LOG steps of a cell. Owner: the cell's
+/// `DurableCell`. Crossing: pacing, the later LOG steps waking the rest in LSN order.
+// The least non-zero count and 1,023 more: a construction with no refusal to handle.
+pub const ACK_WAKES_PER_TURN: NonZeroU32 = NonZeroU32::MIN.saturating_add(1_023);
 
 /// Timer owner positions one server cell holds (ADR-0154 D1, D4): its roles'
 /// count, `TimerRole::COUNT` (one listener's accept retry, everysec, fill
@@ -678,3 +692,68 @@ pub const GATED_REPLIES_PER_POLL: usize = 1_024;
 /// `checked_mesh_config`. Crossing: none at run time; a pair the check
 /// refuses fails the build.
 pub const FABRIC_RING_SLOTS_PER_PEER: usize = 4096;
+
+#[cfg(test)]
+mod tests {
+    use super::ACK_WAKES_PER_TURN;
+
+    /// The wake budget's two bounds (ADR-0177 A2.1): at most the loop's default EXECUTE budget,
+    /// which polls that many tasks a pass, so waking more runs nothing sooner; and the value the
+    /// limit's doc reasons from.
+    #[test]
+    fn the_wake_budget_is_at_most_one_execute_pass() {
+        let exec_budget = inf_runtime::LoopConfig::default().exec_budget;
+        let budget = usize::try_from(ACK_WAKES_PER_TURN.get()).expect("a u32 fits a usize here");
+        assert!(
+            budget <= exec_budget,
+            "{budget} wakes a turn past an EXECUTE pass's {exec_budget}"
+        );
+        assert_eq!(budget, 1_024, "the budget the limit's doc reads its batch time at");
+    }
+
+    /// The bench copies of the wake budget: `inf-runtime`'s benches cannot reach this crate,
+    /// so each keeps its own `WAKE_BUDGET`, which this test reads from its source and holds
+    /// equal to the limit. A copy that drifts, is renamed or loses its line is red here.
+    #[test]
+    fn every_bench_copy_of_the_wake_budget_is_the_limit() {
+        let copies = [
+            ("executor_ab.rs", include_str!("../../inf-runtime/benches/executor_ab.rs")),
+            ("cold_path/waits.rs", include_str!("../../inf-runtime/benches/cold_path/waits.rs")),
+        ];
+        for (file, source) in copies {
+            assert_eq!(
+                declared_wake_budget(source),
+                Ok(u64::from(ACK_WAKES_PER_TURN.get())),
+                "{file}'s wake budget is not ACK_WAKES_PER_TURN"
+            );
+        }
+    }
+
+    /// The tie's planted reds: a copy one past the limit, a copy declared twice, and a source
+    /// with no copy are each refused, so the tie above can go red.
+    #[test]
+    fn the_bench_budget_tie_refuses_a_drifted_doubled_or_missing_copy() {
+        let limit = u64::from(ACK_WAKES_PER_TURN.get());
+        let drifted = format!("const WAKE_BUDGET: usize = {};\n", limit + 1);
+        assert_eq!(declared_wake_budget(&drifted), Ok(limit + 1), "the drifted value is read");
+        assert_ne!(declared_wake_budget(&drifted), Ok(limit), "a drifted copy is refused");
+        let doubled = "const WAKE_BUDGET: u64 = 1_024;\nconst WAKE_BUDGET: u64 = 1_024;\n";
+        assert_eq!(declared_wake_budget(doubled), Err("declared twice"));
+        assert_eq!(declared_wake_budget("const OTHER: u64 = 1;\n"), Err("not declared"));
+        assert_eq!(declared_wake_budget("const WAKE_BUDGET: u64 = x;\n"), Err("not a number"));
+    }
+
+    /// The value of the one `const WAKE_BUDGET: <type> = <digits>;` line of `source`.
+    fn declared_wake_budget(source: &str) -> Result<u64, &'static str> {
+        let mut lines = source.lines().filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("const WAKE_BUDGET:")?;
+            let (_, value) = rest.split_once('=')?;
+            Some(value.trim().trim_end_matches(';').replace('_', ""))
+        });
+        let value = lines.next().ok_or("not declared")?;
+        if lines.next().is_some() {
+            return Err("declared twice");
+        }
+        value.parse().map_err(|_| "not a number")
+    }
+}
