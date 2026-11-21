@@ -8265,13 +8265,18 @@ done
 # turns the case red. Each copy runs on the argv root, its calls cleared,
 # with CARGO_TARGET_DIR unset or set to the fourth argument.
 FZ_MROOT=$root
+# fz_gate_copy <dir>: the whole scripts/ directory copied to <dir>, so a copy of the gate reads
+# every file the gate reads: a list of them would leave each copy dying on the next import, and
+# every canary red for that reason.
+fz_gate_copy() {
+    rm -rf "${1:?}"
+    mkdir -p "$1"
+    cp -R "$SCRIPT_DIR/." "$1/"
+}
 fz_mutant() { # <name> <sed expression> <what the copy does> [<CARGO_TARGET_DIR>]
     local dir want=$FZ_OWN
     dir="$work/fz-gate-$1"
-    rm -rf "${dir:?}"
-    mkdir -p "$dir"
-    cp "$SCRIPT_DIR/check-fuzz-targets.sh" "$SCRIPT_DIR/fuzz_targets.py" "$SCRIPT_DIR/lint_scope_table.py" \
-        "$SCRIPT_DIR/strip-test-modules.awk" "$SCRIPT_DIR/target-root.sh" "$dir/"
+    fz_gate_copy "$dir"
     fz_sed "$2" "$dir/check-fuzz-targets.sh"
     chmod +x "$dir/check-fuzz-targets.sh"
     if cmp -s "$SCRIPT_DIR/check-fuzz-targets.sh" "$dir/check-fuzz-targets.sh"; then
@@ -8288,6 +8293,12 @@ fz_mutant() { # <name> <sed expression> <what the copy does> [<CARGO_TARGET_DIR>
     expect red "fuzz-targets: the call's check is red on a gate that $3" \
         fz_calls_ok "$FZ_MROOT.stub" "$want"
 }
+# The copy unmutated is green: a canary red on every copy would prove nothing.
+fz_gate_copy "$work/fz-gate-null"
+rm -f "${FZ_MROOT:?}.stub/calls"
+fz_argv_run "$work/fz-gate-null/check-fuzz-targets.sh" "$FZ_MROOT" >/dev/null 2>&1 || true
+expect green "fuzz-targets: the call's check is green on an unmutated copy of the gate" \
+    fz_calls_ok "$FZ_MROOT.stub" "$FZ_OWN"
 fz_mutant bins 's/"check", "--bins", /"check", /' "drops --bins"
 fz_mutant locked 's/"--locked", //' "drops --locked"
 fz_mutant keep-going 's/"--keep-going", //' "drops --keep-going"
@@ -8773,10 +8784,7 @@ expect green "fuzz-targets: the probe builds in a directory of its own each run,
     fz_probe_per_run "$root" "$FZ_PKEPT"
 fz_probe_mutant() { # <name> <sed expression> <what the copy does>
     local dir="$work/fz-probe-gate-$1" FUZZ
-    rm -rf "${dir:?}"
-    mkdir -p "$dir"
-    cp "$SCRIPT_DIR/check-fuzz-targets.sh" "$SCRIPT_DIR/fuzz_targets.py" "$SCRIPT_DIR/lint_scope_table.py" \
-        "$SCRIPT_DIR/strip-test-modules.awk" "$SCRIPT_DIR/target-root.sh" "$dir/"
+    fz_gate_copy "$dir"
     fz_sed "$2" "$dir/check-fuzz-targets.sh"
     chmod +x "$dir/check-fuzz-targets.sh"
     if cmp -s "$SCRIPT_DIR/check-fuzz-targets.sh" "$dir/check-fuzz-targets.sh"; then
@@ -8787,6 +8795,14 @@ fz_probe_mutant() { # <name> <sed expression> <what the copy does>
     expect red "fuzz-targets: the probe's directory check is red on a gate that $3" \
         fz_probe_per_run "$root" "$FZ_PKEPT"
 }
+# The copy unmutated is green, as the call's copy is.
+fz_gate_copy "$work/fz-probe-gate-null"
+fz_probe_null() (
+    FUZZ="$work/fz-probe-gate-null/check-fuzz-targets.sh"
+    fz_probe_per_run "$root" "$FZ_PKEPT"
+)
+expect green "fuzz-targets: the probe's directory check is green on an unmutated copy of the gate" \
+    fz_probe_null
 fz_probe_mutant fixed 's|^\(        INF_FUZZ_PROBE_DIR=\)$(mktemp -d "$INF_FUZZ_TARGET_DIR/probe.XXXXXX")$|\1"$INF_FUZZ_TARGET_DIR/probe.fixed1"; mkdir -p "$INF_FUZZ_PROBE_DIR"|' \
     "builds the probe in a fixed directory"
 fz_probe_mutant kept 's|^    PROBE_TARGET = \["--target-dir", os.environ\["INF_FUZZ_PROBE_DIR"\]\]$|    PROBE_TARGET = KEPT|' \
