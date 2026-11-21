@@ -176,9 +176,15 @@ fx_only() {
 # every recorded path its owner's access back, and the group's EXIT trap
 # calls it before it removes $work, which a directory at 000 would refuse.
 # Root reads through mode 000, so a caller runs its locked cases only when
-# `id -u` is not 0.
+# `id -u` is not 0. Each checks $work first (fx_work): with $work empty,
+# "$work"/?* is /?* and would pass any absolute path to chmod.
 FX_LOCKED=
+fx_work() { # <caller>
+    [ -n "$work" ] && [ -d "$work" ] ||
+        { echo "$1: no work directory to build a path under (work='$work')" >&2; exit 2; }
+}
 fx_lock() {
+    fx_work fx_lock
     case $1 in
     "$work"/?*) ;;
     *) echo "fx_lock: '$1' is not a fixture path under $work" >&2; exit 2 ;;
@@ -189,8 +195,14 @@ fx_lock() {
 }
 fx_unlock() {
     local path
+    [ -n "$FX_LOCKED" ] || return 0
+    fx_work fx_unlock
     while IFS= read -r path; do
-        [ -n "$path" ] && chmod u+rwx "$path"
+        case $path in
+        "") ;;
+        "$work"/?*) chmod u+rwx "$path" ;;
+        *) echo "fx_unlock: '$path' is not a fixture path under $work" >&2 ;;
+        esac
     done <<<"$FX_LOCKED"
     FX_LOCKED=
 }

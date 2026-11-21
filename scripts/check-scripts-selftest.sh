@@ -444,6 +444,15 @@ expect_red_because "driver: a pool that is no fifo: path is refused" \
 expect_red_because "driver: a pool whose FIFO is gone is refused" \
     "a pool the driver cannot open: 'fifo:$work/drv-gone/p'" \
     env -u INF_SELFTEST_CASE_LOG CARGO_MAKEFLAGS="-j --jobserver-auth=fifo:$work/drv-gone/p" "$f"
+# fx_lock and fx_unlock build paths under $work; with $work empty each refuses before it
+# builds one, so a path outside every fixture keeps its mode. The lib, sourced alone, holds an
+# empty $work.
+: >"$work/fx-victim"
+expect_red_because "fx_lock: an empty work directory is refused" "fx_lock: no work directory" \
+    bash -c '. "$1"; fx_lock "$2"' fx "$SCRIPT_DIR/selftest-lib.sh" "$work/fx-victim"
+expect green "fx_lock: the refused path keeps its mode" test -r "$work/fx-victim"
+expect_red_because "fx_unlock: an empty work directory is refused" "fx_unlock: no work directory" \
+    bash -c '. "$1"; FX_LOCKED="$2"; fx_unlock' fx "$SCRIPT_DIR/selftest-lib.sh" "$work/fx-victim"
 }
 
 group_stage() {
