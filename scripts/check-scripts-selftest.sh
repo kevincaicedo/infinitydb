@@ -42,7 +42,11 @@ unset CARGO_TARGET_DIR
 # and a `for` over a glob of crates/, bins/ or tests/, which probes inside each entry
 # (tree_dirs lists them). The Python forms: pathlib's glob, rglob and iterdir, os.listdir and
 # os.scandir, and an os.walk with no onerror: scripts/source_files.py holds the forms that
-# fail closed. Written for BSD awk: bracket classes, no interval braces.
+# fail closed. In either language, a git listing (ls-files, grep, status) not run by
+# git_listing, which fails on the stderr warning git gives, with exit 0, for a directory it
+# cannot open: a shell command line that runs git, or a Python line that passes the
+# subcommand as a string and does not name git_listing. Written for BSD awk: bracket classes,
+# no interval braces.
 walk_forms() {
     awk '
         BEGIN {
@@ -53,6 +57,9 @@ walk_forms() {
             forloop = "(^|[ \t;])for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in[ \t]"
             treeglob = "(^|[ \t\"'\''])(crates|bins|tests)/[^ \t;]*[*]"
             listing = "[.]r?glob[(]|glob[.]i?glob[(]|[.]iterdir[(]|os[.]listdir[(]|os[.]scandir[(]"
+            gitsub = "(ls-files|grep|status)"
+            gitcmd = "(^|[;&|({!]|[$][(]|then[ \t]|do[ \t]|else[ \t])[ \t]*git([ \t]+-C[ \t]+[^ \t]+)?[ \t]+" gitsub "([ \t]|$)"
+            gitarg = "[\"'\'']" gitsub "[\"'\'']"
             found = 0
         }
         /^[ \t]*#/ { next }
@@ -63,6 +70,8 @@ walk_forms() {
             else if ($0 ~ forloop && $0 ~ treeglob) form = "a for over a tree glob, which probes inside each entry"
             else if ($0 ~ listing) form = "a listing that reads an unreadable directory as empty"
             else if ($0 ~ /os[.]walk[(]/ && $0 !~ /onerror=/) form = "an os.walk with no onerror"
+            else if ($0 ~ gitcmd) form = "a git listing not run by git_listing"
+            else if ($0 ~ gitarg && $0 ~ /git/ && $0 !~ /git_listing/) form = "a git listing not run by git_listing"
             if (form != "") { print FILENAME ":" FNR ": " form ": " $0; found++ }
         }
         END {
@@ -144,7 +153,11 @@ for wf_line in \
     '        rust = sorted(source.rglob("*.rs"))' \
     '    crate_roots += sorted((src / "bin").glob("*.rs"))' \
     '    for crate in sorted(root.iterdir()):' \
-    '    for dirpath, dirnames, names in os.walk(cell_dir):'
+    '    for dirpath, dirnames, names in os.walk(cell_dir):' \
+    'git ls-files -z --cached --others --exclude-standard -- '"'*.rs'"' >"$work/listed.z" ||' \
+    'top=$(git -C . status --porcelain)' \
+    '    listed = subprocess.run(["git", "ls-files", "-co", "-z"], capture_output=True)' \
+    '    grep = git(top, "grep", "-nIzF", "--untracked", "--", ".")'
 do
     wf_n=$((wf_n + 1))
     cp "$SCRIPT_DIR/check-refusal-text.sh" "$work/walk-form-$wf_n.sh"
@@ -154,8 +167,10 @@ do
 done
 cp "$SCRIPT_DIR/check-refusal-text.sh" "$work/walk-form-ok.sh"
 printf '%s\n' '# done < <(find "$DIR" -name x)' '    for here, dirs, files in os.walk(top, onerror=unreadable):' \
-    >>"$work/walk-form-ok.sh"
-expect green "self-test: a comment line and an os.walk with onerror are not refused" \
+    'git_listing ls-files -z -- x >"$work/x" || scope_error "git ls-files failed"' \
+    '    listed = walked(git_listing, "-C", top, "ls-files", "-z", "-co")' \
+    'is `git grep -nIzF --untracked`, one -e a name' >>"$work/walk-form-ok.sh"
+expect green "self-test: a comment, an os.walk with onerror, git_listing and prose are not refused" \
     walk_forms "$work/walk-form-ok.sh"
 }
 
@@ -1889,6 +1904,12 @@ ns_case() {
     expect_red_because "node-spawn: $label" "$pattern" ns "$NS_ROOT"
     ns_reset
 }
+# Git reads a directory it cannot open as empty, with a warning and exit 0: an untracked
+# directory it cannot open fails the scan (git_listing), never a shorter one.
+fx_walk_lock "node-spawn: an untracked directory git cannot open fails the scan" \
+    "NODE-SPAWN SCOPE ERROR: git ls-files failed or wrote to stderr" "$NS_ROOT" \
+    crates/fx/tests/locked plant.rs 'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");' "$NS"
+ns_reset
 ns_case 'env!("CARGO_BIN_EXE_infinityd") is rule 1' "$P:1: rule 1," \
     <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
 ns_case 'std::env::var("NEXTEST_BIN_EXE_infinityd") is rule 1' "$P:2: rule 1," <<'EOF'
@@ -2969,6 +2990,55 @@ expect_red_because "source walks: listing fails on a directory it cannot read" \
     "WalkError: tree/e cannot be read" sw_py listing tree/e
 expect_red_because "source walks: tree_listing fails on a directory below it that it cannot read" \
     "WalkError: tree/e cannot be read" sw_py tree tree
+fx_unlock
+fi
+# git_listing, in each language, on a repository of untracked files: the listing passes git's
+# stdout through, a status the caller allows is kept, and a git that writes to stderr (as it
+# does, with exit 0, for a directory it cannot open) fails.
+mkdir -p "$sw/repo/a" "$sw/repo/locked"
+git init -q "$sw/repo"
+: >"$sw/repo/a/one.rs"
+: >"$sw/repo/locked/two.rs"
+# sw_git <git args…>: the shell helper, run in the repository.
+sw_git() { (cd "$sw/repo" && . "$SCRIPT_DIR/source-files.sh" && git_listing "$@"); }
+# sw_git_names <git args…>: sw_git, a NUL-separated listing read one space apart.
+sw_git_names() { sw_git "$@" | tr '\0' ' '; }
+# sw_git_py <ok…> -- <git args…>: the Python helper, the names of its NUL-separated stdout
+# printed one space apart.
+sw_git_py() {
+    (cd "$sw/repo" && python3 -I - "$SCRIPT_DIR" "$@" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from source_files import WalkError, git_listing
+split = sys.argv.index("--")
+ok = tuple(int(code) for code in sys.argv[2:split])
+try:
+    found = git_listing(*sys.argv[split + 1:], ok=ok).split(b"\0")
+    print(" ".join(sorted(name.decode() for name in found if name)))
+except WalkError as err:
+    print(f"WalkError: {err}")
+    sys.exit(1)
+PY
+    )
+}
+expect_output "source walks: git_listing passes git's listing through" "a/one.rs locked/two.rs" \
+    sw_git_names ls-files -z --cached --others --exclude-standard
+expect_output "source walks: the Python git_listing returns git's listing" "a/one.rs locked/two.rs" \
+    sw_git_py 0 -- ls-files -z --cached --others --exclude-standard
+expect red "source walks: git_listing keeps git's own status (grep finding nothing)" \
+    sw_git grep -q no-such-text
+expect_red_because "source walks: the Python git_listing refuses a status outside ok" \
+    "WalkError: git grep -q no-such-text exited 1" sw_git_py 0 -- grep -q no-such-text
+expect green "source walks: the Python git_listing keeps a status inside ok" \
+    sw_git_py 0 1 -- grep -q no-such-text
+if [ "$(id -u)" -ne 0 ]; then
+fx_lock "$sw/repo/locked"
+expect_red_because "source walks: git_listing fails on git's warning for a directory it cannot open" \
+    "SOURCE-FILES SCOPE ERROR: git ls-files .* wrote to stderr (exit 0)" \
+    sw_git ls-files -z --cached --others --exclude-standard
+expect_red_because "source walks: the Python git_listing fails on that warning" \
+    "WalkError: git ls-files .* wrote to stderr (exit 0)" \
+    sw_git_py 0 -- ls-files -z --cached --others --exclude-standard
 fx_unlock
 fi
 }
@@ -5709,6 +5779,12 @@ printf '# Architecture\n\nSee [the style](INFINITY_STYLE.md).\n' >"$doc_root/doc
 printf '# Style\n' >"$doc_root/docs/INFINITY_STYLE.md"
 printf '> **GENERATED — do not edit.**\n' >"$doc_root/docs/compat-matrix.md"
 expect green "docs: standalone workspace" env INF_CHECK_ROOT="$doc_root" $DOCS
+# An untracked directory git cannot open fails the published-link scan (git_listing), never a
+# shorter one: a broken link there is unread.
+cp -R "$doc_root" "$work/doc-git-locked"
+fx_walk_lock "docs: an untracked directory git cannot open fails the gate" \
+    "DOC SCOPE ERROR: git -C .* ls-files .* wrote to stderr" "$work/doc-git-locked" docs/locked \
+    x.md '[gone](missing.md)' $DOCS
 expect_output "docs: the OK line states the published-link scope" \
     "published links: 1 relative links in 3 Markdown files" env INF_CHECK_ROOT="$doc_root" $DOCS
 printf '[gone](missing.md)\n' >>"$doc_root/docs/ARCHITECTURE.md"
@@ -8115,6 +8191,12 @@ fz_manifest "$root" bins/b
 fz_red "C1: no [[bin]] row in any fuzz manifest is a scope error" \
     "SCOPE ERROR: no .*bin.* row in any fuzz manifest" "$root"
 # C2: every manifest is the root, a member, a fuzz manifest or a probe.
+# The census's listing fails on an untracked directory git cannot open (git_listing): the
+# crate there no gate compiles is unread otherwise. The matrix mode runs the census alone.
+root=$(fz_root git-locked)
+fx_walk_lock "fuzz-targets: an untracked directory git cannot open fails the census" \
+    "FUZZ-TARGETS SCOPE ERROR: git -C . ls-files .* wrote to stderr" "$root" tools/x Cargo.toml \
+    "$(printf '[package]\nname = "x"\nversion = "0.0.0"')" "$FUZZ" --matrix nightly
 root=$(fz_root c2)
 mkdir -p "$root/tools/x"
 printf '[package]\nname = "x"\nversion = "0.0.0"\n' >"$root/tools/x/Cargo.toml"
@@ -10232,6 +10314,12 @@ for td_kind in scripts/plant.sh justfile scripts/tool.py src/lib.rs .github/work
 done
 td_tree scripts/a.sh 'echo one'
 expect green "target-dirs: a tree with no output-layout line and an empty table is green" td "$TD_DIR"
+# An untracked directory git cannot open fails the census (git_listing): its line is unread
+# otherwise.
+td_tree scripts/a.sh 'echo one'
+fx_walk_lock "target-dirs: an untracked directory git cannot open fails the census" \
+    "target-dirs census SCOPE ERROR: git -C .* ls-files .* wrote to stderr" "$TD_DIR" locked b.sh \
+    'cargo build --target-dir "$x"' python3 -I "$TD" "$TD_DIR"
 td_tree scripts/a.sh 'cargo build --target-dir "$x"'
 td_row scripts/a.sh root 1 'cargo build --target-dir "$x"'
 expect_red_because "target-dirs: a root row whose text does not hold \$TARGET_ROOT is red" \
@@ -10951,6 +11039,13 @@ nc_tree
 fx_walk_lock "nextest-config: a workflow directory the listing cannot read fails the gate" \
     "SCOPE ERROR: .github/workflows cannot be read" "$NC_DIR" .github/workflows more.yml 'on: push' \
     "$NC"
+# An untracked directory git cannot open fails the source listing (git_listing): a static lock
+# with no marker there is unread otherwise.
+nc_tree
+fx_walk_lock "nextest-config: an untracked directory git cannot open fails the gate" \
+    "SCOPE ERROR: git cannot list the sources (git ls-files .* wrote to stderr" "$NC_DIR" \
+    crates/fx/tests/support/locked lock.rs \
+    'static WAKE: std::sync::Condvar = std::sync::Condvar::new();' "$NC"
 }
 
 selftest_main "$SCRIPT_DIR/check-scripts-selftest.sh" "$@"

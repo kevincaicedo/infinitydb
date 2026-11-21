@@ -1,6 +1,7 @@
 # source-files.sh, sourced: the gates' walks of the source trees, each failing closed on what it
-# cannot read (below, each function's own rule); tree_dirs lists a tree's crate directories, and
-# source_files holds the rule for leaving a build's output out of a walk of the source trees.
+# cannot read (below, each function's own rule); tree_dirs lists a tree's crate directories,
+# git_listing runs a git listing of the work tree, and source_files holds the rule for leaving a
+# build's output out of a walk of the source trees.
 # Every gate script's walk that leaves a directory out as a build's output reads it, the
 # shell gates by calling source_files and the Python gates through scripts/source_files.py, so
 # each leaves out exactly the directories the others do; a walk that leaves nothing out (one
@@ -102,4 +103,23 @@ tree_dirs() {
         done
     done
     printf '%s' "$found"
+}
+
+# git_listing <git args…>: runs `git <git args…>`, a listing that reads the work tree (ls-files
+# --cached --others, grep --untracked), its stdout passed through. Git reads a directory it
+# cannot open as an empty one: it warns on stderr and exits 0, so its listing is short with a
+# green status. It is the one way a gate runs a git listing, and it fails closed: a git that
+# exits non-zero or writes anything to stderr returns non-zero (2 for the stderr) after
+# `SOURCE-FILES SCOPE ERROR` and git's first 300 characters on stderr, and the caller discards
+# what was printed. Git's stdout stays a stream, so a -z listing keeps its NUL bytes.
+git_listing() {
+    local err status=0
+    { err=$(git "$@" 2>&1 >&3 3>&-); } 3>&1 || status=$?
+    if [ -n "$err" ]; then
+        echo "SOURCE-FILES SCOPE ERROR: git $(printf '%s ' "$@" | cut -c1-80)wrote to stderr" \
+            "(exit $status), so its listing is not whole: $(printf '%s' "$err" | tr '\n' ' ' |
+                cut -c1-300)" >&2
+        return 2
+    fi
+    return "$status"
 }

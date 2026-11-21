@@ -7,6 +7,10 @@ gate reads. The helper fails closed (a find that fails, a path holding a newline
 this: its non-zero exit raises WalkError with the exit and the helper's message, never a short
 listing.
 
+`git_listing` is scripts/source-files.sh's `git_listing` for the Python gates: a git listing of
+the work tree that fails on any stderr, since git reads a directory it cannot open as an empty
+one with a warning and exit 0.
+
 `listing`, `tree_listing` and `subdirectories` are the forms of pathlib's `glob`, `rglob` and an
 `iterdir` loop over crate directories that a gate may use: each of those reads a directory it
 cannot read as an empty one (glob and rglob skip it; a probe such as `is_file()` inside a
@@ -42,6 +46,25 @@ def source_files(name, *dirs):
     if lines[-1] == "":
         lines.pop()
     return [Path(line) for line in lines]
+
+
+def git_listing(*args, ok=(0,)):
+    """`git <args>`'s stdout, as bytes: a listing that reads the work tree (ls-files --cached
+    --others, grep --untracked). It raises WalkError when git cannot run, exits with a status
+    outside `ok`, or writes anything to stderr: git warns and exits 0 on a directory it cannot
+    open, and its listing is then short."""
+    what = " ".join(("git",) + args)[:80]
+    try:
+        done = subprocess.run(["git", *args], capture_output=True, check=False)
+    except OSError as err:
+        raise WalkError(f"{what} cannot run ({err.strerror})") from err
+    message = " ".join(done.stderr.decode(errors="replace").split())[:300]
+    if done.stderr:
+        raise WalkError(f"{what} wrote to stderr (exit {done.returncode}), so its listing is not "
+                        f"whole: {message}")
+    if done.returncode not in ok:
+        raise WalkError(f"{what} exited {done.returncode}")
+    return done.stdout
 
 
 def unreadable(err):

@@ -110,6 +110,8 @@
 # macOS. INF_CHECK_ROOT names another checkout (the self-test's fixtures).
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=source-files.sh
+. "$SCRIPT_DIR/source-files.sh"
 BLANK="$SCRIPT_DIR/rust-strip-comments.awk"
 MODULE=bins/infinityd/tests/support/node.rs
 MODULE_TEST=bins/infinityd/tests/node_lock.rs
@@ -165,8 +167,10 @@ work=$(mktemp -d)
 [ -n "$work" ] && [ -d "$work" ] || { echo "node-spawn: mktemp failed" >&2; exit 2; }
 trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
 
-git ls-files -z --cached --others --exclude-standard -- '*.rs' >"$work/listed.z" ||
-    scope_error "git ls-files failed in $(pwd -P)"
+# git_listing (scripts/source-files.sh): a directory git cannot open fails the scan, never a
+# shorter one.
+git_listing ls-files -z --cached --others --exclude-standard -- '*.rs' >"$work/listed.z" ||
+    scope_error "git ls-files failed or wrote to stderr in $(pwd -P) (scripts/source-files.sh, above)"
 # One path a line: a path holding a newline or a tab cannot be one record.
 : >"$work/listed"
 while IFS= read -r -d '' path; do

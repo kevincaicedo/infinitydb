@@ -16,17 +16,17 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import unquote
 
 sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
-from source_files import WalkError, listing
+from source_files import WalkError, git_listing, listing
 
 root = Path.cwd()
 errors = []
 
 
-def listed(directory, pattern):
-    """The directory's entries matching `pattern`, or the scope error: a directory the walk
-    cannot read fails the gate."""
+def walked(walk, *args):
+    """A walk's listing (scripts/source_files.py), or the scope error: a directory the walk
+    cannot read, or a git listing that fails or writes to stderr, fails the gate."""
     try:
-        return listing(directory, pattern)
+        return walk(*args)
     except WalkError as err:
         print(f"DOC SCOPE ERROR: {err}")
         sys.exit(2)
@@ -34,7 +34,7 @@ def listed(directory, pattern):
 
 # Check the index: a force-add must not bypass the output policy.
 if (root / ".git").exists():
-    tracked = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+    tracked = walked(git_listing, "ls-files", "-z").decode().split("\0")
     output = [p for p in tracked if {".artifacts", "artifacts"}.intersection(Path(p).parts[:-1])]
     if output:
         errors.append(f"DOC OUTPUT: {len(output)} tracked generated-output paths: {output[:8]}")
@@ -63,7 +63,7 @@ adrs = []
 governance = any(path.exists() for path in [*markers, docs / "milestones"])
 if governance:
     sources[markers[0]] = read_required(markers[0])
-    plans = listed(docs / "milestones", "*.md") if (docs / "milestones").is_dir() else []
+    plans = walked(listing, docs / "milestones", "*.md") if (docs / "milestones").is_dir() else []
     if not plans:
         errors.append("DOC SCOPE: missing or empty parent milestone directory")
     for path in plans:
@@ -81,7 +81,7 @@ if governance:
     if not markers[1].is_dir():
         errors.append(f"DOC SCOPE: missing ADR directory {markers[1]}")
     else:
-        adrs = listed(markers[1], "*.md")
+        adrs = walked(listing, markers[1], "*.md")
     numbers = {}
     for path in adrs:
         if path.name == "README.md":
@@ -173,7 +173,8 @@ if top is None or Path(top.strip()).resolve() != base:
         "Markdown set is git's"
     )
 else:
-    listing = git_text("ls-files", "-z", "--cached", "--others", "--exclude-standard") or ""
+    listing = walked(git_listing, "-C", str(root), "ls-files", "-z", "--cached", "--others",
+                     "--exclude-standard").decode(errors="replace")
     published = {p for p in listing.split("\0") if p and (root / p).is_file()}
     published |= {str(d) for p in published for d in PurePosixPath(p).parents}
     for name in sorted(p for p in published if p.lower().endswith(".md")):

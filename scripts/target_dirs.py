@@ -64,6 +64,9 @@ import os
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from source_files import WalkError, git_listing  # noqa: E402  (the gates' walks)
+
 NAMES = ["target-dir", "build-dir", "--target", "build.target", "CARGO_TARGET_DIR",
          "CARGO_BUILD_TARGET", "CARGO_BUILD_BUILD_DIR", "--config", "CARGO_HOME",
          ".cargo/config"]
@@ -88,6 +91,16 @@ def git(top, *args, ok=(0,)):
         scope_error(f"git {' '.join(args[:2])} exited {run.returncode}: "
                     f"{run.stderr.decode(errors='replace').strip()}")
     return run
+
+
+def walked(walk, *args, **options):
+    """A git listing of the work tree (scripts/source_files.py), or the scope error: git that
+    fails or writes to stderr, as it does on a directory it cannot open, fails the census,
+    never a shorter one."""
+    try:
+        return walk(*args, **options)
+    except WalkError as err:
+        scope_error(str(err))
 
 
 def read_table(path):
@@ -142,16 +155,17 @@ def main():
     if shown.returncode != 0 or os.path.realpath(named) != top:
         scope_error(f"{top} is not the top of a git work tree "
                     f"({named or shown.stderr.decode(errors='replace').strip()})")
-    listed = git(top, "ls-files", "-z", "-co", "--exclude-standard", "--", *PATHSPECS)
-    files = [p for p in listed.stdout.split(b"\0") if p]
+    listed = walked(git_listing, "-C", top, "ls-files", "-z", "-co", "--exclude-standard", "--",
+                    *PATHSPECS)
+    files = [p for p in listed.split(b"\0") if p]
     if not files:
         scope_error("git lists no file to read")
     rows, reds = read_table(table)
     patterns = [arg for name in NAMES for arg in ("-e", name)]
-    grep = git(top, "grep", "-nIzF", "--untracked", "--no-color", *patterns, "--", *PATHSPECS,
-               ok=(0, 1))
+    grep = walked(git_listing, "-C", top, "grep", "-nIzF", "--untracked", "--no-color", *patterns,
+                  "--", *PATHSPECS, ok=(0, 1))
     lines = 0
-    for record in grep.stdout.split(b"\n"):
+    for record in grep.split(b"\n"):
         if not record:
             continue
         path, number, text = record.split(b"\0", 2)
@@ -164,9 +178,10 @@ def main():
                         f"{TABLE} holds it: {body}")
         else:
             row[3] += 1
-    configs = git(top, "ls-files", "-z", "-co", "--exclude-standard", "--", *CONFIGS)
+    configs = walked(git_listing, "-C", top, "ls-files", "-z", "-co", "--exclude-standard", "--",
+                     *CONFIGS)
     config_files = sorted(p.decode("utf-8", "surrogateescape")
-                          for p in configs.stdout.split(b"\0") if p)
+                          for p in configs.split(b"\0") if p)
     for file in config_files:
         row = rows.get((file, ""))
         if row is None:
