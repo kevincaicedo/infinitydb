@@ -34,6 +34,43 @@ unset CARGO_TARGET_DIR
 # shellcheck source=selftest-lib.sh
 . "$SCRIPT_DIR/selftest-lib.sh"
 
+# walk_forms <file>…: each line of the gates' scripts that lists a tree in a form that reads a
+# directory it cannot read as an empty one, as `<file>:<line>: <form>: <text>`, and status 1;
+# with none, a count line and status 0. Comment lines are not code. The shell forms: a walk
+# (find, git ls-files, a recursive grep, ls, or the helpers source_files, tree_dirs and
+# cell_crate_dirs) inside `< <(…)` or as a `for` word list, where nothing reads its status;
+# and a `for` over a glob of crates/, bins/ or tests/, which probes inside each entry
+# (tree_dirs lists them). The Python forms: pathlib's glob, rglob and iterdir, os.listdir and
+# os.scandir, and an os.walk with no onerror: scripts/source_files.py holds the forms that
+# fail closed. Written for BSD awk: bracket classes, no interval braces.
+walk_forms() {
+    awk '
+        BEGIN {
+            walker = "(find|git([ \t]+-C[ \t]+[^ \t]+)?[ \t]+ls-files|grep[ \t]+-[A-Za-z]*[rR][A-Za-z]*|ls"
+            walker = walker "|source_files|tree_dirs|cell_crate_dirs)([ \t;|)]|$)"
+            procsub = "<[ \t]*<[(][ \t]*" walker
+            wordlist = "(^|[ \t;])in[ \t]+([$][(]|`)[ \t]*" walker
+            forloop = "(^|[ \t;])for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in[ \t]"
+            treeglob = "(^|[ \t\"'\''])(crates|bins|tests)/[^ \t;]*[*]"
+            listing = "[.]r?glob[(]|glob[.]i?glob[(]|[.]iterdir[(]|os[.]listdir[(]|os[.]scandir[(]"
+            found = 0
+        }
+        /^[ \t]*#/ { next }
+        {
+            form = ""
+            if ($0 ~ procsub) form = "a walk inside < <(…), its status lost"
+            else if ($0 ~ wordlist) form = "a walk as a for word list, its status lost"
+            else if ($0 ~ forloop && $0 ~ treeglob) form = "a for over a tree glob, which probes inside each entry"
+            else if ($0 ~ listing) form = "a listing that reads an unreadable directory as empty"
+            else if ($0 ~ /os[.]walk[(]/ && $0 !~ /onerror=/) form = "an os.walk with no onerror"
+            if (form != "") { print FILENAME ":" FNR ": " form ": " $0; found++ }
+        }
+        END {
+            if (found) exit 1
+            print "walk forms: " ARGC - 1 " files, " NR " lines read, none found"
+        }' "$@"
+}
+
 group_self_test() {
 expect green "self-test: every git command on a fixture root goes through fx_git" \
     fx_only "$SCRIPT_DIR/check-scripts-selftest.sh"
@@ -82,6 +119,44 @@ nv_canary() (
         [ "$pass" -eq 0 ] && [ "$fail" -eq 5 ]
 )
 expect green "self-test: a gate that never ran is never counted as a verdict (canary)" nv_canary
+# The gates' walks fail closed (scripts/source-files.sh, scripts/source_files.py): no gate
+# script, no helper a gate sources and no Python module of theirs lists a tree in a form that
+# reads an unreadable directory as empty. The self-test's own fixture builders and the module
+# that holds the forms that fail closed are not scanned.
+walk_scope=()
+for f in "$SCRIPT_DIR"/check-*.sh "$SCRIPT_DIR"/cell-crates.sh "$SCRIPT_DIR"/source-files.sh \
+    "$SCRIPT_DIR"/*.py; do
+    case ${f##*/} in check-scripts-selftest.sh | source_files.py) continue ;; esac
+    walk_scope+=("$f")
+done
+expect green "self-test: no gate script walks a tree in a form that loses a failed walk" \
+    walk_forms "${walk_scope[@]}"
+expect_output "self-test: the walk-form scan reads every gate script" \
+    "walk forms: ${#walk_scope[@]} files, " walk_forms "${walk_scope[@]}"
+# Each form, planted in a copy of a gate, is red naming it (the canaries).
+wf_n=0
+for wf_line in \
+    'done < <(find "$DIR" -name '"'*.rs'"' | sort)' \
+    'while read -r f; do :; done < <(git ls-files -co -- crates)' \
+    'done < <(grep -rl Mutex crates)' \
+    'for f in $(find crates -name '"'*.rs'"'); do :; done' \
+    'for dir in crates/*/src bins/*/src; do :; done' \
+    '        rust = sorted(source.rglob("*.rs"))' \
+    '    crate_roots += sorted((src / "bin").glob("*.rs"))' \
+    '    for crate in sorted(root.iterdir()):' \
+    '    for dirpath, dirnames, names in os.walk(cell_dir):'
+do
+    wf_n=$((wf_n + 1))
+    cp "$SCRIPT_DIR/check-refusal-text.sh" "$work/walk-form-$wf_n.sh"
+    printf '%s\n' "$wf_line" >>"$work/walk-form-$wf_n.sh"
+    expect_red_because "self-test: the walk form '$wf_line' is refused (canary)" \
+        "walk-form-$wf_n.sh:[0-9]*: " walk_forms "$work/walk-form-$wf_n.sh"
+done
+cp "$SCRIPT_DIR/check-refusal-text.sh" "$work/walk-form-ok.sh"
+printf '%s\n' '# done < <(find "$DIR" -name x)' '    for here, dirs, files in os.walk(top, onerror=unreadable):' \
+    >>"$work/walk-form-ok.sh"
+expect green "self-test: a comment line and an os.walk with onerror are not refused" \
+    walk_forms "$work/walk-form-ok.sh"
 }
 
 group_driver() {
