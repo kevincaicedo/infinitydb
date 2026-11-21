@@ -124,11 +124,14 @@ fn no_ack_before_covering_fsync_across_random_schedules() {
 #[test]
 fn wake_storm_50k_drains_a_budget_a_turn() {
     const WAITERS: u64 = 50_000;
-    /// A turn's EXECUTE pass and its wakes: the loop's default budget, which
-    /// the durable cell's wake budget may not pass.
-    const BUDGET: usize = 1024;
+    /// A turn's wakes and its EXECUTE pass: the durable cell's wakes between
+    /// two LOG steps, `ACK_WAKES_PER_TURN`, which `inf-server` owns and this
+    /// crate cannot reach, so `inf-server`'s tie holds this copy equal to it;
+    /// and the loop's default EXECUTE budget, which the wake budget may not
+    /// pass.
+    const WAKE_BUDGET: usize = 1_024;
     /// The turns the storm takes: one a budget of waits.
-    const TURNS: usize = WAITERS.div_ceil(BUDGET as u64) as usize;
+    const TURNS: usize = WAITERS.div_ceil(WAKE_BUDGET as u64) as usize;
     /// The storm's waiters, all alive at once.
     const STORM: Cap = Cap::entries::<{ WAITERS as u32 }>("storm-waiters", CapFill::Serving);
     /// The gate's pool: a wait node for each waiter (ADR-0177 D5).
@@ -153,13 +156,13 @@ fn wake_storm_50k_drains_a_budget_a_turn() {
         permit.spawn_local(move || storm_waiter(gate, lsn, order));
     }
     // Futures suspend on first poll (spawn queues them once).
-    while executor.run_ready(BUDGET) == BUDGET {}
-    executor.run_ready(BUDGET);
+    while executor.run_ready(WAKE_BUDGET) == WAKE_BUDGET {}
+    executor.run_ready(WAKE_BUDGET);
     assert_eq!(gate.waiting(), WAITERS as usize);
 
     // ONE fsync completion advances the watermark over all of them.
     gate.advance(WAITERS);
-    assert_eq!(executor.run_ready(BUDGET), 0, "advance itself woke a wait");
+    assert_eq!(executor.run_ready(WAKE_BUDGET), 0, "advance itself woke a wait");
     assert!(gate.owes(), "the advance owes the storm's wakes");
 
     let mut turns = 0;
@@ -169,9 +172,9 @@ fn wake_storm_50k_drains_a_budget_a_turn() {
         if !gate.owes() {
             break;
         }
-        let woken = gate.wake_covered(BUDGET);
-        assert!(woken <= BUDGET, "a call woke {woken}, past its budget");
-        let polled = executor.run_ready(BUDGET);
+        let woken = gate.wake_covered(WAKE_BUDGET);
+        assert!(woken <= WAKE_BUDGET, "a call woke {woken}, past its budget");
+        let polled = executor.run_ready(WAKE_BUDGET);
         assert_eq!(polled, woken, "turn {turns}: the pass runs the batch it woke");
         polled_total += polled;
         turns += usize::from(woken > 0);

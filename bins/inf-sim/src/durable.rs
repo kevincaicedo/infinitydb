@@ -242,8 +242,7 @@ pub struct DurableScenario {
     /// durability, quiescence and budget oracles run unchanged.
     pub group: inf_server::GroupHoldConfig,
     /// The ack gate's wakes between two LOG steps (ADR-0177 A2.1): the
-    /// node's limit on every scenario but the wake budget's own rows, which
-    /// lower it so a few writers cross it.
+    /// node's limit, which a test may lower so a few writers cross it.
     pub ack_wakes_per_turn: core::num::NonZeroU32,
     /// A first life in another barrier class (ADR-0086 D4 as amended,
     /// 2026-08-21): the cell boots in `prelude.io_mode`, the writers run

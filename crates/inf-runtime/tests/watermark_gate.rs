@@ -104,13 +104,40 @@ fn lsn_of(id: u32, n: u32) -> u64 {
     if id + 1 == n { u64::MAX } else { 10 * (u64::from(id) + 1) }
 }
 
+/// A call's budget against `c`, the waits its advance covers: the limit's edges, each at
+/// least 1, as the durable config's `NonZeroU32` carries it.
+#[derive(Clone, Copy, Debug)]
+enum Budget {
+    /// 1: every covered wait its own call.
+    One,
+    /// `c - 1`: the call ends on its budget with one covered wait left for the next.
+    BelowCovered,
+    /// `c`: the call ends on its budget with nothing covered left, still owing one call.
+    Covered,
+    /// `c + 1`: the call finds no covered minimum and clears the debt itself.
+    PastCovered,
+}
+
+impl Budget {
+    fn of(self, covered: usize) -> usize {
+        let budget = match self {
+            Budget::One => 1,
+            Budget::BelowCovered => covered.saturating_sub(1),
+            Budget::Covered => covered,
+            Budget::PastCovered => covered + 1,
+        };
+        budget.max(1)
+    }
+}
+
 /// A case: `n` waits made and first-polled in `order` on a pool of `T`, then each advance of
-/// the list followed by calls of `budget` while the gate owes. After every call the model's
-/// covered waits, least LSN first, are the ones woken, the call's count is at most its budget
-/// and is the wakes it recorded, and every wait the model holds queued polls Pending; after
-/// the calls nothing is owed, each woken wait polls Ready once and gives its node back.
-fn run_case(n: u32, order: Order, budget: usize) {
-    let name = format!("{n} waits {order:?}, budget {budget}");
+/// the list followed by calls while the gate owes, each of `budget` against the waits the
+/// advance covers. After every call the model's covered waits, least LSN first, are the ones
+/// woken, the call's count is at most its budget and is the wakes it recorded, and every wait
+/// the model holds queued polls Pending; after the calls nothing is owed, each woken wait
+/// polls Ready once and gives its node back.
+fn run_case(n: u32, order: Order, budget: Budget) {
+    let name = format!("{n} waits {order:?}, budget {budget:?}");
     let (gate, nodes) = gate(POOL);
     let mut waits: BTreeMap<u32, WatermarkWait> = BTreeMap::new();
     let mut queued: BTreeMap<u64, u32> = BTreeMap::new();
@@ -128,6 +155,7 @@ fn run_case(n: u32, order: Order, budget: usize) {
         gate.advance(to);
         assert!(woken().is_empty(), "{name}: the advance to {to} woke a wait");
         let covered: Vec<u32> = queued.range(..=to).map(|(_, id)| *id).collect();
+        let budget = budget.of(covered.len());
         let mut order_woken = Vec::new();
         // At most a call a wait, and one that finds none: a gate still owing after them fails.
         for _ in 0..=n {
@@ -136,7 +164,7 @@ fn run_case(n: u32, order: Order, budget: usize) {
             }
             let count = gate.wake_covered(budget);
             let call = woken();
-            assert!(count <= budget, "{name}: a call woke {count}, past its budget");
+            assert!(count <= budget, "{name}: a call woke {count}, past its budget {budget}");
             assert_eq!(call.len(), count, "{name}: the call's count is its wakes");
             order_woken.extend(call);
         }
@@ -160,14 +188,15 @@ fn run_case(n: u32, order: Order, budget: usize) {
 }
 
 /// The gate against its model in three orders, rising, falling and seeded, at 1, 2, `T - 1`
-/// and `T` waits, each at budgets of 1, `k - 1`, `k` and `k + 1`, `k` the case's waits. A
-/// wait at `u64::MAX` is woken by the advance to it.
+/// and `T` waits, each advance's calls at budgets of 1, `c - 1`, `c` and `c + 1`, `c` the
+/// waits that advance covers (at `T - 1` and `T`: 0, 0, 2, 1 and `n - 3`). A wait at
+/// `u64::MAX` is woken by the advance to it.
 #[test]
 fn the_gate_wakes_exactly_the_models_covered_waits_in_lsn_order() {
     for n in [1, 2, T - 1, T] {
         for order in [Order::Rising, Order::Falling, Order::Shuffled(0x5EED_0000 + u64::from(n))] {
-            let k = n as usize;
-            for budget in [1, k.saturating_sub(1).max(1), k, k + 1] {
+            for budget in [Budget::One, Budget::BelowCovered, Budget::Covered, Budget::PastCovered]
+            {
                 run_case(n, order, budget);
             }
         }
@@ -246,10 +275,19 @@ enum Fate {
 /// drops, and one failure stays one panic.
 type Held = BTreeMap<u32, (Fate, ManuallyDrop<WatermarkWait>)>;
 
+/// The queued entries and the held nodes the drop row's model holds for `waits`: every wait
+/// polled holds a node, and an entry until the wakes (`woken`) pop it. A drop that left its
+/// entry or its node behind, as a lazy removal does, reads more than these.
+fn drop_model(waits: &Held, woken: bool) -> (usize, u32) {
+    let polled = waits.values().filter(|(fate, _)| *fate != Fate::Unpolled).count();
+    let nodes = u32::try_from(polled).expect("a pool's count");
+    (if woken { 0 } else { polled }, nodes)
+}
+
 /// 1,000 waits of each fate at shuffled LSNs, so the queued drops remove entries from every
-/// depth of the heap and the covered ones from its covered prefix: after the drops and the
-/// wakes past them all, `waiting()` and the pool read 0, and every kept wait was woken once
-/// and no dropped one at all.
+/// depth of the heap and the covered ones from its covered prefix: after each fate's drops and
+/// after the wakes, `waiting()` and the pool read the model's counts, the drops' leaving at
+/// once; after the wakes past them all every kept wait was woken once and no dropped one.
 #[test]
 fn every_drop_leaves_the_heap_and_the_pool_at_once() {
     const EACH: u32 = 1_000;
@@ -275,10 +313,18 @@ fn every_drop_leaves_the_heap_and_the_pool_at_once() {
             drop(ManuallyDrop::into_inner(wait));
         }
     };
+    let counts = |at: &str, waits: &Held, woken: bool| {
+        let held = (gate.waiting(), nodes.len());
+        assert_eq!(held, drop_model(waits, woken), "{at}: the heap's and the pool's counts");
+    };
+    counts("queued", &waits, false);
     drop_all(&mut waits, Fate::Unpolled);
+    counts("after the unpolled drops", &waits, false);
     drop_all(&mut waits, Fate::Queued);
+    counts("after the queued drops", &waits, false);
     gate.advance(u64::MAX);
     drop_all(&mut waits, Fate::Covered);
+    counts("after the covered drops", &waits, false);
     for _ in 0..=5 * EACH / 256 + 1 {
         if !gate.owes() {
             break;
@@ -286,7 +332,9 @@ fn every_drop_leaves_the_heap_and_the_pool_at_once() {
         let _ = gate.wake_covered(256);
     }
     assert!(!gate.owes(), "still owed after the wakes past every wait");
+    counts("after the wakes", &waits, true);
     drop_all(&mut waits, Fate::Unread);
+    counts("after the unread drops", &waits, true);
     let log = woken();
     let set: BTreeSet<u32> = log.iter().copied().collect();
     assert_eq!(log.len(), set.len(), "a wait woken twice");
@@ -303,6 +351,140 @@ fn every_drop_leaves_the_heap_and_the_pool_at_once() {
     }
     assert_eq!((gate.waiting(), nodes.len()), (0, 0), "the heap and the pool empty");
     assert_eq!(nodes.full(), 0, "no first poll found the pool empty");
+}
+
+/// Which covered wait, still queued after the first call, the drop-between-calls row ends.
+#[derive(Clone, Copy, Debug)]
+enum Doomed {
+    /// The least covered LSN still queued: the heap's minimum.
+    Least,
+    /// The middle one of the covered waits still queued.
+    Middle,
+    /// The greatest covered LSN still queued.
+    Greatest,
+}
+
+/// The drop-between-calls row's gate, its waits by id and its model: the queued waits by LSN.
+struct BetweenCalls {
+    name: String,
+    gate: WatermarkGate,
+    nodes: WaitNodes,
+    waits: BTreeMap<u32, WatermarkWait>,
+    queued: BTreeMap<u64, u32>,
+}
+
+impl BetweenCalls {
+    /// One call of `budget`, answering its wakes: the model's least covered waits in LSN
+    /// order, at most the budget, and fewer only once none is left covered and the debt is
+    /// cleared. Each woken wait reads Ready and gives its node back, so `waiting()` and the
+    /// pool's `len` are then the model's queued count, exactly.
+    fn call(&mut self, budget: usize) -> Vec<u32> {
+        let name = &self.name;
+        let count = self.gate.wake_covered(budget);
+        let call = woken();
+        assert!(count <= budget, "{name}: a call woke {count}, past its budget {budget}");
+        assert_eq!(call.len(), count, "{name}: the call's count is its wakes");
+        let watermark = self.gate.watermark();
+        let least: Vec<(u64, u32)> =
+            self.queued.range(..=watermark).take(count).map(|(lsn, id)| (*lsn, *id)).collect();
+        let model: Vec<u32> = least.iter().map(|(_, id)| *id).collect();
+        assert_eq!(call, model, "{name}: a call woke other than the model's least covered");
+        for (lsn, id) in least {
+            self.queued.remove(&lsn);
+            let mut wait = self.waits.remove(&id).expect("a woken wait");
+            assert_eq!(poll(&mut wait, id), Poll::Ready(()), "{name}: woken wait {id} read");
+        }
+        if count < budget {
+            assert!(!self.gate.owes(), "{name}: a call short of its budget left the debt");
+            let left = self.queued.range(..=watermark).count();
+            assert_eq!(left, 0, "{name}: a call short of its budget left covered waits");
+        }
+        let queued = self.queued.len();
+        let held = (self.gate.waiting(), self.nodes.len() as usize);
+        assert_eq!(held, (queued, queued), "{name}: the heap's and the pool's counts");
+        call
+    }
+}
+
+/// A covered wait dropped between two budgeted calls, then a second advance while the gate
+/// still owes, past more waits or to `u64::MAX` (or none): `T` waits at 10, 20, …, made in
+/// `order`; an advance to 200, covering 20; one call of `budget`, which ends on it; the drop
+/// of a covered wait still queued; the second advance; the calls while the gate owes. Every
+/// call wakes the model's least covered waits, so across the calls the wakes are the covered
+/// waits but the dropped one in LSN order, the first advance's remainder before the second's.
+/// The drop is one removal: `waiting()` and the pool's `len` fall by one and the debt stands,
+/// stale-true when the drop took the last covered wait, so at most one call answers 0 before
+/// the debt clears.
+fn run_drop_between_calls(order: Order, budget: usize, doomed: Doomed, second: Option<u64>) {
+    /// The first advance: over the least 20 of the row's waits.
+    const FIRST: u64 = 200;
+    let (gate, nodes) = gate(POOL);
+    let name = format!("{order:?}, budget {budget}, {doomed:?} dropped, second {second:?}");
+    let mut row =
+        BetweenCalls { name, gate, nodes, waits: BTreeMap::new(), queued: BTreeMap::new() };
+    for id in ordered(T, order) {
+        let lsn = 10 * (u64::from(id) + 1);
+        let mut wait = row.gate.wait_for(lsn);
+        assert_eq!(poll(&mut wait, id), Poll::Pending, "{}: wait {id} queued", row.name);
+        row.waits.insert(id, wait);
+        row.queued.insert(lsn, id);
+    }
+    let made = row.queued.clone();
+    row.gate.advance(FIRST);
+    let mut all = row.call(budget);
+    let name = row.name.clone();
+    assert_eq!(all.len(), budget, "{name}: the first call ends on its budget");
+    let covered: Vec<(u64, u32)> = row.queued.range(..=FIRST).map(|(l, id)| (*l, *id)).collect();
+    let (lsn, dropped) = match doomed {
+        Doomed::Least => covered[0],
+        Doomed::Middle => covered[covered.len() / 2],
+        Doomed::Greatest => covered[covered.len() - 1],
+    };
+    let (waiting, held) = (row.gate.waiting(), row.nodes.len());
+    drop(row.waits.remove(&dropped).expect("a covered wait still queued"));
+    row.queued.remove(&lsn);
+    let after = (row.gate.waiting(), row.nodes.len());
+    assert_eq!(after, (waiting - 1, held - 1), "{name}: the drop is one removal");
+    assert!(row.gate.owes(), "{name}: the drop leaves the debt standing");
+    if let Some(to) = second {
+        row.gate.advance(to);
+        assert!(row.gate.owes(), "{name}: the second advance owes its wakes");
+    }
+    let mut zeros = 0;
+    // A call a wait at most, and one that finds none: a gate still owing after them fails.
+    for _ in 0..=T {
+        if !row.gate.owes() {
+            break;
+        }
+        let call = row.call(budget);
+        zeros += usize::from(call.is_empty());
+        all.extend(call);
+    }
+    assert!(!row.gate.owes(), "{name}: still owed after the calls the waits need");
+    assert!(zeros <= 1, "{name}: {zeros} calls answered 0 before the debt cleared");
+    let watermark = row.gate.watermark();
+    let model: Vec<u32> =
+        made.range(..=watermark).map(|(_, id)| *id).filter(|id| *id != dropped).collect();
+    assert_eq!(all, model, "{name}: across the calls the wakes are the model's, in LSN order");
+    for (id, wait) in &mut row.waits {
+        assert_eq!(poll(wait, *id), Poll::Pending, "{name}: wait {id} Ready uncovered");
+    }
+}
+
+/// A queued covered wait dropped between two budgeted calls, and an advance past more waits
+/// while the gate owes (or none, or to `u64::MAX`): each of three dropped positions at
+/// budgets of 1, 8 and 19 (the first advance's 20 covered less one) in three orders.
+#[test]
+fn a_covered_wait_dropped_between_calls_and_a_second_advance_keep_the_models_order() {
+    for order in [Order::Rising, Order::Falling, Order::Shuffled(0xD80B_E7EE)] {
+        for budget in [1, 8, 19] {
+            for doomed in [Doomed::Least, Doomed::Middle, Doomed::Greatest] {
+                for second in [None, Some(400), Some(u64::MAX)] {
+                    run_drop_between_calls(order, budget, doomed, second);
+                }
+            }
+        }
+    }
 }
 
 /// A pool of one node: a second wait above the watermark finds none at each of 100 polls,

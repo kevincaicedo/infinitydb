@@ -2182,6 +2182,9 @@ impl WatermarkGate {
                 );
                 let node = live_mut(&mut nodes, entry.node);
                 debug_assert_eq!(node.position, 0, "a popped node's position names the top");
+                // A node on the heap is on no list: no list linked it while it was there.
+                debug_assert!(node.prev.is_none(), "a node leaving the heap has no list's prev");
+                debug_assert!(node.next.is_none(), "a node leaving the heap has no list's next");
                 node.state = NodeState::Woken;
                 node.waker.take()
             };
@@ -2290,10 +2293,6 @@ impl WatermarkWait {
             state: NodeState::Queued,
         };
         let id = slot.publish(node);
-        debug_assert!(
-            matches!(nodes.get(id), Lookup::Live(node) if node.prev.or(node.next).is_none()),
-            "a node on the heap is on no list"
-        );
         let pushed = heap.push(
             WaitEntry { lsn, node: id },
             #[inline(always)]
@@ -2342,6 +2341,10 @@ impl WatermarkWait {
             let mut heap = inner.heap.borrow_mut();
             let mut nodes = inner.nodes.pool.nodes.borrow_mut();
             let node = live_mut(&mut nodes, id);
+            // A node on the heap is on no list: queued, it leaves the heap here; woken, it left
+            // at the pop, and no list linked it after.
+            debug_assert!(node.prev.is_none(), "a watermark wait's node has no list's prev");
+            debug_assert!(node.next.is_none(), "a watermark wait's node has no list's next");
             let waker = node.waker.take();
             let (state, at) = (node.state, node.position);
             // Canary: a queued wait's drop skips its removal, its entry left on the heap.

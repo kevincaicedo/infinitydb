@@ -57,8 +57,8 @@ pub const ACK_MAP: Cap = Cap::entries::<ACK_MAP_ENTRIES>("ack-map", CapFill::Ser
 /// pass polls runs no task sooner (a test holds both). The durable config carries it, so a
 /// test may lower it. Unit: waits between two LOG steps of a cell. Owner: the cell's
 /// `DurableCell`. Crossing: pacing, the later LOG steps waking the rest in LSN order.
-// The least non-zero count and 1,023 more: a construction with no refusal to handle.
-pub const ACK_WAKES_PER_TURN: NonZeroU32 = NonZeroU32::MIN.saturating_add(1_023);
+// 1,024 built from the least non-zero count: a construction with no refusal to handle.
+pub const ACK_WAKES_PER_TURN: NonZeroU32 = NonZeroU32::MIN.saturating_add(1_024 - 1);
 
 /// Timer owner positions one server cell holds (ADR-0154 D1, D4): its roles'
 /// count, `TimerRole::COUNT` (one listener's accept retry, everysec, fill
@@ -711,28 +711,41 @@ mod tests {
         assert_eq!(budget, 1_024, "the budget the limit's doc reads its batch time at");
     }
 
-    /// The bench copies of the wake budget: `inf-runtime`'s benches cannot reach this crate,
-    /// so each keeps its own `WAKE_BUDGET`, which this test reads from its source and holds
-    /// equal to the limit. A copy that drifts, is renamed or loses its line is red here.
+    /// Every copy of the wake budget in a bench or a test: the crates below this one cannot
+    /// reach the limit, so a bench or test of theirs keeps its own `WAKE_BUDGET`. Every `.rs`
+    /// file under `benches/` and `tests/` of each package in the workspace's `crates/` and
+    /// `bins/` is read, and one that names `WAKE_BUDGET` declares it once, as a literal equal
+    /// to the limit: a copy joins the tie by its name, with no list of files to extend. A copy
+    /// that drifts, is declared twice, `pub`, commented out or not a literal is red here, and
+    /// so is a scan that finds no copy.
     #[test]
-    fn every_bench_copy_of_the_wake_budget_is_the_limit() {
-        let copies = [
-            ("executor_ab.rs", include_str!("../../inf-runtime/benches/executor_ab.rs")),
-            ("cold_path/waits.rs", include_str!("../../inf-runtime/benches/cold_path/waits.rs")),
-        ];
-        for (file, source) in copies {
-            assert_eq!(
-                declared_wake_budget(source),
-                Ok(u64::from(ACK_WAKES_PER_TURN.get())),
-                "{file}'s wake budget is not ACK_WAKES_PER_TURN"
-            );
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test-only: reads the workspace's bench and test sources"
+    )]
+    fn every_bench_and_test_copy_of_the_wake_budget_is_the_limit() {
+        let limit = u64::from(ACK_WAKES_PER_TURN.get());
+        let sources = bench_and_test_sources();
+        let mut copies = 0_usize;
+        for path in &sources {
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            if let Some(copy) = wake_budget_copy(&source) {
+                let file = path.display();
+                assert_eq!(copy, Ok(limit), "{file}'s wake budget is not ACK_WAKES_PER_TURN");
+                copies += 1;
+            }
         }
+        let scanned = sources.len();
+        assert!(copies > 0, "VACUOUS no-copy: {scanned} sources name no WAKE_BUDGET");
     }
 
-    /// The tie's planted reds: a copy one past the limit, a copy declared twice, and a source
-    /// with no copy are each refused, so the tie above can go red.
+    /// The tie's planted reds: a copy one past the limit, a copy declared twice, a source with
+    /// no copy, a copy not a literal, and a source that names `WAKE_BUDGET` with its one
+    /// declaration `pub` or commented out are each refused, so the tie above can go red; a
+    /// source that never names it is no copy.
     #[test]
-    fn the_bench_budget_tie_refuses_a_drifted_doubled_or_missing_copy() {
+    fn the_wake_budget_tie_refuses_a_drifted_doubled_hidden_or_missing_copy() {
         let limit = u64::from(ACK_WAKES_PER_TURN.get());
         let drifted = format!("const WAKE_BUDGET: usize = {};\n", limit + 1);
         assert_eq!(declared_wake_budget(&drifted), Ok(limit + 1), "the drifted value is read");
@@ -741,6 +754,65 @@ mod tests {
         assert_eq!(declared_wake_budget(doubled), Err("declared twice"));
         assert_eq!(declared_wake_budget("const OTHER: u64 = 1;\n"), Err("not declared"));
         assert_eq!(declared_wake_budget("const WAKE_BUDGET: u64 = x;\n"), Err("not a number"));
+        let public = "pub const WAKE_BUDGET: u64 = 1_024;\n";
+        assert_eq!(wake_budget_copy(public), Some(Err("not declared")), "a pub copy is refused");
+        let hidden = "// const WAKE_BUDGET: u64 = 1_024;\nfn f() { g(WAKE_BUDGET) }\n";
+        assert_eq!(wake_budget_copy(hidden), Some(Err("not declared")), "a hidden copy");
+        assert_eq!(wake_budget_copy("const BUDGET: u64 = 1_024;\n"), None, "no name, no copy");
+    }
+
+    /// A source's copy of the wake budget: none when it never names `WAKE_BUDGET`, else its
+    /// one declaration's value, or why it has none.
+    fn wake_budget_copy(source: &str) -> Option<Result<u64, &'static str>> {
+        source.contains("WAKE_BUDGET").then(|| declared_wake_budget(source))
+    }
+
+    /// Every `.rs` file under `benches/` and `tests/` of each package in the workspace's
+    /// `crates/` and `bins/`, walked with a stack of directories, sorted. A directory that
+    /// cannot be listed fails the test, so the scan never skips a tree it was meant to read.
+    #[allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "test-only: lists the workspace's bench and test directories"
+    )]
+    fn bench_and_test_sources() -> Vec<std::path::PathBuf> {
+        use std::path::{Path, PathBuf};
+        let listed = |dir: &Path| -> Vec<(PathBuf, bool)> {
+            let entries =
+                std::fs::read_dir(dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+            entries
+                .map(|entry| {
+                    let entry = entry.unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+                    let kind = entry.file_type().unwrap_or_else(|error| panic!("{error}"));
+                    (entry.path(), kind.is_dir())
+                })
+                .collect()
+        };
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut trees = Vec::new();
+        for family in ["crates", "bins"] {
+            for (package, is_dir) in listed(&root.join(family)) {
+                for tree in ["benches", "tests"] {
+                    let dir = package.join(tree);
+                    if is_dir && dir.is_dir() {
+                        trees.push(dir);
+                    }
+                }
+            }
+        }
+        assert!(!trees.is_empty(), "no bench or test directory under {}", root.display());
+        let mut files = Vec::new();
+        while let Some(dir) = trees.pop() {
+            for (path, is_dir) in listed(&dir) {
+                if is_dir {
+                    trees.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        files
     }
 
     /// The value of the one `const WAKE_BUDGET: <type> = <digits>;` line of `source`.
