@@ -329,7 +329,7 @@ fn step_suspend<L: Foreign>(cell: &mut SuspendCell, lane: &mut L) -> usize {
     cell.delivered += 1;
     FabricGate::complete(cell.gate, token, cell.delivered, inf_foundation::time::Nanos(0));
     lane.on_wake();
-    let polled = cell.exec.run_ready(1);
+    let polled = cell.exec.run_ready(1).tasks_polled;
     lane.on_drain();
     polled
 }
@@ -338,7 +338,7 @@ fn step_suspend<L: Foreign>(cell: &mut SuspendCell, lane: &mut L) -> usize {
 fn step_wake_run<L: Foreign>(cell: &mut ParkedCell, lane: &mut L) -> usize {
     cell.waker.wake_by_ref();
     lane.on_wake_by_ref();
-    let polled = cell.exec.run_ready(1);
+    let polled = cell.exec.run_ready(1).tasks_polled;
     lane.on_drain();
     polled
 }

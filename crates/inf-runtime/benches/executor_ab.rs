@@ -248,7 +248,7 @@ fn deferred_op(cell: &mut DeferredCell) -> usize {
     if cell.queue.parked.replace(false) {
         black_box(cell.exec.wake(cell.task));
     }
-    cell.exec.run_ready(1)
+    cell.exec.run_ready(1).tasks_polled
 }
 
 #[inline(never)]
@@ -270,7 +270,7 @@ fn drive_deferred(cap: Cap, ops: u64, step: fn(&mut DeferredCell) -> usize) -> R
         return Err("the deferred row's class refused its one task".into());
     };
     let task = permit.spawn_local(|| deferred_task(task_queue));
-    expect("the task's first poll", count(exec.run_ready(1)), 1)?;
+    expect("the task's first poll", count(exec.run_ready(1).tasks_polled), 1)?;
     if !queue.parked.get() {
         return Err("engagement: the task did not park at its first poll".into());
     }
@@ -398,7 +398,7 @@ fn suspend_op(cell: &mut SuspendCell) -> bool {
     let first = permit.poll_immediate(|| waiter_task(waiter, sink));
     let suspended = matches!(first, PollImmediate::Suspended(_));
     let delivered = fabric_complete(cell.gate, key, key) == Delivery::Delivered;
-    suspended & delivered & (cell.exec.run_ready(1) == 1)
+    suspended & delivered & (cell.exec.run_ready(1).tasks_polled == 1)
 }
 
 #[inline(never)]

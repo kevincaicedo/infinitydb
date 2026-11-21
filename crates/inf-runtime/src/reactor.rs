@@ -40,7 +40,7 @@ use inf_foundation::time::{Clock, Nanos};
 
 use crate::cold::{ColdDeliveryBudget, ColdPreparationBudget};
 use crate::driver::{BackendDriver, Completion, IoOp, Wait};
-use crate::executor::CellExecutor;
+use crate::executor::{CellExecutor, ExecutorProgress};
 use crate::limits::{PARK_CEILING_MAX, TIMER_DELIVERIES_PER_TURN};
 use crate::sched::{GroupClass, GroupScheduler};
 use crate::timer::{Consumed, TimerNotice, TimerOutcome, TimerSet, Timers};
@@ -126,7 +126,8 @@ impl ParkCeiling {
 pub struct IterStats {
     /// Completions dispatched this iteration.
     pub reaped: usize,
-    /// Resumed futures polled.
+    /// Tasks this cell's executor polled, over both EXECUTE passes; a reclaimed slot is not
+    /// one (ADR-0149 D3).
     pub polled: usize,
     /// Commands the plane reported executing.
     pub commands: u64,
@@ -441,17 +442,23 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             // ops NOW, and an early FABRIC-OUT makes them peer-visible before
             // the local parse+execute bulk — the hop RTT overlaps local work.
             // Off by default; both slices stay bounded by `exec_budget`.
-            let mut early_polled = 0;
+            let mut early = ExecutorProgress::default();
             if self.config.remote_first_execute {
-                early_polled = cx.executor.run_ready(self.config.exec_budget);
-                if early_polled > 0 {
+                early = cx.executor.run_ready(self.config.exec_budget);
+                // A polled task may have staged a remote op; a reclaim stages none.
+                if early.tasks_polled > 0 {
                     plane.fabric_out(&mut cx);
                 }
             }
             #[cfg(inf_canary_cold_delivery_after_execute)]
             plane.before_execute(&mut cx);
             plane.parse_execute(&mut cx);
-            polled = early_polled + cx.executor.run_ready(self.config.exec_budget);
+            let late = cx.executor.run_ready(self.config.exec_budget);
+            polled = early.tasks_polled + late.tasks_polled;
+            // Both passes' entries, polls and reclaims, decide the idle step below: a
+            // reclaim returned a slot its class's admission may take, so it is work as a
+            // poll is (ADR-0149 D3).
+            let entries = early.entries() + late.entries();
 
             // ---- step 5: MAINTAIN (maintenance budget).
             plane.maintain(&mut cx);
@@ -472,7 +479,7 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
             // woken after run_ready (steps 5–8) is work too: parking on
             // top of it would delay it a full park timeout (F-L11-07).
             let had_work = reaped > 0
-                || polled > 0
+                || entries > 0
                 || commands > 0
                 || fabric_msgs > 0
                 || fabric_pending

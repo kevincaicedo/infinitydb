@@ -11,7 +11,19 @@ use std::rc::Rc;
 
 use inf_foundation::CellId;
 use inf_foundation::bounded::{Cap, CapCensus, CapFill};
-use inf_runtime::{CellExecutor, ExecutorLayout, PollImmediate, TaskAdmission, TaskClass, TaskId};
+use inf_runtime::{
+    CellExecutor, ExecutorLayout, ExecutorProgress, PollImmediate, TaskAdmission, TaskClass, TaskId,
+};
+
+/// A `run_ready` pass that polled `tasks` tasks and reclaimed no slot.
+pub const fn tasks_polled(tasks: usize) -> ExecutorProgress {
+    ExecutorProgress { tasks_polled: tasks, slots_reclaimed: 0 }
+}
+
+/// A `run_ready` pass that reclaimed `slots` Retired slots and polled no task.
+pub const fn slots_reclaimed(slots: usize) -> ExecutorProgress {
+    ExecutorProgress { tasks_polled: 0, slots_reclaimed: slots }
+}
 
 /// The class's one future type.
 pub type Boxed = Pin<Box<dyn Future<Output = ()>>>;
