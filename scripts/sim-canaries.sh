@@ -1202,9 +1202,9 @@ ordered_rows=(
   # for any LSN, and a wait above the watermark is Ready at its first poll.
   "inf_canary_ack_wait_covered_early crate-test inf-runtime test:watermark_gate the_gate_wakes_exactly_the_models_covered_waits_in_lsn_order above the watermark"
   # A queued watermark wait's drop removes its entry from the gate's heap at its node's position
-  # (ADR-0177 D5). Planted, the drop skips the removal, and the next sift or pop that places the
-  # dead entry finds its node released.
-  "inf_canary_ack_wait_drop_keeps_entry crate-test inf-runtime test:watermark_gate every_drop_leaves_the_heap_and_the_pool_at_once a held wait node is live"
+  # (ADR-0177 D5). Planted, the drop skips the removal and releases the node, so after the
+  # queued drops the heap holds more entries than the model's queued waits, the pool as many nodes.
+  "inf_canary_ack_wait_drop_keeps_entry crate-test inf-runtime test:watermark_gate every_drop_leaves_the_heap_and_the_pool_at_once the heap's and the pool's counts"
   # The heap's hook stores each placed entry's position in its node, so a queued drop removes
   # its own entry (ADR-0177 D5). Planted, the store is skipped, and a drop removes the entry at
   # a position that names another.
