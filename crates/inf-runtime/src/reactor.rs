@@ -52,7 +52,7 @@ pub struct LoopConfig {
     /// Busy iterations with `Wait::Poll` after work goes quiet, before
     /// parking (adaptive idle, §5.1 step 10).
     pub spin_iters: u32,
-    /// Max resumed futures polled per iteration (EXECUTE slice bound).
+    /// Ready entries (task polls and slot reclaims) one EXECUTE pass takes at most.
     pub exec_budget: usize,
     /// The longest park: a park ends by the earliest armed timer or this ceiling, whichever
     /// comes first, so every park carries a timeout.
@@ -477,7 +477,7 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
 
             // ---- step 10: IDLE policy for the next iteration. A task
             // woken after run_ready (steps 5–8) is work too: parking on
-            // top of it would delay it a full park timeout (F-L11-07).
+            // top of it would delay it a full park timeout.
             let had_work = reaped > 0
                 || entries > 0
                 || commands > 0

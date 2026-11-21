@@ -441,11 +441,11 @@ fn remote_first_execute_early_flush_needs_a_resumed_future() {
     }
 }
 
-/// F-L11-07: the wake lands in MAINTAIN — after `run_ready`, with no
-/// completion, command, fabric message or queued op beside it (the shape
-/// of every wake driven by another thread's state: `ddl_waiters`,
-/// `ckpt_waiters`, `stall_waiters`). The test arms the wake itself, in
-/// an otherwise idle iteration.
+/// A task woken after `run_ready` is work the park decision must see: the
+/// wake lands in MAINTAIN, with no completion, command, fabric message or
+/// queued op beside it (the shape of every wake driven by another thread's
+/// state: `ddl_waiters`, `ckpt_waiters`, `stall_waiters`). The test arms
+/// the wake itself, in an otherwise idle iteration.
 struct WakeInMaintain {
     waker: std::rc::Rc<std::cell::RefCell<Option<std::task::Waker>>>,
     done: std::rc::Rc<std::cell::Cell<bool>>,
