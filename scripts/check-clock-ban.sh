@@ -75,11 +75,18 @@ done
 # ---- 3. source membership; the sole allow audit is check-lint-scopes.sh ----
 # ADR-0144 I8: all suppression classes/scopes, including clock:, are audited
 # together. Do not add a second reason scan here.
-dirs=$(cell_crate_dirs)
+dirs=$(cell_crate_dirs) || {
+    echo "CLOCK-BAN SCOPE ERROR: the cell crate set is unknown (scripts/cell-crates.sh, above)"
+    exit 2
+}
 files=0
-# `find`, as every sibling gate: the CI runners ship no ripgrep.
+# `find`, as every sibling gate: the CI runners ship no ripgrep. A walk that fails fails the
+# count, never a smaller one.
 while IFS= read -r dir; do
-    n=$(find "$dir" -name '*.rs' | wc -l)
+    n=$(find "$dir" -name '*.rs' | wc -l) || {
+        echo "CLOCK-BAN SCOPE ERROR: the walk of $dir failed, so its files are uncounted"
+        exit 2
+    }
     files=$((files + n))
 done <<< "$dirs"
 if [ "$files" -eq 0 ]; then

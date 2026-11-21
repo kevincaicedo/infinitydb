@@ -4749,6 +4749,18 @@ root=$(clock_fixture clock-locked <<<'pub fn ok() -> u64 { 1 }')
 fx_walk_lock "clock-ban: a crate directory the walk cannot search fails the gate" \
     "CLOCK-BAN SCOPE ERROR: the directories under bins/ are unknown" \
     "$root" bins/locked clippy.toml 'disallowed-methods = []' env INF_CLOCK_BAN_PROBE=off $CLOCK
+# The source count's walk that fails, and the cell crate set that fails, each name the gate's
+# scope error.
+root=$(clock_fixture clock-locked-src <<<'pub fn ok() -> u64 { 1 }')
+fx_walk_lock "clock-ban: a directory the count's walk cannot read fails the gate" \
+    "CLOCK-BAN SCOPE ERROR: the walk of crates/fake/src failed" \
+    "$root" crates/fake/src/locked a.rs 'pub fn a() {}' env INF_CLOCK_BAN_PROBE=off $CLOCK
+root=$(clock_fixture clock-stale <<<'pub fn ok() -> u64 { 1 }')
+first=${CELL_CRATE_EXCLUDE[0]%%|*}
+[ -n "$first" ] && [ -n "$root" ] && [ -d "$root/$first" ] && rm -rf "$root/$first"
+expect_red_because "clock-ban: a cell crate set that cannot be read (a stale exclusion) fails the gate" \
+    "CLOCK-BAN SCOPE ERROR: the cell crate set is unknown" \
+    env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 
 # Suppression plants moved to the generated lint-scopes matrix below, the
 # single owner of all classes and scopes (ADR-0144 I8).
