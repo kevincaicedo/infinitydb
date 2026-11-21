@@ -525,7 +525,11 @@ expect_red_because "driver: a pool whose FIFO is gone is refused" \
 : >"$work/fx-victim"
 expect_red_because "fx_lock: an empty work directory is refused" "fx_lock: no work directory" \
     bash -c '. "$1"; fx_lock "$2"' fx "$SCRIPT_DIR/selftest-lib.sh" "$work/fx-victim"
+# Root reads through mode 000, so the mode is checked only as another user, as the locked
+# cases are.
+if [ "$(id -u)" -ne 0 ]; then
 expect green "fx_lock: the refused path keeps its mode" test -r "$work/fx-victim"
+fi
 expect_red_because "fx_unlock: an empty work directory is refused" "fx_unlock: no work directory" \
     bash -c '. "$1"; FX_LOCKED="$2"; fx_unlock' fx "$SCRIPT_DIR/selftest-lib.sh" "$work/fx-victim"
 # fx_unlock gives access back only to a recorded path under $work: one outside it, here a path
