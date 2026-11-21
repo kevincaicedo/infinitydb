@@ -99,8 +99,8 @@ const K_SUSPEND_16384: u16 = 2;
 const K_SUSPEND_65536: u16 = 35;
 const K_KEYED_2496: u16 = 1_067;
 const K_KEYED_159744: u16 = 1_660;
-const K_WAIT_WAKE: u16 = 110;
-const K_WAIT_WAKE_KEYS_15: u16 = 344;
+const K_WAIT_WAKE: u16 = 103;
+const K_WAIT_WAKE_KEYS_15: u16 = 338;
 
 /// `NOPS` operand-free `nop`s: the count must read exactly `NOPS` more an op.
 #[inline(always)]
