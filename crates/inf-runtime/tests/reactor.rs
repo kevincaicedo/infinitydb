@@ -522,6 +522,104 @@ fn a_task_woken_in_maintain_is_polled_before_any_park() {
     }
 }
 
+/// A task that keeps a clone of its waker in `kept` and finishes on its
+/// first poll: Retired, its slot held, until that clone's drop links its
+/// reclaim.
+struct KeepsWakerAndFinishes {
+    kept: Rc<std::cell::RefCell<Option<std::task::Waker>>>,
+}
+
+impl Future for KeepsWakerAndFinishes {
+    type Output = ();
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        *self.kept.borrow_mut() = Some(cx.waker().clone());
+        std::task::Poll::Ready(())
+    }
+}
+
+/// Spawns a [`KeepsWakerAndFinishes`] in its first PARSE and drops the kept
+/// clone in its second iteration's FABRIC-IN, so that iteration's executor
+/// passes take one reclaim and poll nothing. It records its PARSE and
+/// FABRIC-OUT calls, and whether the drop linked a reclaim, and reports no
+/// other work.
+struct ReclaimInFabricIn {
+    calls: Rc<std::cell::RefCell<Vec<&'static str>>>,
+    kept: Rc<std::cell::RefCell<Option<std::task::Waker>>>,
+    spawned: bool,
+    iteration: u32,
+    linked: bool,
+}
+
+impl CellPlane for ReclaimInFabricIn {
+    fn on_completion(&mut self, _cx: &mut LoopCx<'_>, _c: Completion) {}
+    fn fabric_in(&mut self, cx: &mut LoopCx<'_>) {
+        self.iteration += 1;
+        if self.iteration != 2 {
+            return;
+        }
+        let kept = self.kept.borrow_mut().take().expect("the finished task's clone");
+        assert!(!cx.executor.has_ready(), "nothing is ready before the clone's drop");
+        drop(kept);
+        self.linked = cx.executor.has_ready();
+    }
+    fn parse_execute(&mut self, cx: &mut LoopCx<'_>) {
+        self.calls.borrow_mut().push("parse_execute");
+        if !self.spawned {
+            self.spawned = true;
+            tasks::spawn(cx.executor, KeepsWakerAndFinishes { kept: Rc::clone(&self.kept) });
+        }
+    }
+    fn respond(&mut self, _cx: &mut LoopCx<'_>) {}
+    fn fabric_out(&mut self, _cx: &mut LoopCx<'_>) -> bool {
+        self.calls.borrow_mut().push("fabric_out");
+        false
+    }
+}
+
+/// An iteration whose executor passes only reclaim (ADR-0149 D3): its
+/// `IterStats::polled` counts no task; with `remote_first_execute` its early
+/// pass, which polled nothing, publishes nothing ahead of PARSE; and the
+/// returned slot is work, so at `spin_iters` 1 the next iteration does not
+/// park. Each leg has its own red: the count read from the entries, the early
+/// flush on the entries, the park decision on the polls alone.
+#[test]
+fn an_iteration_that_only_reclaims_polls_nothing_and_does_not_park() {
+    for remote_first_execute in [false, true] {
+        let mut lp =
+            test_loop(LoopConfig { spin_iters: 1, remote_first_execute, ..LoopConfig::default() });
+        let mut plane = ReclaimInFabricIn {
+            calls: Rc::default(),
+            kept: Rc::default(),
+            spawned: false,
+            iteration: 0,
+            linked: false,
+        };
+        let spawn = lp.run_iteration(&mut plane).expect("iteration");
+        assert_eq!(spawn.polled, 1, "lever {remote_first_execute}: the task's one poll");
+        assert_eq!(lp.executor().live_tasks(), 0, "it finished, Retired by its kept clone");
+        plane.calls.borrow_mut().clear();
+        let reclaim = lp.run_iteration(&mut plane).expect("iteration");
+        assert!(plane.linked, "lever {remote_first_execute}: the clone's drop linked a reclaim");
+        assert!(!lp.executor().has_ready(), "lever {remote_first_execute}: the reclaim was taken");
+        assert!(!reclaim.parked, "lever {remote_first_execute}: the reclaim's iteration polled");
+        assert_eq!(reclaim.polled, 0, "lever {remote_first_execute}: a reclaim is not a poll");
+        assert_eq!(
+            *plane.calls.borrow(),
+            vec!["parse_execute", "fabric_out"],
+            "lever {remote_first_execute}: a reclaim-only early pass publishes nothing early"
+        );
+        let next = lp.run_iteration(&mut plane).expect("iteration");
+        assert!(
+            !next.parked,
+            "lever {remote_first_execute}: parked after a returned slot: {:?}",
+            lp.driver().waits
+        );
+    }
+}
+
 /// Arms `owners` timers one millisecond out in its first PARSE, then counts
 /// the callbacks each iteration begins. It reports no work, so the loop's
 /// idle policy alone decides each wait.
