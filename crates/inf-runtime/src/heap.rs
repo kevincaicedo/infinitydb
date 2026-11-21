@@ -360,8 +360,8 @@ impl<E: HeapEntry> IndexedHeap<E> {
     }
 
     fn sift_down(&mut self, mut index: u32, entry: E, moved: &mut impl FnMut(E, u32)) {
-        while let Some(left) = child(index, 0).filter(|left| *left < self.len) {
-            let right = child(index, 1).filter(|right| *right < self.len);
+        while let Some(left) = child(index, Side::Left).filter(|left| *left < self.len) {
+            let right = child(index, Side::Right).filter(|right| *right < self.len);
             let least = match right {
                 Some(right) if self.entries.get(right).key() < self.entries.get(left).key() => {
                     right
@@ -387,10 +387,17 @@ fn parent(index: u32) -> u32 {
     (index - 1) / 2
 }
 
-/// Child `side` (0 left, 1 right) of `index`, `None` past `u32`.
+/// Which child of an index: the left at `2 × index + 1`, the right at the next.
+#[derive(Clone, Copy)]
+enum Side {
+    Left = 0,
+    Right = 1,
+}
+
+/// Child `side` of `index`, `None` past `u32`.
 #[inline]
-fn child(index: u32, side: u32) -> Option<u32> {
-    index.checked_mul(2)?.checked_add(1 + side)
+fn child(index: u32, side: Side) -> Option<u32> {
+    index.checked_mul(2)?.checked_add(1 + side as u32)
 }
 
 #[cfg(test)]
