@@ -317,7 +317,10 @@ pub static DECLARED: &[Declared] = &[
         "subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE (accepted and ignored — the wheel \
              stays on; lazy expiry alone upholds visibility); OBJECT routes to the key's owner \
              cell and COMMAND GETKEYS reports that key (ADR-0104); SLEEP stalls one cell, never \
-             the node",
+             the node; a `SLEEP` past `timeout` answers every client of the stalled cell, and \
+             `timeout` counts each one's idle time from the stall's end at the earliest; Redis \
+             closes each client idle past `timeout` at the sleep's end, the issuer's reply unsent \
+             and a request that arrived during the sleep unread (ADR-0193)",
     ),
     d(
         "EXPIREAT",
@@ -346,8 +349,11 @@ pub static DECLARED: &[Declared] = &[
              maxclients exceeds boot capacity; restart with --maxclients` and changes no key of \
              the `CONFIG SET`, and below the cell count every cell keeps one slot (ADR-0123 \
              A1); `timeout` closes idle \
-             unsubscribed connections at MAINTAIN resolution, `tcp-keepalive` applies to \
-             connections accepted after the change (ADR-0123); `client-output-buffer-limit` \
+             unsubscribed connections at MAINTAIN resolution, and a connection the server owes a \
+             reply (a command queued or held, a byte unparsed, a reply not yet offered, its cell \
+             stalled) is not closed by `timeout`, and a send is activity (ADR-0193); \
+             `tcp-keepalive` applies to connections accepted after the change (ADR-0123); \
+             `client-output-buffer-limit` \
              enforces `normal` and `pubsub`, the `slave` class is accepted and inert until M9 \
              replicas exist; `save`/`appendonly` are accepted and inert (no RDB/AOF); \
              `doc-path-cache-size` is BootOnly, 0–4,096 entries per cell (default 1,024; \
