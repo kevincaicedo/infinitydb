@@ -969,6 +969,18 @@ rows=(
   # the Retiring grant's receipt is never written.
   "inf_canary_grants_generation_relaxed loom inf-foundation loom_a_pass_that_sees_the_generation_sees_the_retiring F9:"
   "inf_canary_grants_generation_first loom inf-foundation loom_a_pass_that_sees_the_generation_sees_the_retiring F9:"
+  # ADR-0157 D3, D5 (KR1-KR4): the retained ring's endpoint release made
+  # `Relaxed`, the owner's join load made `Relaxed`, a join after one
+  # release, or the producer's release before its last publication's tail
+  # store: a join before the fixture's thread join reads a stale tail, or
+  # joins while the fixture holds an endpoint.
+  "inf_canary_ring_release_relaxed loom inf-fabric loom_retained_join_sees_both_endpoints_final_writes JOIN_VISIBILITY_GAP:"
+  "inf_canary_ring_join_relaxed loom inf-fabric loom_retained_join_sees_both_endpoints_final_writes JOIN_VISIBILITY_GAP:"
+  "inf_canary_ring_join_after_one loom inf-fabric loom_retained_join_waits_while_the_consumer_is_held JOIN_WITH_HELD_ENDPOINT:"
+  "inf_canary_ring_release_before_write loom inf-fabric loom_retained_join_sees_both_endpoints_final_writes JOIN_VISIBILITY_GAP:"
+  # ADR-0157 D3 (KR5): a backing owner dropped before its retirement leaks
+  # silently instead of failing stop.
+  "inf_canary_ring_drop_live_silent crate-test inf-fabric lib a_backing_dropped_before_its_retirement_fails_stop"
   # ADR-0148 D2: the writer returns a tiered grant at its CREATE's notice,
   # while every cell holds the owner: the next tiered CREATE's apply finds
   # its position held and answers an internal error.

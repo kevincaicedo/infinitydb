@@ -98,7 +98,12 @@ rests on these rules:
   programs, explored with no preemption, permutation or time bound): both
   endpoints released concurrently, where a join before the fixture's
   thread join must see the producer's tail and the consumer's head; the
-  producer held, and the consumer held, where no execution joins.
+  producer held, and the consumer held, where no execution joins. Their
+  plants, `inf_canary_ring_release_relaxed`, `inf_canary_ring_join_relaxed`,
+  `inf_canary_ring_release_before_write` (`JOIN_VISIBILITY_GAP`) and
+  `inf_canary_ring_join_after_one` (`JOIN_WITH_HELD_ENDPOINT`), are rows of
+  `scripts/sim-canaries.sh`; `inf_canary_ring_drop_live_silent` is the
+  class-I `Drop`'s, on its `should_panic` test.
 - **Miri**: the non-loom unit tests (including a two-thread stress test at
   reduced count) run under Miri in CI with strict provenance, the retained
   ring's among them: both drop orders, the last release on another thread,

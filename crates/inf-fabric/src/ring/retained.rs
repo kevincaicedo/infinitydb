@@ -51,10 +51,18 @@ pub const RETAINED_RING_SLOTS: usize = TIER_RETIRE_JOBS_PER_CELL;
 const ENDPOINTS: usize = 2;
 
 /// An endpoint's release: `Release`, its last access to the header.
+#[cfg(not(inf_canary_ring_release_relaxed))]
 const RELEASE: Ordering = Ordering::Release;
+/// Canary: the release without its ordering. The Loom join models must fail.
+#[cfg(inf_canary_ring_release_relaxed)]
+const RELEASE: Ordering = Ordering::Relaxed;
 
 /// The owner's join: `Acquire`, before it reads anything an endpoint wrote.
+#[cfg(not(inf_canary_ring_join_relaxed))]
 const JOIN: Ordering = Ordering::Acquire;
+/// Canary: the join without its ordering. The Loom join models must fail.
+#[cfg(inf_canary_ring_join_relaxed)]
+const JOIN: Ordering = Ordering::Relaxed;
 
 /// The shared header: the indices, the endpoint count and the slot block
 /// it holds until its retirement detaches it. One element of a one-element
@@ -155,6 +163,11 @@ unsafe impl<T: Send> Send for RetainedConsumer<T> {}
 
 impl<T> Drop for RetainedProducer<T> {
     fn drop(&mut self) {
+        // Canary `inf_canary_ring_release_before_write`: the producer
+        // released at its publication, before the tail store.
+        if cfg!(inf_canary_ring_release_before_write) {
+            return;
+        }
         release(&self.inner.backing);
     }
 }
@@ -241,6 +254,11 @@ impl<T> Drop for Reservation<'_, T> {
     fn drop(&mut self) {
         if self.written == 0 {
             return;
+        }
+        // Canary `inf_canary_ring_release_before_write`: the producer's
+        // release before its final write, the tail store.
+        if cfg!(inf_canary_ring_release_before_write) {
+            release(&self.sender.backing);
         }
         self.sender.publish(self.written);
     }
@@ -472,7 +490,8 @@ fn take_queued<T>(header: &mut Header<T>) -> Option<T> {
 
 /// Whether `left` endpoints let the owner join.
 fn joined(left: usize) -> bool {
-    left == 0
+    // Canary `inf_canary_ring_join_after_one`: a join after one release.
+    if cfg!(inf_canary_ring_join_after_one) { left <= 1 } else { left == 0 }
 }
 
 impl<T> RetainedRing<T> {
@@ -641,7 +660,12 @@ impl<T> Drop for RetainedRing<T> {
     /// nothing and returns, its storage leaked: forgetting never authorizes
     /// a free, and no second panic starts during an unwind.
     fn drop(&mut self) {
-        if matches!(*self.phase, Phase::Terminal(_)) || std::thread::panicking() {
+        // Canary `inf_canary_ring_drop_live_silent`: the leak without the
+        // fail-stop.
+        if matches!(*self.phase, Phase::Terminal(_))
+            || std::thread::panicking()
+            || cfg!(inf_canary_ring_drop_live_silent)
+        {
             return;
         }
         panic!("retained ring dropped before its retirement");
@@ -935,7 +959,8 @@ mod tests {
         retire_all(&mut at, &mut Vec::new());
     }
 
-    /// A backing owner dropped before Terminal fails stop. Admitted and unbuilt, it holds
+    /// Canary `inf_canary_ring_drop_live_silent` (KR5): a backing owner
+    /// dropped before Terminal fails stop. Admitted and unbuilt, it holds
     /// no block, so the test leaks nothing.
     #[test]
     #[should_panic(expected = "retained ring dropped before its retirement")]
