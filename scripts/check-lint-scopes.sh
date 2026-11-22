@@ -83,7 +83,7 @@ CAPPED_BACKING_SITES=1
 # later date on either line. The line
 # stays spelled `CONTAINER_EXPIRY_MOVES="<record>=<date> …"` alone, so every
 # copy reads it.
-CONTAINER_EXPIRY_MOVES="T=2026-11-30 E=2026-12-31 D=2026-12-31 A=2026-12-31 R=2026-12-31 C=2026-12-31"
+CONTAINER_EXPIRY_MOVES="T=2026-11-30 D=2026-12-31 A=2026-12-31 R=2026-12-31 C=2026-12-31"
 # ADR-0201 D1: the second move line, keyed to the first. A record on the first
 # line may move its rows up to its later date here, which must follow its
 # first-line date. This line only loses records or moves earlier, against
