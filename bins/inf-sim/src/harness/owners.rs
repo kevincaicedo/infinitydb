@@ -92,6 +92,9 @@ impl OwnersJudge {
         core::mem::take(&mut self.violations)
     }
 
+    /// Records a cell's first breach under its caller's check, so a
+    /// per-step and a settled breach each print.
+    #[track_caller]
     fn record(&mut self, cell: usize, breach: &str, at: &dyn std::fmt::Display) {
         if !self.breached[cell] {
             self.breached[cell] = true;

@@ -99,8 +99,8 @@ mod split;
 
 pub use conn::OwnedOutcome;
 use conn::{
-    CONN_SLOT_CAP, ClosedBy, ConnSlot, Emitted, Link, MAXCLIENTS_REFUSAL, OwnedCmd, PeerStream,
-    RecvArm, RunOut,
+    CONN_SLOT_CAP, ClosedBy, ConnAdmission, ConnSlab, ConnSlot, Emitted, Link, MAXCLIENTS_REFUSAL,
+    OwnedCmd, PeerStream, RecvArm, RunOut,
 };
 use credit::{FanLegs, FanReserve, PlaneFabric, PointOp, PubFanArgv};
 pub use credit::{MeshConfigRefused, checked_mesh_config};
@@ -179,18 +179,6 @@ pub(super) struct StagedParse {
     /// `hasher.hash(argv[1])` when the command carries a key.
     hash: u64,
     has_key: bool,
-}
-
-/// Generation-keyed connection slab. Generic over the entry so the
-/// admission bound is unit-testable without building a `Conn`.
-pub(super) struct ConnSlab<T = Conn> {
-    slots: Vec<Option<T>>,
-    gens: Vec<u32>,
-    free: Vec<u32>,
-    live: usize,
-    /// Slots this slab may allocate (`CONN_SLOT_CAP` in production; a
-    /// small number in the admission test).
-    cap: u32,
 }
 
 /// One fabric-origin namespace apply parked for its origin's FIFO pump
@@ -1093,7 +1081,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 stall_until: Cell::new(Nanos(0)),
                 store: RefCell::new(store),
                 fabric: RefCell::new(fabric),
-                conns: RefCell::new(ConnSlab::default()),
+                conns: RefCell::new(ConnSlab::new(
+                    usize::try_from(caps.conn.entries_max()).unwrap_or(usize::MAX),
+                )),
                 gate: RefCell::new(gate),
                 wait_nodes,
                 credit_waiters,
@@ -1896,11 +1886,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             return;
         }
         let knobs = self.shared.knobs.get();
-        // `maxclients` (ADR-0123 D1): this cell's share of the node
-        // bound; past it the socket gets Redis's error and a close.
-        if self.shared.conns.borrow().live >= knobs.maxclients_share {
-            self.refuse_accept(cx, fd);
-            return;
+        // `maxclients` (ADR-0123 D1, A1): this cell's active clients under
+        // its share of the hot value, and its occupied slots, a draining one
+        // included, under the boot share; past either the socket gets
+        // Redis's error and a close.
+        match self.shared.conns.borrow().admits(knobs.maxclients_share) {
+            ConnAdmission::Admitted => {}
+            ConnAdmission::ActiveShare | ConnAdmission::Occupied => {
+                self.refuse_accept(cx, fd);
+                return;
+            }
         }
         let ns = self.conn_default_ns();
         let parser_limits = self.shared.parser_limits.get();
@@ -2092,7 +2087,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         // A draining slot's pump still running its queue or shipping its
         // 1→0 deltas sends fabric ops; its slot stays occupied until the
         // pump returns, so it ends before the node-wide barrier too.
-        let live = shared.conns.borrow().live;
+        let live = shared.conns.borrow().live();
         if live > 0 {
             return Err(StopHold::Connections { live });
         }
@@ -2138,23 +2133,21 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     fn mark_every_slot(shared: &Shared<O, F>) {
         let mut rearms = shared.mark_rearms.borrow_mut();
         let mut conns = shared.conns.borrow_mut();
-        let ConnSlab { slots, gens, .. } = &mut *conns;
-        for (slot, entry) in slots.iter_mut().enumerate() {
-            let Some(conn) = entry.as_mut() else { continue };
+        conns.for_each_keyed_mut(|key, conn| {
             // Canary: the stop's mark reaches active slots alone, so a
             // `Peer` parser keeps its held bytes past the stop.
             #[cfg(inf_canary_stop_skips_peer_reader)]
             if !matches!(conn.slot, ConnSlot::Active { .. }) {
-                continue;
+                return;
             }
             if conn.mark() {
-                rearms.push(ConnKey { slot: slot as u32, generation: gens[slot] });
+                rearms.push(key);
             }
-        }
+        });
     }
 
     pub fn connections(&self) -> usize {
-        self.shared.conns.borrow().live
+        self.shared.conns.borrow().live()
     }
 
     /// Takes of fabric holders past the key's generation field: the

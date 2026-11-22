@@ -1232,6 +1232,17 @@ ordered_rows=(
   # linked sync and a write-through write, each whole until the hold lifts. Planted,
   # hold_barriers keeps standalone syncs alone, and the frame barriers complete while held.
   "inf_canary_barrier_hold_standalone_only crate-test inf-sim test:disk a_barrier_hold_keeps_every_barrier_until_it_lifts barrier-completed-while-held"
+  # The capped slab's admission compare on the `conn` class, whose cap is the cell's share
+  # (ADR-0177 D2), at its control: the fan leg's share of clients on one cell. One task short,
+  # the class holds 3 of its 4 and the last client's accept is refused there, so the leg reads
+  # the row unfilled and crossed, each clause by its own token.
+  "inf_canary_cap_minus_one m0-capacity cap-row-unfilled --close-leg fan"
+  "inf_canary_cap_minus_one m0-capacity cap-row-crossed --close-leg fan"
+  # The same plant on the tasks leg, whose draining slots keep the share's `occupied < C`
+  # refusing ahead of the class: one task short, the first wave holds 3 of 4, and every accept
+  # the share then admits is refused at the class instead, which never crosses on the plain build.
+  "inf_canary_cap_minus_one m0-capacity cap-row-unfilled --close-leg tasks"
+  "inf_canary_cap_minus_one m0-capacity cap-row-crossed --close-leg tasks"
   # A slot takes the largest power-of-two chunk one 64 KiB allocation holds, at most 64 slots,
   # and the builder takes no other count (ADR-0194 A1). Planted, chunk_slots_for answers 64 at
   # every width, the fixed chunk, and a slab of 1,032 B slots in chunks of 32 is refused.
@@ -1279,6 +1290,9 @@ ordered_rows=(
   # slots at every step (O1). Planted, the slot is vacated at Closed, before its pump returns,
   # and O1 reads fewer slots than tasks.
   "inf_canary_conn_slot_frees_at_closed m0-capacity conn-tasks-unequal --close-leg close"
+  # The same plant on the tasks leg's engagement: a slot that vacates at Closed never drains, so
+  # no client reads the maxclients refusal while its cell's occupied slots outnumber its clients.
+  "inf_canary_conn_slot_frees_at_closed m0-capacity drain-refusal-unengaged --close-leg tasks"
   # The `conn` class's slots are the cell's share (ADR-0177 D2), resident whole from its build
   # and billed by the idle row. Planted, it is built over (1 + k) C slots, k from its stride:
   # the idle node's resident memory a cell rises by k x C x s_conn, 2,500 x 3,104 B at 4 cells
@@ -1302,6 +1316,12 @@ ordered_rows=(
   # Planted, the queue alone diverts: a flat write runs inline while a tiered write of the same
   # origin holds its slot on a held cold read, and the flat write's open stops the cell.
   "inf_canary_divert_queue_only m0-capacity second-open-slot --close-leg gated-cold"
+  # The slab's draining count, which the accept's active share reads, leaves with a draining
+  # slot's removal (ADR-0123 A1). Planted, the removal keeps it, and MAINTAIN's sweep asserts
+  # the count against its own walk once the first drained slot vacates: the lowered plane test
+  # at its thaw, the tasks-lowered leg at its admitted clients' ends.
+  "inf_canary_draining_count_kept crate-test inf-server lib a_draining_slot_counts_against_the_boot_share_alone draining-count-drift"
+  "inf_canary_draining_count_kept m0-capacity draining-count-drift --close-leg tasks-lowered"
   # A Peer parser ends at the run-out once a take of the inbox completed since its stamp
   # (ADR-0196 D2). Planted, the run-out's test reads false, and the FIN-only client's slot never
   # closes.

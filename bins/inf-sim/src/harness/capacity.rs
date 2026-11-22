@@ -20,6 +20,7 @@ use std::rc::Rc;
 
 use inf_alloc::BufferPool;
 use inf_fabric::Mesh;
+use inf_foundation::bounded::CapRow;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Nanos, VirtualClock};
 use inf_foundation::{CellId, hash64};
@@ -47,6 +48,10 @@ pub enum CloseLeg {
     /// acks, then more clients: the tasks a cell holds stay within its
     /// connection share and its plane-start pumps (O1).
     Tasks,
+    /// The same first wave draining under a share lowered at runtime: a
+    /// later client is admitted while the active clients are under the
+    /// share and the occupied slots under the boot share (ADR-0123 A1).
+    TasksLowered,
     /// Remote `DEL`s held at a peer: a connection holds at most its window
     /// of 32 gate holders.
     Fan,
@@ -116,8 +121,9 @@ pub enum CloseLeg {
 
 impl CloseLeg {
     /// Every leg, in the order the help text lists them.
-    pub const ALL: [CloseLeg; 22] = [
+    pub const ALL: [CloseLeg; 23] = [
         CloseLeg::Tasks,
+        CloseLeg::TasksLowered,
         CloseLeg::Fan,
         CloseLeg::Close,
         CloseLeg::Rearm,
@@ -152,6 +158,7 @@ impl CloseLeg {
     pub const fn name(self) -> &'static str {
         match self {
             CloseLeg::Tasks => "tasks",
+            CloseLeg::TasksLowered => "tasks-lowered",
             CloseLeg::Fan => "fan",
             CloseLeg::Close => "close",
             CloseLeg::Rearm => "rearm",
@@ -280,6 +287,11 @@ struct Rig {
     nodes: Vec<Rc<NodeInfo>>,
     /// O1's judge: each cell's first breach, recorded once.
     owners: OwnersJudge,
+    /// The cells of this step's clients whose first frame was the
+    /// `maxclients` refusal, judged once the step's frames are read.
+    refusals_read: Vec<usize>,
+    /// Per cell, the refusals read at a step where a slot of the cell drained.
+    refused_while_draining: Vec<u64>,
 }
 
 impl Rig {
@@ -367,6 +379,8 @@ impl Rig {
             tasks_most: None,
             nodes,
             owners: OwnersJudge::new(usize::from(CELLS)),
+            refusals_read: Vec::new(),
+            refused_while_draining: vec![0; usize::from(CELLS)],
         };
         for _ in 0..8 {
             rig.step();
@@ -378,6 +392,9 @@ impl Rig {
         &self.cells[cell].1
     }
 
+    /// Records a violation under its caller's check, so each clause's first
+    /// entry is printed whatever the run's count.
+    #[track_caller]
     fn violate(&mut self, text: String) {
         self.violations.push(text);
     }
@@ -410,6 +427,7 @@ impl Rig {
         for id in 0..self.clients.len() {
             self.observe(id);
         }
+        self.judge_refusals();
         drain_violations(&self.nets, &mut self.violations);
         self.clock.advance(Nanos(STEP_NS_FLOOR + self.rng.next_u64() % self.step_ns_max));
         self.steps += 1;
@@ -434,6 +452,28 @@ impl Rig {
         }
     }
 
+    /// Each refusal read this step counts toward `refused_while_draining`
+    /// when its cell's occupied slots (O1's product count) outnumber its
+    /// clients that may hold one: those the server has not closed and the
+    /// refusal has not answered. A slot past them is one whose client's
+    /// close was posted, still draining.
+    fn judge_refusals(&mut self) {
+        for cell in core::mem::take(&mut self.refusals_read) {
+            let (cell_loop, plane) = &self.cells[cell];
+            let slots = plane.conn_owners(cell_loop.executor()).slots;
+            let net = self.nets[cell].borrow();
+            let open = self
+                .clients
+                .iter()
+                .filter(|client| client.cell == cell && !net.closed(client.fd))
+                .filter(|client| client.replies.first().is_none_or(|reply| reply != REFUSAL_FRAME))
+                .count();
+            if slots > open {
+                self.refused_while_draining[cell] += 1;
+            }
+        }
+    }
+
     /// Reads what reached client `id`, frames its replies and notes the
     /// server's close; a half-closed client past its close bound is ended
     /// as `half-close-unclosed`.
@@ -452,8 +492,12 @@ impl Rig {
             client.rx.extend_from_slice(&bytes);
             client.last_byte_at = Some(steps);
         }
+        let first_frame = client.replies.is_empty();
         while let Some(n) = reply_len(&client.rx) {
             client.replies.push(client.rx.drain(..n).collect());
+        }
+        if first_frame && client.replies.first().is_some_and(|reply| reply == REFUSAL_FRAME) {
+            self.refusals_read.push(client.cell);
         }
         if net.closed(client.fd) {
             client.closed_at = Some(steps);
@@ -707,6 +751,7 @@ pub fn run_capacity_scenario(scenario: &CapacityScenario) -> CapacityReport {
     let leg = scenario.leg;
     let rig = match leg {
         CloseLeg::Tasks => tasks_leg(seed),
+        CloseLeg::TasksLowered => tasks_lowered_leg(seed),
         CloseLeg::Fan => fan_leg(seed),
         CloseLeg::Close => close_leg(seed),
         CloseLeg::Rearm => rearm_leg(seed),
@@ -864,6 +909,12 @@ const PLANE_START_TASKS: usize = CELLS as usize + 1;
 /// subscriber's delta reached every peer.
 /// Engagement: the first wave confirmed, then closed while cell 2 was held,
 /// cell 0 owing a delta after the closes, else `VACUOUS tasks-unengaged`.
+/// On cell 0's `conn` class: the first wave holds it at its cap, and a
+/// client reads the `maxclients` refusal at a step where the cell's occupied
+/// slots outnumber its clients that may hold one, so a slot drains (each
+/// else `VACUOUS`); the class never crosses: admission's `occupied < C`
+/// counts a draining slot, so the accept is refused before the class is
+/// asked (ADR-0123 A1).
 fn tasks_leg(seed: u64) -> Rig {
     let mut rig = Rig::new(seed, (SHARE * usize::from(CELLS)) as u32, 15_000);
     rig.tasks_most = Some(vec![0; usize::from(CELLS)]);
@@ -899,6 +950,7 @@ fn tasks_leg(seed: u64) -> Rig {
         }
         rig.until("a churn wave's closes", |rig| ids.iter().all(|&id| rig.ended(id)));
     }
+    let refused = rig.refused_while_draining[X];
     rig.held = None;
     rig.settle();
     let most = rig.tasks_most.take().unwrap_or_default();
@@ -919,6 +971,13 @@ fn tasks_leg(seed: u64) -> Rig {
         let text = "VACUOUS tasks-unengaged: the first wave never closed owing a held delta";
         rig.violate(text.to_string());
     }
+    rig.read("refused_while_draining", refused);
+    if refused == 0 {
+        let text = "VACUOUS cell 0: drain-refusal-unengaged — no client of cell 0 read the \
+                    maxclients refusal while a slot of the cell drained";
+        rig.violate(text.to_string());
+    }
+    rig.expect_conn_tasks_full_uncrossed("the first wave");
     rig
 }
 
@@ -943,7 +1002,8 @@ impl Rig {
 /// own keys, set first, while cell 1 is held: the remote legs the cell holds (gate waiters and
 /// credit waits) stay within the share's windows of 32, then every reply is the exact count. A
 /// fan with no window holds a holder for each leg until it has sent its last, so the share's
-/// fans pass the gate's holders (`gate-full`).
+/// fans pass the gate's holders (`gate-full`). The share's clients are exactly the `conn`
+/// class's cap on cell 0, its control: the row reads full and never crossed.
 fn fan_leg(seed: u64) -> Rig {
     const KEYS: usize = 1_023;
     let mut rig = Rig::new(seed, (SHARE * usize::from(CELLS)) as u32, 15_000);
@@ -988,7 +1048,149 @@ fn fan_leg(seed: u64) -> Rig {
     if held == 0 {
         rig.violate("VACUOUS fan-unengaged: no remote leg was held".to_string());
     }
+    rig.expect_conn_tasks_full_uncrossed("the share's clients");
     rig
+}
+
+/// The `conn` class's census row, its cap the cell's connection share
+/// (ADR-0177 D2).
+const CONN_TASKS_ROW: &str = inf_server::limits::CONN_TASKS.name();
+
+impl Rig {
+    /// The `conn` class's clauses on cell X's `conn-tasks` row: `filler`
+    /// held the class at its cap, and no accept was refused there, since
+    /// admission refuses at the share first. Judged apart, so a class that
+    /// admits one task fewer reads both: it holds `cap - 1`, and the accept
+    /// after it crosses. A missing row is `cap-row-missing`, the census
+    /// oracle's token for the same fact, never a fill clause's.
+    fn expect_conn_tasks_full_uncrossed(&mut self, filler: &str) {
+        let Some(row) = self.conn_tasks_row() else { return };
+        let (held, cap) = (row.high_water, row.entries_max);
+        if held < cap {
+            self.violate(format!(
+                "VACUOUS cell {X}: cap-row-unfilled — the `{CONN_TASKS_ROW}` row held {held} of \
+                 {cap}: {filler} never filled it"
+            ));
+        }
+        self.expect_conn_tasks_uncrossed(&row);
+    }
+
+    /// Cell X's `conn-tasks` row, its high water and crossings read; a missing row is
+    /// `cap-row-missing`.
+    fn conn_tasks_row(&mut self) -> Option<CapRow> {
+        let Some(row) = self.plane(X).cap_census().row(CONN_TASKS_ROW) else {
+            self.violate(format!("VACUOUS cell {X}: cap-row-missing — no `{CONN_TASKS_ROW}` row"));
+            return None;
+        };
+        self.read("conn_tasks_high_water", u64::from(row.high_water));
+        self.read("conn_tasks_crossings", row.crossings);
+        Some(row)
+    }
+
+    /// No accept was refused at the `conn` class: admission refuses at the share or at the
+    /// occupied slots first (ADR-0123 A1), so a crossing is an accept those compares passed.
+    fn expect_conn_tasks_uncrossed(&mut self, row: &CapRow) {
+        let crossings = row.crossings;
+        if crossings > 0 {
+            self.violate(format!(
+                "CAP CENSUS VIOLATION cell {X}: cap-row-crossed — the `{CONN_TASKS_ROW}` row \
+                 crossed {crossings} time(s): an accept found the class full, past the share's \
+                 refusal"
+            ));
+        }
+    }
+}
+
+/// The accept at a lowered share (ADR-0123 A1): boot `maxclients` 24 on three cells, a
+/// cell's boot share `C` 8, lowered by `CONFIG SET maxclients 12` from a client of cell 1 to
+/// a share of 4 before the hold. A first wave one short of the share, three pattern
+/// subscribers on cell 0, closes while cell 2 holds their deltas' acks, so their slots drain:
+/// none active, three occupied. Clients then connect to cell 0 one at a time, each sending a
+/// `SET` of a key the cell owns: the share's four are admitted, active under the share and
+/// occupied under `C`, each `+OK` judged; the fifth is refused by the share's compare alone,
+/// its occupied seven still under `C`, and cell 0's `conn` class never crosses. Then the
+/// admitted clients end, cell 2 is released and the node settles: every slot vacant, no
+/// pattern counted.
+/// Engagement, each else `VACUOUS`: the `CONFIG SET` answered `+OK`, and the first wave closed
+/// owing a held delta.
+fn tasks_lowered_leg(seed: u64) -> Rig {
+    let boot = 2 * SHARE * usize::from(CELLS);
+    let mut rig = Rig::new(seed, boot as u32, 15_000);
+    let setter = rig.admitted(Y);
+    let lowered = (SHARE * usize::from(CELLS)).to_string();
+    let set = rig.call(setter, &[b"CONFIG", b"SET", b"maxclients", lowered.as_bytes()]);
+    let first: Vec<usize> = (0..SHARE - 1).map(|_| rig.connect(X)).collect();
+    for (n, &id) in first.iter().enumerate() {
+        rig.send(id, &encode(&[b"PSUBSCRIBE", format!("lowered:{n}:*").as_bytes()]));
+    }
+    let confirmed = rig.until("the first wave's confirmations", |rig| {
+        first.iter().all(|&id| !rig.clients[id].replies.is_empty())
+    });
+    rig.held = Some(Z);
+    for &id in &first {
+        rig.fin(id);
+    }
+    let closed = rig.until("the first wave's closes", |rig| first.iter().all(|&id| rig.ended(id)));
+    let owed = rig.plane(X).suspended();
+    rig.read("deltas_owed", owed as u64);
+    let later = rig.lowered_clients();
+    for &id in &later {
+        rig.fin(id);
+    }
+    rig.until("the later clients' closes", |rig| later.iter().all(|&id| rig.ended(id)));
+    rig.held = None;
+    rig.settle();
+    rig.expect_vacant(X, 0);
+    rig.expect_no_pattern();
+    if let Some(row) = rig.conn_tasks_row() {
+        rig.expect_conn_tasks_uncrossed(&row);
+    }
+    if set != b"+OK\r\n" {
+        let set = String::from_utf8_lossy(&set).into_owned();
+        rig.violate(format!("VACUOUS share-unlowered: CONFIG SET maxclients answered {set:?}"));
+    }
+    if !(confirmed && closed && owed >= 1) {
+        let text =
+            "VACUOUS tasks-lowered-unengaged: the first wave never closed owing a held delta";
+        rig.violate(text.to_string());
+    }
+    rig
+}
+
+impl Rig {
+    /// The tasks-lowered leg's later clients on cell 0, one at a time while the first wave's
+    /// slots drain, each sending a `SET` of a key the cell owns: the share's are owed its
+    /// `+OK` (`draining-slot-refused` where the `maxclients` refusal answered one), the next
+    /// the refusal (`share-past-admitted` where it was answered). Returns the clients the cell
+    /// admitted.
+    fn lowered_clients(&mut self) -> Vec<usize> {
+        let names = names_on(X, "lowered-set", SHARE + 1);
+        let mut admitted = Vec::new();
+        for (n, name) in names.iter().enumerate() {
+            let id = self.connect(X);
+            let reply = self.call(id, &[b"SET", name, b"1"]);
+            let refused = reply == REFUSAL_FRAME;
+            if n < SHARE && refused {
+                let active = admitted.len();
+                self.violate(format!(
+                    "draining-slot-refused: cell {X} refused client {n} with {active} active \
+                     under the share of {SHARE}, the first wave's slots draining"
+                ));
+            } else if n < SHARE {
+                self.judge_replies(id, 0, &oks(1), "an admitted client");
+            } else if !refused {
+                let read = String::from_utf8_lossy(&reply).into_owned();
+                self.violate(format!(
+                    "share-past-admitted: client {n}, past the share of {SHARE}, read {read:?}"
+                ));
+            }
+            if !refused {
+                admitted.push(id);
+            }
+        }
+        self.read("lowered_admitted", admitted.len() as u64);
+        admitted
+    }
 }
 
 // ---- E-close's legs: a close runs the bytes its client handed over ------------------
