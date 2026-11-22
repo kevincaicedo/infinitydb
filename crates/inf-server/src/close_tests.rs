@@ -256,6 +256,76 @@ fn a_reset_connection_runs_its_queued_commands() {
     assert!(node.written(0, CLIENT).is_empty(), "a reset client is answered nothing");
 }
 
+/// How a slot reaches `Flushing` with commands queued behind a held `DEL`.
+#[derive(Clone, Copy)]
+enum FlushingBy {
+    /// The peer's end of stream: Flushing `Peer`.
+    EndOfStream,
+    /// A protocol error after the commands: the plane's mark, Flushing `Open`.
+    ProtocolError,
+}
+
+/// A client's `DEL` of 32 keys cell 1 owns holds its pump's window while
+/// cell 1 is frozen, a `SET` and an `INCR` queued behind it; the slot then
+/// moves to `Flushing` by `by`, and `CLIENT KILL ID` closes it at once. The
+/// immediate close cancels no command: the queue runs to its end unanswered
+/// (ADR-0123 A2 rule 3, ADR-0193 D3's immediate shape), so the key reads 2
+/// and nothing is written to the client. A close that dropped the queue
+/// would never write the key.
+fn kill_of_a_flushing_slot_runs_its_queue(by: FlushingBy) {
+    let mut node = Node::new(2);
+    node.accept(0, CLIENT);
+    node.accept(0, READER);
+    node.freeze(1, true);
+    let held = node.keys_on(1, "held", crate::limits::GATE_UNITS_PER_CONN_TASK as usize);
+    let key = node.key_on(0, "queued");
+    let mut argv: Vec<&[u8]> = vec![b"DEL"];
+    argv.extend(held.iter().map(Vec::as_slice));
+    let mut bytes = frame(&argv);
+    bytes.extend(frame(&[b"SET", &key, b"1"]));
+    bytes.extend(frame(&[b"INCR", &key]));
+    let stream = match by {
+        FlushingBy::EndOfStream => "peer",
+        FlushingBy::ProtocolError => {
+            bytes.extend(MALFORMED);
+            "open"
+        }
+    };
+    node.send(0, CLIENT, &bytes);
+    node.rounds(2);
+    if let FlushingBy::EndOfStream = by {
+        node.eof(0, CLIENT);
+        node.rounds(2);
+    }
+    assert_eq!(client_slot(&node, 0, stream_of), stream, "engagement: the slot is flushing");
+    let queued = client_slot(&node, 0, |conn| conn.queue.len());
+    assert!(queued >= 2, "engagement: {queued} entries queued behind the held DEL");
+    assert!(!node.closed(0).contains(&CLIENT), "engagement: the flush did not close the slot");
+    let id = client_slot(&node, 0, |conn| conn.cx.id);
+    let marked = node.cells[0].plane.shared.node.clients.borrow_mut().request_kill(id);
+    assert!(marked, "the id resolves until `Closed`");
+    node.rounds(2);
+    assert!(node.closed(0).contains(&CLIENT), "the kill did not close the flushing slot");
+    node.freeze(1, false);
+    node.rounds(8);
+    assert_eq!(
+        read_back(&mut node, 0, &key),
+        b"$1\r\n2\r\n",
+        "flushing-kill-queue-unrun: the SET and the INCR queued before the kill did not both run"
+    );
+    assert!(node.written(0, CLIENT).is_empty(), "a killed client was answered");
+}
+
+#[test]
+fn a_kill_of_a_half_closed_slot_runs_its_queue_unanswered() {
+    kill_of_a_flushing_slot_runs_its_queue(FlushingBy::EndOfStream);
+}
+
+#[test]
+fn a_kill_of_a_marked_slot_runs_its_queue_unanswered() {
+    kill_of_a_flushing_slot_runs_its_queue(FlushingBy::ProtocolError);
+}
+
 /// A `SET` and the peer's end of stream reach the cell in one completion
 /// pass, before PARSE runs. The command the client sent before its FIN is
 /// run and answered, then the connection closes (ADR-0196 A1). An end of

@@ -153,6 +153,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_first_poll_unwind_unowned)',
     'cfg(inf_canary_first_poll_wake_dropped)',
     'cfg(inf_canary_flushing_drops_own_frame)',
+    'cfg(inf_canary_flushing_kill_drops_queue)',
     'cfg(inf_canary_flushing_takes_delivery)',
     'cfg(inf_canary_foreign_segment)',
     'cfg(inf_canary_forget_in_place)',

@@ -1364,6 +1364,11 @@ ordered_rows=(
   # comes before the flushing slot's answer. Planted, the answer comes first, and the own
   # message is dropped.
   "inf_canary_flushing_drops_own_frame crate-test inf-server lib own_frame_rides_reply_after_protocol_error own-frame-dropped"
+  # An immediate close (`CLIENT KILL`, the output cap, `timeout`) of a flushing slot runs its
+  # queue to its end, unanswered (ADR-0123 A2 rule 3). Planted, the close drops the queue: a
+  # half-closed slot's and a marked slot's queued `SET` and `INCR` never run.
+  "inf_canary_flushing_kill_drops_queue crate-test inf-server lib a_kill_of_a_half_closed_slot_runs_its_queue_unanswered flushing-kill-queue-unrun"
+  "inf_canary_flushing_kill_drops_queue crate-test inf-server lib a_kill_of_a_marked_slot_runs_its_queue_unanswered flushing-kill-queue-unrun"
   # A flushing slot is written no message published after its mark (ADR-0196 D4). Planted, the
   # delivery writes into it, and a message follows the subscriber's +OK.
   "inf_canary_flushing_takes_delivery m0-capacity push-after-quit --close-leg quit-subscriber"

@@ -490,6 +490,10 @@ impl Conn {
                 if let PeerStream::Ended { mut by } = stream {
                     end_reader(&mut by);
                 }
+                // Canary: the immediate close of a flushing slot drops its queue.
+                if cfg!(inf_canary_flushing_kill_drops_queue) {
+                    self.queue.clear();
+                }
                 (Some(link.fd), ConnSlot::Closing { by: ClosedBy::Plane })
             }
             other @ (ConnSlot::Closing { .. } | ConnSlot::Draining { .. }) => (None, other),
