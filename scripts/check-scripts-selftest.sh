@@ -4568,8 +4568,7 @@ expect_red_because "waker probe: a probe whose controls were deleted is red" \
     "$work/wk/scripts/check-waker-atomics.sh"
 # The probe's asm is the probe crate's codegen alone: each build gives the asm flag to the
 # scanned crate's rustc (`cargo rustc --lib -- --emit asm=…`), so no other crate of the build
-# writes the file. Under RUSTFLAGS every crate wrote it and the last codegen won: under load the
-# nested crate's, and the probe read no plant (a false red, step 12 of the ticket). A rustc
+# writes the file. RUSTFLAGS reaches every crate, so the codegen that ends last owns it. A rustc
 # wrapper lands the nested crate's codegen last on demand: an asm that crate is asked for goes
 # aside, and is copied over the path once the probe crate's rustc has exited, a fifo ordering
 # the two (cargo starts the probe from the nested crate's metadata while its codegen still
@@ -9639,7 +9638,7 @@ rm -rf "${TR_PNA:?}/target"
 # holding B's marker and outputs, in a root from before the rule (no marker).
 tr_nested_by_hand() {
     local nest
-    nest="$TR_PNA/target/checkout-$(tr_key "$TR_NB")"
+    nest="$TR_PNA/target/checkout-$(tr_key "$TR_NB")" || return 1
     mkdir -p "$nest/debug"
     tr_phys "$TR_NB" >"$nest/.checkout-path"
     printf 'built by B\n' >"$nest/debug/b-bin"

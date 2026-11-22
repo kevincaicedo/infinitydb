@@ -296,9 +296,9 @@ else
         # target as the tree, so the probe proves the scan of that codegen. It
         # builds cold, in a directory no earlier run wrote (ADR-0204 D4). The
         # asm flag goes to the probe crate's rustc alone (`cargo rustc --lib
-        # -- --emit`), as the tree's does: under RUSTFLAGS the nested crate
-        # wrote the same path, and under load its codegen, ending last, left
-        # no probe symbol to scan (a false red; the ticket's step 12).
+        # -- --emit`), as the tree's does: RUSTFLAGS reaches every crate of
+        # the build, so the nested crate would write the same path and the
+        # codegen that ends last would own the file.
         # shellcheck source=target-root.sh
         . "$SCRIPT_DIR/target-root.sh"
         target_root_cargo_fresh "$work/ptarget" cargo rustc --release --quiet --target "$target" \
