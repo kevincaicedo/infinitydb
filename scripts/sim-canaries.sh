@@ -1316,6 +1316,12 @@ ordered_rows=(
   # Planted, the queue alone diverts: a flat write runs inline while a tiered write of the same
   # origin holds its slot on a held cold read, and the flat write's open stops the cell.
   "inf_canary_divert_queue_only m0-capacity second-open-slot --close-leg gated-cold"
+  # The slab's draining count, which the accept's active share reads, leaves with a draining
+  # slot's removal (ADR-0123 A1). Planted, the removal keeps it, and MAINTAIN's sweep asserts
+  # the count against its own walk once the first drained slot vacates: the lowered plane test
+  # at its thaw, the tasks-lowered leg at its admitted clients' ends.
+  "inf_canary_draining_count_kept crate-test inf-server lib a_draining_slot_counts_against_the_boot_share_alone draining-count-drift"
+  "inf_canary_draining_count_kept m0-capacity draining-count-drift --close-leg tasks-lowered"
   # A Peer parser ends at the run-out once a take of the inbox completed since its stamp
   # (ADR-0196 D2). Planted, the run-out's test reads false, and the FIN-only client's slot never
   # closes.

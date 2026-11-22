@@ -672,7 +672,8 @@ impl<T: DrainingEntry> ConnSlab<T> {
             self.gens[key.slot as usize] = self.gens[key.slot as usize].wrapping_add(1);
             self.free.push(key.slot);
             self.live -= 1;
-            if entry.draining() {
+            // Canary: the removal leaves the draining count unmoved.
+            if entry.draining() && !cfg!(inf_canary_draining_count_kept) {
                 // Wraps only past a count D1 forbids: `admits` then refuses
                 // and MAINTAIN's sweep reads the drift.
                 self.draining = self.draining.wrapping_sub(1);
