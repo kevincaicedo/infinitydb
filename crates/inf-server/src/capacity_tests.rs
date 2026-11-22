@@ -189,7 +189,6 @@ fn sent(rig: &Rig, fd: RawFd) -> String {
 /// which the cell's MAINTAIN refreshes, not the config store), and its sweep reads one draining
 /// slot. The `CONFIG SET` answers once every cell has, so it is read before cell 1 freezes.
 #[test]
-#[ignore = "red until the accept compares the active share and the occupied slots apart"]
 fn a_draining_slot_counts_against_the_boot_share_alone() {
     let mut rig = Rig::with_maxclients(2, 8);
     let (probe, subscriber) = (fd(0), fd(1));

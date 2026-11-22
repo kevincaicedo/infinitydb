@@ -566,24 +566,25 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// not touched (the drain's end drops them); the pump is woken.
     fn on_closed(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
         let takes = self.shared.inbox_takes.get();
+        // The move into `Draining` is the slab's, which counts it (D1).
+        if !self.shared.conns.borrow_mut().closed(key, takes) {
+            return;
+        }
         let moved = self.shared.with_conn(key, |conn| {
-            let moved = conn.closed(takes);
             // Canary: `Closed` drops the queue, as a removed slot did.
             #[cfg(inf_canary_closed_conn_queue_dropped)]
-            if moved {
-                for entry in conn.queue.drain(..) {
-                    entry.recycle(&self.shared);
-                }
+            for entry in conn.queue.drain(..) {
+                entry.recycle(&self.shared);
             }
             // Canary: the registry removal and the 1→0 capture at `Closed`,
             // before the drain.
             #[cfg(inf_canary_registry_dropped_at_closed)]
-            if moved {
+            {
                 conn.closed_notes = Some(unsubscribe_closed_conn(&self.shared, key, &mut conn.cx));
             }
-            moved.then(|| (conn.cx.id, conn.take_parked_pump()))
+            (conn.cx.id, conn.take_parked_pump())
         });
-        let Some(Some((id, pump))) = moved else { return };
+        let Some((id, pump)) = moved else { return };
         // Canary: the slot is vacated at `Closed`, before its pump returns.
         #[cfg(inf_canary_conn_slot_frees_at_closed)]
         let _ = self.shared.conns.borrow_mut().remove(key);
@@ -1537,11 +1538,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let now_ms = cx.now.as_millis();
         let mut conns = self.shared.conns.borrow_mut();
         let mut bytes = 0usize;
-        let mut draining = 0u64;
+        let mut draining = 0usize;
         let mut idle: Vec<ConnKey> = Vec::new();
-        let ConnSlab { slots, gens, .. } = &mut *conns;
-        for (slot, entry) in slots.iter_mut().enumerate() {
-            let Some(conn) = entry.as_mut() else { continue };
+        conns.for_each_keyed_mut(|key, conn| {
             bytes += conn.state_bytes();
             let Conn { cx: conn_cx, slot: state, .. } = conn;
             // `timeout` and the output cap read the two states that hold
@@ -1549,10 +1548,10 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // skipped, so `idle_disconnections` counts each close once.
             let link = match state {
                 ConnSlot::Active { link, .. } | ConnSlot::Flushing { link, .. } => link,
-                ConnSlot::Closing { .. } => continue,
+                ConnSlot::Closing { .. } => return,
                 ConnSlot::Draining { .. } => {
                     draining += 1;
-                    continue;
+                    return;
                 }
             };
             // The output-buffer class follows the subscription state
@@ -1572,13 +1571,20 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 && !subscribed
                 && now_ms.saturating_sub(link.last_active_ms) >= knobs.timeout_ms
             {
-                idle.push(ConnKey { slot: slot as u32, generation: gens[slot] });
+                idle.push(key);
             }
-        }
+        });
+        // D1: the slab's draining count, which the accept's active share
+        // reads, is the walk's (ADR-0123 A1). One compare a sweep.
+        assert_eq!(
+            draining,
+            conns.draining(),
+            "draining-count-drift: the slab's count is not the walk's"
+        );
         // `active` (ADR-0123 A1): Active, Flushing and Closing slots; a
         // draining slot is the third population, read beside it.
-        node.connections.set(conns.live as u64 - draining);
-        node.draining_connections.set(draining);
+        node.connections.set((conns.live() - draining) as u64);
+        node.draining_connections.set(draining as u64);
         node.conn_state_bytes.set(bytes as u64);
         drop(conns);
         // Recycle-pool residency (v0.4.0-alpha RSS-attribution gauges):

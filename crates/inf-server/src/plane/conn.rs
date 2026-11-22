@@ -427,8 +427,9 @@ impl Conn {
     /// `Closed`, the `Close` op's terminal completion: `Closing` becomes
     /// `Draining`, a `Peer` parser moving with its take count stamped (an
     /// entry of the connection may wait in the inbox). Returns whether the
-    /// slot moved.
-    pub(super) fn closed(&mut self, inbox_takes: u64) -> bool {
+    /// slot moved. Private to this file: [`ConnSlab::closed`] is its one
+    /// caller, which counts the move.
+    fn closed(&mut self, inbox_takes: u64) -> bool {
         let (moved, slot) = match self.take_slot() {
             ConnSlot::Closing { by } => (true, ConnSlot::Draining { by: by.stamped(inbox_takes) }),
             other @ (ConnSlot::Active { .. }
@@ -511,19 +512,95 @@ pub(super) const CONN_SLOT_CAP: u32 = crate::limits::CONN_TASKS_MAX;
 // reply-outcome-allow: a connection frame copied to a send buffer, no reply (ADR-0123 D1)
 pub(super) const MAXCLIENTS_REFUSAL: &[u8] = b"-ERR max number of clients reached\r\n";
 
-impl<T> Default for ConnSlab<T> {
-    fn default() -> ConnSlab<T> {
+/// Generation-keyed connection slab. Generic over the entry so the
+/// admission bound is unit-testable without building a `Conn`. Its fields
+/// are this file's: every count moves in its own methods.
+pub(super) struct ConnSlab<T = Conn> {
+    slots: Vec<Option<T>>,
+    gens: Vec<u32>,
+    free: Vec<u32>,
+    /// Occupied slots, a draining one included.
+    live: usize,
+    /// Occupied slots whose state is `Draining` (D1: `draining <= live`):
+    /// up one at the move into `Draining` ([`ConnSlab::closed`]), down one
+    /// at the removal of a `Draining` entry; MAINTAIN's sweep asserts it
+    /// against its own walk.
+    draining: usize,
+    /// The boot share `C`, the `conn` class's cap: the occupied slots'
+    /// bound (ADR-0123 A1).
+    boot_share: usize,
+    /// Slots this slab may allocate (`CONN_SLOT_CAP` in production; a
+    /// small number in the admission test).
+    cap: u32,
+}
+
+/// An accept's answer from the slab's two compares (ADR-0123 A1), named
+/// apart from the client and task admissions.
+#[must_use = "a refused accept is answered with the `maxclients` frame"]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ConnAdmission {
+    Admitted,
+    /// The active clients are at the cell's share of the hot `maxclients`.
+    ActiveShare,
+    /// The occupied slots, a draining one included, are at the boot share.
+    Occupied,
+}
+
+/// What the slab reads of an entry it removes: whether its slot is
+/// `Draining`, so the draining count leaves with it.
+pub(super) trait DrainingEntry {
+    fn draining(&self) -> bool;
+}
+
+impl DrainingEntry for Conn {
+    fn draining(&self) -> bool {
+        matches!(self.slot, ConnSlot::Draining { .. })
+    }
+}
+
+impl<T> ConnSlab<T> {
+    /// An empty slab of a cell whose boot share is `boot_share`.
+    pub(super) fn new(boot_share: usize) -> ConnSlab<T> {
         ConnSlab {
             slots: Vec::new(),
             gens: Vec::new(),
             free: Vec::new(),
             live: 0,
+            draining: 0,
+            boot_share,
             cap: CONN_SLOT_CAP,
         }
     }
-}
 
-impl<T> ConnSlab<T> {
+    /// Occupied slots, a draining one included.
+    pub(super) fn live(&self) -> usize {
+        self.live
+    }
+
+    /// Occupied slots whose state is `Draining`.
+    pub(super) fn draining(&self) -> usize {
+        self.draining
+    }
+
+    /// The accept's two compares (ADR-0123 A1): the active clients, the
+    /// occupied slots less the draining ones, under `share`, the cell's
+    /// share of the hot `maxclients`; then the occupied slots, a draining
+    /// one included, under the boot share. A draining count past the
+    /// occupied one, which D1 forbids, refuses as `Occupied`: never an
+    /// over-admit, and MAINTAIN's sweep reads it.
+    pub(super) fn admits(&self, share: usize) -> ConnAdmission {
+        let Some(active) = self.live.checked_sub(self.draining) else {
+            return ConnAdmission::Occupied;
+        };
+        if active >= share {
+            ConnAdmission::ActiveShare
+        } else if self.live >= self.boot_share {
+            ConnAdmission::Occupied
+        } else {
+            ConnAdmission::Admitted
+        }
+    }
+
     /// Admits the connection `make` builds from its own key, so whatever serves the key (its
     /// pump) is made in the step that installs it; `None` when every slot
     /// below the cap is live — the admission bound, so no client can drive a cell to the
@@ -555,19 +632,6 @@ impl<T> ConnSlab<T> {
         self.slots.get_mut(key.slot as usize).and_then(Option::as_mut)
     }
 
-    pub(super) fn remove(&mut self, key: ConnKey) -> Option<T> {
-        if self.gens.get(key.slot as usize) != Some(&key.generation) {
-            return None;
-        }
-        let conn = self.slots.get_mut(key.slot as usize).and_then(Option::take);
-        if conn.is_some() {
-            self.gens[key.slot as usize] = self.gens[key.slot as usize].wrapping_add(1);
-            self.free.push(key.slot);
-            self.live -= 1;
-        }
-        conn
-    }
-
     pub(super) fn keys(&self) -> Vec<ConnKey> {
         self.slots
             .iter()
@@ -583,18 +647,77 @@ impl<T> ConnSlab<T> {
             f(conn);
         }
     }
+
+    /// Every live connection with its key, in slot order (MAINTAIN's sweep,
+    /// the stop's mark).
+    pub(super) fn for_each_keyed_mut(&mut self, mut f: impl FnMut(ConnKey, &mut T)) {
+        for (slot, entry) in self.slots.iter_mut().enumerate() {
+            if let Some(conn) = entry.as_mut() {
+                f(ConnKey { slot: slot as u32, generation: self.gens[slot] }, conn);
+            }
+        }
+    }
+}
+
+impl<T: DrainingEntry> ConnSlab<T> {
+    /// Vacates `key`'s slot: the occupied count down one, and the draining
+    /// count with it when the entry is `Draining`. A stale or vacant key
+    /// removes nothing.
+    pub(super) fn remove(&mut self, key: ConnKey) -> Option<T> {
+        if self.gens.get(key.slot as usize) != Some(&key.generation) {
+            return None;
+        }
+        let conn = self.slots.get_mut(key.slot as usize).and_then(Option::take);
+        if let Some(entry) = &conn {
+            self.gens[key.slot as usize] = self.gens[key.slot as usize].wrapping_add(1);
+            self.free.push(key.slot);
+            self.live -= 1;
+            if entry.draining() {
+                // Wraps only past a count D1 forbids: `admits` then refuses
+                // and MAINTAIN's sweep reads the drift.
+                self.draining = self.draining.wrapping_sub(1);
+            }
+        }
+        conn
+    }
+}
+
+impl ConnSlab<Conn> {
+    /// `Closed` on `key`: the slot's move from `Closing` into `Draining`,
+    /// counted here, its one way in. Returns whether the slot moved; a
+    /// stale or vacant key moves nothing.
+    pub(super) fn closed(&mut self, key: ConnKey, inbox_takes: u64) -> bool {
+        let Some(conn) = self.get_mut(key) else { return false };
+        let moved = conn.closed(inbox_takes);
+        if moved {
+            self.draining += 1;
+        }
+        moved
+    }
 }
 
 #[cfg(test)]
 mod conn_slab_tests {
-    use super::{CONN_SLOT_CAP, ConnKey, ConnSlab};
+    use super::{CONN_SLOT_CAP, ConnKey, ConnSlab, DrainingEntry};
+
+    impl DrainingEntry for u32 {
+        fn draining(&self) -> bool {
+            false
+        }
+    }
+
+    impl DrainingEntry for u8 {
+        fn draining(&self) -> bool {
+            false
+        }
+    }
 
     /// The slab refuses the accept past its cap instead of asserting, and `make` runs only
     /// for a slot it grants, with that slot's key. A tiny cap stands in for `CONN_SLOT_CAP`;
     /// the arithmetic is the same.
     #[test]
     fn slab_refuses_past_the_cap_and_readmits_on_release() {
-        let mut slab: ConnSlab<u32> = ConnSlab { cap: 3, ..ConnSlab::default() };
+        let mut slab: ConnSlab<u32> = ConnSlab { cap: 3, ..ConnSlab::new(3) };
         let keyed = |slab: &mut ConnSlab<u32>, value: u32| {
             slab.insert_with(|key| {
                 assert_eq!(key.generation, if value == 5 { 1 } else { 0 }, "make sees its key");
@@ -629,7 +752,7 @@ mod conn_slab_tests {
             refused,
         );
         assert_eq!(token.slot(), CONN_SLOT_CAP);
-        let slab: ConnSlab<u8> = ConnSlab::default();
+        let slab: ConnSlab<u8> = ConnSlab::new(1);
         assert_eq!(slab.cap, CONN_SLOT_CAP);
     }
 }
