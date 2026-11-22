@@ -205,7 +205,9 @@ impl CensusVerdict {
     }
 }
 
-/// The marks' derived rule on one row: a crossing is red, under `token`.
+/// The marks' derived rule on one row: a crossing is red, under `token`,
+/// recorded under its caller's check, so each row's token prints.
+#[track_caller]
 fn marks_crossed(
     cell: usize,
     census: &CapCensus,
