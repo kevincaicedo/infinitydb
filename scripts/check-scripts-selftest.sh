@@ -808,7 +808,7 @@ pub fn ok() {}
 EOF
 root=$(printf '%s' "$body" | fixture stale)
 first=${CELL_CRATE_EXCLUDE[0]%%|*}
-[ -n "$first" ] && [ -n "$root" ] && [ -d "$root/$first" ] && rm -rf "$root/$first"
+[ -n "$first" ] && [ -n "$root" ] && [ -d "$root/$first" ] && rm -rf "${root:?}/${first:?}"
 expect red "deny-list: exclusion naming a missing directory fails" env INF_CHECK_ROOT="$root" $DENY
 
 # Each banned family, planted in production code.
@@ -2965,7 +2965,7 @@ echo "inf_canary_fixture crate-test fake/uring,extra test:suite the_row" >"$dir/
 expect green "canaries: a row's package features reach both legs" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 echo "inf_canary_fixture crate-test fake test:suite the_row" >"$dir/rows"
 expect_red_because "canaries: on Linux a row without the test's feature judged nothing" "red: judged nothing on the lane's host: inf_canary_fixture crate-test the_row (no test the_row ran)" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
-for token in fake/ fake/uring, fake/,uring fake//uring; do
+for token in fake/ 'fake/uring,' fake/,uring fake//uring; do
     echo "inf_canary_fixture crate-test $token test:suite the_row" >"$dir/rows"
     expect_red_because "canaries: a crate-test package token '$token' is malformed" "malformed row" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 done
@@ -5605,7 +5605,7 @@ ls_case() {
 # self-test here instead of running no case.
 LS_RULES=$(env INF_LINT_RULES=1 INF_CHECK_ROOT="$root" "$LINTSCOPES")
 [ -n "$LS_RULES" ] || { echo "selftest: the gate listed no lint rule" >&2; exit 2; }
-while IFS=$'\t' read -r lint scope cls; do
+while IFS=$'\t' read -r lint _ cls; do
     cls=${cls%:}
     if [ "$cls" = - ]; then
         # No class: a reasoned allow at any scope is red too (ADR-0144 A2).
@@ -9638,7 +9638,8 @@ rm -rf "${TR_PNA:?}/target"
 # A root nested as the per-variable rule made it: <A>/target/checkout-<kB>,
 # holding B's marker and outputs, in a root from before the rule (no marker).
 tr_nested_by_hand() {
-    local nest="$TR_PNA/target/checkout-$(tr_key "$TR_NB")"
+    local nest
+    nest="$TR_PNA/target/checkout-$(tr_key "$TR_NB")"
     mkdir -p "$nest/debug"
     tr_phys "$TR_NB" >"$nest/.checkout-path"
     printf 'built by B\n' >"$nest/debug/b-bin"
