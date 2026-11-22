@@ -400,9 +400,10 @@ Every cell runs the same loop forever. One iteration:
               (bounded)
  MAINTAIN     budgeted background slices: expiry, eviction, checkpoints,
               tiering, recovery, housekeeping
- LOG          seal the log records staged since the last seal into at
-              most one frame and queue its write (or hold the frame
-              open for a later iteration)
+ LOG          wake the next batch of acknowledgments the durable
+              watermark covers; seal the log records staged since the
+              last seal into at most one frame and queue its write (or
+              hold the frame open for a later iteration)
  RESPOND      queue a send for each connection with pending output
  FABRIC-OUT   publish staged fabric messages, ring doorbells
  IDLE         keep spinning, or park until I/O or a doorbell
@@ -592,8 +593,10 @@ cell.
  next iter.     SUBMIT      one io_uring_enter carries the write and its
                             barrier (linked fdatasync, or an RWF_DSYNC write)
  later          REAP        barrier completes → the durable watermark
-                            advances → the gate releases every waiting reply
-                            it now covers → pump resumes → +OK is sent
+                            advances → the gate wakes the replies it now
+                            covers, in LSN order, up to 1,024 between two
+                            LOG steps; each LOG step wakes the next batch
+                            → pump resumes → +OK is sent
 ```
 
 With `FSYNC everysec` the reply does not wait for the gate: it is sent as

@@ -923,10 +923,24 @@ the module docs; `inf-server` adopts it at S08):
   `on_fsync_error(ticket)` freezes the watermark forever (fsync failure is
   fail-stop — caller
   fail-stops; observable in tests).
-- Watermark = **exclusive end** of the fsync-covered range; gate key =
-  `Lsn::to_u64()` (`(segment << 32) | offset`, order-preserving). `always`
-  futures register at their record LSN via `FrameLease::lsn_of` and wake
-  FIFO by LSN under the EXECUTE budget (wake storms drain across slices).
+- Watermark = **exclusive end** of the fsync-covered range. The gate's
+  key differs by plane, in the same order. The reference plane (the
+  `inf-log` test harness's `DurablePlane`) keys it by `Lsn::to_u64()`
+  (`(segment << 32) | offset`, order-preserving), each record's LSN taken
+  at LOG through `FrameLease::lsn_of`, and advances it to the covered
+  range's end. The server's durable plane keys it by the record's durable
+  seq, assigned when the record is staged, because a record's LSN exists
+  only once LOG seals its frame; frames are FIFO, so seq order is LSN
+  order, and the plane advances the gate to the last seq of a frame the
+  watermark covers. There a task makes its wait when it reaches the
+  reply, one at a time (`wait_for(seq)`): a connection's pump at its
+  front `always` reply, and the cell's gated task, which holds its
+  replies to other cells' durable applies, at its smallest pending seq.
+  The plane wakes the covered waits in key order, at most
+  `ACK_WAKES_PER_TURN` (1,024) between two LOG steps of a cell, each
+  batch run under the EXECUTE budget (ADR-0177 D5, A2). On either plane,
+  waits at one key wake in the gate's heap order, deterministic but not
+  their arrival order.
 - Counters (S21 vocabulary): `CommitStats`, `fsync_latency_hist` (µs),
   `pending_log_bytes`, `last_durable_lsn` (= watermark), `queued_up_to`.
 - M4.5-S27 amendment (ADR-0083 D4): `rebase_clock(FsyncTicket, now)` —
@@ -2175,7 +2189,7 @@ so promotion is free.
 
 ## 2. `WatermarkGate` — LSN-keyed ack gate (`inf-runtime/src/gate.rs`)
 
-> **Accepted 2026-10-19, implementation open — ADR-0177:** D5 rebuilds this
+> **Accepted 2026-10-19, built — ADR-0177:** D5 rebuilds this
 > gate as an indexed minimum heap over the cell's wait-node pool. A pending
 > `always` reply carries its record's LSN, and its task waits on the gate
 > for one LSN at a time, where the group-commit section above has every
@@ -2184,29 +2198,34 @@ so promotion is free.
 > (row 2.3). A dropped wait leaves the heap in the same step, so row 2.4's
 > cancelled state and its `unreachable!` go; an `always` reply's wait is
 > still dropped only with its task. Rows 2.1, 2.2 and 2.5 are unchanged.
-> The rows below do not establish that the replacement is built.
+> The rows below are as built.
 
-> **Accepted 2026-11-20, implementation open — ADR-0177 A2:** this gate wakes
-> its queued waits FIFO by LSN, at most `ACK_WAKES_PER_TURN` (1,024 at
-> ADR-0177 A2) between two LOG steps of a cell: the first batch at the sync's
+> **Accepted 2026-11-20, built — ADR-0177 A2:** this gate wakes its queued
+> waits in LSN order, at most `ACK_WAKES_PER_TURN` (1,024 at ADR-0177 A2)
+> between two LOG steps of a cell: the first batch at the sync's
 > completion, each later one at the head of the durable cell's LOG step.
 > `advance` moves the watermark and wakes nothing (rows 2.1 and 2.2 are
 > unchanged); `wake_covered(budget)` wakes, and `owes()` reads whether a
-> covered wait may be left. The group-commit section's "wake FIFO by LSN
-> under the EXECUTE budget (wake storms drain across slices)" stands. The
-> rows below do not establish that the replacement is built.
+> covered wait may be left. The group-commit section states the same
+> order and budget. The rows below are as built.
 
 Wakes `always` response futures when the durability watermark reaches their
 record LSN. It *trusts* the LSN fed by `GroupCommit` (machine 1); its own
-job is monotonicity + correct FIFO wake.
+job is monotonicity and a wake of exactly the covered waits, in LSN order,
+a budget at a time. Waits at one LSN wake in the heap's order: deterministic,
+not their arrival order. It is a minimum heap by LSN over the cell's
+wait-node pool, its entries one per node, built in the pool's steps.
 
 | # | Invariant | Why it must hold | Current enforcement | Disposition |
 |---|---|---|---|---|
-| 2.1 | `advance`: watermark is monotone; `to <= current` is a no-op | A regressing watermark would un-ack or double-wake | by-construction (early return) gate.rs:403 | keep, but see 2.2 |
+| 2.1 | `advance`: watermark is monotone; `to <= current` is a no-op | A regressing watermark would un-ack or double-wake | by-construction (`advance`'s early return; it sets `owes()` and wakes no wait) | keep, but see 2.2 |
 | 2.2 | `advance` **silently** ignores `to < current` (a caller feeding a lower watermark) | A `GroupCommit`↔gate wiring bug (feeding a stale watermark) is masked as a no-op instead of caught | **UNCHECKED — gap** (deliberate: doc says "lower values are no-ops") | **document** — the no-op is intended for idempotent re-advances; a `debug_assert!(to >= watermark || <known re-advance>)` is not cleanly expressible because equal/replayed advances are legal. Leave as deliberate gap; note in inventory |
-| 2.3 | `waiter(lsn)`: a waiter at or below the current watermark is `Woken` at construction (same-iteration delivery) | A missed same-iteration wake parks a future forever | by-construction gate.rs:387 | keep |
-| 2.4 | `WatermarkWait` is never cancelled (unlike `WaitList`) | An `always` ack future outlives to completion; cancellation would drop an ack | `unreachable!` gate.rs:468 (panics in release too) | keep |
+| 2.3 | `wait_for(lsn)`: a wait at or below the watermark is Ready at its first poll, with one load, no node and no borrow; above it, that poll takes a node and pushes its entry, and with no node free it stays unregistered, counted in `wait_nodes_full`, and wakes its own task to compare again | A missed same-iteration wake parks a future forever | by-construction (`WatermarkWait`'s first poll compares before it borrows); `a_covered_poll_and_the_gates_accessors_take_no_borrow`, `a_wait_with_no_node_stays_pending_until_one_frees_and_its_wake_lands` | keep — restated (ADR-0177 D5) |
+| 2.4 | withdrawn: no cancelled state exists. A dropped wait leaves the heap at its node's position, and its node, in the same step; a woken, unread one passes nothing on, as every covered wait is woken | An `always` reply's wait is still dropped only with its task, so no ack is dropped | the drop's removal (debug assert: a queued node's position names its entry); `every_drop_leaves_the_heap_and_the_pool_at_once`; canary `inf_canary_ack_wait_drop_keeps_entry` | withdrawn (ADR-0177 D5) |
 | 2.5 | single writer (owning cell thread; no atomics) | L1: shared mutable data-plane state is forbidden | by-construction (`Rc`/`Cell`/`RefCell`, cell-resident) | keep |
+| 2.6 | a wait answers Ready only when its LSN is at or below the watermark: an `always` reply never leaves before its record is durable | An early Ready acknowledges a write a crash can lose | type: Ready needs a private proof made only by the compare and by reading a node a wake marked; `no_ack_before_covering_fsync_across_random_schedules`; canary `inf_canary_ack_wait_covered_early` | keep — added (ADR-0177 D5) |
+| 2.7 | a pool has at most one gate | Two heaps over one pool's entries would share an entry array | type: `WaitNodes::build` answers one move-only, non-`Clone` `WatermarkSeat`, which `WatermarkGate::build` consumes (two `compile_fail` doctests) | keep — added (ADR-0177 D5) |
+| 2.8 | no entry's LSN is below its parent's, a queued node's position names its entry, and `wake_covered` wakes exactly the queued waits at or below the watermark, in LSN order, at most its budget | A broken heap wakes a wait early or leaves a covered one parked | debug asserts at each pop and removal; `the_gate_wakes_exactly_the_models_covered_waits_in_lsn_order`; canaries `inf_canary_ack_wait_no_sift`, `inf_canary_ack_wait_no_position` | keep — added (ADR-0177 D5, A2) |
 
 **Verdict:** correct by construction; the only gap (2.2) is a deliberate
 idempotence affordance, documented, not a promotion target.

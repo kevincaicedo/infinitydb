@@ -126,8 +126,12 @@ impl Arena {
 > slots). Failure: a construction refusal releases partial backing and
 > takes part in the all-cells boot barrier, and task-identity exhaustion
 > is a typed refusal before any effect, never a wrap (ADR-0149 D1–D3). The
-> signatures below are the implemented shape; the replacement above is not
-> built.
+> executor's replacement is built as the ADR-0177 note below amends it
+> (an erased class id, no `Closed`): `run_ready` returns
+> `ExecutorProgress`, the tasks polled and the slots reclaimed apart, each
+> entry charged against the slice budget, so their sum is at most it. The
+> gate part is built as the same note amends it; `IoGate` takes no
+> cleanup parameter: its fixed cleanup is the default, `DropValue`.
 
 > **Accepted 2026-09-22, implementation open — ADR-0151:** fixed storage
 > and bounded cell maps narrows `KeyedGate` keys to the runtime's sealed,
@@ -140,8 +144,13 @@ impl Arena {
 > and never through a caller's `Hash` or comparison. A map answers
 > `Occupied`, `Vacant` or `Full`, and a vacant slot fixes the key and
 > every tree position before the payload is built (ADR-0151 D1, D2).
+> Built: both key bounds are sealed. A keyed gate's key is a `GateKey`
+> (`u64`, `CompletionToken` or the cold gate's `LogicalId`, each routed by
+> its exact word), and a wait list's is a `ListKey`, bounded by the
+> foundation's sealed `ExactKey`; no crate outside the runtime implements
+> either.
 
-> **Accepted 2026-10-19, implementation open — ADR-0177:** the executor
+> **Accepted 2026-10-19, built — ADR-0177:** the executor
 > and the gates, as this decision rebuilds them, change the ADR-0149
 > note above and, for the fabric gate only, what the ADR-0151 note says
 > of gate keys. A task class is an erased `TaskClass` id from
@@ -163,15 +172,46 @@ impl Arena {
 > `WatermarkGate` take one wait node per parked task from a per-cell
 > pool; `WaitList`'s keys, FIFO, `wake_one`, `wake_all` and baton are
 > unchanged, and no type joins the suspension primitives sketched below.
-> No wire, durable or token layout changes. The old signatures below do
-> not establish that the replacement is built.
+> No wire, durable or token layout changes. Built: D2's task classes,
+> `reserve`'s four answers, `wake(TaskId)` and `park()`; D4's fabric gate,
+> with its units, minted keys and orphaned holders, and the keyed gates'
+> holds, `has_waiter` deleted; and D7's generation policies. A keyed
+> gate's key is a `GateKey`, its exact `u64` word: `u64`,
+> `CompletionToken` or the cold gate's `LogicalId`, a sealed set that no
+> crate outside the runtime implements. D5 is built. A cell
+> builds one wait-node pool before it serves: `WaitNodes::build` answers
+> its `T` nodes, one for each task slot of its classes, on its census
+> (row `wait-nodes`), with the seat of its one `WatermarkGate`, the gate's
+> heap entries built in the pool's steps. Each of the cell's `WaitList`s
+> takes the pool at its constructor, and `WatermarkGate::build(seat)`
+> consumes the seat, which is move-only, so a pool has one gate. A
+> list's wait takes its node at its first poll, not at
+> `wait(key)`, so a key's FIFO is in first-poll order, and returns it at
+> the poll that reads its wake or at its drop; dropped while queued, it
+> unlinks in O(1). `WaitList::unit` keeps the unit key's one pair of ends
+> in its own state, with no map and no refusal. `WaitList::keyed` holds
+> every key it serves in a capped map filled at its build and admits none
+> after: a refused map, or a cap short of its keys, answers `KeysRefused`
+> before the cell serves. A list's keys are the unit key, `u8`, `u16`,
+> `u32`, `u64` and `CellId` (ADR-0151 D1). A first poll that finds no
+> free node, or no entry for its key, counts `wait_nodes_full` in
+> `INFO tripwires`, wakes its task and is Ready at its next poll with no
+> wake landed: `ListWait::starved()` says so, and a caller that counts
+> on a wake waits again. The watermark gate is a minimum heap by LSN over
+> the same pool: a wait at or below the watermark is Ready at its first
+> poll with no node; above it, it takes a node and a heap entry at that
+> poll and gives both back at the poll that reads its wake or at its
+> drop, so no cancelled state exists (`interfaces-m2` section 2 holds
+> its rows). The executor's and the gate module's lines below are as
+> built.
 
-> **Accepted 2026-11-20, implementation open — ADR-0177 A2:**
+> **Accepted 2026-11-20, built — ADR-0177 A2:**
 > `WatermarkGate`'s wake is budgeted. `advance(lsn)` moves the watermark
 > and wakes nothing; `wake_covered(budget)` wakes the queued waits at or
-> below it in LSN order, at most `budget` a call; `owes()` says whether a
-> covered wait may be left. The sketch line below, "advance(lsn) wakes
-> all ≤ lsn", does not establish that the replacement is built.
+> below it in LSN order, at most `budget` a call, and answers how many;
+> `owes()` says whether a covered wait may be left. The durable plane
+> calls it at a sync's completion and at the head of each LOG step, at
+> most `ACK_WAKES_PER_TURN` (1,024) between two LOG steps of a cell.
 
 > **Accepted 2026-10-19, built — ADR-0003 A1:** a standard
 > `Waker` is thread-safe. Its data names a `Sync` wake bridge whose only
@@ -306,7 +346,9 @@ impl Arena {
 > below). The driver contract is untouched: a merged read is one ordinary `TierRead` whose
 > window fits one pool buffer (the `ReadFixed` upgrade applies only to a
 > registered pool).
-> `KeyedGate` gains `has_waiter` (drain-side stale-intent skip). No
+> `KeyedGate` gained `has_waiter` (drain-side stale-intent skip);
+> `waiting(&GateHold)`, asked through the queued intent's hold, has
+> replaced it (ADR-0177 D4, above). No
 > `IoOp`/`CompletionResult`/`TokenClass` layout change.
 >
 > **Amended 2026-09-30 (ADR-0167 D3):** `enqueue`
@@ -479,31 +521,67 @@ pub trait BackendDriver {
 }
 // impls: KqueueDriver (macOS dev tier) · UringDriver (linux + --features uring) · SimDriver (inf-sim)
 
-// Executor (ADR-0003 A1): !Send futures, bridge wakers (no atomics on the owner lane), slab tasks.
-// NOTE: the original sketch (`poll_immediate -> PollImmediate<F>` returning
-// the future on Pending) was unsound — a !Unpin future cannot move after its
-// first poll. The shipped shape places the future into stable storage BEFORE
-// the first poll and promotes in place; Ready still allocates nothing (reused
-// scratch buffer + recycled header, no task slot).
+// Executor (ADR-0003 A1, ADR-0177 D2): !Send futures, bridge wakers (no atomics on the owner
+// lane), one fixed slab a task class, built before the cell serves. A permit's future is placed
+// in its class's spare slot before its first poll, polled where it lies and dropped there: Ready
+// at the first poll keeps no task, and a slot a waker still names is held Retired until that
+// waker's last drop, then reclaimed by run_ready. A slot whose u64 generation is spent retires
+// for good; a class with no slot left answers Exhausted, the cell's fail-stop (ADR-0177 D7).
+pub struct ExecutorLayout;                  // a cell's classes, each slab on the cell's census
 pub struct CellExecutor;
-pub struct TaskId;                          // {slot, generation}; stale ids detectable
+pub struct TaskClass;                       // erased and Copy; reserve checks its slab's instance
+pub struct TaskId;                          // {class, slot, generation}; stale ids detectable
+pub enum TaskAdmission<'a, F> { Granted(TaskPermit<'a, F>), Full, Exhausted, Foreign }
 pub enum PollImmediate { Completed, Suspended(TaskId) }
+pub enum Woken { Queued, AlreadyRunnable, Stale }
+pub struct ExecutorProgress { pub tasks_polled: usize, pub slots_reclaimed: usize }
+impl ExecutorLayout {
+    pub fn new(census: &Rc<CapCensus>) -> ExecutorLayout;
+    /// The factory is read for its future's type and never called.
+    pub fn class<Args, Fac: TaskFactory<Args>>(&mut self, factory: &Fac, cap: Cap)
+        -> Result<TaskClass, CapError>;
+    pub fn build(self) -> Result<CellExecutor, ExecutorInitError>;
+}
 impl CellExecutor {
-    pub fn new(capacity: usize) -> Self;
-    /// Fast path: poll in place once; Completed ⇒ no slot, no malloc, no waker kept.
-    pub fn poll_immediate<F: Future<Output = ()> + 'static>(&mut self, fut: F) -> PollImmediate;
-    pub fn spawn_local<F: Future<Output = ()> + 'static>(&mut self, fut: F) -> TaskId;
-    pub fn run_ready(&mut self, budget: usize) -> usize;   // tasks polled this slice
-    pub fn live_tasks(&self) -> usize;                     // slab occupancy (leak assert)
+    pub fn reserve<F: Future<Output = ()> + 'static>(&mut self, class: TaskClass)
+        -> TaskAdmission<'_, F>;
+    pub fn wake(&mut self, id: TaskId) -> Woken;          // the owner's wake, by id
+    pub fn run_ready(&mut self, budget: usize) -> ExecutorProgress;  // apart; sum ≤ budget
+    pub fn has_ready(&self) -> bool;
+    pub fn live_tasks(&self) -> usize;
     pub fn is_live(&self, id: TaskId) -> bool;
 }
-// Suspension primitives (typed, the only ways to suspend — `gate` module):
-pub struct KeyedGate<K, V>;        // single-waiter primitive; complete() may precede first poll
-pub type FabricGate<V> = KeyedGate<u64, V>;   // token-keyed; V = fabric reply payload
-                                              // (inf-fabric is ABOVE this crate in the DAG)
+// A permit borrows its executor: used in the step that reserved it, never across an await.
+impl<F: Future<Output = ()> + 'static> TaskPermit<'_, F> {
+    /// Fast path: poll once in place; Completed ⇒ no task kept, the slot stays the spare.
+    pub fn poll_immediate(self, make: impl FnOnce() -> F) -> PollImmediate;
+    pub fn spawn_local(self, make: impl FnOnce() -> F) -> TaskId;   // polled by run_ready
+}
+pub fn park() -> Park;      // a leaf future: suspends once, stores no waker, woken by wake(id)
+// Suspension primitives (typed, the only ways to suspend: the `gate` module and park() above):
+// A gate's holders are fixed at its build; a value no waiter takes goes to its fixed Cleanup,
+// and complete() answers Delivered or Orphan. One waiter a key; complete() may precede first poll.
+pub struct KeyedGate<K: GateKey, V, C: Cleanup<V> = DropValue>;  // the caller's key (ADR-0177 D4)
+    // K: u64, CompletionToken or LogicalId; GateKey is sealed (ADR-0151 D1)
+    // build(cap, &census): routes and holders of cap; reserve(key) -> Granted(permit) | Duplicate
+    // | Full; permit.register() -> wait, or register_held() -> (wait, GateHold); waiting(&hold);
+    // release(hold); complete(key, value)
+pub struct FabricGate<V, C: Cleanup<V> = DropValue>;  // mints its key; V = fabric reply payload
+    // build(origin, units_max, holders, &census, &nodes); units(n) -> Option<GateUnits>;
+    // reserve(&units) -> Granted(permit) | NoUnit | Full; permit.key() is the request's
+    // FabricToken word; permit.register(&gate, sent) -> GateWait; complete(&gate, key, value,
+    // now); a wait dropped before its value leaves its holder Orphaned until the reply
+    // (inf-fabric is ABOVE this crate in the DAG)
 pub type IoGate = KeyedGate<CompletionToken, CompletionResult>;  // M7 seam, exists at M0
-pub struct WaitList<K>;            // key-keyed FIFO; wake_one/wake_all; baton-pass on drop
-pub struct WatermarkGate;          // LSN-keyed; advance(lsn) wakes all ≤ lsn
+pub struct WaitList<K: ListKey>;   // key-keyed FIFO; wake_one/wake_all; baton-pass on drop;
+                                   // unit(&nodes) or keyed(&nodes, cap, &census, keys)
+                                   // -> Result<_, KeysRefused>; a ListWait reads starved()
+pub struct WatermarkGate;          // LSN-keyed min-heap over the pool: build(seat); wait_for(lsn);
+                                   // advance(to) wakes none; wake_covered(budget) -> woken, in
+                                   // LSN order; owes() -> bool (ADR-0177 D5, A2)
+// Not a suspension primitive: the cell's wait-node pool, taken by every WaitList (ADR-0177 D5).
+pub struct WaitNodes;              // build(cap, &census) -> Result<WaitPool, CapError>; T nodes
+pub struct WaitPool { pub nodes: WaitNodes, pub seat: WatermarkSeat }  // seat: move-only, one gate
 
 // Reactor loop skeleton: the 10 steps with budgets + always-on iteration histogram.
 pub trait CellPlane {
