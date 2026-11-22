@@ -127,9 +127,9 @@ impl Arena {
 > takes part in the all-cells boot barrier, and task-identity exhaustion
 > is a typed refusal before any effect, never a wrap (ADR-0149 D1–D3). The
 > executor's replacement is built as the ADR-0177 note below amends it
-> (an erased class id, no `Closed`), but for `ExecutorProgress`, which is
-> not built: `run_ready` returns one count, the ready entries it took,
-> polls and reclaims together, each charged against the slice budget. The
+> (an erased class id, no `Closed`): `run_ready` returns
+> `ExecutorProgress`, the tasks polled and the slots reclaimed apart, each
+> entry charged against the slice budget, so their sum is at most it. The
 > gate part is built as the same note amends it; `IoGate` takes no
 > cleanup parameter: its fixed cleanup is the default, `DropValue`.
 
@@ -144,6 +144,11 @@ impl Arena {
 > and never through a caller's `Hash` or comparison. A map answers
 > `Occupied`, `Vacant` or `Full`, and a vacant slot fixes the key and
 > every tree position before the payload is built (ADR-0151 D1, D2).
+> Built: both key bounds are sealed. A keyed gate's key is a `GateKey`
+> (`u64`, `CompletionToken` or the cold gate's `LogicalId`, each routed by
+> its exact word), and a wait list's is a `ListKey`, bounded by the
+> foundation's sealed `ExactKey`; no crate outside the runtime implements
+> either.
 
 > **Accepted 2026-10-19, built — ADR-0177:** the executor
 > and the gates, as this decision rebuilds them, change the ADR-0149
@@ -172,7 +177,8 @@ impl Arena {
 > with its units, minted keys and orphaned holders, and the keyed gates'
 > holds, `has_waiter` deleted; and D7's generation policies. A keyed
 > gate's key is a `GateKey`, its exact `u64` word: `u64`,
-> `CompletionToken` or the cold gate's `LogicalId`. D5 is built. A cell
+> `CompletionToken` or the cold gate's `LogicalId`, a sealed set that no
+> crate outside the runtime implements. D5 is built. A cell
 > builds one wait-node pool before it serves: `WaitNodes::build` answers
 > its `T` nodes, one for each task slot of its classes, on its census
 > (row `wait-nodes`), with the seat of its one `WatermarkGate`, the gate's
@@ -528,6 +534,7 @@ pub struct TaskId;                          // {class, slot, generation}; stale 
 pub enum TaskAdmission<'a, F> { Granted(TaskPermit<'a, F>), Full, Exhausted, Foreign }
 pub enum PollImmediate { Completed, Suspended(TaskId) }
 pub enum Woken { Queued, AlreadyRunnable, Stale }
+pub struct ExecutorProgress { pub tasks_polled: usize, pub slots_reclaimed: usize }
 impl ExecutorLayout {
     pub fn new(census: &Rc<CapCensus>) -> ExecutorLayout;
     /// The factory is read for its future's type and never called.
@@ -539,7 +546,7 @@ impl CellExecutor {
     pub fn reserve<F: Future<Output = ()> + 'static>(&mut self, class: TaskClass)
         -> TaskAdmission<'_, F>;
     pub fn wake(&mut self, id: TaskId) -> Woken;          // the owner's wake, by id
-    pub fn run_ready(&mut self, budget: usize) -> usize;  // entries taken: polls and reclaims
+    pub fn run_ready(&mut self, budget: usize) -> ExecutorProgress;  // apart; sum ≤ budget
     pub fn has_ready(&self) -> bool;
     pub fn live_tasks(&self) -> usize;
     pub fn is_live(&self, id: TaskId) -> bool;
@@ -555,6 +562,7 @@ pub fn park() -> Park;      // a leaf future: suspends once, stores no waker, wo
 // A gate's holders are fixed at its build; a value no waiter takes goes to its fixed Cleanup,
 // and complete() answers Delivered or Orphan. One waiter a key; complete() may precede first poll.
 pub struct KeyedGate<K: GateKey, V, C: Cleanup<V> = DropValue>;  // the caller's key (ADR-0177 D4)
+    // K: u64, CompletionToken or LogicalId; GateKey is sealed (ADR-0151 D1)
     // build(cap, &census): routes and holders of cap; reserve(key) -> Granted(permit) | Duplicate
     // | Full; permit.register() -> wait, or register_held() -> (wait, GateHold); waiting(&hold);
     // release(hold); complete(key, value)
