@@ -1156,7 +1156,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
         // catalog word and the ticket's generation; parked DDL pumps wake
         // on either's edge.
         self.maintain_control_wakes();
-        // ---- stats flush
+        // ---- stats flush, then the connection sweep
+        self.maintain_stats_flush(cx);
         self.maintain_conn_sweep(cx);
     }
 
@@ -1515,8 +1516,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 
     /// One MAINTAIN concern of `maintain`, in phase order:
-    ///  stats flush
-    fn maintain_conn_sweep(&mut self, cx: &mut LoopCx<'_>) {
+    ///  stats flush: the cell's counters and gauges `INFO` reads, copied
+    /// into `NodeInfo` once a MAINTAIN, before the connection sweep.
+    fn maintain_stats_flush(&mut self, cx: &mut LoopCx<'_>) {
         let node = &self.shared.node;
         node.recv_dropped.set(self.shared.recv_dropped.get());
         node.waker_foreign_ops.set(cx.executor.waker_foreign_ops());
@@ -1529,12 +1531,17 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             node.gate_stale.set(gate.stale());
         }
         node.wait_nodes_full.set(self.shared.wait_nodes.full());
-        {
-            let ps = self.shared.pubsub.borrow();
-            node.pubsub_channels.set(ps.live_owned_channel_count());
-            node.pubsub_patterns.set(ps.live_pattern_count());
-            node.pubsub_state_bytes.set(ps.state_bytes() as u64);
-        }
+        let ps = self.shared.pubsub.borrow();
+        node.pubsub_channels.set(ps.live_owned_channel_count());
+        node.pubsub_patterns.set(ps.live_pattern_count());
+        node.pubsub_state_bytes.set(ps.state_bytes() as u64);
+    }
+
+    /// One MAINTAIN concern of `maintain`, in phase order:
+    ///  the connection sweep: the output caps, `timeout`, and the
+    /// connection gauges.
+    fn maintain_conn_sweep(&mut self, cx: &mut LoopCx<'_>) {
+        let node = &self.shared.node;
         let knobs = self.shared.knobs.get();
         let now_ms = cx.now.as_millis();
         let mut conns = self.shared.conns.borrow_mut();
