@@ -566,7 +566,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// not touched (the drain's end drops them); the pump is woken.
     fn on_closed(&mut self, cx: &mut LoopCx<'_>, key: ConnKey) {
         let takes = self.shared.inbox_takes.get();
-        // The move into `Draining` is the slab's, which counts it (D1).
+        // The move into `Draining` is the slab's, which counts it, so
+        // `draining <= live` holds (ADR-0123 A1).
         if !self.shared.conns.borrow_mut().closed(key, takes) {
             return;
         }
@@ -1574,8 +1575,9 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 idle.push(key);
             }
         });
-        // D1: the slab's draining count, which the accept's active share
-        // reads, is the walk's (ADR-0123 A1). One compare a sweep.
+        // The slab's draining count, which the accept's active share reads,
+        // is the walk's, so `draining <= live` (ADR-0123 A1). One compare a
+        // sweep.
         assert_eq!(
             draining,
             conns.draining(),

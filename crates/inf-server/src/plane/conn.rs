@@ -521,10 +521,10 @@ pub(super) struct ConnSlab<T = Conn> {
     free: Vec<u32>,
     /// Occupied slots, a draining one included.
     live: usize,
-    /// Occupied slots whose state is `Draining` (D1: `draining <= live`):
-    /// up one at the move into `Draining` ([`ConnSlab::closed`]), down one
-    /// at the removal of a `Draining` entry; MAINTAIN's sweep asserts it
-    /// against its own walk.
+    /// Occupied slots whose state is `Draining`, so `draining <= live`
+    /// (ADR-0123 A1's third population): up one at the move into `Draining`
+    /// ([`ConnSlab::closed`]), down one at the removal of a `Draining`
+    /// entry; MAINTAIN's sweep asserts it against its own walk.
     draining: usize,
     /// The boot share `C`, the `conn` class's cap: the occupied slots'
     /// bound (ADR-0123 A1).
@@ -586,8 +586,8 @@ impl<T> ConnSlab<T> {
     /// occupied slots less the draining ones, under `share`, the cell's
     /// share of the hot `maxclients`; then the occupied slots, a draining
     /// one included, under the boot share. A draining count past the
-    /// occupied one, which D1 forbids, refuses as `Occupied`: never an
-    /// over-admit, and MAINTAIN's sweep reads it.
+    /// occupied one (`draining <= live` fails) refuses as `Occupied`: never
+    /// an over-admit, and MAINTAIN's sweep reads it.
     pub(super) fn admits(&self, share: usize) -> ConnAdmission {
         let Some(active) = self.live.checked_sub(self.draining) else {
             return ConnAdmission::Occupied;
@@ -674,8 +674,8 @@ impl<T: DrainingEntry> ConnSlab<T> {
             self.live -= 1;
             // Canary: the removal leaves the draining count unmoved.
             if entry.draining() && !cfg!(inf_canary_draining_count_kept) {
-                // Wraps only past a count D1 forbids: `admits` then refuses
-                // and MAINTAIN's sweep reads the drift.
+                // Wraps only where `draining <= live` already failed:
+                // `admits` then refuses and MAINTAIN's sweep reads the drift.
                 self.draining = self.draining.wrapping_sub(1);
             }
         }
