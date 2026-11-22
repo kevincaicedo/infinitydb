@@ -8,9 +8,8 @@
 //! `inf_runtime::FabricGate`; this crate's job is moving frames with bounded
 //! memory and returning credits.
 //!
-//! `unsafe` is confined to the [`ring`] module and its child `retained`
-//! (milestone §3.3) and inventoried in `SAFETY.md`; the rest of the crate is
-//! `#![deny(unsafe_code)]`.
+//! `unsafe` is confined to the [`ring`] module (milestone §3.3) and
+//! inventoried in `SAFETY.md`; the rest of the crate is `#![deny(unsafe_code)]`.
 
 #![deny(unsafe_code)]
 // ADR-0144 D1: a production `match` names every variant of its enum.
