@@ -867,6 +867,10 @@ const PLANE_START_TASKS: usize = CELLS as usize + 1;
 /// subscriber's delta reached every peer.
 /// Engagement: the first wave confirmed, then closed while cell 2 was held,
 /// cell 0 owing a delta after the closes, else `VACUOUS tasks-unengaged`.
+/// On cell 0's `conn` class: the first wave holds it at its cap, a later
+/// client is refused while those slots drain (each else `VACUOUS`), and the
+/// class never crosses: admission's `occupied < C` counts a draining slot,
+/// so the accept is refused before the class is asked (ADR-0123 A1).
 fn tasks_leg(seed: u64) -> Rig {
     let mut rig = Rig::new(seed, (SHARE * usize::from(CELLS)) as u32, 15_000);
     rig.tasks_most = Some(vec![0; usize::from(CELLS)]);
@@ -902,6 +906,8 @@ fn tasks_leg(seed: u64) -> Rig {
         }
         rig.until("a churn wave's closes", |rig| ids.iter().all(|&id| rig.ended(id)));
     }
+    // Each later client connected while cell 2 held the first wave's deltas: those slots drained.
+    let refused = rig.refused_on(X, SHARE);
     rig.held = None;
     rig.settle();
     let most = rig.tasks_most.take().unwrap_or_default();
@@ -922,10 +928,26 @@ fn tasks_leg(seed: u64) -> Rig {
         let text = "VACUOUS tasks-unengaged: the first wave never closed owing a held delta";
         rig.violate(text.to_string());
     }
+    rig.read("refused_while_draining", refused as u64);
+    if refused == 0 {
+        let text = "VACUOUS cell 0: drain-refusal-unengaged — no client of cell 0 was refused \
+                    while the first wave's slots drained";
+        rig.violate(text.to_string());
+    }
+    rig.expect_conn_tasks_full_uncrossed("the first wave");
     rig
 }
 
 impl Rig {
+    /// The clients of `cell` from the `from`-th on that the `maxclients`
+    /// refusal answered, by their own reading of their first frame.
+    fn refused_on(&self, cell: usize, from: usize) -> usize {
+        let refused = |client: &&Client| {
+            client.cell == cell && client.replies.first().map(Vec::as_slice) == Some(REFUSAL_FRAME)
+        };
+        self.clients[from..].iter().filter(refused).count()
+    }
+
     /// No cell counts a pattern, each read over the wire by a fresh client
     /// of its own (`PUBSUB NUMPAT`), else `pattern-count-after-close`.
     fn expect_no_pattern(&mut self) {
@@ -992,7 +1014,7 @@ fn fan_leg(seed: u64) -> Rig {
     if held == 0 {
         rig.violate("VACUOUS fan-unengaged: no remote leg was held".to_string());
     }
-    rig.expect_conn_tasks_full_uncrossed();
+    rig.expect_conn_tasks_full_uncrossed("the share's clients");
     rig
 }
 
@@ -1001,13 +1023,13 @@ fn fan_leg(seed: u64) -> Rig {
 const CONN_TASKS_ROW: &str = inf_server::limits::CONN_TASKS.name();
 
 impl Rig {
-    /// The `conn` class's control at exactly the share's clients, read on
-    /// cell X's `conn-tasks` row: the clients hold the class at its cap, and
-    /// no accept is refused there. Judged apart, so a class that admits one
-    /// task fewer reads both: it holds `cap - 1`, and the last client's
-    /// accept crosses. A missing row is `cap-row-missing`, the census
+    /// The `conn` class's clauses on cell X's `conn-tasks` row: `filler`
+    /// held the class at its cap, and no accept was refused there, since
+    /// admission refuses at the share first. Judged apart, so a class that
+    /// admits one task fewer reads both: it holds `cap - 1`, and the accept
+    /// after it crosses. A missing row is `cap-row-missing`, the census
     /// oracle's token for the same fact, never a fill clause's.
-    fn expect_conn_tasks_full_uncrossed(&mut self) {
+    fn expect_conn_tasks_full_uncrossed(&mut self, filler: &str) {
         let Some(row) = self.plane(X).cap_census().row(CONN_TASKS_ROW) else {
             self.violate(format!("VACUOUS cell {X}: cap-row-missing — no `{CONN_TASKS_ROW}` row"));
             return;
@@ -1018,13 +1040,14 @@ impl Rig {
         if held < cap {
             self.violate(format!(
                 "VACUOUS cell {X}: cap-row-unfilled — the `{CONN_TASKS_ROW}` row held {held} of \
-                 {cap}: the share's clients never filled it"
+                 {cap}: {filler} never filled it"
             ));
         }
         if crossings > 0 {
             self.violate(format!(
                 "CAP CENSUS VIOLATION cell {X}: cap-row-crossed — the `{CONN_TASKS_ROW}` row \
-                 crossed {crossings} time(s) with exactly {cap} clients"
+                 crossed {crossings} time(s): an accept found the class full, past the share's \
+                 refusal"
             ));
         }
     }
