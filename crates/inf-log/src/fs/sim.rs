@@ -1691,6 +1691,37 @@ impl Drop for SimFile {
     }
 }
 
+impl SimFile {
+    /// This handle's final close (a retired tier file's, ADR-0156 D3): its
+    /// fd leaves the disk's open table as the handle's drop does, then
+    /// `tier_close_fail` fires and reports `EIO`, Linux's order (the number
+    /// is gone before the error is reported), and the disk logs the close
+    /// under the harness's mark with the first name reaching its inode.
+    ///
+    /// # Errors
+    /// `EIO` when `tier_close_fail` fires; the handle is closed either way.
+    pub fn close_reporting(self) -> io::Result<()> {
+        let state = Rc::clone(&self.state);
+        let path = match &self.target {
+            Target::File { ino, .. } => {
+                let disk = state.borrow();
+                let named = disk.os_names.iter().find(|&(_, &named)| named == *ino);
+                named.map(|(name, _)| name.clone()).unwrap_or_default()
+            }
+            Target::Dir(dir, _) => dir.clone(),
+        };
+        drop(self);
+        let (result, logged) = if inf_foundation::fault::fire(crate::fault::TIER_CLOSE_FAIL) {
+            let point = crate::fault::TIER_CLOSE_FAIL;
+            (Err(io::Error::from_raw_os_error(libc::EIO)), CallResult::Injected(point))
+        } else {
+            (Ok(()), CallResult::Ok)
+        };
+        state.borrow_mut().calls.record(DiskCall::FinalClose, &path, logged);
+        result
+    }
+}
+
 impl SegmentFile for SimFile {
     fn write_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
