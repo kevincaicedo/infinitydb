@@ -943,7 +943,8 @@ impl Rig {
 /// own keys, set first, while cell 1 is held: the remote legs the cell holds (gate waiters and
 /// credit waits) stay within the share's windows of 32, then every reply is the exact count. A
 /// fan with no window holds a holder for each leg until it has sent its last, so the share's
-/// fans pass the gate's holders (`gate-full`).
+/// fans pass the gate's holders (`gate-full`). The share's clients are exactly the `conn`
+/// class's cap on cell 0, its control: the row reads full and never crossed.
 fn fan_leg(seed: u64) -> Rig {
     const KEYS: usize = 1_023;
     let mut rig = Rig::new(seed, (SHARE * usize::from(CELLS)) as u32, 15_000);
@@ -988,7 +989,42 @@ fn fan_leg(seed: u64) -> Rig {
     if held == 0 {
         rig.violate("VACUOUS fan-unengaged: no remote leg was held".to_string());
     }
+    rig.expect_conn_tasks_full_uncrossed();
     rig
+}
+
+/// The `conn` class's census row, its cap the cell's connection share
+/// (ADR-0177 D2).
+const CONN_TASKS_ROW: &str = inf_server::limits::CONN_TASKS.name();
+
+impl Rig {
+    /// The `conn` class's control at exactly the share's clients, read on
+    /// cell X's `conn-tasks` row: the clients hold the class at its cap, and
+    /// no accept is refused there. Judged apart, so a class that admits one
+    /// task fewer reads both: it holds `cap - 1`, and the last client's
+    /// accept crosses. A missing row is `cap-row-missing`, the census
+    /// oracle's token for the same fact, never a fill clause's.
+    fn expect_conn_tasks_full_uncrossed(&mut self) {
+        let Some(row) = self.plane(X).cap_census().row(CONN_TASKS_ROW) else {
+            self.violate(format!("VACUOUS cell {X}: cap-row-missing — no `{CONN_TASKS_ROW}` row"));
+            return;
+        };
+        let (held, cap, crossings) = (row.high_water, row.entries_max, row.crossings);
+        self.read("conn_tasks_high_water", u64::from(held));
+        self.read("conn_tasks_crossings", crossings);
+        if held < cap {
+            self.violate(format!(
+                "VACUOUS cell {X}: cap-row-unfilled — the `{CONN_TASKS_ROW}` row held {held} of \
+                 {cap}: the share's clients never filled it"
+            ));
+        }
+        if crossings > 0 {
+            self.violate(format!(
+                "CAP CENSUS VIOLATION cell {X}: cap-row-crossed — the `{CONN_TASKS_ROW}` row \
+                 crossed {crossings} time(s) with exactly {cap} clients"
+            ));
+        }
+    }
 }
 
 // ---- E-close's legs: a close runs the bytes its client handed over ------------------

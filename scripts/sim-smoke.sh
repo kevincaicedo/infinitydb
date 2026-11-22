@@ -73,6 +73,8 @@ rows=(
   # m0-capacity runs each close leg green on this tree on its own row, a leg named, never
   # drawn from the seed; every other leg is a pinned red in its source until it is green.
   "m0-capacity --close-leg tasks --verify-determinism"
+  # The fan leg is also the `conn` class's control: exactly the share's clients on one cell
+  # read the class's census row full at its cap and never crossed.
   "m0-capacity --close-leg fan --verify-determinism"
   "m0-capacity --close-leg close --verify-determinism"
   "m0-capacity --close-leg rearm --verify-determinism"
