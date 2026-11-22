@@ -1238,6 +1238,11 @@ ordered_rows=(
   # the row unfilled and crossed, each clause by its own token.
   "inf_canary_cap_minus_one m0-capacity cap-row-unfilled --close-leg fan"
   "inf_canary_cap_minus_one m0-capacity cap-row-crossed --close-leg fan"
+  # The same plant on the tasks leg, whose draining slots keep the share's `occupied < C`
+  # refusing ahead of the class: one task short, the first wave holds 3 of 4, and every accept
+  # the share then admits is refused at the class instead, which never crosses on the plain build.
+  "inf_canary_cap_minus_one m0-capacity cap-row-unfilled --close-leg tasks"
+  "inf_canary_cap_minus_one m0-capacity cap-row-crossed --close-leg tasks"
   # A slot takes the largest power-of-two chunk one 64 KiB allocation holds, at most 64 slots,
   # and the builder takes no other count (ADR-0194 A1). Planted, chunk_slots_for answers 64 at
   # every width, the fixed chunk, and a slab of 1,032 B slots in chunks of 32 is refused.
