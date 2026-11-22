@@ -809,19 +809,22 @@ enum Judged {
     Idle { closed: bool },
 }
 
-/// The admitted connection's answer at `now` under a 1 s `timeout`, after
-/// `set` arranges its facts.
-fn judged(rig: &Rig, now_ms: u64, set: impl FnOnce(&mut Conn)) -> Judged {
-    judged_under(rig, now_ms, 1_000, set)
+/// One row of `idleness`'s table: how a fresh admitted connection (its clock
+/// the admission's, 0 ms) is arranged, the instant and `timeout` it is judged
+/// at, and the answer the sweep reads.
+struct IdleRow {
+    name: &'static str,
+    arrange: fn(&Rig),
+    now_ms: u64,
+    timeout_ms: u64,
+    expected: Judged,
 }
 
-fn judged_under(rig: &Rig, now_ms: u64, timeout_ms: u64, set: impl FnOnce(&mut Conn)) -> Judged {
+/// The sweep's reading of the admitted connection at `now_ms`.
+fn judged(rig: &Rig, now_ms: u64, timeout_ms: u64) -> Judged {
     let clock = SweepClock::new(Nanos::from_millis(now_ms), &rig.plane.shared);
-    let (mut set, mut read) = (Some(set), None);
+    let mut read = None;
     rig.plane.shared.conns.borrow_mut().for_each_mut(|conn| {
-        if let Some(set) = set.take() {
-            set(conn);
-        }
         read = Some(match conn.idleness(&clock) {
             Idleness::Closing => Judged::Unjudged,
             Idleness::Subscribed => Judged::Exempt,
@@ -834,90 +837,235 @@ fn judged_under(rig: &Rig, now_ms: u64, timeout_ms: u64, set: impl FnOnce(&mut C
     read.expect("the admitted connection")
 }
 
+/// `arrange` on the admitted connection's slot entry.
+fn on_conn(rig: &Rig, arrange: impl FnOnce(&mut Conn)) {
+    let mut arrange = Some(arrange);
+    rig.plane.shared.conns.borrow_mut().for_each_mut(|conn| {
+        if let Some(arrange) = arrange.take() {
+            arrange(conn);
+        }
+    });
+}
+
 fn link(conn: &mut Conn) -> &mut Link {
     conn.link_mut().expect("a slot that can send")
 }
 
-/// Two replies staged in `out`, and a send of the first issued at `at_ms`:
-/// the second waits behind a send in flight.
-fn two_replies_one_sent(conn: &mut Conn, at_ms: u64) {
-    let link = link(conn);
-    for _ in 0..2 {
-        RespWriter::new(link.out.open(), Protocol::Resp2).simple("OK");
-    }
-    link.out.consume(b"+OK\r\n".len());
-    link.send_issued(Nanos::from_millis(at_ms));
-}
-
-/// The table of `idleness` (ADR-0193 D1–D3) on one admitted connection,
-/// its clock the admission's at 0 ms: each term of the server's work keeps
-/// the slot, bytes behind a send in flight do not, the clock restarts at a
-/// send issued and at a send completed, a stall keeps every slot and its
-/// end restarts the idle time, and the close falls at exactly `timeout`.
-#[test]
-fn idleness_judges_a_slot_only_when_the_server_owes_it_nothing() {
-    let rig = Rig::admitted();
-    let shared = &rig.plane.shared;
-    assert_eq!(judged(&rig, 0, |conn| assert!(conn.pump_parked)), Judged::Idle { closed: false });
-    assert_eq!(judged(&rig, 999, |_| {}), Judged::Idle { closed: false }, "999 ms idle");
-    assert_eq!(judged(&rig, 1_000, |_| {}), Judged::Idle { closed: true }, "1 000 ms idle");
-    let max_ms = 2_147_483_647_000;
-    let idle = judged_under(&rig, 1_000_000, max_ms, |_| {});
-    assert_eq!(idle, Judged::Idle { closed: false }, "the largest timeout");
-    let busy = judged(&rig, 1_000, |conn| conn.pump_parked = false);
-    assert_eq!(busy, Judged::Kept { counted: true }, "the pump holds a command");
-    let queued = judged(&rig, 1_000, |conn| {
-        conn.pump_parked = true;
-        conn.queue.push_back(Queued::Command(OwnedCmd::from_staged(Vec::new())));
-    });
-    assert_eq!(queued, Judged::Kept { counted: true }, "a command queued");
-    let behind = judged(&rig, 2_999, |conn| {
-        conn.queue.clear();
-        two_replies_one_sent(conn, 2_000);
-    });
-    assert_eq!(behind, Judged::Idle { closed: false }, "the offer at 2 000 ms restarts the clock");
-    let behind = judged(&rig, 3_000, |_| {});
-    assert_eq!(behind, Judged::Idle { closed: true }, "a reply behind a send in flight");
-    let completed =
-        judged(&rig, 4_499, |conn| link(conn).send_completed(Nanos::from_millis(3_500)));
-    assert_eq!(completed, Judged::Kept { counted: false }, "a reply in out, no send in flight");
-    let completed = judged(&rig, 4_499, |conn| {
+/// `replies` replies staged in `out`, and a send of the first issued at
+/// `at_ms`: the rest wait behind a send in flight.
+fn replies_one_sent(rig: &Rig, replies: usize, at_ms: u64) {
+    on_conn(rig, |conn| {
         let link = link(conn);
-        link.out.consume(link.out.len());
+        for _ in 0..replies {
+            RespWriter::new(link.out.open(), Protocol::Resp2).simple("OK");
+        }
+        link.out.consume(b"+OK\r\n".len());
+        link.send_issued(Nanos::from_millis(at_ms));
     });
-    assert_eq!(completed, Judged::Idle { closed: false }, "the completion at 3 500 ms restarts it");
-    shared.stall_until.set(Nanos::from_millis(7_000));
-    let stalled = judged(&rig, 6_999, |_| {});
-    assert_eq!(stalled, Judged::Kept { counted: true }, "a stalled cell owes every client");
-    let after = judged(&rig, 7_999, |_| {});
-    assert_eq!(after, Judged::Idle { closed: false }, "idle since the stall's end, 7 000 ms");
-    assert_eq!(judged(&rig, 8_000, |_| {}), Judged::Idle { closed: true }, "a timeout after it");
-    let subscribed = judged(&rig, 9_000, |conn| conn.cx.sub_channels.push(b"news".to_vec()));
-    assert_eq!(subscribed, Judged::Exempt, "a subscriber");
-    let marked = judged(&rig, 9_000, |conn| {
-        conn.cx.sub_channels.clear();
-        let _ = conn.mark();
-    });
-    assert_eq!(marked, Judged::Idle { closed: true }, "a flushing slot is judged as an active one");
-    rig.plane.shared.conns.borrow_mut().for_each_mut(|conn| {
-        let _ = conn.close_at_once();
-    });
-    assert_eq!(judged(&rig, 9_000, |_| {}), Judged::Unjudged, "a closing slot");
 }
 
-/// A half-closed slot (Flushing `Peer`) whose parser was stamped at the
-/// cell's current take count may hold an entry reaped before its end of
-/// stream that PARSE has not taken: it is kept until a take completes, then
-/// judged (ADR-0196 A1.1, ADR-0193 D1).
-#[test]
-fn idleness_keeps_a_half_closed_slot_until_its_entries_are_taken() {
-    let rig = Rig::admitted();
+/// The first send completes at `at_ms`.
+fn send_completed(rig: &Rig, at_ms: u64) {
+    on_conn(rig, |conn| link(conn).send_completed(Nanos::from_millis(at_ms)));
+}
+
+/// The peer's end of stream at the cell's current take count, its pump then
+/// parked, so the stream's term alone is read.
+fn half_closed(rig: &Rig) {
     let takes = rig.plane.shared.inbox_takes.get();
-    let ended = judged(&rig, 1_000, |conn| {
+    on_conn(rig, |conn| {
         let _ = conn.end_of_stream(takes);
         conn.pump_parked = true;
     });
-    assert_eq!(ended, Judged::Kept { counted: true }, "an entry may wait unparsed");
-    rig.plane.shared.inbox_takes.set(takes.wrapping_add(1));
-    assert_eq!(judged(&rig, 1_000, |_| {}), Judged::Idle { closed: true }, "a take completed");
+}
+
+/// `timeout` as a 1 s knob, in milliseconds.
+const SECOND_MS: u64 = 1_000;
+
+/// The rows of `idleness`'s table (ADR-0193 D1–D3): each term of the server's
+/// work keeps the slot; bytes behind a send in flight do not; the clock
+/// restarts at a send issued and at a send completed; a stall keeps every
+/// slot and its end restarts the idle time; the close falls at exactly
+/// `timeout` and not a millisecond before.
+fn idle_rows() -> Vec<IdleRow> {
+    fn row(
+        name: &'static str,
+        arrange: fn(&Rig),
+        now_ms: u64,
+        timeout_ms: u64,
+        expected: Judged,
+    ) -> IdleRow {
+        IdleRow { name, arrange, now_ms, timeout_ms, expected }
+    }
+    let none: fn(&Rig) = |_| {};
+    vec![
+        row("nothing owed, 999 ms idle", none, 999, SECOND_MS, Judged::Idle { closed: false }),
+        row("nothing owed, 1 000 ms idle", none, 1_000, SECOND_MS, Judged::Idle { closed: true }),
+        row(
+            "the largest timeout",
+            none,
+            1_000_000,
+            2_147_483_647_000,
+            Judged::Idle { closed: false },
+        ),
+        row(
+            "the pump holds a command",
+            |rig| on_conn(rig, |conn| conn.pump_parked = false),
+            1_000,
+            SECOND_MS,
+            Judged::Kept { counted: true },
+        ),
+        row(
+            "a command queued",
+            |rig| {
+                on_conn(rig, |conn| {
+                    conn.queue.push_back(Queued::Command(OwnedCmd::from_staged(Vec::new())));
+                });
+            },
+            1_000,
+            SECOND_MS,
+            Judged::Kept { counted: true },
+        ),
+        row(
+            "a reply in out, no send in flight",
+            |rig| {
+                on_conn(rig, |conn| {
+                    RespWriter::new(link(conn).out.open(), Protocol::Resp2).simple("OK");
+                });
+            },
+            1_000,
+            SECOND_MS,
+            Judged::Kept { counted: true },
+        ),
+        row(
+            "a reply behind a send issued at 2 000 ms, 999 ms on",
+            |rig| replies_one_sent(rig, 2, 2_000),
+            2_999,
+            SECOND_MS,
+            Judged::Idle { closed: false },
+        ),
+        row(
+            "a reply behind a send issued at 2 000 ms, 1 000 ms on",
+            |rig| replies_one_sent(rig, 2, 2_000),
+            3_000,
+            SECOND_MS,
+            Judged::Idle { closed: true },
+        ),
+        row(
+            "a send completed at 3 500 ms, 999 ms on",
+            |rig| {
+                replies_one_sent(rig, 1, 2_000);
+                send_completed(rig, 3_500);
+            },
+            4_499,
+            SECOND_MS,
+            Judged::Idle { closed: false },
+        ),
+        row(
+            "a send completed at 3 500 ms, 1 000 ms on",
+            |rig| {
+                replies_one_sent(rig, 1, 2_000);
+                send_completed(rig, 3_500);
+            },
+            4_500,
+            SECOND_MS,
+            Judged::Idle { closed: true },
+        ),
+        row(
+            "a reply left unoffered after a send completed at 3 500 ms",
+            |rig| {
+                replies_one_sent(rig, 2, 2_000);
+                send_completed(rig, 3_500);
+            },
+            4_499,
+            SECOND_MS,
+            Judged::Kept { counted: false },
+        ),
+        row(
+            "a cell stalled until 7 000 ms",
+            |rig| rig.plane.shared.stall_until.set(Nanos::from_millis(7_000)),
+            6_999,
+            SECOND_MS,
+            Judged::Kept { counted: true },
+        ),
+        row(
+            "idle since a stall's end at 7 000 ms, 999 ms on",
+            |rig| rig.plane.shared.stall_until.set(Nanos::from_millis(7_000)),
+            7_999,
+            SECOND_MS,
+            Judged::Idle { closed: false },
+        ),
+        row(
+            "idle since a stall's end at 7 000 ms, 1 000 ms on",
+            |rig| rig.plane.shared.stall_until.set(Nanos::from_millis(7_000)),
+            8_000,
+            SECOND_MS,
+            Judged::Idle { closed: true },
+        ),
+        row(
+            "a subscriber",
+            |rig| on_conn(rig, |conn| conn.cx.sub_channels.push(b"news".to_vec())),
+            9_000,
+            SECOND_MS,
+            Judged::Exempt,
+        ),
+        row(
+            "a slot the plane marked, judged as an active one",
+            |rig| {
+                on_conn(rig, |conn| {
+                    let _ = conn.mark();
+                });
+            },
+            1_000,
+            SECOND_MS,
+            Judged::Idle { closed: true },
+        ),
+        row(
+            "a half-closed slot with no take since its end of stream",
+            half_closed,
+            1_000,
+            SECOND_MS,
+            Judged::Kept { counted: true },
+        ),
+        row(
+            "a half-closed slot after a take",
+            |rig| {
+                half_closed(rig);
+                let shared = &rig.plane.shared;
+                shared.inbox_takes.set(shared.inbox_takes.get().wrapping_add(1));
+            },
+            1_000,
+            SECOND_MS,
+            Judged::Idle { closed: true },
+        ),
+        row(
+            "a closing slot",
+            |rig| {
+                on_conn(rig, |conn| {
+                    let _ = conn.close_at_once();
+                });
+            },
+            9_000,
+            SECOND_MS,
+            Judged::Unjudged,
+        ),
+    ]
+}
+
+/// The table of `idleness`, each row on a fresh admitted connection, every
+/// row judged before the verdict so one failure hides none after it.
+#[test]
+fn idleness_judges_a_slot_only_when_the_server_owes_it_nothing() {
+    let mut wrong = Vec::new();
+    for IdleRow { name, arrange, now_ms, timeout_ms, expected } in idle_rows() {
+        let rig = Rig::admitted();
+        let parked = judged(&rig, 0, timeout_ms);
+        assert_eq!(parked, Judged::Idle { closed: false }, "engagement: {name}: a fresh slot");
+        arrange(&rig);
+        let read = judged(&rig, now_ms, timeout_ms);
+        if read != expected {
+            wrong.push(format!("{name}: read {read:?}, want {expected:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "idleness-table: {wrong:#?}");
 }

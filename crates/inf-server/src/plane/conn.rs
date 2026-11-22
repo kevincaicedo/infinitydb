@@ -147,7 +147,8 @@ pub(super) struct Link {
     /// `timeout`'s clock (ADR-0193 D2), injected-clock ms of the last
     /// interaction: the admission, each received buffer PARSE takes, each
     /// send issued and each send completed. One store per buffer and per
-    /// send, never per command; [`Link::touch`] is its one writer.
+    /// send, never per command; [`Link::new`] seeds it at admission and
+    /// [`Link::touch`] is its one writer after admission.
     last_active_ms: u64,
     /// The publisher's own frames a tagged fan leg delivered, keyed by
     /// sequence; the pump emits each right after that publish's count
@@ -212,7 +213,9 @@ impl Link {
 /// The instant one MAINTAIN sweep judges at and the cell's two facts
 /// `timeout` reads beside it, built once a sweep by its one constructor from
 /// the plane's own state, so no caller judges a slot with a stall it did not
-/// read (ADR-0193 D2).
+/// read (ADR-0193 D2). Named for the instant; the inbox take count rides
+/// with it because the sweep reads both once, at that instant, and it is no
+/// clock.
 pub(super) struct SweepClock {
     now: Nanos,
     /// The end of the cell's last stall (`DEBUG SLEEP`), in the past once it
@@ -609,9 +612,9 @@ impl Conn {
     }
 
     /// Whether the server owes this connection anything: `timeout`'s one
-    /// answer (ADR-0193 D1). It destructures the entry, both states it
-    /// judges and their link whole, so a field that can hold work does not
-    /// compile without its term here. Bytes behind a send in flight are no
+    /// answer (ADR-0193 D1). It destructures the entry, its context, both
+    /// states it judges and their link whole, so a field that can hold work
+    /// does not compile without its term here. Bytes behind a send in flight are no
     /// term: they wait on the client's read, and a client that does not read
     /// its reply is closed, as Redis closes it.
     pub(super) fn idleness(&self, clock: &SweepClock) -> Idleness {
@@ -641,7 +644,20 @@ impl Conn {
                 return Idleness::Closing;
             }
         };
-        if !cx.sub_channels.is_empty() || !cx.sub_patterns.is_empty() {
+        // `close_requested` is set and read inside one command's execution,
+        // so no sweep sees it set; the rest is the connection's context.
+        let ConnCx {
+            proto: _,
+            id: _,
+            db: _,
+            ns: _,
+            sub_channels,
+            sub_patterns,
+            node: _,
+            close_requested: _,
+            program: _,
+        } = cx;
+        if !sub_channels.is_empty() || !sub_patterns.is_empty() {
             return Idleness::Subscribed;
         }
         // The self-push stash holds frames only while the pump holds that
