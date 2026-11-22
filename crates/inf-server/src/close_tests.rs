@@ -1010,6 +1010,13 @@ fn idle_rows() -> Vec<IdleRow> {
             Judged::Exempt,
         ),
         row(
+            "a pattern subscriber",
+            |rig| on_conn(rig, |conn| conn.cx.sub_patterns.push(b"news.*".to_vec())),
+            9_000,
+            SECOND_MS,
+            Judged::Exempt,
+        ),
+        row(
             "a slot the plane marked, judged as an active one",
             |rig| {
                 on_conn(rig, |conn| {
