@@ -624,6 +624,82 @@ fn tier_create_post_fail_leaves_an_unnamed_file_the_boot_sweep_removes() {
     receipt::verified("tier_create_post_fail", "residue-swept-at-boot");
 }
 
+/// A retired tier file's final close refused by `tier_close_fail`: the
+/// close reports `EIO` after the handle's fd left the disk's open table, so
+/// nothing can close the number again, and the file stays named, as a
+/// retired file is until its unlink. A cut then leaves a file no MANIFEST
+/// names, and the boot's sweep of unnamed tier files removes it before the
+/// namespace serves; the manifested file recovers.
+#[test]
+fn tier_close_fail_releases_the_handle_and_the_boot_sweep_removes_the_file() {
+    let full = 2 * TIER_FRAME_DATA + 400;
+    let config = TierFlushConfig {
+        shard_dir: Path::new("shard-0").to_path_buf(),
+        cell: 0,
+        ns: NS,
+        mode: TierIoMode::Buffered,
+        file_capacity: full as u64,
+        slice_bytes: PAGE,
+        record_len_max: 16 << 20,
+    };
+    let cold = Path::new("shard-0").join("cold");
+    let retired = cold.join("tier-000001.itier");
+    let tier = |path: &Path| path.extension().is_some_and(|ext| ext == "itier");
+    for seed in 0..crash_matrix::seed_count(3) {
+        let disk = SimDisk::new();
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+        let mut flush = TierFlush::new(disk.clone(), config.clone(), 0, &census);
+        flush.set_drive(TierDrive::Reactor);
+        stage_span(&mut flush, LogicalAddr::ZERO, &vec![0xC0; full], None).expect("stage A");
+        run_reactor_round(&disk, &mut flush, true);
+        apply_effects(&mut flush);
+        let manifested = flush.confirmable_end().expect("A's full frames are confirmed");
+        let manifest = TierNsManifest {
+            ns: NS.0,
+            flushed: manifested,
+            files: vec![TierFileRange { id: 0, base: 0, durable_len: manifested }],
+        };
+        // A file no MANIFEST names, its one handle closed as a retired
+        // file's is: the close refused, the handle gone either way.
+        let handle = disk.create_tier(&retired, TierIoMode::Buffered).expect("the file");
+        let open = disk.open_files_named(tier);
+        fault::arm("tier_close_fail", FaultSpec::Nth(1));
+        let err = handle.close_reporting().expect_err("the armed close reports");
+        // EIO is 5 on Linux and macOS alike.
+        assert_eq!(err.raw_os_error(), Some(5), "seed {seed}: EIO, Linux's report");
+        assert!(fault::fired("tier_close_fail") >= 1, "the row is not vacuous");
+        assert_eq!(disk.open_files_named(tier), open - 1, "seed {seed}: its fd is released");
+        assert!(disk.open_read(&retired).is_ok(), "a close unlinks nothing");
+        disk.sync_dir(&cold).expect("a later dirent barrier in the directory");
+        disk.power_cut(0xC105_E000 ^ seed);
+        assert!(disk.open_read(&retired).is_ok(), "seed {seed}: the cut kept the file's name");
+        drop(flush); // the dead life's pipeline
+        let recovered = inf_store::recover_tiered_ns(
+            disk.clone(),
+            &manifest,
+            1,
+            config.clone(),
+            AddressSpaceConfig {
+                reserve_bytes: DemotionConfig::for_budget(4 << 20, PAGE)
+                    .ring_reserve_bytes()
+                    .expect("valid budget"),
+                page_bytes: PAGE as usize,
+                life_origin: LogicalAddr::from_raw(manifested).expect("fits"),
+            },
+            DemotionConfig::for_budget(4 << 20, PAGE),
+            128,
+            KeyHasher::default(),
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
+        )
+        .expect("recovery");
+        assert_eq!(recovered.stats.files_removed, 1, "seed {seed}: the sweep removed the file");
+        assert!(disk.open_read(&retired).is_err(), "seed {seed}: the retired file is gone");
+        assert_eq!(recovered.stats.files_resealed, 1, "A recovers at its manifested length");
+        fault::disarm_all();
+    }
+    receipt::verified("tier_close_fail", "handle-released-file-swept-at-boot");
+}
+
 /// Window 2: the seal **completed** (footer durable, catalog committed)
 /// but no MANIFEST ever named it — the cut lands between the round's
 /// completion and the next checkpoint. Recovery takes the older
