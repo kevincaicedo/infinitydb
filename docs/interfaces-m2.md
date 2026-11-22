@@ -923,15 +923,22 @@ the module docs; `inf-server` adopts it at S08):
   `on_fsync_error(ticket)` freezes the watermark forever (fsync failure is
   fail-stop — caller
   fail-stops; observable in tests).
-- Watermark = **exclusive end** of the fsync-covered range; gate key =
-  `Lsn::to_u64()` (`(segment << 32) | offset`, order-preserving). An
-  `always` reply carries its record's key in LSN order (the durable
-  plane's per-record durable seq), and its task waits on the gate for one
-  key at a time, when it reaches that reply. The gate wakes the covered
-  waits in that order, at most `ACK_WAKES_PER_TURN` (1,024) between two
-  LOG steps of a cell, each batch run under the EXECUTE budget (ADR-0177
-  D5, A2); waits at one key wake in the gate's heap order, deterministic
-  but not their arrival order.
+- Watermark = **exclusive end** of the fsync-covered range. The gate's
+  key differs by plane, in the same order. The reference plane (the
+  `inf-log` test harness's `DurablePlane`) keys it by `Lsn::to_u64()`
+  (`(segment << 32) | offset`, order-preserving), each record's LSN taken
+  at LOG through `FrameLease::lsn_of`, and advances it to the covered
+  range's end. The server's durable plane keys it by the record's durable
+  seq, assigned when the record is staged, because a record's LSN exists
+  only once LOG seals its frame; frames are FIFO, so seq order is LSN
+  order, and the plane advances the gate to the last seq of a frame the
+  watermark covers. There an `always` reply's task makes its wait when
+  its pump reaches that reply (`wait_for(seq)`), one at a time, and the
+  plane wakes the covered waits in key order, at most
+  `ACK_WAKES_PER_TURN` (1,024) between two LOG steps of a cell, each
+  batch run under the EXECUTE budget (ADR-0177 D5, A2). On either plane,
+  waits at one key wake in the gate's heap order, deterministic but not
+  their arrival order.
 - Counters (S21 vocabulary): `CommitStats`, `fsync_latency_hist` (µs),
   `pending_log_bytes`, `last_durable_lsn` (= watermark), `queued_up_to`.
 - M4.5-S27 amendment (ADR-0083 D4): `rebase_clock(FsyncTicket, now)` —
