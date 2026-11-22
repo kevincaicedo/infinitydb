@@ -20,6 +20,7 @@ use std::rc::Rc;
 
 use inf_alloc::BufferPool;
 use inf_fabric::Mesh;
+use inf_foundation::bounded::CapRow;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Nanos, VirtualClock};
 use inf_foundation::{CellId, hash64};
@@ -1063,19 +1064,33 @@ impl Rig {
     /// after it crosses. A missing row is `cap-row-missing`, the census
     /// oracle's token for the same fact, never a fill clause's.
     fn expect_conn_tasks_full_uncrossed(&mut self, filler: &str) {
-        let Some(row) = self.plane(X).cap_census().row(CONN_TASKS_ROW) else {
-            self.violate(format!("VACUOUS cell {X}: cap-row-missing — no `{CONN_TASKS_ROW}` row"));
-            return;
-        };
-        let (held, cap, crossings) = (row.high_water, row.entries_max, row.crossings);
-        self.read("conn_tasks_high_water", u64::from(held));
-        self.read("conn_tasks_crossings", crossings);
+        let Some(row) = self.conn_tasks_row() else { return };
+        let (held, cap) = (row.high_water, row.entries_max);
         if held < cap {
             self.violate(format!(
                 "VACUOUS cell {X}: cap-row-unfilled — the `{CONN_TASKS_ROW}` row held {held} of \
                  {cap}: {filler} never filled it"
             ));
         }
+        self.expect_conn_tasks_uncrossed(&row);
+    }
+
+    /// Cell X's `conn-tasks` row, its high water and crossings read; a missing row is
+    /// `cap-row-missing`.
+    fn conn_tasks_row(&mut self) -> Option<CapRow> {
+        let Some(row) = self.plane(X).cap_census().row(CONN_TASKS_ROW) else {
+            self.violate(format!("VACUOUS cell {X}: cap-row-missing — no `{CONN_TASKS_ROW}` row"));
+            return None;
+        };
+        self.read("conn_tasks_high_water", u64::from(row.high_water));
+        self.read("conn_tasks_crossings", row.crossings);
+        Some(row)
+    }
+
+    /// No accept was refused at the `conn` class: admission refuses at the share or at the
+    /// occupied slots first (ADR-0123 A1), so a crossing is an accept those compares passed.
+    fn expect_conn_tasks_uncrossed(&mut self, row: &CapRow) {
+        let crossings = row.crossings;
         if crossings > 0 {
             self.violate(format!(
                 "CAP CENSUS VIOLATION cell {X}: cap-row-crossed — the `{CONN_TASKS_ROW}` row \
@@ -1088,12 +1103,14 @@ impl Rig {
 
 /// The accept at a lowered share (ADR-0123 A1): boot `maxclients` 24 on three cells, a
 /// cell's boot share `C` 8, lowered by `CONFIG SET maxclients 12` from a client of cell 1 to
-/// a share of 4 before the hold. The tasks leg's first wave, four pattern subscribers on cell
-/// 0, closes while cell 2 holds their deltas' acks, so their slots drain: none active, four
-/// occupied. Clients then connect to cell 0 one at a time, each sending a `SET` of a key the
-/// cell owns: the share's four are admitted, active under the share and occupied under `C`,
-/// each `+OK` judged; the fifth is refused at the share. Then the admitted clients end, cell 2
-/// is released and the node settles: every slot vacant, no pattern counted.
+/// a share of 4 before the hold. A first wave one short of the share, three pattern
+/// subscribers on cell 0, closes while cell 2 holds their deltas' acks, so their slots drain:
+/// none active, three occupied. Clients then connect to cell 0 one at a time, each sending a
+/// `SET` of a key the cell owns: the share's four are admitted, active under the share and
+/// occupied under `C`, each `+OK` judged; the fifth is refused by the share's compare alone,
+/// its occupied seven still under `C`, and cell 0's `conn` class never crosses. Then the
+/// admitted clients end, cell 2 is released and the node settles: every slot vacant, no
+/// pattern counted.
 /// Engagement, each else `VACUOUS`: the `CONFIG SET` answered `+OK`, and the first wave closed
 /// owing a held delta.
 fn tasks_lowered_leg(seed: u64) -> Rig {
@@ -1102,7 +1119,7 @@ fn tasks_lowered_leg(seed: u64) -> Rig {
     let setter = rig.admitted(Y);
     let lowered = (SHARE * usize::from(CELLS)).to_string();
     let set = rig.call(setter, &[b"CONFIG", b"SET", b"maxclients", lowered.as_bytes()]);
-    let first: Vec<usize> = (0..SHARE).map(|_| rig.connect(X)).collect();
+    let first: Vec<usize> = (0..SHARE - 1).map(|_| rig.connect(X)).collect();
     for (n, &id) in first.iter().enumerate() {
         rig.send(id, &encode(&[b"PSUBSCRIBE", format!("lowered:{n}:*").as_bytes()]));
     }
@@ -1125,6 +1142,9 @@ fn tasks_lowered_leg(seed: u64) -> Rig {
     rig.settle();
     rig.expect_vacant(X, 0);
     rig.expect_no_pattern();
+    if let Some(row) = rig.conn_tasks_row() {
+        rig.expect_conn_tasks_uncrossed(&row);
+    }
     if set != b"+OK\r\n" {
         let set = String::from_utf8_lossy(&set).into_owned();
         rig.violate(format!("VACUOUS share-unlowered: CONFIG SET maxclients answered {set:?}"));
