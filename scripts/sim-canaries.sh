@@ -1290,6 +1290,9 @@ ordered_rows=(
   # slots at every step (O1). Planted, the slot is vacated at Closed, before its pump returns,
   # and O1 reads fewer slots than tasks.
   "inf_canary_conn_slot_frees_at_closed m0-capacity conn-tasks-unequal --close-leg close"
+  # The same plant on the tasks leg's engagement: a slot that vacates at Closed never drains, so
+  # no client reads the maxclients refusal while its cell's occupied slots outnumber its clients.
+  "inf_canary_conn_slot_frees_at_closed m0-capacity drain-refusal-unengaged --close-leg tasks"
   # The `conn` class's slots are the cell's share (ADR-0177 D2), resident whole from its build
   # and billed by the idle row. Planted, it is built over (1 + k) C slots, k from its stride:
   # the idle node's resident memory a cell rises by k x C x s_conn, 2,500 x 3,104 B at 4 cells
