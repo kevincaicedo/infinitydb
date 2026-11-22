@@ -417,7 +417,7 @@ impl Scenario {
         }
     }
 
-    /// F-L15-05 (ADR-0123): the admission bound and the idle reaper. 60
+    /// The admission bound (ADR-0123 D1) and the idle reaper (ADR-0193): 60
     /// clients on 3 cells under `maxclients 45` (15 per cell) — the
     /// seeded spread puts ~20 on a cell, so every cell refuses some; then
     /// an idle phase under `timeout 1` with 4 plain + 4 subscribed idle

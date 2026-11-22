@@ -27,7 +27,7 @@ bin="$TARGET_ROOT/release/inf-sim"
 # F-L19-05/06: namespace-bound + SELECTed clients, the served surface and
 # the stored content under audit at 4 cells.
 # F-L12-02: one hot owner, the binary's mesh sizing, deep pipelines.
-# F-L15-05 (ADR-0123): maxclients refusal at accept + the idle reaper.
+# maxclients refusal at accept (ADR-0123) + the idle reaper (ADR-0193).
 # ADR-0124 (F-L15-08): a graceful stop before the cut keeps every ack.
 # F-L17-14: the M4.5 index crash scenarios.
 # F-L04-02 (ADR-0119): one EIO under a cold read is one typed reply.

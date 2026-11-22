@@ -4,7 +4,7 @@
 use super::*;
 use crate::driver::Violations;
 
-// ---- admission + idle phase (ADR-0123, batch 50) ------------------------------
+// ---- admission + idle phase (ADR-0123, ADR-0193) ------------------------------
 
 /// Redis's reply past `maxclients` (networking.c; the plane's constant).
 pub(super) const REFUSAL_FRAME: &[u8] = b"-ERR max number of clients reached\r\n";
