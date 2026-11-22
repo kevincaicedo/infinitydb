@@ -696,12 +696,25 @@ pub fn decode(frame: &[u8]) -> Result<Op<'_>, CodecError>;
 // retained backing owner and two non-cloneable endpoints, fallible
 // construction, eight slots for ADR-0156's cleanup jobs, capacity-first
 // reservation and explicit budgeted retirement. Existing ring/mesh
-// signatures are unchanged. The variant is unbuilt.
+// signatures are unchanged. Built: both variants run one algorithm.
 pub struct Producer<T>; pub struct Consumer<T>;
 pub fn ring<T>(capacity: usize) -> (Producer<T>, Consumer<T>);
 impl Producer<T> { pub fn try_push(&mut self, v: T) -> Result<(), T>;
                    pub fn publish_batch(&mut self, it: impl Iterator<Item=T>) -> usize; }
 impl Consumer<T> { pub fn consume_batch(&mut self, max: usize, f: impl FnMut(T)) -> usize; }
+// The retained variant (RETAINED_RING_SLOTS = 8; each block ≤ 65,536 B):
+impl RetainedRing<T> { pub fn admit() -> Result<Self, RingLayoutRefused>;
+    pub fn build_step(&mut self, steps: &mut RingSteps) -> RingPhase;
+    pub fn split(&mut self) -> Option<(RetainedProducer<T>, RetainedConsumer<T>)>;
+    pub fn cancel(&mut self) -> RingPhase; pub fn join(&mut self) -> RingPhase;
+    pub fn retire_step(&mut self, steps: &mut RingSteps, sink: impl FnOnce(T)) -> RingPhase; }
+   // a drop before RingPhase::Terminal fails stop and frees nothing
+impl RetainedProducer<T> { pub fn reserve(&mut self, want: usize) -> Reservation<'_, T>; }
+impl Reservation<'_, T> { pub fn permit(&mut self) -> Option<Permit<'_, '_, T>>;
+                          pub fn publish(self) -> usize; }   // its drop publishes too
+impl Permit<'_, '_, T> { pub fn write(self, v: T); }
+impl RetainedConsumer<T> { pub fn consume_batch(&mut self, max: usize, f: impl FnMut(T)) -> usize; }
+   // each endpoint's drop is its one Release decrement; the join is an Acquire zero
 
 // Mesh: N×(N−1) ring pairs + single-writer doorbells + credit flow control.
 // (implemented — the code is the spec)
