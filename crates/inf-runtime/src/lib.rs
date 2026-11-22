@@ -66,8 +66,8 @@ pub use driver::{
     StableBytes, StableBytesMut, SubmitStats, Wait, WriteBarrier, classify_accept_errno,
 };
 pub use executor::{
-    CellExecutor, ExecutorInitError, ExecutorLayout, Park, PollImmediate, TaskAdmission, TaskClass,
-    TaskFactory, TaskId, TaskPermit, Woken, park,
+    CellExecutor, ExecutorInitError, ExecutorLayout, ExecutorProgress, Park, PollImmediate,
+    TaskAdmission, TaskClass, TaskFactory, TaskId, TaskPermit, Woken, park,
 };
 pub use gate::{
     Cleanup, Delivery, DropValue, FabricAdmission, FabricGate, GateHold, GateKey, GatePermit,

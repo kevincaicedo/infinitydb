@@ -14,15 +14,15 @@ use inf_foundation::CellId;
 use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_runtime::gate::{KeyedGate, KeyedWait, ListWait};
 use inf_runtime::{
-    CellExecutor, CompletionToken, Delivery, ExecutorLayout, FabricAdmission, FabricGate, GateKey,
-    IoGate, KeyedAdmission, PollImmediate, TaskAdmission, TaskClass, TaskId, TokenClass, WaitList,
-    WaitNodes, WatermarkGate, Woken, park,
+    CellExecutor, CompletionToken, Delivery, ExecutorLayout, ExecutorProgress, FabricAdmission,
+    FabricGate, GateKey, IoGate, KeyedAdmission, PollImmediate, TaskAdmission, TaskClass, TaskId,
+    TokenClass, WaitList, WaitNodes, WatermarkGate, Woken, park,
 };
 use proptest::prelude::*;
 
 #[path = "support/tasks.rs"]
 mod tasks;
-use tasks::TestExecutor;
+use tasks::{TestExecutor, slots_reclaimed, tasks_polled};
 
 /// A task's wait on a fabric gate: the future owns the gate's handle and its
 /// one unit, which its wait borrows, and publishes the key it waits under,
@@ -129,13 +129,13 @@ fn suspended_future_promotes_resumes_and_frees() {
     };
     assert!(ex.is_live(id));
     assert_eq!(ex.live_tasks(), 1);
-    assert_eq!(ex.run_ready(64), 0, "nothing ready before completion");
+    assert_eq!(ex.run_ready(64), ExecutorProgress::default(), "nothing ready before completion");
 
     assert_eq!(
         FabricGate::complete(&gate, key.get(), 42, inf_foundation::time::Nanos(0)),
         Delivery::Delivered
     );
-    assert_eq!(ex.run_ready(64), 1);
+    assert_eq!(ex.run_ready(64), tasks_polled(1));
     assert_eq!(*seen.borrow(), vec![42]);
     assert_eq!(ex.live_tasks(), 0, "completed task must free its slot");
     assert!(!ex.is_live(id));
@@ -184,9 +184,9 @@ fn spawn_local_runs_under_budget() {
         });
     }
     assert_eq!(ex.live_tasks(), 10);
-    assert_eq!(ex.run_ready(3), 3, "budget bounds the slice");
+    assert_eq!(ex.run_ready(3), tasks_polled(3), "budget bounds the slice");
     assert_eq!(*ran.borrow(), 3);
-    assert_eq!(ex.run_ready(100), 7);
+    assert_eq!(ex.run_ready(100), tasks_polled(7));
     assert_eq!(*ran.borrow(), 10);
     assert_eq!(ex.live_tasks(), 0);
 }
@@ -218,7 +218,7 @@ fn wake_during_poll_requeues_without_losing_the_task() {
     });
     assert!(matches!(outcome, PollImmediate::Suspended(_)));
     // The self-wake must already have it queued — no external event needed.
-    assert_eq!(ex.run_ready(64), 1);
+    assert_eq!(ex.run_ready(64), tasks_polled(1));
     assert!(*done.borrow());
     assert_eq!(ex.live_tasks(), 0);
 }
@@ -248,8 +248,44 @@ fn escaped_waker_clone_on_fast_path_is_harmless() {
     assert_eq!(ex.live_tasks(), 0);
     assert!(!ex.has_ready(), "a Retired task's wake must not queue anything");
     waker.wake(); // the last clone: its drop links the reclaim
-    assert_eq!(ex.run_ready(64), 1, "one reclaim entry, no activation");
+    assert_eq!(ex.run_ready(64), slots_reclaimed(1), "one reclaim entry, no activation");
     assert_eq!(ex.retired(), 0);
+}
+
+/// A finished task whose waker a test holds is Retired; that waker's drop links its reclaim.
+fn retire_holding_its_waker(ex: &mut TestExecutor) -> Waker {
+    let stolen = Rc::new(RefCell::new(None));
+    assert_eq!(ex.poll_immediate(WakerThief(Rc::clone(&stolen))), PollImmediate::Completed);
+    stolen.borrow_mut().take().expect("the clone escaped")
+}
+
+/// One pass takes polls and reclaims in ready order and counts each apart, and the budget bounds
+/// their sum (ADR-0149 D3). The ready list holds a reclaim, a task, two reclaims and a task: a
+/// pass of four takes one poll and three reclaims and leaves the last task, which the next pass
+/// polls. An executor that counted a reclaim as a poll, or bounded polls alone, is red here.
+#[test]
+fn a_pass_counts_its_polls_and_its_reclaims_apart() {
+    let mut ex = TestExecutor::new();
+    let wakers: Vec<Waker> = (0..3).map(|_| retire_holding_its_waker(&mut ex)).collect();
+    assert_eq!(ex.retired(), 3, "three finished tasks held by their wakers");
+    let ran = Rc::new(Cell::new(0));
+    let mut wakers = wakers.into_iter();
+    drop(wakers.next());
+    let first = Rc::clone(&ran);
+    ex.spawn_local(async move { first.set(first.get() + 1) });
+    drop(wakers.next());
+    drop(wakers.next());
+    let second = Rc::clone(&ran);
+    ex.spawn_local(async move { second.set(second.get() + 10) });
+    let pass = ex.run_ready(4);
+    assert_eq!(pass, ExecutorProgress { tasks_polled: 1, slots_reclaimed: 3 });
+    assert_eq!(pass.entries(), 4, "the budget bounds polls and reclaims together");
+    assert_eq!((ran.get(), ex.retired()), (1, 0), "the first task ran and every slot returned");
+    assert!(ex.has_ready(), "the second task is left for the next pass");
+    assert_eq!(ex.run_ready(4), tasks_polled(1), "the next pass polls the task the budget left");
+    assert_eq!(ran.get(), 11);
+    assert_eq!(ex.run_ready(4), ExecutorProgress::default(), "nothing is left");
+    assert_eq!(ex.live_tasks(), 0);
 }
 
 #[test]
@@ -450,7 +486,7 @@ proptest! {
                 prop_assert_eq!(delivery, Delivery::Delivered);
             }
         }
-        while ex.run_ready(16) > 0 {}
+        while ex.run_ready(16).entries() > 0 {}
 
         let mut observed = done.borrow().clone();
         observed.sort_unstable();
@@ -501,7 +537,7 @@ proptest! {
         for key in open {
             gate.complete(key, ());
         }
-        while ex.run_ready(16) > 0 {}
+        while ex.run_ready(16).entries() > 0 {}
         prop_assert_eq!(ex.live_tasks(), 0);
         prop_assert_eq!(gate.pending(), 0);
     }
@@ -515,7 +551,7 @@ fn a_class_and_a_task_of_one_executor_are_foreign_to_another_built_alike() {
     let mut one = TestExecutor::at(0);
     let mut other = TestExecutor::at(1);
     let id = one.spawn_local(core::future::pending::<()>());
-    assert_eq!(one.run_ready(1), 1, "the task parks");
+    assert_eq!(one.run_ready(1), tasks_polled(1), "the task parks");
     let admission = other.reserve::<tasks::Boxed>(one.class());
     assert!(
         matches!(admission, TaskAdmission::Foreign),
@@ -598,7 +634,7 @@ fn a_zero_sized_and_an_over_aligned_future_run_in_their_slots() {
         panic!("the class has room");
     };
     assert!(matches!(permit.poll_immediate(|| ZeroSized), PollImmediate::Suspended(_)));
-    assert_eq!(executor.run_ready(4), 1, "the zero-sized future's own wake polls it");
+    assert_eq!(executor.run_ready(4), tasks_polled(1), "the zero-sized future's own wake polls it");
     assert_eq!(ZERO_SIZED_POLLS.with(Cell::get), 2);
     assert_eq!(executor.live_tasks(), 0);
 
@@ -613,9 +649,13 @@ fn a_zero_sized_and_an_over_aligned_future_run_in_their_slots() {
             assert!(matches!(permit.poll_immediate(make), PollImmediate::Suspended(_)));
         } else {
             permit.spawn_local(make);
-            assert_eq!(executor.run_ready(1), 1, "the first poll");
+            assert_eq!(executor.run_ready(1), tasks_polled(1), "the first poll");
         }
-        assert_eq!(executor.run_ready(4), 1, "the aligned future's own wake polls it");
+        assert_eq!(
+            executor.run_ready(4),
+            tasks_polled(1),
+            "the aligned future's own wake polls it"
+        );
         let seen = seen.borrow();
         assert_eq!(seen.len(), 2, "immediate {immediate}: two polls");
         assert_eq!(seen[0], seen[1], "immediate {immediate}: polled where it was placed");
@@ -697,7 +737,11 @@ fn the_first_poll_runs_in_its_slot_and_keeps_its_wake() {
     let (polls, at) = (Rc::new(Cell::new(0)), Rc::new(RefCell::new(Vec::new())));
     let outcome = poll_recorder(&mut executor, class, Recorder::twice(&polls, &at));
     assert!(matches!(outcome, PollImmediate::Suspended(_)), "the first poll is Pending");
-    assert_eq!(executor.run_ready(1), 1, "first-poll-wake-lost: the wake in the first poll");
+    assert_eq!(
+        executor.run_ready(1),
+        tasks_polled(1),
+        "first-poll-wake-lost: the wake in the first poll"
+    );
     assert_eq!(polls.get(), 2, "polled twice");
     let at = at.borrow();
     assert_eq!(at.len(), 3, "two polls and the drop");
@@ -722,7 +766,7 @@ fn the_spare_serves_no_task_an_id_names() {
     assert_ne!(first_at, second_at, "spare-under-id: a suspended task's slot was the spare");
     assert!(executor.is_live(id), "the first task stays live");
     assert_eq!(executor.class_tasks(class), 1, "one task; the spare is none");
-    assert_eq!(executor.run_ready(1), 1, "the first task's own wake polls it");
+    assert_eq!(executor.run_ready(1), tasks_polled(1), "the first task's own wake polls it");
     assert_eq!(polls.get(), 2);
     assert!(!executor.is_live(id));
     assert_eq!(executor.class_tasks(class), 0);
@@ -758,26 +802,26 @@ fn the_spare_lend_survives_every_other_borrow() {
     fast(&mut ex);
     assert_eq!(ex.wake(id), Woken::Queued);
     fast(&mut ex);
-    assert_eq!(ex.run_ready(8), 1, "the woken task polls and parks again");
+    assert_eq!(ex.run_ready(8), tasks_polled(1), "the woken task polls and parks again");
     fast(&mut ex);
     let spawned = Rc::clone(&hits);
     ex.spawn_local(async move { spawned.set(spawned.get() + 1_000) });
     fast(&mut ex);
-    assert_eq!(ex.run_ready(8), 1);
+    assert_eq!(ex.run_ready(8), tasks_polled(1));
     fast(&mut ex);
     let stolen = Rc::new(RefCell::new(None));
     assert_eq!(ex.poll_immediate(WakerThief(Rc::clone(&stolen))), PollImmediate::Completed);
     assert_eq!(ex.retired(), 1);
     fast(&mut ex);
     drop(stolen.borrow_mut().take());
-    assert_eq!(ex.run_ready(8), 1, "the Retired task's reclaim");
+    assert_eq!(ex.run_ready(8), slots_reclaimed(1), "the Retired task's reclaim");
     fast(&mut ex);
     assert_eq!(
         FabricGate::complete(&gate, key.get(), 1_000_000, inf_foundation::time::Nanos(0)),
         Delivery::Delivered
     );
     fast(&mut ex);
-    assert_eq!(ex.run_ready(8), 1, "the waiter completes");
+    assert_eq!(ex.run_ready(8), tasks_polled(1), "the waiter completes");
     fast(&mut ex);
     fast(&mut ex);
     assert_eq!(hits.get(), 13 + 1_000 + 1_000_000, "thirteen fast ops, the spawn and the waiter");
@@ -816,7 +860,7 @@ fn the_kept_lend_across_an_id_lookup_and_a_shared_borrow() {
         FabricGate::complete(&gate, key.get(), 1, inf_foundation::time::Nanos(0)),
         Delivery::Delivered
     );
-    assert_eq!(ex.run_ready(8), 1);
+    assert_eq!(ex.run_ready(8), tasks_polled(1));
     assert_eq!(hits.get(), 6);
     assert_eq!(ex.live_tasks(), 0);
 }
@@ -865,7 +909,7 @@ fn the_class_at_its_cap_with_its_spare() {
     let row = census.row(RECORDERS.name()).expect("the class's row");
     assert_eq!((row.high_water, row.crossings), (2, 1), "the crossing counted, nothing taken");
     assert_eq!(executor.class_tasks(class), 2);
-    assert_eq!(executor.run_ready(4), 2, "each task's own wake polls it");
+    assert_eq!(executor.run_ready(4), tasks_polled(2), "each task's own wake polls it");
     assert_eq!(executor.live_tasks(), 0);
 }
 
@@ -879,7 +923,7 @@ fn the_class_at_its_cap_with_its_spare() {
 fn an_id_another_class_minted_past_this_class_is_stale() {
     let mut wide = TestExecutor::new();
     let ids: Vec<_> = (0..3).map(|_| wide.spawn_local(core::future::pending::<()>())).collect();
-    assert_eq!(wide.run_ready(8), 3, "each task parks");
+    assert_eq!(wide.run_ready(8), tasks_polled(3), "each task parks");
     let mut narrow = TestExecutor::one();
     let mut other_cell = TestExecutor::at(1);
     for id in ids {
@@ -898,9 +942,9 @@ fn an_id_another_class_minted_past_this_class_is_stale() {
 fn a_stale_id_wakes_nothing_of_its_slots_next_occupant() {
     let mut ex = TestExecutor::one();
     let first = ex.spawn_local(async {});
-    assert_eq!(ex.run_ready(4), 1, "the first task completes");
+    assert_eq!(ex.run_ready(4), tasks_polled(1), "the first task completes");
     let next = ex.spawn_local(core::future::pending::<()>());
-    assert_eq!(ex.run_ready(4), 1, "the next task parks in the same slot");
+    assert_eq!(ex.run_ready(4), tasks_polled(1), "the next task parks in the same slot");
     assert_eq!(first.generation() + 1, next.generation());
     assert!(!ex.is_live(first));
     assert_eq!(ex.wake(first), Woken::Stale);
@@ -958,15 +1002,15 @@ fn self_referential_futures_resume_in_their_slots() {
     assert!(ex.is_live(id_a) && ex.is_live(id_b));
     assert_eq!(ex.class_tasks(class), 2);
     assert_eq!(ex.wake(id_b), Woken::Queued, "a neighbour's wake");
-    assert_eq!(ex.run_ready(4), 1);
+    assert_eq!(ex.run_ready(4), tasks_polled(1));
     assert_eq!(b.get(), 8, "b resumed through its own &mut");
     let c = Rc::new(Cell::new(0));
     let id_c = park_self_referential(&mut ex, class, &c);
     assert_eq!(ex.wake(id_a), Woken::Queued, "its own wake, after a neighbour's poll");
-    assert_eq!(ex.run_ready(4), 1);
+    assert_eq!(ex.run_ready(4), tasks_polled(1));
     assert_eq!(a.get(), 8, "a resumed through its own &mut");
     assert_eq!(ex.wake(id_c), Woken::Queued);
-    assert_eq!(ex.run_ready(4), 1);
+    assert_eq!(ex.run_ready(4), tasks_polled(1));
     assert_eq!(c.get(), 8);
     assert_eq!(ex.live_tasks(), 0);
 }
@@ -1018,12 +1062,12 @@ fn self_referential_futures_woken_by_their_wakers_resume_in_their_slots() {
         let TaskAdmission::Granted(permit) = ex.reserve(class) else { panic!("room") };
         let (s, w) = (Rc::clone(&seen), Rc::clone(&slot));
         let _ = permit.spawn_local(move || self_referential_on_waker(s, w));
-        assert_eq!(ex.run_ready(4), 1, "it parks on its waker");
+        assert_eq!(ex.run_ready(4), tasks_polled(1), "it parks on its waker");
         parked.push((seen, slot));
     }
     for (seen, slot) in parked.iter().rev() {
         slot.borrow_mut().take().expect("the waker it left").wake();
-        assert_eq!(ex.run_ready(4), 1);
+        assert_eq!(ex.run_ready(4), tasks_polled(1));
         assert_eq!(seen.get(), 8);
     }
     assert_eq!(ex.live_tasks(), 0);
@@ -1214,7 +1258,11 @@ fn a_first_poll_that_unwinds_with_a_waker_kept() {
     poll_registering_unwinds(&mut executor, class, Act::PanicKeepingWaker, &registry);
     let kept = registry.kept.borrow_mut().take().expect("the waker the first poll kept");
     kept.wake_by_ref();
-    assert_eq!(executor.run_ready(4), 0, "a wake of the unwound task activates nothing");
+    assert_eq!(
+        executor.run_ready(4),
+        ExecutorProgress::default(),
+        "a wake of the unwound task activates nothing"
+    );
     assert!(!executor.has_ready());
     assert_eq!(executor.class_tasks(class), 1, "first-poll-unwind-unowned: no slot held");
     assert_eq!(registry.drops.get(), 0, "the unwind drops nothing");

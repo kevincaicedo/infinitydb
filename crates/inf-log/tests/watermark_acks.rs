@@ -22,7 +22,9 @@ use inf_foundation::CellId;
 use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_foundation::time::{Nanos, VirtualClock};
 use inf_log::{FsyncClass, LogGeometry, SegmentConfig, StagingConfig};
-use inf_runtime::{CellLoop, ExecutorLayout, LoopConfig, TaskAdmission, WaitNodes, WatermarkGate};
+use inf_runtime::{
+    CellLoop, ExecutorLayout, ExecutorProgress, LoopConfig, TaskAdmission, WaitNodes, WatermarkGate,
+};
 use support::{DurablePlane, IoMode, ScriptedDriver, test_dir};
 
 /// Deterministic xorshift64* (L7: no ambient randomness).
@@ -156,13 +158,17 @@ fn wake_storm_50k_drains_a_budget_a_turn() {
         permit.spawn_local(move || storm_waiter(gate, lsn, order));
     }
     // Futures suspend on first poll (spawn queues them once).
-    while executor.run_ready(WAKE_BUDGET) == WAKE_BUDGET {}
+    while executor.run_ready(WAKE_BUDGET).entries() == WAKE_BUDGET {}
     executor.run_ready(WAKE_BUDGET);
     assert_eq!(gate.waiting(), WAITERS as usize);
 
     // ONE fsync completion advances the watermark over all of them.
     gate.advance(WAITERS);
-    assert_eq!(executor.run_ready(WAKE_BUDGET), 0, "advance itself woke a wait");
+    assert_eq!(
+        executor.run_ready(WAKE_BUDGET),
+        ExecutorProgress::default(),
+        "advance itself woke a wait"
+    );
     assert!(gate.owes(), "the advance owes the storm's wakes");
 
     let mut turns = 0;
@@ -174,9 +180,10 @@ fn wake_storm_50k_drains_a_budget_a_turn() {
         }
         let woken = gate.wake_covered(WAKE_BUDGET);
         assert!(woken <= WAKE_BUDGET, "a call woke {woken}, past its budget");
-        let polled = executor.run_ready(WAKE_BUDGET);
-        assert_eq!(polled, woken, "turn {turns}: the pass runs the batch it woke");
-        polled_total += polled;
+        let pass = executor.run_ready(WAKE_BUDGET);
+        let batch = ExecutorProgress { tasks_polled: woken, slots_reclaimed: 0 };
+        assert_eq!(pass, batch, "turn {turns}: the pass runs the batch it woke");
+        polled_total += pass.tasks_polled;
         turns += usize::from(woken > 0);
     }
     assert!(!gate.owes(), "wakes still owed after {TURNS} turns");

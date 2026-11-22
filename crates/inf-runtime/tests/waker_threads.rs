@@ -23,11 +23,11 @@ use std::sync::{Arc, Barrier, mpsc};
 use std::task::{Context, Poll, Waker};
 
 use inf_alloc::CountingAllocator;
-use inf_runtime::PollImmediate;
+use inf_runtime::{ExecutorProgress, PollImmediate};
 
 #[path = "support/tasks.rs"]
 mod tasks;
-use tasks::TestExecutor;
+use tasks::{TestExecutor, slots_reclaimed, tasks_polled};
 
 #[global_allocator]
 static ALLOC: CountingAllocator = CountingAllocator::new();
@@ -76,7 +76,7 @@ fn a_waker_moved_to_another_thread_and_back_is_sound() {
     .join()
     .expect("the other thread returns the waker");
     waker.wake_by_ref();
-    assert_eq!(executor.run_ready(4), 1, "the woken task is polled once");
+    assert_eq!(executor.run_ready(4), tasks_polled(1), "the woken task is polled once");
     assert_eq!(polls.get(), 2, "its first poll and the woken one");
     drop(waker);
     assert_eq!(executor.live_tasks(), 1, "the task stays parked");
@@ -101,9 +101,9 @@ fn two_threads_wake_one_task() {
     barrier.wait();
     one.join().expect("the first waking thread");
     two.join().expect("the second waking thread");
-    assert_eq!(executor.run_ready(4), 1, "two wakes of one task are one poll");
+    assert_eq!(executor.run_ready(4), tasks_polled(1), "two wakes of one task are one poll");
     assert_eq!(polls.get(), 2, "its first poll and the woken one");
-    assert_eq!(executor.run_ready(4), 0, "nothing is left queued");
+    assert_eq!(executor.run_ready(4), ExecutorProgress::default(), "nothing is left queued");
 }
 
 /// A wake from another thread takes the foreign lane: it is counted, `has_ready` reports it
@@ -122,7 +122,11 @@ fn a_wake_from_another_thread_takes_the_foreign_lane() {
     .expect("the waking thread returns the waker");
     assert_eq!(executor.waker_foreign_ops(), 1, "one foreign wake, counted");
     assert!(executor.has_ready(), "the foreign wake is ready work before the next run_ready");
-    assert_eq!(executor.run_ready(4), 1, "the drain delivers the wake and the task is polled");
+    assert_eq!(
+        executor.run_ready(4),
+        tasks_polled(1),
+        "the drain delivers the wake and the task is polled"
+    );
     assert_eq!(polls.get(), 2, "its first poll and the woken one");
     assert!(!executor.has_ready(), "the drain left nothing");
     drop(waker);
@@ -166,7 +170,7 @@ fn a_foreign_clone_keeps_a_finished_tasks_header() {
     let clone = kept.borrow_mut().take().expect("the clone was kept");
     drop(ManuallyDrop::into_inner(clone));
     assert!(executor.has_ready(), "the clone's drop on the owner thread links the reclaim");
-    assert_eq!(executor.run_ready(4), 1, "one entry: the reclaim");
+    assert_eq!(executor.run_ready(4), slots_reclaimed(1), "one entry: the reclaim");
     assert_eq!(executor.retired(), 0, "the reclaim freed the slot");
 }
 
@@ -203,9 +207,13 @@ fn a_foreign_wake_queued_for_a_finished_task_never_polls_the_next() {
     let next = executor.poll_immediate(CountPolls { polls: Rc::clone(&polls) });
     assert!(matches!(next, PollImmediate::Suspended(_)), "the next task parks");
     assert!(executor.has_ready(), "the queued wake is ready work");
-    let polled = executor.run_ready(4);
+    let pass = executor.run_ready(4);
     assert_eq!(polls.get(), 1, "the next task was polled once, by its own first poll");
-    assert_eq!(polled, 1, "the drain wakes no task: the one entry is the finished one's reclaim");
+    assert_eq!(
+        pass,
+        slots_reclaimed(1),
+        "the drain wakes no task: the one entry is the finished one's"
+    );
     assert_eq!(executor.retired(), 0, "the reclaim freed the finished task's slot");
 }
 
@@ -278,7 +286,7 @@ fn clone_and_drop_churn_across_threads_counts_exactly() {
     assert_eq!(executor.waker_foreign_ops(), foreign, "every foreign clone and drop counted");
     done.set(true);
     waker.wake();
-    assert_eq!(executor.run_ready(4), 1, "the woken task finishes");
+    assert_eq!(executor.run_ready(4), tasks_polled(1), "the woken task finishes");
     assert_eq!(polls.get(), 2);
     assert_eq!(executor.live_tasks(), 0);
     assert_eq!(executor.retired(), 0, "no waker names it: freed at its release, not Retired");
@@ -304,9 +312,9 @@ fn a_foreign_wake_during_a_pending_poll_is_polled_at_the_next_run_ready() {
     }));
     assert!(matches!(outcome, PollImmediate::Suspended(_)));
     assert!(executor.has_ready(), "the wake made during the poll is ready work");
-    assert_eq!(executor.run_ready(4), 1, "the next run_ready polls the task");
+    assert_eq!(executor.run_ready(4), tasks_polled(1), "the next run_ready polls the task");
     assert_eq!(polls.get(), 2, "its first poll and the woken one");
-    assert_eq!(executor.run_ready(4), 0, "one wake, one poll");
+    assert_eq!(executor.run_ready(4), ExecutorProgress::default(), "one wake, one poll");
 }
 
 /// Keeps a clone of its own waker in its state; completes on its second poll (`finish`) or
@@ -353,9 +361,13 @@ fn a_future_that_keeps_its_own_waker_clone_is_freed_once() {
     // Leg 1: released by run_ready.
     let mut executor = TestExecutor::one();
     let first = executor.spawn_local(KeepsOwnClone { own: None, finish: true, polls: 0 });
-    assert_eq!(executor.run_ready(1), 1, "the first poll keeps the clone and requeues");
+    assert_eq!(
+        executor.run_ready(1),
+        tasks_polled(1),
+        "the first poll keeps the clone and requeues"
+    );
     let before = ALLOC.thread_freed_bytes();
-    assert_eq!(executor.run_ready(1), 1, "the second poll completes");
+    assert_eq!(executor.run_ready(1), tasks_polled(1), "the second poll completes");
     assert_eq!(ALLOC.thread_freed_bytes() - before, block, "the release frees the block once");
     assert!(
         !executor.has_ready(),
@@ -368,14 +380,14 @@ fn a_future_that_keeps_its_own_waker_clone_is_freed_once() {
         first.generation() + 1,
         "the slot's generation advanced exactly once, after the decision"
     );
-    assert_eq!(executor.run_ready(1), 1);
+    assert_eq!(executor.run_ready(1), tasks_polled(1));
     drop(executor);
     // Leg 2: dropped by the executor's drop, still pending.
     let allocated = ALLOC.thread_bytes();
     let freed = ALLOC.thread_freed_bytes();
     let mut executor = TestExecutor::new();
     executor.spawn_local(KeepsOwnClone { own: None, finish: false, polls: 0 });
-    assert_eq!(executor.run_ready(1), 1, "the first poll keeps the clone and parks");
+    assert_eq!(executor.run_ready(1), tasks_polled(1), "the first poll keeps the clone and parks");
     let made = ALLOC.thread_bytes() - allocated;
     drop(executor);
     assert_eq!(
@@ -395,8 +407,8 @@ fn two_executors_on_one_thread_both_take_the_owner_lane() {
     // A consuming wake: the owner lane's `wake`, then its drop.
     let consumed = second_waker.clone();
     consumed.wake();
-    assert_eq!(first.run_ready(4), 1);
-    assert_eq!(second.run_ready(4), 1);
+    assert_eq!(first.run_ready(4), tasks_polled(1));
+    assert_eq!(second.run_ready(4), tasks_polled(1));
     assert_eq!((first_polls.get(), second_polls.get()), (2, 2));
     assert_eq!(first.waker_foreign_ops(), 0, "one thread, one mark: no foreign operation");
     assert_eq!(second.waker_foreign_ops(), 0, "one thread, one mark: no foreign operation");
@@ -439,7 +451,7 @@ fn a_waker_dropped_during_another_tasks_poll_frees_the_first_held_header() {
         let third = drop_the_last_inside_a_poll(&keeper);
         if by_run_ready {
             executor.spawn_local(third);
-            assert_eq!(executor.run_ready(1), 1);
+            assert_eq!(executor.run_ready(1), tasks_polled(1));
         } else {
             assert_eq!(executor.poll_immediate(third), PollImmediate::Completed);
         }
@@ -448,7 +460,11 @@ fn a_waker_dropped_during_another_tasks_poll_frees_the_first_held_header() {
             executor.has_ready(),
             "by_run_ready {by_run_ready}: the dropped clone linked its entry, to be reclaimed next"
         );
-        assert_eq!(executor.run_ready(4), 1, "the reclaim, at the run_ready after the poll");
+        assert_eq!(
+            executor.run_ready(4),
+            slots_reclaimed(1),
+            "the reclaim, at the run_ready after the poll"
+        );
         assert_eq!(executor.retired(), 1, "one reclaimed; the other stays Retired");
         drop(executor);
         assert_eq!(keeper.borrow().len(), 1);
@@ -471,7 +487,11 @@ fn a_retired_slot_is_never_reused_while_a_waker_names_its_header() {
         None => {
             assert_eq!(executor.retired(), 1, "the Retired task holds the one slot");
             drop(keeper.borrow_mut().pop());
-            assert_eq!(executor.run_ready(4), 1, "the clone's drop linked the reclaim");
+            assert_eq!(
+                executor.run_ready(4),
+                slots_reclaimed(1),
+                "the clone's drop linked the reclaim"
+            );
             let next = CountPolls { polls: Rc::clone(&polls) };
             let placed = executor.try_poll_immediate(next);
             assert!(matches!(placed, Some(PollImmediate::Suspended(_))), "the slot is free now");

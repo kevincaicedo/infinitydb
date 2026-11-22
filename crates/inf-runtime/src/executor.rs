@@ -131,6 +131,27 @@ pub enum PollImmediate {
     Suspended(TaskId),
 }
 
+/// What one [`CellExecutor::run_ready`] pass of one cell's executor took from its ready list
+/// (ADR-0149 D2, D3). Each entry is one activation or one reclaim, and each is charged against
+/// the pass's budget, so `tasks_polled + slots_reclaimed <= budget`. A reclaim runs no future and
+/// executes no command, so the two are counted apart.
+#[derive(Copy, Clone, Default, PartialEq, Eq, Debug)]
+pub struct ExecutorProgress {
+    /// Queued tasks of this cell polled, one activation each.
+    pub tasks_polled: usize,
+    /// Retired slots of this cell returned to their class: their last waker gone, the husk
+    /// dropped where it lies.
+    pub slots_reclaimed: usize,
+}
+
+impl ExecutorProgress {
+    /// The ready entries the pass took, polls and reclaims together: what its budget bounds.
+    #[must_use]
+    pub const fn entries(self) -> usize {
+        self.tasks_polled + self.slots_reclaimed
+    }
+}
+
 // ---- Task classes (ADR-0177 D2) ----------------------------------------------------------------
 
 /// What a class's factory makes, read from the factory's type alone: a function or closure of one
@@ -1574,21 +1595,27 @@ impl CellExecutor {
         (entry.instance == class.instance).then_some(entry)
     }
 
-    /// Poll up to `budget` ready entries, each one activation or one reclaim. Returns how many
-    /// were taken — the loop's EXECUTE step charges this against the foreground deficit. It
-    /// first delivers the foreign wakes queued on the remote stack.
-    pub fn run_ready(&mut self, budget: usize) -> usize {
+    /// Takes up to `budget` ready entries in ready order, each one activation or one reclaim, and
+    /// returns how many of each (ADR-0149 D3: both are charged against the budget, and a reclaim
+    /// is not a poll). It first delivers the foreign wakes queued on the remote stack.
+    pub fn run_ready(&mut self, budget: usize) -> ExecutorProgress {
         self.drain_remote();
-        let mut polled = 0;
-        while polled < budget {
+        // The loop carries only `left` and `slots_reclaimed`; `budget` stays out of it, read once
+        // after, so a poll updates one count and reloads nothing per entry.
+        let mut left = budget;
+        let mut slots_reclaimed = 0;
+        while left > 0 {
             // SAFETY: the executor holds its array, on this thread.
             let Some(header) = (unsafe { pop_ready(self.array) }) else { break };
-            polled += 1;
+            left -= 1;
             // SAFETY: the executor holds its headers: open, on this thread.
             let state = unsafe { owner(header) }.state.get();
             match state {
                 TaskState::Queued => self.poll_queued(header),
-                TaskState::Reclaiming => self.reclaim(header),
+                TaskState::Reclaiming => {
+                    slots_reclaimed += 1;
+                    self.reclaim(header);
+                }
                 other @ (TaskState::Free
                 | TaskState::Idle
                 | TaskState::Running
@@ -1603,7 +1630,14 @@ impl CellExecutor {
                 }
             }
         }
-        polled
+        // Each reclaim spent one unit of the budget, so the rest of what was spent is the polls.
+        let tasks_polled = budget - left - slots_reclaimed;
+        let progress = ExecutorProgress { tasks_polled, slots_reclaimed };
+        debug_assert!(
+            left == 0 || !self.ready_linked(),
+            "a pass ends on its budget or on an empty ready list"
+        );
+        progress
     }
 
     /// One activation of a queued task, through its class's erased object.
@@ -1697,9 +1731,15 @@ impl CellExecutor {
     /// after `run_ready`, a reclaim, or a foreign wake on the remote stack, which the next
     /// `run_ready` delivers.
     pub fn has_ready(&self) -> bool {
+        self.ready_linked() || self.stack_ref().pending()
+    }
+
+    /// Whether the ready list links a header: an activation or a reclaim, the remote stack aside.
+    #[inline]
+    fn ready_linked(&self) -> bool {
         // SAFETY: the executor holds its array.
         let head = unsafe { self.array.as_ref() };
-        head.ready_head.get() != NO_HEADER || self.stack_ref().pending()
+        head.ready_head.get() != NO_HEADER
     }
 
     /// Whether `id` still names a live task (slots are recycled; stale ids compare against the
