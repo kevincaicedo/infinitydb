@@ -148,20 +148,36 @@ expect_red_because() {
     fi
 }
 
+# fx_under <path>: true for a path under $work that holds no `..` component,
+# ends in no `/`, is no link itself, and whose parent, read physically
+# (`cd -P`, `pwd -P`), lies under $work read the same way. A textual match
+# alone admits `$work/../x`, and `$work/link/x` for a link under $work to a
+# directory outside it, which chmod and git -C would follow.
+fx_under() {
+    local parent top
+    [ -n "$work" ] || return 1
+    case $1 in "$work"/?*) ;; *) return 1 ;; esac
+    case /$1/ in */../*) return 1 ;; esac
+    case $1 in */) return 1 ;; esac
+    [ ! -L "$1" ] || return 1
+    parent=$(cd -P "${1%/*}" 2>/dev/null && pwd -P) || return 1
+    top=$(cd -P "$work" 2>/dev/null && pwd -P) || return 1
+    case $parent/ in "$top"/*) ;; *) return 1 ;; esac
+}
 # fx_git <root> <git args…>: git in a fixture repository only. `git -C ""`
 # runs in the current directory, and a root that is not its own repository
 # lets git walk up to an enclosing one, the developer's engine branch: a root
-# that is empty, outside $work or without its own `.git` is refused before
-# git runs (the rule every destructive command on a variable keeps). `init`
+# that is empty, outside $work (fx_under, read physically: a `..` component
+# or a link under $work leaves it) or without its own `.git` is refused
+# before git runs (the rule every
+# destructive command on a variable keeps). `init`
 # creates that `.git`, so it alone runs bare, on a root its guarded
 # constructor made.
 fx_git() {
     local root=$1
     shift
-    case $root in
-    "$work"/?*) ;;
-    *) echo "fx_git: '$root' is not a fixture directory under $work" >&2; exit 2 ;;
-    esac
+    fx_under "$root" ||
+        { echo "fx_git: '$root' is not a fixture directory under $work" >&2; exit 2; }
     [ -d "$root/.git" ] || { echo "fx_git: no repository of its own at '$root'" >&2; exit 2; }
     git -C "$root" "$@"
 }
@@ -171,9 +187,11 @@ fx_only() {
     ! grep -n 'git -C "\$' "$1" | grep -v -e ' init -q$' -e '^[0-9]*:    git -C "\$root" "\$@"$'
 }
 
-# fx_lock <path>: a fixture path under $work set to mode 000, for a case
-# whose gate must fail on what it cannot read, and recorded: fx_unlock gives
-# every recorded path its owner's access back, and the group's EXIT trap
+# fx_lock <path> [<mode>]: a fixture path under $work (fx_under) set to mode
+# 000 (or <mode>: 400 makes a directory readable but not searchable), for a
+# case whose gate must fail on what it cannot read, and recorded: fx_unlock
+# gives every recorded path under $work its owner's access back and names any
+# other, and the group's EXIT trap
 # calls it before it removes $work, which a directory at 000 would refuse.
 # Root reads through mode 000, so a caller runs its locked cases only when
 # `id -u` is not 0. Each checks $work first (fx_work): with $work empty,
@@ -185,24 +203,22 @@ fx_work() { # <caller>
 }
 fx_lock() {
     fx_work fx_lock
-    case $1 in
-    "$work"/?*) ;;
-    *) echo "fx_lock: '$1' is not a fixture path under $work" >&2; exit 2 ;;
-    esac
+    fx_under "$1" || { echo "fx_lock: '$1' is not a fixture path under $work" >&2; exit 2; }
     FX_LOCKED="$FX_LOCKED$1
 "
-    chmod 000 "$1" || { echo "fx_lock: chmod 000 $1 failed" >&2; exit 2; }
+    chmod "${2:-000}" "$1" || { echo "fx_lock: chmod ${2:-000} $1 failed" >&2; exit 2; }
 }
 fx_unlock() {
     local path
     [ -n "$FX_LOCKED" ] || return 0
     fx_work fx_unlock
     while IFS= read -r path; do
-        case $path in
-        "") ;;
-        "$work"/?*) chmod u+rwx "$path" ;;
-        *) echo "fx_unlock: '$path' is not a fixture path under $work" >&2 ;;
-        esac
+        [ -n "$path" ] || continue
+        if fx_under "$path"; then
+            chmod u+rwx "$path"
+        else
+            echo "fx_unlock: '$path' is not a fixture path under $work" >&2
+        fi
     done <<<"$FX_LOCKED"
     FX_LOCKED=
 }

@@ -123,7 +123,7 @@ from pathlib import Path
 sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
 import fuzz_targets
 import lint_scope_table as scope_table
-from source_files import WalkError, source_files
+from source_files import WalkError, listing, source_files, subdirectories, unreadable
 from lint_scope_table import FN, attribute_end
 
 EXEMPTIONS = os.environ["INF_EXEMPTIONS"]
@@ -605,15 +605,25 @@ def rows_of(text, label):
     return rows
 
 
+def walked(listed, *args):
+    """A walk's listing, or the scope error: a directory the walk cannot read fails the
+    audit, never a shorter one (scripts/source_files.py)."""
+    try:
+        return listed(*args)
+    except WalkError as err:
+        print(f"LINT-SCOPES SCOPE ERROR: {err}")
+        sys.exit(1)
+
+
 # ---- D1: every crate root carries the attribute
 roots = 0
 for top in (Path("crates"), Path("bins")):
-    for crate in sorted(top.iterdir()):
+    for crate in walked(subdirectories, top):
         src = crate / "src"
         if not (crate / "Cargo.toml").is_file() or not src.is_dir():
             continue
         crate_roots = [p for p in (src / "lib.rs", src / "main.rs") if p.is_file()]
-        crate_roots += sorted((src / "bin").glob("*.rs")) if (src / "bin").is_dir() else []
+        crate_roots += walked(listing, src / "bin", "*.rs") if (src / "bin").is_dir() else []
         for root in crate_roots:
             roots += 1
             if not ROOT_ATTR.search(root.read_text()):
@@ -627,13 +637,18 @@ if roots == 0:
 # file: the mock swap's twin, a `#[path]` alias; an `include!`'s) stays
 # production code.
 for cell_dir in CELL_DIRS:
+    cell_bins = walked(listing, cell_dir / "bin", "*.rs") if (cell_dir / "bin").is_dir() else []
     production_files.update(os.path.normpath(p) for p in [cell_dir / "lib.rs", cell_dir / "main.rs"]
-                            + sorted((cell_dir / "bin").glob("*.rs")) if p.is_file())
-    for dirpath, dirnames, names in os.walk(cell_dir):
-        dirnames.sort()
-        for name in sorted(names):
-            if name.endswith(".rs"):
-                module_declarations(Path(dirpath) / name)
+                            + cell_bins if p.is_file())
+    try:
+        for dirpath, dirnames, names in os.walk(cell_dir, onerror=unreadable):
+            dirnames.sort()
+            for name in sorted(names):
+                if name.endswith(".rs"):
+                    module_declarations(Path(dirpath) / name)
+    except WalkError as err:
+        print(f"LINT-SCOPES SCOPE ERROR: {err}")
+        sys.exit(1)
 for file in sorted(production_files & set(test_module_files)):
     site, name = test_module_files.pop(file)
     errors.append(f"{site}: test-only `mod {name};` names {file}, which production code also compiles "
@@ -667,7 +682,7 @@ for top in ("crates", "bins", "tests"):
 # row reader (ADR-0198 D1), whose gate holds every file under fuzz_targets/ to
 # a row; this gate runs none of the census's other checks.
 targets = set()
-for crate in sorted(Path("crates").iterdir()):
+for crate in walked(subdirectories, Path("crates")):
     manifest = crate / "fuzz" / "Cargo.toml"
     if manifest.is_file():
         try:

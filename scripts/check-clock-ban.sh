@@ -54,21 +54,39 @@ fi
 
 # ---- 2. no shadow config ------------------------------------------------
 shadows=0
-for cfg in crates/*/clippy.toml crates/*/.clippy.toml bins/*/clippy.toml bins/*/.clippy.toml tests/*/clippy.toml tests/*/.clippy.toml; do
-    [ -e "$cfg" ] || continue
-    echo "CLOCK-BAN violation: $cfg shadows the workspace clippy.toml (clippy stops at the nearest config — every ban vanishes for that crate)"
-    shadows=$((shadows + 1))
-    fail=1
+# Each top's crate directories come from tree_dirs (scripts/source-files.sh), which fails on one
+# it cannot search: a shadow config inside it would go unseen.
+for top in crates bins tests; do
+    crate_dirs=$(tree_dirs . "$top") || {
+        echo "CLOCK-BAN SCOPE ERROR: the directories under $top/ are unknown (scripts/source-files.sh, above)"
+        exit 2
+    }
+    for name in clippy.toml .clippy.toml; do
+        while IFS= read -r dir; do
+            cfg="$dir/$name"
+            [ -n "$dir" ] && [ -e "$cfg" ] || continue
+            echo "CLOCK-BAN violation: $cfg shadows the workspace clippy.toml (clippy stops at the nearest config — every ban vanishes for that crate)"
+            shadows=$((shadows + 1))
+            fail=1
+        done <<<"$crate_dirs"
+    done
 done
 
 # ---- 3. source membership; the sole allow audit is check-lint-scopes.sh ----
 # ADR-0144 I8: all suppression classes/scopes, including clock:, are audited
 # together. Do not add a second reason scan here.
-dirs=$(cell_crate_dirs)
+dirs=$(cell_crate_dirs) || {
+    echo "CLOCK-BAN SCOPE ERROR: the cell crate set is unknown (scripts/cell-crates.sh, above)"
+    exit 2
+}
 files=0
-# `find`, as every sibling gate: the CI runners ship no ripgrep.
+# `find`, as every sibling gate: the CI runners ship no ripgrep. A walk that fails fails the
+# count, never a smaller one.
 while IFS= read -r dir; do
-    n=$(find "$dir" -name '*.rs' | wc -l)
+    n=$(find "$dir" -name '*.rs' | wc -l) || {
+        echo "CLOCK-BAN SCOPE ERROR: the walk of $dir failed, so its files are uncounted"
+        exit 2
+    }
     files=$((files + n))
 done <<< "$dirs"
 if [ "$files" -eq 0 ]; then

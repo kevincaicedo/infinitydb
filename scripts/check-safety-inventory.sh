@@ -11,15 +11,31 @@
 # Scope: shipped surface only (crates/*/src, bins/*/src). Test/bench
 # unsafe lives outside src/ and is covered by clippy's
 # undocumented_unsafe_blocks = deny (workspace-wide). The grep matches
-# unsafe *usage* tokens, not the word in prose or `forbid(unsafe_code)`.
+# unsafe *usage* tokens, not the word in prose or `forbid(unsafe_code)`. A
+# directory the walk cannot read (scripts/source_files.py) is a scope error.
 
 set -euo pipefail
-cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 
-python3 - <<'PY'
+INF_SCRIPT_DIR="$SCRIPT_DIR" python3 - <<'PY'
+import os
 from pathlib import Path
 import re
 import sys
+
+sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
+from source_files import WalkError, subdirectories, tree_listing
+
+
+def walked(listed, *args):
+    """A walk's listing, or the scope error: a directory the walk cannot read fails the gate."""
+    try:
+        return listed(*args)
+    except WalkError as err:
+        print(f"SAFETY INVENTORY SCOPE ERROR: {err}")
+        sys.exit(2)
+
 
 unsafe = re.compile(r"\bunsafe\s+(?:\{|fn\b|impl\b|extern\b)")
 path_char = r"A-Za-z0-9_./-"
@@ -29,11 +45,9 @@ for root in [Path("crates"), Path("bins")]:
     if not root.is_dir():
         errors.append(f"SAFETY INVENTORY SCOPE: missing {root}")
         continue
-    for crate in sorted(root.iterdir()):
-        if not crate.is_dir():
-            continue
+    for crate in walked(subdirectories, root):
         source = crate / "src"
-        rust = sorted(source.rglob("*.rs"))
+        rust = walked(tree_listing, source, "*.rs") if source.is_dir() else []
         if not source.is_dir() or not rust:
             errors.append(f"SAFETY INVENTORY SCOPE: missing or empty {source}")
             continue

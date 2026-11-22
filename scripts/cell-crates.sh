@@ -12,14 +12,21 @@
 #
 # Portable bash 3.2 (macOS CI): no mapfile, no associative arrays.
 
+# The crate directories come from tree_dirs, which fails on one the walk cannot search.
+# shellcheck source=source-files.sh
+. "$(dirname "${BASH_SOURCE[0]}")/source-files.sh"
+
 CELL_CRATE_EXCLUDE=(
     "crates/inf-probe/src|the boot-time device probe (ADR-0086 D7 / ADR-0091): a dev tool that runs before any cell starts; its own header sanctions Instant::now + std::thread"
 )
 
-# Prints one directory per line. Returns 1 (after an explanation on
-# stderr) when an exclusion names a missing directory or the set is empty.
+# Prints one directory per line. Returns non-zero (after an explanation on
+# stderr) when an exclusion names a missing directory, a crate directory
+# cannot be searched (tree_dirs: whether it holds src/ is unknown) or the set
+# is empty; a caller reads the status (`dirs=$(cell_crate_dirs) || …`), which
+# `< <(cell_crate_dirs)` would lose.
 cell_crate_dirs() {
-    local dir excluded entry path reason found=0
+    local dir excluded entry path reason listing found=0
     for entry in "${CELL_CRATE_EXCLUDE[@]}"; do
         path=${entry%%|*}
         if [ ! -d "$path" ]; then
@@ -28,8 +35,9 @@ cell_crate_dirs() {
             return 1
         fi
     done
-    for dir in crates/*/src; do
-        [ -d "$dir" ] || continue
+    listing=$(tree_dirs src crates) || return
+    while IFS= read -r dir; do
+        [ -n "$dir" ] || continue
         excluded=0
         for entry in "${CELL_CRATE_EXCLUDE[@]}"; do
             path=${entry%%|*}
@@ -38,7 +46,7 @@ cell_crate_dirs() {
         [ "$excluded" -eq 1 ] && continue
         echo "$dir"
         found=$((found + 1))
-    done
+    done <<<"$listing"
     if [ "$found" -eq 0 ]; then
         echo "cell-crates: no crates/*/src directories found from $(pwd)" >&2
         return 1

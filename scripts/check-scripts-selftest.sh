@@ -34,6 +34,70 @@ unset CARGO_TARGET_DIR
 # shellcheck source=selftest-lib.sh
 . "$SCRIPT_DIR/selftest-lib.sh"
 
+# walk_forms <file>…: each line of the gates' scripts that lists a tree in a form whose failure
+# reads as a shorter scan, as `<file>:<line>: <form>: <text>`, and status 1; with none, a count
+# line and status 0. Comment lines are not code. A walk is find, git ls-files (git's global
+# options before it), grep with -r in any flag group, ls, or the helpers source_files, tree_dirs
+# and cell_crate_dirs. The shell forms, each losing the walk's status: a walk anywhere inside
+# `< <(…)` or `<<<"$(…)"`, in a `for` word list, or assigned by local, export, declare or
+# readonly, whose own status replaces it; a `for` over a glob of crates/, bins/ or tests/, which
+# probes inside each entry (tree_dirs lists them); a command substitution inside an arithmetic
+# expansion, whose failure ends the enclosing loop with no errexit, so the scan reads as cut
+# short and green (in `$((…))`, `((…))` or `let`). The Python forms: pathlib's glob and rglob,
+# and an os.walk, os.fwalk or Path.walk with no error hook (or one set to None), which skip a
+# directory they cannot read; iterdir, os.listdir and os.scandir outside
+# scripts/source_files.py, which raise on the directory itself but leave its loop to probe each
+# entry, and a probe (is_dir, is_file) reads a refusal as absence. In either language, a git
+# listing (ls-files, grep, status) not run by git_listing, which fails on the warning git gives,
+# with exit 0, for a directory it cannot open: a shell command line that runs git, or a Python
+# line that passes the subcommand as a string and does not name git_listing. Written for BSD
+# awk: bracket classes, no interval braces.
+walk_forms() {
+    awk '
+        BEGIN {
+            gitopts = "([ \t]+-[Cc][ \t]+[^ \t]+|[ \t]+--[a-z-]+(=[^ \t]+)?|[ \t]+-[A-Za-z])*"
+            grepr = "grep([ \t]+-[A-Za-z]+)*[ \t]+(-[A-Za-z]*[rR][A-Za-z]*|--recursive|--dereference-recursive)"
+            walker = "(find|git" gitopts "[ \t]+ls-files|" grepr "|ls"
+            walker = walker "|source_files|tree_dirs|cell_crate_dirs)([ \t;|)]|$)"
+            # A walk anywhere after the opening parenthesis: first, or after a word boundary.
+            inside = "([^)`]*[ \t;&|(!])?" walker
+            procsub = "<[ \t]*<[(]" inside
+            herestr = "<<<[ \t]*\"?[$][(]" inside
+            wordlist = "(^|[ \t;])in[ \t]+([$][(]|`)" inside
+            declared = "(^|[ \t;])(local|export|declare|readonly)([ \t]+-[A-Za-z]+)*[ \t]+[A-Za-z_][A-Za-z0-9_]*=\"?[$][(]" inside
+            forloop = "(^|[ \t;])for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in[ \t]"
+            treeglob = "(^|[ \t\"'\''])(crates|bins|tests)/[^ \t;]*[*]"
+            globbing = "[.]r?glob[(]|glob[.]i?glob[(]"
+            dirloop = "[.]iterdir[(]|os[.]listdir[(]|os[.]scandir[(]"
+            gitsub = "(ls-files|grep|status)"
+            gitcmd = "(^|[;&|({!]|[$][(]|then[ \t]|do[ \t]|else[ \t])[ \t]*git" gitopts "[ \t]+" gitsub "([ \t]|$)"
+            gitarg = "[\"'\'']" gitsub "[\"'\'']"
+            arithsub = "([$][(][(]|(^|[^$])[(][(])[^)]*[$][(]|(^|[ \t;])let[ \t].*[$][(]"
+            pywalk = "os[.]f?walk[(]|[A-Za-z0-9_)\\]][.]walk[(]"
+            found = 0
+        }
+        /^[ \t]*#/ { next }
+        {
+            form = ""
+            if ($0 ~ procsub) form = "a walk inside < <(…), its status lost"
+            else if ($0 ~ herestr) form = "a walk inside <<<\"$(…)\", its status lost"
+            else if ($0 ~ wordlist) form = "a walk as a for word list, its status lost"
+            else if ($0 ~ declared) form = "a walk assigned by local, export, declare or readonly, whose status replaces its own"
+            else if ($0 ~ forloop && $0 ~ treeglob) form = "a for over a tree glob, which probes inside each entry"
+            else if ($0 ~ globbing) form = "a glob, which skips a directory it cannot read"
+            else if ($0 ~ dirloop) form = "a directory listing whose loop probes each entry, a refusal read as absence (scripts/source_files.py stats them)"
+            else if ($0 ~ pywalk && ($0 !~ /on_?error=/ || $0 ~ /on_?error=None/)) form = "an os.walk, os.fwalk or Path.walk with no error hook, which skips a directory it cannot read"
+            else if ($0 ~ arithsub) form = "a command substitution inside $((…)), ((…)) or let, whose failure ends the loop with no errexit"
+            else if ($0 ~ gitcmd) form = "a git listing not run by git_listing"
+            else if ($0 ~ gitarg && $0 ~ /git/ && $0 !~ /git_listing/) form = "a git listing not run by git_listing"
+            if (form != "") { print FILENAME ":" FNR ": " form ": " $0; found++ }
+        }
+        END {
+            if (found) exit 1
+            print "walk forms: " ARGC - 1 " files, " NR " lines read, none found"
+        }' "$@"
+}
+
 group_self_test() {
 expect green "self-test: every git command on a fixture root goes through fx_git" \
     fx_only "$SCRIPT_DIR/check-scripts-selftest.sh"
@@ -82,6 +146,66 @@ nv_canary() (
         [ "$pass" -eq 0 ] && [ "$fail" -eq 5 ]
 )
 expect green "self-test: a gate that never ran is never counted as a verdict (canary)" nv_canary
+# The gates' walks fail closed (scripts/source-files.sh, scripts/source_files.py): no gate
+# script, no helper a gate sources and no Python module of theirs lists a tree in a form that
+# reads an unreadable directory as empty. The self-test's own fixture builders and the module
+# that holds the forms that fail closed are not scanned.
+walk_scope=()
+for f in "$SCRIPT_DIR"/check-*.sh "$SCRIPT_DIR"/cell-crates.sh "$SCRIPT_DIR"/source-files.sh \
+    "$SCRIPT_DIR"/*.py; do
+    case ${f##*/} in check-scripts-selftest.sh | source_files.py) continue ;; esac
+    walk_scope+=("$f")
+done
+expect green "self-test: no gate script walks a tree in a form that loses a failed walk" \
+    walk_forms "${walk_scope[@]}"
+expect_output "self-test: the walk-form scan reads every gate script" \
+    "walk forms: ${#walk_scope[@]} files, " walk_forms "${walk_scope[@]}"
+# Each form, planted in a copy of a gate, is red naming it (the canaries).
+wf_n=0
+for wf_line in \
+    'done < <(find "$DIR" -name '"'*.rs'"' | sort)' \
+    'while read -r f; do :; done < <(git ls-files -co -- crates)' \
+    'done < <(grep -rl Mutex crates)' \
+    'for f in $(find crates -name '"'*.rs'"'); do :; done' \
+    'for dir in crates/*/src bins/*/src; do :; done' \
+    '        rust = sorted(source.rglob("*.rs"))' \
+    '    crate_roots += sorted((src / "bin").glob("*.rs"))' \
+    '    for crate in sorted(root.iterdir()):' \
+    '    for dirpath, dirnames, names in os.walk(cell_dir):' \
+    'git ls-files -z --cached --others --exclude-standard -- '"'*.rs'"' >"$work/listed.z" ||' \
+    'top=$(git -C . status --porcelain)' \
+    '    listed = subprocess.run(["git", "ls-files", "-co", "-z"], capture_output=True)' \
+    '    grep = git(top, "grep", "-nIzF", "--untracked", "--", ".")' \
+    '    lines=$((lines + $(wc -l < "$f")))' \
+    'done < <(LC_ALL=C find crates -name '"'*.rs'"' | sort)' \
+    'done < <(cd "$DIR" && find . -name '"'*.rs'"')' \
+    'done < <(grep -n -r Mutex crates)' \
+    'done < <(git --no-pager ls-files -co)' \
+    'git -c core.quotepath=off ls-files -z >"$work/listed.z"' \
+    'done <<<"$(find crates -name '"'*.rs'"')"' \
+    '    local listed=$(find "$dir" -name '"'*.rs'"' | sort) || exit 2' \
+    '    for here, dirs, files in Path(top).walk():' \
+    '    for here, dirs, files in os.fwalk(top):' \
+    '    for here, dirs, files in os.walk(top, onerror=None):' \
+    '    let "lines += $(wc -l < "$f")"' \
+    '    (( lines += $(wc -l < "$f") ))'
+do
+    wf_n=$((wf_n + 1))
+    cp "$SCRIPT_DIR/check-refusal-text.sh" "$work/walk-form-$wf_n.sh"
+    printf '%s\n' "$wf_line" >>"$work/walk-form-$wf_n.sh"
+    expect_red_because "self-test: the walk form '$wf_line' is refused (canary)" \
+        "walk-form-$wf_n.sh:[0-9]*: " walk_forms "$work/walk-form-$wf_n.sh"
+done
+cp "$SCRIPT_DIR/check-refusal-text.sh" "$work/walk-form-ok.sh"
+printf '%s\n' '# done < <(find "$DIR" -name x)' '    for here, dirs, files in os.walk(top, onerror=unreadable):' \
+    'git_listing ls-files -z -- x >"$work/x" || scope_error "git ls-files failed"' \
+    '    for here, dirs, files in Path(top).walk(on_error=unreadable):' \
+    '    listed = walked(git_listing, "-C", top, "ls-files", "-z", "-co")' \
+    'is `git grep -nIzF --untracked`, one -e a name' \
+    '    listing=$(find "$dir" -name '"'*.rs'"' | sort) || {' 'local dirs listing found=0' \
+    >>"$work/walk-form-ok.sh"
+expect green "self-test: a comment, an os.walk with onerror, git_listing and prose are not refused" \
+    walk_forms "$work/walk-form-ok.sh"
 }
 
 group_driver() {
@@ -450,9 +574,83 @@ expect_red_because "driver: a pool whose FIFO is gone is refused" \
 : >"$work/fx-victim"
 expect_red_because "fx_lock: an empty work directory is refused" "fx_lock: no work directory" \
     bash -c '. "$1"; fx_lock "$2"' fx "$SCRIPT_DIR/selftest-lib.sh" "$work/fx-victim"
+# Root reads through mode 000, so the mode is checked only as another user, as the locked
+# cases are.
+if [ "$(id -u)" -ne 0 ]; then
 expect green "fx_lock: the refused path keeps its mode" test -r "$work/fx-victim"
+fi
 expect_red_because "fx_unlock: an empty work directory is refused" "fx_unlock: no work directory" \
     bash -c '. "$1"; FX_LOCKED="$2"; fx_unlock' fx "$SCRIPT_DIR/selftest-lib.sh" "$work/fx-victim"
+# fx_unlock gives access back only to a recorded path under $work: one outside it, here a path
+# beside the work directory of the lib sourced alone, is named and keeps its mode.
+if [ "$(id -u)" -ne 0 ]; then
+mkdir -p "$work/fx-own"
+: >"$work/fx-outside"
+fx_lock "$work/fx-outside"
+expect_output "fx_unlock: a recorded path outside the work directory is named, not unlocked" \
+    "fx_unlock: '$work/fx-outside' is not a fixture path under $work/fx-own" \
+    bash -c '. "$1"; work=$2; FX_LOCKED="$3"; fx_unlock' fx "$SCRIPT_DIR/selftest-lib.sh" \
+    "$work/fx-own" "$work/fx-outside"
+expect green "fx_unlock: the path outside the work directory keeps its mode" \
+    test ! -r "$work/fx-outside"
+fx_unlock
+fi
+# A path holding a `..` component leaves $work whatever its prefix: fx_lock, fx_unlock and fx_git
+# refuse it, and the file outside keeps its mode (the lib sourced alone, its work directory
+# beside that file).
+mkdir -p "$work/fx-dot/in"
+git init -q "$work/fx-dot/repo"
+: >"$work/fx-dot/outside"
+expect_red_because "fx_lock: a path holding a .. component is refused" \
+    "fx_lock: '$work/fx-dot/in/../outside' is not a fixture path under" \
+    bash -c '. "$1"; work=$2; fx_lock "$3"' fx "$SCRIPT_DIR/selftest-lib.sh" "$work/fx-dot/in" \
+    "$work/fx-dot/in/../outside"
+expect_red_because "fx_git: a root holding a .. component is refused" \
+    "fx_git: '$work/fx-dot/in/../repo' is not a fixture directory under" \
+    bash -c '. "$1"; work=$2; fx_git "$3" status' fx "$SCRIPT_DIR/selftest-lib.sh" \
+    "$work/fx-dot/in" "$work/fx-dot/in/../repo"
+if [ "$(id -u)" -ne 0 ]; then
+expect green "fx_lock: the file outside a refused .. path keeps its mode" test -r "$work/fx-dot/outside"
+fx_lock "$work/fx-dot/outside"
+expect_output "fx_unlock: a recorded path holding a .. component is named, not unlocked" \
+    "fx_unlock: '$work/fx-dot/in/../outside' is not a fixture path under" \
+    bash -c '. "$1"; work=$2; FX_LOCKED="$3"; fx_unlock' fx "$SCRIPT_DIR/selftest-lib.sh" \
+    "$work/fx-dot/in" "$work/fx-dot/in/../outside"
+expect green "fx_unlock: the file outside a refused .. path keeps its mode" \
+    test ! -r "$work/fx-dot/outside"
+fx_unlock
+fi
+# A link under $work to a path outside it leaves $work too, whether it is the path's parent or
+# the path itself: each helper resolves the path physically and refuses it, and the file
+# outside keeps its mode (the lib sourced alone, its work directory beside the targets).
+mkdir -p "$work/fx-link/in" "$work/fx-link/out"
+git init -q "$work/fx-link/repo"
+: >"$work/fx-link/out/f"
+ln -s ../out "$work/fx-link/in/dir"
+ln -s ../out/f "$work/fx-link/in/file"
+ln -s ../repo "$work/fx-link/in/repo"
+fx_link() { # <code> <path>: the lib sourced alone, $work at fx-link/in, <code> run on <path>
+    bash -c '. "$1"; work=$2; path=$3; eval "$4"' fx "$SCRIPT_DIR/selftest-lib.sh" \
+        "$work/fx-link/in" "$2" "$1"
+}
+expect_red_because "fx_lock: a path under a link to a directory outside \$work is refused" \
+    "fx_lock: '$work/fx-link/in/dir/f' is not a fixture path under" fx_link 'fx_lock "$path"' \
+    "$work/fx-link/in/dir/f"
+expect_red_because "fx_lock: a link to a file outside \$work is refused" \
+    "fx_lock: '$work/fx-link/in/file' is not a fixture path under" fx_link 'fx_lock "$path"' \
+    "$work/fx-link/in/file"
+expect_red_because "fx_git: a link to a repository outside \$work is refused" \
+    "fx_git: '$work/fx-link/in/repo' is not a fixture directory under" fx_link 'fx_git "$path" status' \
+    "$work/fx-link/in/repo"
+if [ "$(id -u)" -ne 0 ]; then
+expect green "fx_lock: the file behind a refused link keeps its mode" test -r "$work/fx-link/out/f"
+fx_lock "$work/fx-link/out/f"
+expect_output "fx_unlock: a recorded path under a link out of \$work is named, not unlocked" \
+    "fx_unlock: '$work/fx-link/in/dir/f' is not a fixture path under" \
+    fx_link 'FX_LOCKED="$path"; fx_unlock' "$work/fx-link/in/dir/f"
+expect green "fx_unlock: the file behind a refused link keeps its mode" test ! -r "$work/fx-link/out/f"
+fx_unlock
+fi
 }
 
 group_stage() {
@@ -460,10 +658,10 @@ group_stage() {
 # its own beside a copy of the stage and its take. Every run unsets the job
 # pool the self-test may inherit, so its width is the one planted, unless the
 # case plants a pool of its own.
-stg_dir() { # <name>: a scripts directory holding the stage and its take
+stg_dir() { # <name>: a scripts directory holding the stage and its take, the whole scripts/
     local dir="$work/stg-$1/scripts"
     mkdir -p "$dir"
-    cp "$SCRIPT_DIR/check-stage.sh" "$SCRIPT_DIR/job_token.py" "$dir/"
+    cp -R "$SCRIPT_DIR/." "$dir/"
     echo "$dir"
 }
 stg_gate() { # <dir> <name> <line…>: the executable gate check-<name>.sh holding those lines
@@ -774,6 +972,51 @@ fixture() {
 # scope assertion refuses; each group that reads it builds it.
 fx_build_empty() { mkdir -p "$work/empty/crates"; }
 
+# fx_walk_lock <label> <why> <root> <locked> <file> <line> <gate…>: a gate's walk that fails
+# fails the gate, never a shorter scan. <line> goes into <locked>/<file> under the fixture
+# <root> (into <locked> itself, a file, when <file> is empty), <locked> is set to mode 000
+# (fx_lock), and the gate, run as <gate…> with INF_CHECK_ROOT=<root>, is red naming <why>. A
+# walk that skips what it cannot read reads the file as absent, so a violation planted there
+# reads green. Skipped as root, which reads through mode 000.
+fx_walk_lock() {
+    local label=$1 why=$2 root=$3 locked=$4 file=$5 line=$6 path
+    shift 6
+    [ "$(id -u)" -ne 0 ] || return 0
+    path="$root/$locked${file:+/$file}"
+    mkdir -p "$(dirname "$path")"
+    printf '%s\n' "$line" >"$path"
+    fx_lock "$root/$locked"
+    expect_red_because "$label" "$why" env INF_CHECK_ROOT="$root" "$@"
+    fx_unlock
+}
+# fx_held <label> <why> <root> <dir> <file> <line> <gate…>: a file git tracks, under a directory
+# the gate can list but not search. <line> goes into <dir>/<file> under the fixture repository
+# <root>, which commits that file alone; <dir> is set to 0400 (fx_lock), and the gate, run as
+# <gate…> with INF_CHECK_ROOT=<root>, is red naming <why>. Git lists the file and warns nothing,
+# and a test of it there answers "not there", so a gate that reads that as gone from the work
+# tree reads green. Skipped as root, which reads through mode 0400.
+fx_held() {
+    local label=$1 why=$2 root=$3 dir=$4 file=$5 line=$6
+    shift 6
+    [ "$(id -u)" -ne 0 ] || return 0
+    mkdir -p "$root/$dir"
+    printf '%s\n' "$line" >"$root/$dir/$file"
+    fx_git "$root" add -- "$dir/$file"
+    fx_git "$root" -c user.name=t -c user.email=t@t commit -q -m held
+    fx_lock "$root/$dir" 400
+    expect_red_because "$label" "$why" env INF_CHECK_ROOT="$root" "$@"
+    fx_unlock
+}
+# fx_scripts_copy <name>: the whole scripts/ directory copied to $work/<name>, so a copy of a gate
+# reads every file the gate reads: a list of them would leave each copy dying on the next
+# import, and every planted red it carries red for that reason.
+fx_scripts_copy() {
+    [ -n "$1" ] && [ -n "$work" ] || { echo "fx_scripts_copy: empty name or work dir" >&2; exit 2; }
+    rm -rf "${work:?}/${1:?}"
+    mkdir -p "$work/$1"
+    cp -R "$SCRIPT_DIR/." "$work/$1/"
+}
+
 # fx_root_key <dir>: the target-root key of a checkout at <dir>, the first 16
 # hex digits of SHA-256 of its physical path, read by coreutils' sha256sum or
 # perl's shasum: an oracle that shares no code with scripts/target-root.sh.
@@ -945,6 +1188,22 @@ pub fn t() -> std::time::Instant { std::time::Instant::now() }
 EOF
 root=$(printf '%s' "$body" | fixture unterminated)
 expect red "deny-list: an unterminated test module is a scope error" env INF_CHECK_ROOT="$root" $DENY
+
+# A violation under a directory the walk cannot read fails the gate: one under the crate's src/
+# (the file walk fails) and a crate directory (the crate set, tree_dirs, fails).
+deny_sleep='pub fn t() { std::thread::sleep(std::time::Duration::from_millis(1)); }'
+root=$(fixture deny-locked-src <<<'pub fn ok() {}')
+fx_walk_lock "deny-list: a directory the walk cannot read fails the gate" \
+    "DENY-LIST SCOPE ERROR: the walk of crates/fake/src failed" \
+    "$root" crates/fake/src/locked bad.rs "$deny_sleep" $DENY
+root=$(fixture deny-locked-crate <<<'pub fn ok() {}')
+fx_walk_lock "deny-list: a crate directory the walk cannot search fails the gate" \
+    "DENY-LIST SCOPE ERROR: the cell crate set is unknown" \
+    "$root" crates/locked src/lib.rs "$deny_sleep" $DENY
+root=$(fixture deny-locked-file <<<'pub fn ok() {}')
+fx_walk_lock "deny-list: a listed file the gate cannot read fails the gate" \
+    "DENY-LIST SCOPE ERROR: crates/fake/src/z.rs cannot be read" \
+    "$root" crates/fake/src/z.rs '' "$deny_sleep" $DENY
 }
 
 # --------------------------------------------------------------- panic policy
@@ -1018,6 +1277,21 @@ expect red "panic-policy: a bare marker without a reason fails" env INF_CHECK_RO
 
 fx_build_empty
 expect red "panic-policy: no crates at all is a failure, not OK" env INF_CHECK_ROOT="$work/empty" $PANIC
+
+# A violation under a directory the walk cannot read fails the gate: one under the crate's src/
+# (the file walk fails) and a crate directory (the crate set, tree_dirs, fails).
+root=$(fixture panic-locked-src <<<'pub fn ok() {}')
+fx_walk_lock "panic-policy: a directory the walk cannot read fails the gate" \
+    "PANIC-POLICY SCOPE ERROR: the walk of crates/fake/src failed" \
+    "$root" crates/fake/src/locked bad.rs 'pub fn t(v: Option<u8>) -> u8 { v.unwrap() }' $PANIC
+root=$(fixture panic-locked-crate <<<'pub fn ok() {}')
+fx_walk_lock "panic-policy: a crate directory the walk cannot search fails the gate" \
+    "PANIC-POLICY SCOPE ERROR: the cell crate set is unknown" \
+    "$root" crates/locked src/lib.rs 'pub fn t(v: Option<u8>) -> u8 { v.unwrap() }' $PANIC
+root=$(fixture panic-locked-file <<<'pub fn ok() {}')
+fx_walk_lock "panic-policy: a listed file the gate cannot read fails the gate" \
+    "PANIC-POLICY SCOPE ERROR: crates/fake/src/z.rs cannot be read" \
+    "$root" crates/fake/src/z.rs '' 'pub fn t(v: Option<u8>) -> u8 { v.unwrap() }' $PANIC
 }
 
 # ------------------------------------------------------------ reply outcome
@@ -1598,6 +1872,18 @@ root=$(ro_fixture rolibonly <<<"pub fn ok() {}")
 expect_output "reply-outcome: the OK line names each row whose file is not in the scan" \
     "rows not judged, file not in the scan: crates/inf-server/src/plane/fabric.rs:wire_reply, crates/inf-server/src/plane/fabric.rs:owned_outcome, crates/inf-server/src/plane/scatter.rs:stages)" \
     env INF_CHECK_ROOT="$root" $REPLY
+# A byte read under a directory the walk cannot read fails the gate, never a shorter scan.
+root=$(ro_fixture rolocked <<<"pub fn ok() {}")
+fx_walk_lock "reply-outcome: a directory the walk cannot read fails the gate" \
+    "REPLY-OUTCOME SCOPE ERROR: the walk of crates/inf-server/src failed" \
+    "$root" crates/inf-server/src/locked bad.rs "pub fn t(b: &[u8]) -> bool { b.first() == Some(&b'-') }" \
+    $REPLY
+# A listed file the gate cannot read fails it, never a scan cut short after lib.rs.
+root=$(ro_fixture rolockedfile <<<"pub fn ok() {}")
+fx_walk_lock "reply-outcome: a listed file the gate cannot read fails the gate" \
+    "REPLY-OUTCOME SCOPE ERROR: crates/inf-server/src/z.rs cannot be read" \
+    "$root" crates/inf-server/src/z.rs '' "pub fn t(b: &[u8]) -> bool { b.first() == Some(&b'-') }" \
+    $REPLY
 }
 
 # -------------------------------------------------------------- node spawn
@@ -1724,6 +2010,12 @@ ns_case() {
     expect_red_because "node-spawn: $label" "$pattern" ns "$NS_ROOT"
     ns_reset
 }
+# Git reads a directory it cannot open as empty, with a warning and exit 0: an untracked
+# directory it cannot open fails the scan (git_listing), never a shorter one.
+fx_walk_lock "node-spawn: an untracked directory git cannot open fails the scan" \
+    "NODE-SPAWN SCOPE ERROR: git ls-files failed or wrote to stderr" "$NS_ROOT" \
+    crates/fx/tests/locked plant.rs 'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");' "$NS"
+ns_reset
 ns_case 'env!("CARGO_BIN_EXE_infinityd") is rule 1' "$P:1: rule 1," \
     <<<'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");'
 ns_case 'std::env::var("NEXTEST_BIN_EXE_infinityd") is rule 1' "$P:2: rule 1," <<'EOF'
@@ -2353,6 +2645,11 @@ mkdir -p "$NS_ROOT/bins/inf-bench/src" "$NS_ROOT/bins/inf-compare/src"
 expect_red_because "node-spawn: every listed file empty, the blanker reading no line, is a scope error" \
     "SCOPE ERROR: the blanker read no line" ns "$NS_ROOT"
 NS_ROOT="$NSW/base"
+# A tracked file under a directory the gate can list but not search is not gone from the work
+# tree: git's own `--deleted` listing fails on it, and the scan with it.
+fx_held "node-spawn: a tracked file the gate cannot stat is a scope error, not a path gone" \
+    "NODE-SPAWN SCOPE ERROR: git ls-files --deleted failed or wrote to stderr" "$NS_ROOT" \
+    crates/fx/tests/held plant.rs 'pub const B: &str = env!("CARGO_BIN_EXE_infinityd");' "$NS"
 }
 
 # ------------------------------------------------------------ refusal text
@@ -2416,6 +2713,18 @@ expect_red_because "refusal-text: an empty file set is a scope error" "REFUSAL-T
     env INF_CHECK_ROOT="$work/rtempty" $REFUSAL
 fx_build_empty
 expect red "refusal-text: a missing directory is a scope error" env INF_CHECK_ROOT="$work/empty" $REFUSAL
+# A suffix under a directory the walk cannot read fails the gate, never a shorter scan.
+root=$(rt_fixture rtlocked <<<'pub fn ok() {}')
+fx_walk_lock "refusal-text: a directory the walk cannot read fails the gate" \
+    "REFUSAL-TEXT SCOPE ERROR: the walk of crates/inf-server/src failed" \
+    "$root" crates/inf-server/src/locked bad.rs 'pub const E: &str = "ERR planted limit reached";' \
+    $REFUSAL
+# A listed file the gate cannot read fails it, never a scan cut short where its count failed: the
+# file sorts after lib.rs, so a cut scan has read one file and would print OK.
+root=$(rt_fixture rtlockedfile <<<'pub fn ok() {}')
+fx_walk_lock "refusal-text: a listed file the gate cannot read fails the gate" \
+    "REFUSAL-TEXT SCOPE ERROR: crates/inf-server/src/z.rs cannot be read" \
+    "$root" crates/inf-server/src/z.rs '' 'pub const E: &str = "ERR planted limit reached";' $REFUSAL
 }
 
 # ---------------------------------------------------------------- run-sweep
@@ -2698,6 +3007,160 @@ printf '%s' "$ship_normal" >"$root/crates/locked/Cargo.toml"
 fx_lock "$root/crates/locked"
 expect_red_because "shipping: a directory the walk cannot read fails the fence" \
     "SHIPPING-FEATURE SCOPE ERROR: the walk of crates/ failed" env INF_CHECK_ROOT="$root" $SHIP
+fx_unlock
+fi
+}
+
+# ------------------------------------------------------------ the source walks
+group_source_walks() {
+# The gates' walks, called directly: scripts/source-files.sh's tree_dirs, and
+# scripts/source_files.py's listing, tree_listing and subdirectories. Each lists
+# what the form it replaces lists (a glob of crate directories; pathlib's glob,
+# rglob and an iterdir loop over crate directories) and fails closed on a
+# directory it cannot read, which that form reads as empty.
+sw="$work/sw"
+mkdir -p "$sw/crates/a/src" "$sw/crates/b" "$sw/crates/c/src" "$sw/crates/.hidden/src" \
+    "$sw/tree/d/sub.rs/inner" "$sw/tree/e"
+: >"$sw/crates/f.txt"
+: >"$sw/tree/d/a.rs"
+: >"$sw/tree/d/.h.rs"
+: >"$sw/tree/d/B.RS"
+: >"$sw/tree/d/sub.rs/inner/x.rs"
+ln -s a.rs "$sw/tree/d/l.rs"
+ln -s sub.rs "$sw/tree/d/linked.rs"
+ln -s ../tree/d "$sw/crates/linked"
+# sw_dirs <want> <sub> <top>…: tree_dirs, run from $sw, prints exactly <want>.
+sw_dirs() {
+    local want=$1 got
+    shift
+    got=$(cd "$sw" && . "$SCRIPT_DIR/source-files.sh" && tree_dirs "$@") || return
+    [ "$got" = "$want" ] || { echo "tree_dirs $*: printed [$got], not [$want]"; return 1; }
+}
+# sw_dirs_silent <sub> <top>…: tree_dirs fails, status 2, and prints nothing on stdout.
+sw_dirs_silent() {
+    local got status=0
+    got=$(cd "$sw" && . "$SCRIPT_DIR/source-files.sh" && tree_dirs "$@") || status=$?
+    [ "$status" -eq 2 ] && [ -z "$got" ]
+}
+# sw_dirs_in <dir> <sub> <top>…: tree_dirs, run from <dir>.
+sw_dirs_in() {
+    local dir=$1
+    shift
+    (cd "$dir" && . "$SCRIPT_DIR/source-files.sh" && tree_dirs "$@")
+}
+# sw_py <mode> <path>: the Python helper <mode> names, on <path> from $sw; `same` compares
+# each helper with the pathlib form it replaces. A WalkError is printed, and status 1.
+sw_py() {
+    (cd "$sw" && python3 -I - "$SCRIPT_DIR" "$@" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from source_files import WalkError, listing, subdirectories, tree_listing
+mode, path = sys.argv[2], sys.argv[3]
+try:
+    if mode == "same":
+        pairs = [(sorted(Path(path).glob("*.rs")), listing(path, "*.rs")),
+                 (sorted(Path("tree").rglob("*.rs")), tree_listing("tree", "*.rs")),
+                 (sorted(c for c in Path("crates").iterdir() if c.is_dir()),
+                  subdirectories("crates"))]
+        for want, got in pairs:
+            if want != got:
+                sys.exit(f"helper listed {got}, the pathlib form {want}")
+        print("same:", ", ".join(str(len(got)) for _, got in pairs))
+    else:
+        print({"listing": listing, "subdirs": subdirectories,
+               "tree": lambda p: tree_listing(p, "*.rs")}[mode](path))
+except WalkError as err:
+    print(f"WalkError: {err}")
+    sys.exit(1)
+PY
+    )
+}
+expect green "source walks: tree_dirs lists each crate's src/ in glob order, never a file or a hidden one" \
+    sw_dirs "crates/a/src
+crates/c/src" src crates
+expect green "source walks: tree_dirs . lists each crate directory, a link to one included" \
+    sw_dirs "crates/a
+crates/b
+crates/c
+crates/linked" . crates
+expect green "source walks: a top that is not a directory adds nothing" sw_dirs "" src nowhere
+expect_output "source walks: listing, tree_listing and subdirectories list what glob, rglob and iterdir do" \
+    "same: 5, 6, 5" sw_py same tree/d
+mkdir -p "$sw/nl/crates/"$'two\nlines'"/src"
+expect_red_because "source walks: tree_dirs refuses a directory name holding a newline" \
+    "SOURCE-FILES SCOPE ERROR: a directory under crates holds a newline" sw_dirs_in "$sw/nl" src crates
+if [ "$(id -u)" -ne 0 ]; then
+fx_lock "$sw/crates/b"
+expect_red_because "source walks: tree_dirs fails on a crate directory it cannot search" \
+    "SOURCE-FILES SCOPE ERROR: crates/b cannot be searched" sw_dirs "" src crates
+expect green "source walks: tree_dirs prints nothing when it fails" sw_dirs_silent src crates
+expect_red_because "source walks: subdirectories fails on a directory it cannot search" \
+    "WalkError: crates/b cannot be searched" sw_py subdirs crates
+fx_unlock
+# A top it can list but not search: each entry's probe would answer False, the walk empty.
+fx_lock "$sw/crates" 400
+expect_red_because "source walks: subdirectories fails on a top it can list but not search" \
+    "WalkError: crates/[^ ]* cannot be read (Permission denied)" sw_py subdirs crates
+fx_unlock
+fx_lock "$sw/crates"
+expect_red_because "source walks: tree_dirs fails on a top it cannot read" \
+    "SOURCE-FILES SCOPE ERROR: crates cannot be read" sw_dirs "" src crates
+fx_unlock
+fx_lock "$sw/tree/e"
+expect_red_because "source walks: listing fails on a directory it cannot read" \
+    "WalkError: tree/e cannot be read" sw_py listing tree/e
+expect_red_because "source walks: tree_listing fails on a directory below it that it cannot read" \
+    "WalkError: tree/e cannot be read" sw_py tree tree
+fx_unlock
+fi
+# git_listing, in each language, on a repository of untracked files: the listing passes git's
+# stdout through, a status the caller allows is kept, and a git that writes to stderr (as it
+# does, with exit 0, for a directory it cannot open) fails.
+mkdir -p "$sw/repo/a" "$sw/repo/locked"
+git init -q "$sw/repo"
+: >"$sw/repo/a/one.rs"
+: >"$sw/repo/locked/two.rs"
+# sw_git <git args…>: the shell helper, run in the repository.
+sw_git() { (cd "$sw/repo" && . "$SCRIPT_DIR/source-files.sh" && git_listing "$@"); }
+# sw_git_names <git args…>: sw_git, a NUL-separated listing read one space apart.
+sw_git_names() { sw_git "$@" | tr '\0' ' '; }
+# sw_git_py <ok…> -- <git args…>: the Python helper, the names of its NUL-separated stdout
+# printed one space apart.
+sw_git_py() {
+    (cd "$sw/repo" && python3 -I - "$SCRIPT_DIR" "$@" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from source_files import WalkError, git_listing
+split = sys.argv.index("--")
+ok = tuple(int(code) for code in sys.argv[2:split])
+try:
+    found = git_listing(*sys.argv[split + 1:], ok=ok).split(b"\0")
+    print(" ".join(sorted(name.decode() for name in found if name)))
+except WalkError as err:
+    print(f"WalkError: {err}")
+    sys.exit(1)
+PY
+    )
+}
+expect_output "source walks: git_listing passes git's listing through" "a/one.rs locked/two.rs" \
+    sw_git_names ls-files -z --cached --others --exclude-standard
+expect_output "source walks: the Python git_listing returns git's listing" "a/one.rs locked/two.rs" \
+    sw_git_py 0 -- ls-files -z --cached --others --exclude-standard
+expect red "source walks: git_listing keeps git's own status (grep finding nothing)" \
+    sw_git grep -q no-such-text
+expect_red_because "source walks: the Python git_listing refuses a status outside ok" \
+    "WalkError: git grep -q no-such-text exited 1" sw_git_py 0 -- grep -q no-such-text
+expect green "source walks: the Python git_listing keeps a status inside ok" \
+    sw_git_py 0 1 -- grep -q no-such-text
+if [ "$(id -u)" -ne 0 ]; then
+fx_lock "$sw/repo/locked"
+expect_red_because "source walks: git_listing fails on git's warning for a directory it cannot open" \
+    "SOURCE-FILES SCOPE ERROR: git ls-files .* wrote to stderr (exit 0)" \
+    sw_git ls-files -z --cached --others --exclude-standard
+expect_red_because "source walks: the Python git_listing fails on that warning" \
+    "WalkError: git ls-files .* wrote to stderr (exit 0)" \
+    sw_git_py 0 -- ls-files -z --cached --others --exclude-standard
 fx_unlock
 fi
 }
@@ -3491,8 +3954,9 @@ builds_lane() { # <name> <row>…: a fixture checkout with the lane, its rows, a
     dir="$work/$1"
     shift
     mkdir -p "$dir/scripts" "$dir/.config"
-    cp "$SCRIPT_DIR/sim-canaries.sh" "$SCRIPT_DIR/target-root.sh" "$SCRIPT_DIR/check-nextest-config.sh" \
-        "$dir/scripts/"
+    # The whole scripts/ directory, so the lane and every gate it runs read what they read in the
+    # tree: a list of the files would leave the copy dying on the next import.
+    cp -R "$SCRIPT_DIR/." "$dir/scripts/"
     printf '%s\n' "$@" >"$dir/rows"
     printf '%s\n' '[profile.default]' 'leak-timeout = { period = "100ms", result = "fail" }' \
         >"$dir/.config/nextest.toml"
@@ -4239,6 +4703,33 @@ inventory "$root" <<'EOF'
 # nothing: debug asserts are not release sites
 EOF
 expect red "release-asserts: an inventory with no rows is a scope failure" env INF_CHECK_ROOT="$root" $RELEASE
+
+# A site under a directory the walk cannot read fails the gate: one under the crate's src/ (the
+# file walk fails) and a crate directory (the crate set, tree_dirs, fails). Read, each is a
+# site the inventory lacks.
+for ra_case in src crate; do
+    root=$(fixture "ra-locked-$ra_case" <<<'pub fn ok(n: u64) -> u64 { assert!(n > 0, "n is positive"); n }')
+    inventory "$root" <<'EOF'
+I	1	crates/fake/src/lib.rs	assert	n is positive	own argument check
+EOF
+    if [ "$ra_case" = src ]; then
+        fx_walk_lock "release-asserts: a directory the walk cannot read fails the gate" \
+            "RELEASE-ASSERT SCOPE ERROR: the walk of crates/fake/src failed" "$root" \
+            crates/fake/src/locked bad.rs 'pub fn t() { assert!(true, "planted"); }' $RELEASE
+    else
+        fx_walk_lock "release-asserts: a crate directory the walk cannot search fails the gate" \
+            "RELEASE-ASSERT SCOPE ERROR: the cell crate set is unknown" "$root" \
+            crates/locked src/lib.rs 'pub fn t() { assert!(true, "planted"); }' $RELEASE
+    fi
+done
+# A listed file the gate cannot read fails it, never a census cut short after lib.rs.
+root=$(fixture ra-locked-file <<<'pub fn ok(n: u64) -> u64 { assert!(n > 0, "n is positive"); n }')
+inventory "$root" <<'EOF'
+I	1	crates/fake/src/lib.rs	assert	n is positive	own argument check
+EOF
+fx_walk_lock "release-asserts: a listed file the gate cannot read fails the gate" \
+    "RELEASE-ASSERT SCOPE ERROR: crates/fake/src/z.rs cannot be read" "$root" crates/fake/src/z.rs '' \
+    'pub fn t() { assert!(true, "planted"); }' $RELEASE
 }
 
 # ---------------------------------------------------------------- clock ban
@@ -4269,6 +4760,24 @@ cp clippy.toml "$root/clippy.toml"
 printf 'disallowed-methods = []\n' >"$root/crates/fake/clippy.toml"
 expect red "clock-ban: a shadow clippy.toml in a crate directory is red" env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 [ -n "$root" ] && rm -f "$root/crates/fake/clippy.toml"
+# A shadow config in a crate directory the walk cannot search fails the gate: the probe for it
+# would read the refusal as absence.
+root=$(clock_fixture clock-locked <<<'pub fn ok() -> u64 { 1 }')
+fx_walk_lock "clock-ban: a crate directory the walk cannot search fails the gate" \
+    "CLOCK-BAN SCOPE ERROR: the directories under bins/ are unknown" \
+    "$root" bins/locked clippy.toml 'disallowed-methods = []' env INF_CLOCK_BAN_PROBE=off $CLOCK
+# The source count's walk that fails, and the cell crate set that fails, each name the gate's
+# scope error.
+root=$(clock_fixture clock-locked-src <<<'pub fn ok() -> u64 { 1 }')
+fx_walk_lock "clock-ban: a directory the count's walk cannot read fails the gate" \
+    "CLOCK-BAN SCOPE ERROR: the walk of crates/fake/src failed" \
+    "$root" crates/fake/src/locked a.rs 'pub fn a() {}' env INF_CLOCK_BAN_PROBE=off $CLOCK
+root=$(clock_fixture clock-stale <<<'pub fn ok() -> u64 { 1 }')
+first=${CELL_CRATE_EXCLUDE[0]%%|*}
+[ -n "$first" ] && [ -n "$root" ] && [ -d "$root/$first" ] && rm -rf "$root/$first"
+expect_red_because "clock-ban: a cell crate set that cannot be read (a stale exclusion) fails the gate" \
+    "CLOCK-BAN SCOPE ERROR: the cell crate set is unknown" \
+    env INF_CHECK_ROOT="$root" INF_CLOCK_BAN_PROBE=off $CLOCK
 
 # Suppression plants moved to the generated lint-scopes matrix below, the
 # single owner of all classes and scopes (ADR-0144 I8).
@@ -4557,9 +5066,9 @@ expect_output "waker probe: the arm64 Linux shape is 8 plants red, 3 controls gr
 expect green "waker probe: the arm64 Linux shape passes" env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 # The controls are exact: a probe copy with both control lines deleted is red.
 mkdir -p "$work/wk/scripts"
-cp scripts/check-waker-atomics.sh scripts/asm-waker-scan.awk scripts/probe-target.sh \
-    scripts/source-files.sh "$work/wk/scripts/"
-cp -R scripts/waker-atomics-probe "$work/wk/scripts/"
+# The whole scripts/ directory, the probe among it: a list of the files the gate reads would
+# leave the copy dying on the next one.
+cp -R scripts/. "$work/wk/scripts/"
 sed -i.bak '/WAKER-PROBE: expect-clean/d; /WAKER-PROBE: expect-unscanned/d' \
     "$work/wk/scripts/waker-atomics-probe/src/lib.rs"
 expect_red_because "waker probe: a probe whose controls were deleted is red" \
@@ -4768,6 +5277,24 @@ mod tests {
     fn f() { inf_foundation::fault::fire(crate::fault::P_ONE); }
 }' 'fn t() { fault::arm(fake::fault::P_ONE, FaultSpec::Nth(1)); }')
 expect red "fault-points: a fire site that exists only in a test module is unwired" env INF_CHECK_ROOT="$root" $FAULTS
+
+# A file the gate cannot read fails it, never a shorter scan: one under a directory of a crate's
+# src/ (the file walk fails), a crate directory (tree_dirs fails) and a listed file grep cannot
+# read. Each holds no evidence, so a walk that skips it reads green.
+for fp_case in src crate file; do
+    root=$(fault_fixture "fp-locked-$fp_case" "$DECL" "$FIRE" 'fn t() { fault::arm(fake::fault::P_ONE, FaultSpec::Nth(1)); }')
+    case $fp_case in
+    src) fx_walk_lock "fault-points: a directory the walk cannot read fails the gate" \
+        "FAULT SCOPE ERROR: the walk of crates/fake/src failed" "$root" crates/fake/src/locked \
+        helper.rs 'pub fn helper() {}' $FAULTS ;;
+    crate) fx_walk_lock "fault-points: a crate directory the walk cannot search fails the gate" \
+        "FAULT SCOPE ERROR: the directories under crates/ are unknown" "$root" crates/locked \
+        src/lib.rs 'pub fn helper() {}' $FAULTS ;;
+    file) fx_walk_lock "fault-points: a listed file grep cannot read fails the gate" \
+        "FAULT SCOPE ERROR: crates/fake/src/helper.rs cannot be read" "$root" \
+        crates/fake/src/helper.rs '' 'pub fn helper() {}' $FAULTS ;;
+    esac
+done
 }
 
 # ---------------------------------------------------- fsync fail-stop (D10)
@@ -4926,6 +5453,24 @@ impl Commit {
 RS
 )
 expect red "fsync-fail-stop: a marker separated from the site by code guards nothing" env INF_CHECK_ROOT="$root" $FSYNC
+# A discarded sync under a directory the walk cannot read fails the gate: one under a crate's
+# src/ (the file walk fails) and a crate directory under bins/ (tree_dirs fails).
+fs_discard='pub fn seal(file: &mut std::fs::File) { let _ = file.sync_data(); }'
+root=$(fsync_fixture fs-locked-src <<<'pub fn ok() -> u64 { 1 }')
+fx_walk_lock "fsync-fail-stop: a directory the walk cannot read fails the gate" \
+    "FSYNC SCOPE ERROR: the walk of crates/fake/src failed" \
+    "$root" crates/fake/src/locked bad.rs "$fs_discard" $FSYNC
+root=$(fsync_fixture fs-locked-crate <<<'pub fn ok() -> u64 { 1 }')
+fx_walk_lock "fsync-fail-stop: a crate directory the walk cannot search fails the gate" \
+    "FSYNC SCOPE ERROR: the directories under bins/ are unknown" \
+    "$root" bins/locked src/main.rs "$fs_discard" $FSYNC
+# A listed file the gate cannot read fails it, never a scan cut short: a binary's file, which only
+# the site scan reads, after its main.rs.
+root=$(fsync_fixture fs-locked-file <<<'pub fn ok() -> u64 { 1 }')
+mkdir -p "$root/bins/x/src"
+printf 'fn main() {}\n' >"$root/bins/x/src/main.rs"
+fx_walk_lock "fsync-fail-stop: a listed file the gate cannot read fails the gate" \
+    "FSYNC SCOPE ERROR: bins/x/src/z.rs cannot be read" "$root" bins/x/src/z.rs '' "$fs_discard" $FSYNC
 }
 
 # ------------------------------------------------- unsafe roots (batch 44)
@@ -5003,6 +5548,25 @@ expect red "unsafe-roots: a manifest with no crate root is a scope error" env IN
 mkdir -p "$work/ur-empty/crates" "$work/ur-empty/bins" "$work/ur-empty/tests"
 expect red "unsafe-roots: zero crate roots is a scope error" env INF_CHECK_ROOT="$work/ur-empty" INF_UNSAFE_LEAVES="" $ROOTS
 expect red "unsafe-roots: a missing top-level directory is a scope error" env INF_CHECK_ROOT="$work/ur-empty/crates" INF_UNSAFE_LEAVES="" $ROOTS
+
+# A file the gate must read, under a directory the walk cannot read, fails the gate: a directory
+# of a crate's src/ (the walk of its files), a crate directory (its probe for Cargo.toml) and
+# src/bin (the listing of its roots). Read, each is red: an allow on no module, or a root that
+# carries no attribute.
+root=$(unsafe_fixture ur-locked-src safe '#![forbid(unsafe_code)]')
+fx_walk_lock "unsafe-roots: a directory the walk cannot read fails the gate" \
+    "UNSAFE ROOTS SCOPE ERROR: crates/safe/src/locked cannot be read" "$root" \
+    crates/safe/src/locked m.rs '#[allow(unsafe_code)] fn f() {}' env INF_UNSAFE_LEAVES="" $ROOTS
+root=$(unsafe_fixture ur-locked-crate safe '#![forbid(unsafe_code)]')
+mkdir -p "$root/crates/locked"
+printf '[package]\nname = "locked"\n' >"$root/crates/locked/Cargo.toml"
+fx_walk_lock "unsafe-roots: a crate directory the walk cannot search fails the gate" \
+    "UNSAFE ROOTS SCOPE ERROR: crates/locked cannot be searched" "$root" \
+    crates/locked src/lib.rs 'pub fn f() {}' env INF_UNSAFE_LEAVES="" $ROOTS
+root=$(unsafe_fixture ur-locked-bin safe '#![forbid(unsafe_code)]')
+fx_walk_lock "unsafe-roots: a src/bin the walk cannot read fails the gate" \
+    "UNSAFE ROOTS SCOPE ERROR: crates/safe/src/bin cannot be read" "$root" \
+    crates/safe/src/bin tool.rs 'fn main() {}' env INF_UNSAFE_LEAVES="" $ROOTS
 }
 
 # ---------------------------------------------- safety inventory (batch 44)
@@ -5018,6 +5582,26 @@ printf '| `src/m.rs` | invariant | coverage |\n' >"$root/crates/leaf/SAFETY.md"
 expect green "safety-inventory: the file named by its exact path" env INF_CHECK_ROOT="$root" $INVENTORY
 printf '| `src/m.rs.old` | invariant | coverage |\n' >"$root/crates/leaf/SAFETY.md"
 expect red "safety-inventory: a path that only contains the file name is not naming it" env INF_CHECK_ROOT="$root" $INVENTORY
+# An unsafe file no SAFETY.md names, under a directory the walk cannot read, fails the gate: a
+# directory of a crate's src/ and a crate directory.
+root=$(unsafe_fixture si-locked-src safe 'pub fn f() {}')
+fx_walk_lock "safety-inventory: a directory the walk cannot read fails the gate" \
+    "SAFETY INVENTORY SCOPE ERROR: crates/safe/src/locked cannot be read" "$root" \
+    crates/safe/src/locked m.rs 'pub unsafe fn f() {}' $INVENTORY
+root=$(unsafe_fixture si-locked-crate safe 'pub fn f() {}')
+fx_walk_lock "safety-inventory: a crate directory the walk cannot search fails the gate" \
+    "SAFETY INVENTORY SCOPE ERROR: crates/locked cannot be searched" "$root" \
+    crates/locked src/lib.rs 'pub unsafe fn f() {}' $INVENTORY
+# A top it can list but not search (bins/ at 0400) fails the gate: its unsafe file is unread.
+if [ "$(id -u)" -ne 0 ]; then
+root=$(unsafe_fixture si-unsearchable-top safe 'pub fn f() {}')
+mkdir -p "$root/bins/x/src"
+printf 'pub unsafe fn f() {}\n' >"$root/bins/x/src/lib.rs"
+fx_lock "$root/bins" 400
+expect_red_because "safety-inventory: a top the walk can list but not search fails the gate" \
+    "SAFETY INVENTORY SCOPE ERROR: bins/x cannot be read" env INF_CHECK_ROOT="$root" $INVENTORY
+fx_unlock
+fi
 }
 
 # --------------------------------------------- style limits (ADR-0125, batch 64)
@@ -5102,6 +5686,27 @@ printf 'fn g() {}\n' >"$root/crates/fake/src/locked/g.rs"
 fx_lock "$root/crates/fake/src/locked"
 expect_red_because "line-width: a directory the walk cannot read fails the gate" \
     "LINE-WIDTH SCOPE: source_files" env INF_CHECK_ROOT="$root" $LINEW
+fx_unlock
+fi
+# The same for file-length's walk: a directory of a crate's src/ and a crate directory, each
+# holding a file the gate must count.
+root=$(style_root fl-locked-src)
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+fx_walk_lock "file-length: a directory the walk cannot read fails the gate" \
+    "FILE-LENGTH SCOPE ERROR: crates/fake/src/locked cannot be read" "$root" \
+    crates/fake/src/locked g.rs 'fn g() {}' $FILELEN
+root=$(style_root fl-locked-crate)
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+fx_walk_lock "file-length: a crate directory the walk cannot search fails the gate" \
+    "FILE-LENGTH SCOPE ERROR: crates/locked cannot be searched" "$root" \
+    crates/locked src/lib.rs 'fn g() {}' $FILELEN
+# A top it can list but not search (bins/ at 0400) fails the gate, never a walk of crates/ alone.
+if [ "$(id -u)" -ne 0 ]; then
+root=$(style_root fl-unsearchable-top)
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+fx_lock "$root/bins" 400
+expect_red_because "file-length: a top the walk can list but not search fails the gate" \
+    "FILE-LENGTH SCOPE ERROR: bins/fake cannot be read" env INF_CHECK_ROOT="$root" $FILELEN
 fx_unlock
 fi
 }
@@ -5300,9 +5905,7 @@ for rt_var in "$(cd "$root" && pwd -P)/target" target "$work/rt-link/target"; do
 done
 rt_mutant() { # <name> <sed expression> <CARGO_TARGET_DIR or ''> <what the copy does>
     local dir="$work/rt-gate-$1"
-    rm -rf "${dir:?}"
-    mkdir -p "$dir"
-    cp "$SCRIPT_DIR/lint_scope_table.py" "$SCRIPT_DIR/target-root.sh" "$dir/"
+    fx_scripts_copy "rt-gate-$1"
     sed "$2" "$RATCHET" >"$dir/check-lint-ratchet.sh"
     chmod +x "$dir/check-lint-ratchet.sh"
     if cmp -s "$RATCHET" "$dir/check-lint-ratchet.sh"; then
@@ -5317,6 +5920,13 @@ rt_mutant() { # <name> <sed expression> <CARGO_TARGET_DIR or ''> <what the copy 
     rt_call_run "$dir/check-lint-ratchet.sh" "$root" >/dev/null 2>&1 || true
     expect red "lint-ratchet: the calls' check is red on a gate that $4" rt_calls_ok "$root.calls" "$rt_own"
 }
+# The copy unmutated is green on both checks: a canary red on every copy would prove nothing.
+fx_scripts_copy rt-gate-null
+rt_call_run "$work/rt-gate-null/check-lint-ratchet.sh" "$root" >/dev/null 2>&1 || true
+expect green "lint-ratchet: the calls' check is green on an unmutated copy of the gate" \
+    rt_calls_ok "$root.calls" "$rt_own"
+expect green "lint-ratchet: the refusal's check is green on an unmutated copy of the gate" \
+    rt_refused "$work/rt-gate-null/check-lint-ratchet.sh" "$rt_target"
 RT_KEPT='^    TARGET_DIR=$(target_root_kept lint-ratchet)$'
 rt_mutant shared "s|$RT_KEPT|    TARGET_DIR=\$TARGET_ROOT|" '' "shares the recipe's target directory"
 RT_SETUP='^    target_root_setup "$(pwd -P)" ||$'
@@ -5342,6 +5952,17 @@ printf '# Architecture\n\nSee [the style](INFINITY_STYLE.md).\n' >"$doc_root/doc
 printf '# Style\n' >"$doc_root/docs/INFINITY_STYLE.md"
 printf '> **GENERATED — do not edit.**\n' >"$doc_root/docs/compat-matrix.md"
 expect green "docs: standalone workspace" env INF_CHECK_ROOT="$doc_root" $DOCS
+# An untracked directory git cannot open fails the published-link scan (git_listing), never a
+# shorter one: a broken link there is unread.
+cp -R "$doc_root" "$work/doc-git-locked"
+fx_walk_lock "docs: an untracked directory git cannot open fails the gate" \
+    "DOC SCOPE ERROR: git -C .* ls-files .* wrote to stderr" "$work/doc-git-locked" docs/locked \
+    x.md '[gone](missing.md)' $DOCS
+# A tracked Markdown file the gate cannot stat fails it, never an unpublished file.
+cp -R "$doc_root" "$work/doc-held"
+fx_held "docs: a tracked file the gate cannot stat fails the gate" \
+    "DOC SCOPE ERROR: .*/docs/held/x.md cannot be read" "$work/doc-held" docs/held x.md \
+    '[gone](missing.md)' $DOCS
 expect_output "docs: the OK line states the published-link scope" \
     "published links: 1 relative links in 3 Markdown files" env INF_CHECK_ROOT="$doc_root" $DOCS
 printf '[gone](missing.md)\n' >>"$doc_root/docs/ARCHITECTURE.md"
@@ -5368,6 +5989,15 @@ printf '# ADR-NNNN: Title\n' >"$doc_case/docs/adr/0000-template.md"
 printf '# ADR-0072: Projection seam\n' >"$doc_case/docs/adr/0072-seam.md"
 expect green "docs: governance with unique identities and a pointer" env INF_CHECK_ROOT="$doc_root" $DOCS
 expect_output "docs: governance scope names its ADR count" "1 ADR numbers" env INF_CHECK_ROOT="$doc_root" $DOCS
+# A record directory the listing cannot read fails the gate, never an empty or shorter set: a
+# milestone plan or an ADR there is unread.
+for doc_lock in milestones adr; do
+    cp -R "$doc_case" "$work/doc-locked-$doc_lock"
+    fx_walk_lock "docs: docs/$doc_lock, which the listing cannot read, fails the gate" \
+        "DOC SCOPE ERROR: .*/docs/$doc_lock cannot be read" \
+        "$work/doc-locked-$doc_lock" "docs/$doc_lock" m1.md '# M1' \
+        env INF_CHECK_ROOT="$work/doc-locked-$doc_lock/infinitydb" $DOCS
+done
 printf '# ADR-0072: Frame decoder\n' >"$doc_case/docs/adr/0072-frame.md"
 expect red "docs: duplicate ADR number" env INF_CHECK_ROOT="$doc_root" $DOCS
 rm -f "$doc_case/docs/adr/0072-frame.md"
@@ -5695,13 +6325,30 @@ expect green "lint-scopes: a directory holding CACHEDIR.TAG is left out, whateve
 # the walk cannot read is the scope error.
 if [ "$(id -u)" -ne 0 ]; then
 root=$(ls_root ls-unreadable)
-mkdir -p "$root/crates/fake/src/locked"
-printf '%s\n' "$ls_fs_allow" >"$root/crates/fake/src/locked/bad.rs"
-fx_lock "$root/crates/fake/src/locked"
+mkdir -p "$root/bins/fake/src/locked"
+printf '%s\n' "$ls_fs_allow" >"$root/bins/fake/src/locked/bad.rs"
+fx_lock "$root/bins/fake/src/locked"
 expect_red_because "lint-scopes: a directory the walk cannot read fails the audit" \
     "LINT-SCOPES SCOPE ERROR: source_files" ls_run "$root"
 fx_unlock
 fi
+# The walks before it fail the same way: a cell crate's module walk (a directory of its src/),
+# the crate-root loop (a crate directory under bins/, which no cell set reads) and a crate's
+# src/bin listing.
+for ls_lock in src crate bin; do
+    root=$(ls_root "ls-locked-$ls_lock")
+    case $ls_lock in
+    src) fx_walk_lock "lint-scopes: a cell directory the module walk cannot read fails the audit" \
+        "LINT-SCOPES SCOPE ERROR: crates/fake/src/locked cannot be read" "$root" \
+        crates/fake/src/locked bad.rs "$ls_fs_allow" env INF_LINT_BASE_REF=base-tip "$LINTSCOPES" ;;
+    crate) fx_walk_lock "lint-scopes: a crate directory the walk cannot search fails the audit" \
+        "LINT-SCOPES SCOPE ERROR: bins/locked cannot be searched" "$root" \
+        bins/locked src/main.rs 'fn main() {}' env INF_LINT_BASE_REF=base-tip "$LINTSCOPES" ;;
+    bin) fx_walk_lock "lint-scopes: a src/bin the walk cannot read fails the audit" \
+        "LINT-SCOPES SCOPE ERROR: crates/fake/src/bin cannot be read" "$root" \
+        crates/fake/src/bin tool.rs 'fn main() {}' env INF_LINT_BASE_REF=base-tip "$LINTSCOPES" ;;
+    esac
+done
 }
 
 group_lint_scopes_table() {
@@ -7677,10 +8324,7 @@ FZ_MROOT=$root
 fz_mutant() { # <name> <sed expression> <what the copy does> [<CARGO_TARGET_DIR>]
     local dir want=$FZ_OWN
     dir="$work/fz-gate-$1"
-    rm -rf "${dir:?}"
-    mkdir -p "$dir"
-    cp "$SCRIPT_DIR/check-fuzz-targets.sh" "$SCRIPT_DIR/fuzz_targets.py" "$SCRIPT_DIR/lint_scope_table.py" \
-        "$SCRIPT_DIR/strip-test-modules.awk" "$SCRIPT_DIR/target-root.sh" "$dir/"
+    fx_scripts_copy "fz-gate-$1"
     fz_sed "$2" "$dir/check-fuzz-targets.sh"
     chmod +x "$dir/check-fuzz-targets.sh"
     if cmp -s "$SCRIPT_DIR/check-fuzz-targets.sh" "$dir/check-fuzz-targets.sh"; then
@@ -7697,6 +8341,12 @@ fz_mutant() { # <name> <sed expression> <what the copy does> [<CARGO_TARGET_DIR>
     expect red "fuzz-targets: the call's check is red on a gate that $3" \
         fz_calls_ok "$FZ_MROOT.stub" "$want"
 }
+# The copy unmutated is green: a canary red on every copy would prove nothing.
+fx_scripts_copy fz-gate-null
+rm -f "${FZ_MROOT:?}.stub/calls"
+fz_argv_run "$work/fz-gate-null/check-fuzz-targets.sh" "$FZ_MROOT" >/dev/null 2>&1 || true
+expect green "fuzz-targets: the call's check is green on an unmutated copy of the gate" \
+    fz_calls_ok "$FZ_MROOT.stub" "$FZ_OWN"
 fz_mutant bins 's/"check", "--bins", /"check", /' "drops --bins"
 fz_mutant locked 's/"--locked", //' "drops --locked"
 fz_mutant keep-going 's/"--keep-going", //' "drops --keep-going"
@@ -7722,6 +8372,17 @@ fz_manifest "$root" bins/b
 fz_red "C1: no [[bin]] row in any fuzz manifest is a scope error" \
     "SCOPE ERROR: no .*bin.* row in any fuzz manifest" "$root"
 # C2: every manifest is the root, a member, a fuzz manifest or a probe.
+# The census's listing fails on an untracked directory git cannot open (git_listing): the
+# crate there no gate compiles is unread otherwise. The matrix mode runs the census alone.
+root=$(fz_root git-locked)
+fx_walk_lock "fuzz-targets: an untracked directory git cannot open fails the census" \
+    "FUZZ-TARGETS SCOPE ERROR: git -C . ls-files .* wrote to stderr" "$root" tools/x Cargo.toml \
+    "$(printf '[package]\nname = "x"\nversion = "0.0.0"')" "$FUZZ" --matrix nightly
+# A tracked manifest the census cannot stat fails it, never a file gone from the work tree.
+root=$(fz_root held)
+fx_held "fuzz-targets: a tracked file the census cannot stat fails it" \
+    "FUZZ-TARGETS SCOPE ERROR: ./tools/x/Cargo.toml cannot be read" "$root" tools/x Cargo.toml \
+    "$(printf '[package]\nname = "x"\nversion = "0.0.0"')" "$FUZZ" --matrix nightly
 root=$(fz_root c2)
 mkdir -p "$root/tools/x"
 printf '[package]\nname = "x"\nversion = "0.0.0"\n' >"$root/tools/x/Cargo.toml"
@@ -8171,10 +8832,7 @@ expect green "fuzz-targets: the probe builds in a directory of its own each run,
     fz_probe_per_run "$root" "$FZ_PKEPT"
 fz_probe_mutant() { # <name> <sed expression> <what the copy does>
     local dir="$work/fz-probe-gate-$1" FUZZ
-    rm -rf "${dir:?}"
-    mkdir -p "$dir"
-    cp "$SCRIPT_DIR/check-fuzz-targets.sh" "$SCRIPT_DIR/fuzz_targets.py" "$SCRIPT_DIR/lint_scope_table.py" \
-        "$SCRIPT_DIR/strip-test-modules.awk" "$SCRIPT_DIR/target-root.sh" "$dir/"
+    fx_scripts_copy "fz-probe-gate-$1"
     fz_sed "$2" "$dir/check-fuzz-targets.sh"
     chmod +x "$dir/check-fuzz-targets.sh"
     if cmp -s "$SCRIPT_DIR/check-fuzz-targets.sh" "$dir/check-fuzz-targets.sh"; then
@@ -8185,6 +8843,14 @@ fz_probe_mutant() { # <name> <sed expression> <what the copy does>
     expect red "fuzz-targets: the probe's directory check is red on a gate that $3" \
         fz_probe_per_run "$root" "$FZ_PKEPT"
 }
+# The copy unmutated is green, as the call's copy is.
+fx_scripts_copy fz-probe-gate-null
+fz_probe_null() (
+    FUZZ="$work/fz-probe-gate-null/check-fuzz-targets.sh"
+    fz_probe_per_run "$root" "$FZ_PKEPT"
+)
+expect green "fuzz-targets: the probe's directory check is green on an unmutated copy of the gate" \
+    fz_probe_null
 fz_probe_mutant fixed 's|^\(        INF_FUZZ_PROBE_DIR=\)$(mktemp -d "$INF_FUZZ_TARGET_DIR/probe.XXXXXX")$|\1"$INF_FUZZ_TARGET_DIR/probe.fixed1"; mkdir -p "$INF_FUZZ_PROBE_DIR"|' \
     "builds the probe in a fixed directory"
 fz_probe_mutant kept 's|^    PROBE_TARGET = \["--target-dir", os.environ\["INF_FUZZ_PROBE_DIR"\]\]$|    PROBE_TARGET = KEPT|' \
@@ -8991,9 +9657,9 @@ esac
 EOF
 printf '%s' "$body" >"$TR_BIN/cargo"
 chmod +x "$TR_BIN/cargo"
-tr_checkout() { # <dir>: a fixture checkout holding the helper
+tr_checkout() { # <dir>: a fixture checkout holding the helper, among the whole scripts/
     mkdir -p "$1/scripts"
-    cp "$SCRIPT_DIR/target-root.sh" "$1/scripts/target-root.sh"
+    cp -R "$SCRIPT_DIR/." "$1/scripts/"
 }
 tr_phys() { (cd "$1" && pwd -P); }
 tr_key() { fx_root_key "$1"; }
@@ -9839,6 +10505,12 @@ for td_kind in scripts/plant.sh justfile scripts/tool.py src/lib.rs .github/work
 done
 td_tree scripts/a.sh 'echo one'
 expect green "target-dirs: a tree with no output-layout line and an empty table is green" td "$TD_DIR"
+# An untracked directory git cannot open fails the census (git_listing): its line is unread
+# otherwise.
+td_tree scripts/a.sh 'echo one'
+fx_walk_lock "target-dirs: an untracked directory git cannot open fails the census" \
+    "target-dirs census SCOPE ERROR: git -C .* ls-files .* wrote to stderr" "$TD_DIR" locked b.sh \
+    'cargo build --target-dir "$x"' python3 -I "$TD" "$TD_DIR"
 td_tree scripts/a.sh 'cargo build --target-dir "$x"'
 td_row scripts/a.sh root 1 'cargo build --target-dir "$x"'
 expect_red_because "target-dirs: a root row whose text does not hold \$TARGET_ROOT is red" \
@@ -10553,6 +11225,23 @@ nc_tree
 printf '\n[[test]]\nname = "ghost"\npath = "tests/ghost.rs"\n' >>"$NC_DIR/crates/fx/Cargo.toml"
 expect_red_because "nextest-config: a crate root that is no file is a scope error" \
     "SCOPE ERROR: a module this gate cannot find would go unread: crates/fx/tests/ghost.rs" ncfg "$NC_DIR"
+# A workflow directory the listing cannot read fails the gate, never an empty listing.
+nc_tree
+fx_walk_lock "nextest-config: a workflow directory the listing cannot read fails the gate" \
+    "SCOPE ERROR: .github/workflows cannot be read" "$NC_DIR" .github/workflows more.yml 'on: push' \
+    "$NC"
+# An untracked directory git cannot open fails the source listing (git_listing): a static lock
+# with no marker there is unread otherwise.
+nc_tree
+fx_walk_lock "nextest-config: an untracked directory git cannot open fails the gate" \
+    "SCOPE ERROR: git cannot list the sources (git ls-files .* wrote to stderr" "$NC_DIR" \
+    crates/fx/tests/support/locked lock.rs \
+    'static WAKE: std::sync::Condvar = std::sync::Condvar::new();' "$NC"
+# A tracked source the gate cannot stat fails it, never a file gone from the work tree.
+nc_tree
+fx_held "nextest-config: a tracked source the gate cannot stat fails the gate" \
+    "SCOPE ERROR: git lists a source it cannot read" "$NC_DIR" crates/fx/tests/support/held \
+    lock.rs 'static WAKE: std::sync::Condvar = std::sync::Condvar::new();' "$NC"
 }
 
 selftest_main "$SCRIPT_DIR/check-scripts-selftest.sh" "$@"

@@ -69,6 +69,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lint_scope_table as lexer  # noqa: E402  (the gates' one Rust lexer)
+import source_files  # noqa: E402  (the gates' walks, the git listing among them)
 
 # GitHub runs at most 256 jobs from one matrix. The fuzz matrices hold a row
 # a target and the deny matrix a row a fuzz manifest and one for the root, so
@@ -194,19 +195,26 @@ def third_party(root, manifest, data, listed):
 
 def git_listing(root):
     """Files git lists under `root`, tracked or untracked and not ignored,
-    that exist in the work tree (a deleted file is not in what cargo reads)."""
+    that exist in the work tree (a deleted file is not in what cargo reads).
+    The listing is scripts/source_files.py's git_listing, which fails on a
+    directory git cannot open instead of listing it as empty."""
     try:
         top = subprocess.run(["git", "-C", root, "rev-parse", "--show-toplevel"],
                              capture_output=True, text=True)
-        listing = subprocess.run(["git", "-C", root, "ls-files", "-z", "--cached", "--others",
-                                  "--exclude-standard"], capture_output=True, text=True)
     except OSError as err:
         raise CensusError(f"cannot run git ({err})") from err
     if top.returncode or os.path.realpath(top.stdout.strip()) != os.path.realpath(root):
         raise CensusError(f"{os.path.realpath(root)} is not the top of its own git work tree")
-    if listing.returncode:
-        raise CensusError(f"git ls-files exited {listing.returncode}")
-    return {p for p in listing.stdout.split("\0") if p and os.path.isfile(os.path.join(root, p))}
+    try:
+        listing = source_files.git_listing("-C", root, "ls-files", "-z", "--cached", "--others",
+                                           "--exclude-standard").decode()
+    except source_files.WalkError as err:
+        raise CensusError(str(err)) from err
+    # A listed file is kept when it is there (present: one it cannot stat raises, never gone).
+    try:
+        return {p for p in listing.split("\0") if p and source_files.present(os.path.join(root, p))}
+    except source_files.WalkError as err:
+        raise CensusError(str(err)) from err
 
 
 def glob_match(directory, pattern):

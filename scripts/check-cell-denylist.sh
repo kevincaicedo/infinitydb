@@ -44,8 +44,13 @@ PATTERN='tokio::|async_std::|std::sync::Mutex|std::sync::RwLock|std::sync::Condv
 ENV_PATTERN='env::var|env::set_var|env::remove_var|env::temp_dir|env::home_dir|getenv|setenv|putenv|clearenv'
 MARKER='denylist-allow'
 
+# Each listing is read whole before its loop, so a walk that fails fails the gate.
+crate_set=$(cell_crate_dirs) || {
+    echo "DENY-LIST SCOPE ERROR: the cell crate set is unknown (scripts/cell-crates.sh, above)"
+    exit 2
+}
 DIRS=()
-while IFS= read -r dir; do DIRS+=("$dir"); done < <(cell_crate_dirs)
+while IFS= read -r dir; do DIRS+=("$dir"); done <<<"$crate_set"
 
 fail=0
 files=0
@@ -53,18 +58,29 @@ lines=0
 stripped=0
 allowed=0
 for dir in "${DIRS[@]}"; do
+    listing=$(find "$dir" -name '*.rs' | sort) || {
+        echo "DENY-LIST SCOPE ERROR: the walk of $dir failed, so its files are unread"
+        exit 2
+    }
     # Files declared `mod name;` under a test-only attribute are test-only
     # in their entirety (report mode names them); everything else is scanned.
     testfiles=""
     while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        # A file the gate cannot read fails it here, before any read whose status is lost.
+        [ -f "$f" ] && [ -r "$f" ] || {
+            echo "DENY-LIST SCOPE ERROR: $f cannot be read, so it is unscanned"
+            exit 2
+        }
         while read -r key value; do
             [ "$key" = "modfile" ] || continue
             testfiles="$testfiles
 $(dirname "$f")/$value.rs
 $(dirname "$f")/$value/mod.rs"
         done < <(awk -v mode=report -f "$STRIP" "$f")
-    done < <(find "$dir" -name '*.rs' | sort)
+    done <<<"$listing"
     while IFS= read -r f; do
+        [ -n "$f" ] || continue
         case "$testfiles" in *"
 $f"*) continue ;; esac
         report=$(awk -v mode=report -f "$STRIP" "$f")
@@ -105,7 +121,7 @@ $f"*) continue ;; esac
                 V\ *) echo "DENY-LISTED in cell code: $f:${row#V }"; fail=1 ;;
             esac
         done <<< "$out"
-    done < <(find "$dir" -name '*.rs' | sort)
+    done <<<"$listing"
 done
 
 if [ "$files" -eq 0 ]; then

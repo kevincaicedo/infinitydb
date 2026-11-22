@@ -41,8 +41,13 @@ STRIP="$SCRIPT_DIR/strip-test-modules.awk"
 PATTERN='[.]unwrap[(][)]|todo!|unimplemented!'
 MARKER='panic-policy-allow'
 
+# Each listing is read whole before its loop, so a walk that fails fails the gate.
+crate_set=$(cell_crate_dirs) || {
+    echo "PANIC-POLICY SCOPE ERROR: the cell crate set is unknown (scripts/cell-crates.sh, above)"
+    exit 2
+}
 DIRS=()
-while IFS= read -r dir; do DIRS+=("$dir"); done < <(cell_crate_dirs)
+while IFS= read -r dir; do DIRS+=("$dir"); done <<<"$crate_set"
 
 fail=0
 files=0
@@ -51,16 +56,27 @@ stripped=0
 inline=0
 allowed=0
 for dir in "${DIRS[@]}"; do
+    listing=$(find "$dir" -name '*.rs' | sort) || {
+        echo "PANIC-POLICY SCOPE ERROR: the walk of $dir failed, so its files are unread"
+        exit 2
+    }
     testfiles=""
     while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        # A file the gate cannot read fails it here, before any read whose status is lost.
+        [ -f "$f" ] && [ -r "$f" ] || {
+            echo "PANIC-POLICY SCOPE ERROR: $f cannot be read, so it is unscanned"
+            exit 2
+        }
         while read -r key value; do
             [ "$key" = "modfile" ] || continue
             testfiles="$testfiles
 $(dirname "$f")/$value.rs
 $(dirname "$f")/$value/mod.rs"
         done < <(awk -v mode=report -f "$STRIP" "$f")
-    done < <(find "$dir" -name '*.rs' | sort)
+    done <<<"$listing"
     while IFS= read -r f; do
+        [ -n "$f" ] || continue
         case "$testfiles" in *"
 $f"*) continue ;; esac
         report=$(awk -v mode=report -f "$STRIP" "$f")
@@ -97,7 +113,7 @@ $f"*) continue ;; esac
                 V\ *) echo "PANIC-POLICY violation (naked unwrap / todo / unimplemented): $f:${row#V }"; fail=1 ;;
             esac
         done <<< "$out"
-    done < <(find "$dir" -name '*.rs' | sort)
+    done <<<"$listing"
 done
 
 if [ "$files" -eq 0 ]; then

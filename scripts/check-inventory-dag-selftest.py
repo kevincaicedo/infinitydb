@@ -18,7 +18,9 @@ class GateFixtures(unittest.TestCase):
         self.scratch = tempfile.TemporaryDirectory(prefix="inf-gate-selftest-")
         self.addCleanup(self.scratch.cleanup)
         self.root = Path(self.scratch.name)
-        (self.root / "scripts").mkdir()
+        # The whole scripts/ directory, so a gate copy reads every file the gate reads: a list
+        # of them would leave the copy dying on the next import.
+        shutil.copytree(SCRIPTS, self.root / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
         (self.root / "crates/fake/src").mkdir(parents=True)
         (self.root / "bins").mkdir()
         self.write("crates/fake/src/lib.rs", "pub fn safe() {}\n")
@@ -46,26 +48,40 @@ class GateFixtures(unittest.TestCase):
         self.write("crates/fake/SAFETY.md", f"# Inventory\n\n`{entry}`\n")
         return self.gate("check-safety-inventory.sh")
 
-    def assert_red(self, result):
+    def assert_red(self, result, reason):
+        """Red, and for its own reason: a gate copy that dies for another (an import its copy
+        lacks, a traceback) is no planted red caught."""
         self.assertNotEqual(result.returncode, 0, f"false green: {result.stdout}{result.stderr}")
+        self.assertIn(reason, result.stdout + result.stderr,
+                      f"red for another reason: {result.stdout}{result.stderr}")
 
     def assert_green(self, result):
         self.assertEqual(result.returncode, 0, f"false red: {result.stdout}{result.stderr}")
 
+    def test_a_red_for_another_reason_is_not_the_planted_red(self):
+        # The null mutant: a copy that lacks the gate's walk helper dies on its import, red but
+        # not for the plant; assert_red refuses it.
+        (self.root / "scripts/source_files.py").unlink()
+        result = self.inventory("bytes.rs", "log_bytes.rs")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ModuleNotFoundError", result.stdout + result.stderr)
+        with self.assertRaises(AssertionError):
+            self.assert_red(result, "SAFETY INVENTORY GAP: crates/fake/src/bytes.rs uses unsafe")
+
     def test_inventory_substring_is_not_a_file(self):
-        self.assert_red(self.inventory("bytes.rs", "log_bytes.rs"))
+        self.assert_red(self.inventory("bytes.rs", "log_bytes.rs"), 'SAFETY INVENTORY GAP: crates/fake/src/bytes.rs uses unsafe')
 
     def test_inventory_dot_is_literal(self):
-        self.assert_red(self.inventory("net.rs", "netXrs"))
+        self.assert_red(self.inventory("net.rs", "netXrs"), 'SAFETY INVENTORY GAP: crates/fake/src/net.rs uses unsafe')
 
     def test_inventory_extension_is_exact(self):
-        self.assert_red(self.inventory("net.rs", "net.rs.bak"))
+        self.assert_red(self.inventory("net.rs", "net.rs.bak"), 'SAFETY INVENTORY GAP: crates/fake/src/net.rs uses unsafe')
 
     def test_inventory_nested_basename_is_not_a_path(self):
-        self.assert_red(self.inventory("a/bytes.rs", "b/bytes.rs"))
+        self.assert_red(self.inventory("a/bytes.rs", "b/bytes.rs"), 'SAFETY INVENTORY GAP: crates/fake/src/a/bytes.rs uses unsafe')
 
     def test_inventory_nested_file_needs_its_directory(self):
-        self.assert_red(self.inventory("a/bytes.rs", "bytes.rs"))
+        self.assert_red(self.inventory("a/bytes.rs", "bytes.rs"), 'SAFETY INVENTORY GAP: crates/fake/src/a/bytes.rs uses unsafe')
 
     def test_inventory_accepts_exact_root_name(self):
         self.assert_green(self.inventory("bytes.rs", "bytes.rs::fixture"))
@@ -81,15 +97,15 @@ class GateFixtures(unittest.TestCase):
 
     def test_inventory_missing_inventory_fails(self):
         self.write("crates/fake/src/unsafe.rs", "unsafe fn fixture() {}\n")
-        self.assert_red(self.gate("check-safety-inventory.sh"))
+        self.assert_red(self.gate("check-safety-inventory.sh"), 'SAFETY INVENTORY GAP: crates/fake/src/unsafe.rs uses unsafe')
 
     def test_inventory_empty_scope_fails(self):
         shutil.rmtree(self.root / "crates/fake")
-        self.assert_red(self.gate("check-safety-inventory.sh"))
+        self.assert_red(self.gate("check-safety-inventory.sh"), 'SAFETY INVENTORY SCOPE: no source crates')
 
     def test_inventory_missing_source_fails(self):
         shutil.rmtree(self.root / "crates/fake/src")
-        self.assert_red(self.gate("check-safety-inventory.sh"))
+        self.assert_red(self.gate("check-safety-inventory.sh"), 'SAFETY INVENTORY SCOPE: missing or empty crates/fake/src')
 
     def test_inventory_safe_tree_reports_scope(self):
         result = self.gate("check-safety-inventory.sh")
@@ -130,12 +146,12 @@ if overwrite.exists():
     def test_dag_forbidden_normal_edge(self):
         self.prepare_dag()
         result = self.gate("check-dep-dag.sh")
-        self.assert_red(result)
+        self.assert_red(result, 'FORBIDDEN DEPENDENCY EDGE: fake -> other')
         self.assertIn("fake -> other", result.stdout)
 
     def test_dag_forbidden_build_edge(self):
         self.prepare_dag(kind="build")
-        self.assert_red(self.gate("check-dep-dag.sh"))
+        self.assert_red(self.gate("check-dep-dag.sh"), 'FORBIDDEN DEPENDENCY EDGE: fake -> other')
 
     def test_dag_allowed_normal_edge(self):
         self.prepare_dag(allowed=True)
@@ -153,7 +169,7 @@ if overwrite.exists():
         clean["packages"][0]["dependencies"] = []
         self.write("overwrite.json", json.dumps(clean))
         result = self.gate("check-dep-dag.sh")
-        self.assert_red(result)
+        self.assert_red(result, 'FORBIDDEN DEPENDENCY EDGE: fake -> other')
         self.assertIn("fake -> other", result.stdout)
 
     def test_dag_never_writes_legacy_metadata_path(self):
@@ -165,17 +181,17 @@ if overwrite.exists():
     def test_dag_cargo_failure_fails(self):
         self.prepare_dag()
         self.env["GATE_TEST_CARGO_FAIL"] = "1"
-        self.assert_red(self.gate("check-dep-dag.sh"))
+        self.assert_red(self.gate("check-dep-dag.sh"), 'dep-dag SCOPE ERROR: cargo metadata exited 17')
 
     def test_dag_bad_metadata_fails(self):
         self.prepare_dag()
         self.write("metadata.json", "not json")
-        self.assert_red(self.gate("check-dep-dag.sh"))
+        self.assert_red(self.gate("check-dep-dag.sh"), 'dep-dag SCOPE ERROR: invalid cargo metadata (Expecting value')
 
     def test_dag_empty_scope_fails(self):
         self.prepare_dag()
         self.write("metadata.json", '{"packages": [], "workspace_members": []}')
-        self.assert_red(self.gate("check-dep-dag.sh"))
+        self.assert_red(self.gate("check-dep-dag.sh"), 'dep-dag SCOPE ERROR: invalid cargo metadata (no workspace crates')
 
     def reserve_edge(self, reason="ADR-0106 D16: M7 stub activation"):
         with (self.root / "docs/dep-dag.toml").open("a") as policy:
@@ -190,12 +206,12 @@ if overwrite.exists():
         self.prepare_dag(allowed=True)
         self.remove_actual_edge()
         result = self.gate("check-dep-dag.sh")
-        self.assert_red(result)
+        self.assert_red(result, 'UNANNOTATED UNUSED EDGE: fake -> other')
         self.assertIn("fake -> other", result.stdout)
 
     def test_dag_dev_edge_does_not_satisfy_normal_permission(self):
         self.prepare_dag(kind="dev", allowed=True)
-        self.assert_red(self.gate("check-dep-dag.sh"))
+        self.assert_red(self.gate("check-dep-dag.sh"), 'UNANNOTATED UNUSED EDGE: fake -> other')
 
     def test_dag_reserved_dev_only_permission_is_visible(self):
         self.prepare_dag(kind="dev", allowed=True)
@@ -208,13 +224,13 @@ if overwrite.exists():
     def test_dag_activation_requires_retiring_annotation(self):
         self.prepare_dag(allowed=True)
         self.reserve_edge()
-        self.assert_red(self.gate("check-dep-dag.sh"))
+        self.assert_red(self.gate("check-dep-dag.sh"), 'ACTIVE RESERVED EDGE: fake -> other')
 
     def test_dag_annotation_cannot_authorize_forbidden_edge(self):
         self.prepare_dag()
         self.remove_actual_edge()
         self.reserve_edge()
-        self.assert_red(self.gate("check-dep-dag.sh"))
+        self.assert_red(self.gate("check-dep-dag.sh"), 'INVALID RESERVATION: fake -> other is not an allowed workspace edge')
 
     def test_dag_reservation_needs_reason_decision_and_milestone(self):
         self.prepare_dag(allowed=True)
@@ -223,46 +239,46 @@ if overwrite.exists():
             with self.subTest(reason=reason):
                 self.write("docs/dep-dag.toml", '[edges]\nfake = ["other"]\nother = []\n')
                 self.reserve_edge(reason)
-                self.assert_red(self.gate("check-dep-dag.sh"))
+                self.assert_red(self.gate("check-dep-dag.sh"), 'INVALID RESERVATION: fake -> other needs an ADR and activation milestone')
 
     def test_dag_missing_row_fails_even_without_dependencies(self):
         self.prepare_dag()
         self.remove_actual_edge()
         self.write("docs/dep-dag.toml", "[edges]\nfake = []\n")
-        self.assert_red(self.gate("check-dep-dag.sh"))
+        self.assert_red(self.gate("check-dep-dag.sh"), 'MISSING PACKAGE ROW: other')
 
     def test_dag_unknown_package_row_fails(self):
         self.prepare_dag(allowed=True)
         with (self.root / "docs/dep-dag.toml").open("a") as policy:
             policy.write("retired = []\n")
-        self.assert_red(self.gate("check-dep-dag.sh"))
+        self.assert_red(self.gate("check-dep-dag.sh"), 'UNKNOWN PACKAGE ROW: retired')
 
     def test_dag_unknown_target_fails(self):
         self.prepare_dag(allowed=True)
         self.write("docs/dep-dag.toml", '[edges]\nfake = ["other", "typo"]\nother = []\n')
-        self.assert_red(self.gate("check-dep-dag.sh"))
+        self.assert_red(self.gate("check-dep-dag.sh"), 'UNKNOWN EDGE TARGET: fake -> typo')
 
     def test_dag_duplicate_permission_fails(self):
         self.prepare_dag(allowed=True)
         self.write("docs/dep-dag.toml", '[edges]\nfake = ["other", "other"]\nother = []\n')
-        self.assert_red(self.gate("check-dep-dag.sh"))
+        self.assert_red(self.gate("check-dep-dag.sh"), 'dep-dag SCOPE ERROR: each edge row must be an array of unique package names')
 
     def test_dag_schema_does_not_accept_substring_membership(self):
         self.prepare_dag(allowed=True)
         self.write("docs/dep-dag.toml", '[edges]\nfake = "other-extra"\nother = []\n')
-        self.assert_red(self.gate("check-dep-dag.sh"))
+        self.assert_red(self.gate("check-dep-dag.sh"), 'dep-dag SCOPE ERROR: each edge row must be an array of unique package names')
 
     def test_dag_unknown_policy_section_fails(self):
         self.prepare_dag(allowed=True)
         with (self.root / "docs/dep-dag.toml").open("a") as policy:
             policy.write("\n[unusd.fake]\nother = 'ADR-0106 M7 stub'\n")
-        self.assert_red(self.gate("check-dep-dag.sh"))
+        self.assert_red(self.gate("check-dep-dag.sh"), 'dep-dag SCOPE ERROR: unknown policy section')
 
     def test_dag_unknown_empty_reservation_package_fails(self):
         self.prepare_dag(allowed=True)
         with (self.root / "docs/dep-dag.toml").open("a") as policy:
             policy.write("\n[unused.typo]\n")
-        self.assert_red(self.gate("check-dep-dag.sh"))
+        self.assert_red(self.gate("check-dep-dag.sh"), 'UNKNOWN RESERVATION PACKAGE: typo')
 
     def test_dag_incomplete_workspace_metadata_fails(self):
         self.prepare_dag(allowed=True)
@@ -270,14 +286,14 @@ if overwrite.exists():
         metadata["workspace_members"].append("missing")
         self.write("metadata.json", json.dumps(metadata))
         result = self.gate("check-dep-dag.sh")
-        self.assert_red(result)
+        self.assert_red(result, 'dep-dag SCOPE ERROR: invalid cargo metadata (workspace members do not match')
         self.assertNotIn("Traceback", result.stderr)
 
     def test_dag_wrong_metadata_shape_is_named(self):
         self.prepare_dag()
         self.write("metadata.json", '{"packages": {}}')
         result = self.gate("check-dep-dag.sh")
-        self.assert_red(result)
+        self.assert_red(result, "dep-dag SCOPE ERROR: invalid cargo metadata ('workspace_members')")
         self.assertIn("SCOPE ERROR", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
@@ -305,7 +321,7 @@ if overwrite.exists():
                 metadata = self.metadata(kind)
                 metadata["packages"][0]["dependencies"][0]["name"] = "external"
                 self.write("metadata.json", json.dumps(metadata))
-                self.assert_red(self.gate("check-dep-dag.sh"))
+                self.assert_red(self.gate("check-dep-dag.sh"), 'ZERO-DEPENDENCY VIOLATION: fake -> external')
 
     def test_dag_zero_dependency_policy_accepts_empty_package(self):
         self.prepare_dag()
@@ -333,16 +349,18 @@ if overwrite.exists():
                     metadata["packages"][0]["dependencies"].append(dep)
                     self.write("metadata.json", json.dumps(metadata))
                     result = self.gate("check-dep-dag.sh")
-                    self.assert_red(result)
+                    self.assert_red(result, 'EXTERNAL-DEPENDENCY VIOLATION')
                     self.assertIn("EXTERNAL-DEPENDENCY VIOLATION", result.stdout)
 
     def test_dag_internal_only_policy_rejects_malformed_duplicate_and_unknown_scope(self):
         self.prepare_dag(allowed=True)
-        for policy in ['"fake"', '["fake", "fake"]', '["absent"]']:
+        for policy, why in [('"fake"', "no-external-dependencies must be a string array"),
+                            ('["fake", "fake"]', "INVALID NO-EXTERNAL-DEPENDENCIES POLICY"),
+                            ('["absent"]', "INVALID NO-EXTERNAL-DEPENDENCIES POLICY")]:
             with self.subTest(policy=policy):
                 self.write("docs/dep-dag.toml", f'no-external-dependencies = {policy}\n'
                            '[edges]\nfake = ["other"]\nother = []\n')
-                self.assert_red(self.gate("check-dep-dag.sh"))
+                self.assert_red(self.gate("check-dep-dag.sh"), why)
 
     def test_dag_internal_only_accepts_empty_package_and_empty_policy(self):
         self.prepare_dag()
@@ -391,11 +409,11 @@ class DocumentPaths(unittest.TestCase):
             text=True, capture_output=True, timeout=15,
         )
 
-    def assert_red(self, cause=None):
+    def assert_red(self, cause):
+        """Red, and for its own reason, as GateFixtures.assert_red."""
         result = self.gate()
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        if cause is not None:
-            self.assertIn(cause, result.stdout)
+        self.assertIn(cause, result.stdout, f"red for another reason: {result.stdout}{result.stderr}")
 
     def write_doc(self, text, name="docs/ARCHITECTURE.md"):
         (self.root / name).parent.mkdir(parents=True, exist_ok=True)
@@ -457,7 +475,7 @@ class DocumentPaths(unittest.TestCase):
     def test_doc_parent_links_are_checked_with_governance(self):
         docs = self.governance()
         (docs / "infinity-master-plan.md").write_text("[wrong](missing.md)\n")
-        self.assert_red()
+        self.assert_red('infinity-master-plan.md:1: missing link missing.md')
 
     def test_doc_titled_wrapped_and_reference_parent_links_are_checked(self):
         docs = self.governance()
@@ -465,52 +483,52 @@ class DocumentPaths(unittest.TestCase):
                      '[wrong]: adr/missing.md "title"']:
             with self.subTest(link=link):
                 (docs / "infinity-master-plan.md").write_text(link + "\n")
-                self.assert_red()
+                self.assert_red('infinity-master-plan.md:1: missing link adr/missing.md')
 
     def test_doc_every_milestone_link_is_checked(self):
         docs = self.governance()
         (docs / "milestones/new.md").write_text("[wrong](missing.md)\n")
-        self.assert_red()
+        self.assert_red('milestones/new.md:1: missing link missing.md')
 
     def test_doc_missing_governing_workspace_input_is_red(self):
         (self.root / "docs/ARCHITECTURE.md").unlink()
-        self.assert_red()
+        self.assert_red('DOC SCOPE: missing file')
 
     def test_doc_empty_milestone_scope_is_red(self):
         docs = self.governance()
         (docs / "milestones/m0.md").unlink()
-        self.assert_red()
+        self.assert_red('DOC SCOPE: missing or empty parent milestone directory')
 
     def test_doc_missing_milestone_directory_is_red(self):
         docs = self.governance()
         (docs / "milestones/m0.md").unlink()
         (docs / "milestones").rmdir()
-        self.assert_red()
+        self.assert_red('DOC SCOPE: missing or empty parent milestone directory')
 
     def test_doc_obsolete_layout_root_is_red(self):
         docs = self.governance()
         (docs / "infinity-master-plan.md").write_text("```text\ninfinity/\n```\n")
-        self.assert_red()
+        self.assert_red('DOC PATH: obsolete workspace/harness path at')
 
     def test_doc_obsolete_compat_path_is_red(self):
         docs = self.governance()
         (docs / "infinity-master-plan.md").write_text("`tests/compat-suite`\n")
-        self.assert_red()
+        self.assert_red('DOC PATH: obsolete workspace/harness path at')
 
     def test_doc_landed_adr_placeholder_is_red(self):
         docs = self.governance()
         (docs / "milestones/m0.md").write_text("`docs/adr/00xx-log-io-tier.md`\n")
-        self.assert_red()
+        self.assert_red('unresolved ADR placeholder docs/adr/00xx-log-io-tier.md')
 
     def test_doc_numbered_adr_citation_must_resolve(self):
         docs = self.governance()
         (docs / "milestones/m0.md").write_text("`docs/adr/0106-wrong-name.md`\n")
-        self.assert_red()
+        self.assert_red('missing ADR citation docs/adr/0106-wrong-name.md')
 
     def test_doc_historical_legacy_path_is_not_a_current_link(self):
         docs = self.governance()
         (docs / "infinity-master-plan.md").write_text("`docs/vortex-master-plan.md`\n")
-        self.assert_red()
+        self.assert_red('deleted legacy document cited as current')
 
 
 if __name__ == "__main__":

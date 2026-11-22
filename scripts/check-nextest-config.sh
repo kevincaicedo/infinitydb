@@ -88,9 +88,10 @@
 # schedules by them. A run-alone filter in none of the forms is a scope error
 # there, as a missing or unreadable config is.
 set -euo pipefail
-cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 
-exec python3 -I - "$@" <<'PY'
+INF_SCRIPT_DIR="$SCRIPT_DIR" exec python3 -I - "$@" <<'PY'
 import json
 import os
 import re
@@ -98,6 +99,9 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
+
+sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
+from source_files import WalkError, git_listing, listing, present
 
 NAME = "nextest-config"
 CONFIG = Path(".config/nextest.toml")
@@ -462,14 +466,19 @@ def source(path):
     return sources[path]
 
 
+# git_listing (scripts/source_files.py): a directory git cannot open fails the gate, never a
+# shorter listing.
 try:
-    listed = subprocess.run(
-        ["git", "ls-files", "-co", "--exclude-standard", "-z", "--", "crates", "bins", "tests"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True,
-    ).stdout.split("\0")
-except (OSError, subprocess.CalledProcessError) as err:
+    listed = git_listing("ls-files", "-co", "--exclude-standard", "-z", "--", "crates", "bins",
+                         "tests").decode().split("\0")
+except WalkError as err:
     scope_error(f"git cannot list the sources ({err})")
-rust_files = sorted(Path(name) for name in listed if name.endswith(".rs") and Path(name).is_file())
+# A listed file is kept when it is there (present: a file it cannot stat is a scope error, not
+# a file gone from the work tree).
+try:
+    rust_files = sorted(Path(name) for name in listed if name.endswith(".rs") and present(name))
+except WalkError as err:
+    scope_error(f"git lists a source it cannot read ({err})")
 if not rust_files:
     scope_error("git lists no .rs file under crates/, bins/ or tests/")
 
@@ -779,7 +788,11 @@ for path in scanned:
                 "is not read: a marker is a comment line of its own, `// nextest-<kind>: <reason>`")
 
 # ---- D4: the install step ---------------------------------------------------------
-workflows = sorted(Path(".github/workflows").glob("*.y*ml"))
+# A workflow directory the walk cannot read is a scope error, never an empty one.
+try:
+    workflows = listing(".github/workflows", "*.y*ml") if Path(".github/workflows").is_dir() else []
+except WalkError as err:
+    scope_error(str(err))
 if not workflows:
     scope_error("no workflow under .github/workflows")
 installs = nextest_jobs = 0
