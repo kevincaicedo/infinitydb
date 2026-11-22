@@ -67,8 +67,8 @@ impl Server {
     /// hand-off, on a data directory of its own; `maxclients` is the node's
     /// connection bound `B`, the shipped default when `None`.
     fn spawn(maxclients: Option<u32>, name: &str) -> Server {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/e2e-task-classes")
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join("e2e-task-classes")
             .join(format!("{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("data dir");
@@ -200,10 +200,15 @@ struct CapRow {
     crossings: u64,
 }
 
-/// The row `name` of `stream`'s cell, read from its `INFO caps`.
-fn cap_row(stream: &mut TcpStream, name: &str) -> CapRow {
+/// `stream`'s cell's `INFO caps`, one cell's census.
+fn caps(stream: &mut TcpStream) -> String {
     let caps = info(stream, "caps");
     assert!(caps.contains("caps_scope:cell\r\n"), "{caps}");
+    caps
+}
+
+/// The row `name` of a cell's `INFO caps` text.
+fn cap_row(caps: &str, name: &str) -> CapRow {
     let prefix = format!("cap_row_{name}:");
     let row = caps
         .lines()
@@ -294,7 +299,7 @@ impl Churn<'_> {
     /// it holds is the bound broken where a client sees it.
     fn keep(&mut self, cell: usize, mut stream: TcpStream) {
         let Some(held) = self.cells[cell].as_mut() else {
-            let share = cap_row(&mut stream, "conn-tasks").entries_max;
+            let share = cap_row(&caps(&mut stream), "conn-tasks").entries_max;
             let maxclients = field(&info(&mut stream, "clients"), "maxclients");
             let cells = field(&info(&mut stream, "server"), "cells");
             assert_eq!(
@@ -357,16 +362,20 @@ impl Churn<'_> {
 /// occupied, its task with it, until its pump has shipped its delta and read
 /// the ack, a fabric round trip after that pass. So a client that reaches a
 /// cell then is refused (VACUOUS if none was), and one admitted later takes
-/// a vacated slot; the cells then fill to their share again. A node that made
-/// a task per close, beside a vacated slot, would hold tasks past `C` under
-/// this churn, which no client could see.
+/// a vacated slot; the cells then fill to their share again. The class's cap
+/// is `C`, so its high water never passes it: a task that outlives its slot
+/// shows instead as the class refusing a client the share admitted, a
+/// crossing, or, where the slot is vacated before its delta ships, as a
+/// pattern counted for good.
 ///
 /// Oracle, from the wire: no cell admits a client past the share it holds;
 /// a refused client reads the frame and then the end; once the last
 /// subscribers close and the node is quiet, `PUBSUB NUMPAT` reads 0 on each
 /// cell and each admits `C − 1` clients again; and each cell's `conn-tasks`
 /// row reports a cap of `C = max(1, maxclients / cells)` (the class is the
-/// boot share, ADR-0123 A1) and a high water of at most `C`, reached.
+/// boot share, ADR-0123 A1), a high water of `C` (the class full, VACUOUS
+/// otherwise) and no crossing: the accept refuses at the share, which counts
+/// draining slots, before the class, its backstop, would (ADR-0177 D2).
 #[test]
 fn subscribers_closed_with_their_deltas_out_hold_no_task_past_the_share() {
     /// `B`: a share of 8 connections a cell, which the churn fills.
@@ -423,12 +432,11 @@ fn subscribers_closed_with_their_deltas_out_hold_no_task_past_the_share() {
     churn.fill("the fill after the last closes");
     for (cell, held) in churn.cells.iter_mut().enumerate() {
         let held = held.as_mut().expect("a probe on every cell");
-        let row = cap_row(&mut held.probe, "conn-tasks");
-        assert!(
-            row.high_water <= held.share,
-            "cell {cell}: {} conn tasks at once, past its share of {} ({row:?})",
-            row.high_water,
-            held.share
+        let row = cap_row(&caps(&mut held.probe), "conn-tasks");
+        assert_eq!(
+            row.crossings, 0,
+            "cell {cell}: the conn class refused a client its share admitted, a task past its \
+             slot ({row:?})"
         );
         assert_eq!(row.high_water, held.share, "VACUOUS: cell {cell}'s conn class never filled");
     }
@@ -462,11 +470,15 @@ fn present(del: usize) -> usize {
 /// D4), so a `DEL` sends the first `W` of its remote legs and settles its
 /// oldest before the next: the cell's gate holds at most `W` holders for the
 /// connection, beside the `owner-pub` pump's one unit per peer, and never
-/// fills its `H` (no crossing). The window fills: the connection's cell holds
-/// `W` at once (VACUOUS otherwise). A fan sent whole, every remote leg of
-/// the pipeline out before its first await, holds tens of thousands of
-/// holders, past the window and under the shipped `H`; a gate it fills parks
-/// its sends with no leg settled, so no reply comes.
+/// fills its `H`. The window fills: the connection's cell holds `W` at once
+/// (VACUOUS otherwise). Each cell's `H` is checked against its formula from
+/// the cell's own census, `W × C + (cells − 1) + (cells − 1) × d`: the conn
+/// class's units, the `owner-pub` pump's unit per peer, and an orphan for each
+/// op a peer may leave unanswered, `d` its credits (the `ns-applies` cap). A
+/// fan sent whole, every remote leg of the pipeline out before its first
+/// await, holds tens of thousands of holders, past the window and under the
+/// shipped `H`; a gate it fills parks its sends with no leg settled, so no
+/// reply comes. So the gate's crossings are a sanity read, not evidence.
 #[test]
 fn sixty_four_pipelined_dels_answer_exact_counts_within_their_window() {
     let server = Server::spawn(None, "fans");
@@ -514,21 +526,22 @@ fn sixty_four_pipelined_dels_answer_exact_counts_within_their_window() {
         }
     }
     let window = u64::from(inf_server::limits::GATE_UNITS_PER_CONN_TASK);
-    let owner_pub_units = u64::from(CELLS) - 1;
     for (cell, probe) in probes.iter_mut().enumerate() {
         let probe = probe.as_mut().unwrap_or_else(|| panic!("no probe of 64 reached cell {cell}"));
-        let row = cap_row(probe, "fabric-gate-holders");
-        assert!(
-            row.high_water <= row.entries_max,
-            "cell {cell}: {} gate holders at once, past H = {} ({row:?})",
-            row.high_water,
-            row.entries_max
-        );
+        let peers = field(&info(probe, "server"), "cells") - 1;
+        let census = caps(probe);
+        let share = cap_row(&census, "conn-tasks").entries_max;
+        let owner_pub_units = cap_row(&census, "owner-pub-tasks").entries_max * peers;
+        let credits = cap_row(&census, "ns-applies").entries_max;
+        let row = cap_row(&census, "fabric-gate-holders");
         assert_eq!(
-            row.crossings, 0,
-            "cell {cell}: the gate filled its H = {} and paced a send ({row:?})",
-            row.entries_max
+            row.entries_max,
+            window * share + owner_pub_units + peers * credits,
+            "cell {cell}: H for C = {share}, {peers} peers and d = {credits} \
+             (H = W × C + (cells − 1) + (cells − 1) × d, W = {window})"
         );
+        // A sanity read: a gate a fan fills parks it before any reply.
+        assert_eq!(row.crossings, 0, "cell {cell}: the gate filled ({row:?})");
         let fans = u64::from(cell == fan_cell);
         assert!(
             row.high_water <= window * fans + owner_pub_units,
