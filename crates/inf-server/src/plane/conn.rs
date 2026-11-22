@@ -699,7 +699,7 @@ impl ConnSlab<Conn> {
 
 #[cfg(test)]
 mod conn_slab_tests {
-    use super::{CONN_SLOT_CAP, ConnKey, ConnSlab, DrainingEntry};
+    use super::{CONN_SLOT_CAP, ConnAdmission, ConnKey, ConnSlab, DrainingEntry};
 
     impl DrainingEntry for u32 {
         fn draining(&self) -> bool {
@@ -740,6 +740,28 @@ mod conn_slab_tests {
         assert!(slab.get_mut(b).is_none());
         assert_eq!(slab.get_mut(reused).copied(), Some(5));
         assert!(keyed(&mut slab, 6).is_none());
+    }
+
+    /// The accept's three answers on small counts (ADR-0123 A1), then a draining count past
+    /// the occupied one, which the slab's writers never leave (`draining <= live`): refused as
+    /// `Occupied`, where an unchecked subtraction would read no active client and admit.
+    #[test]
+    fn admits_answers_each_compare_and_refuses_a_draining_count_past_live() {
+        let mut slab: ConnSlab<u32> = ConnSlab::new(4);
+        for value in 0..2 {
+            slab.insert_with(|_| value).expect("a slot under the cap");
+        }
+        assert_eq!(slab.admits(3), ConnAdmission::Admitted, "active 2 under 3, occupied 2 under 4");
+        assert_eq!(slab.admits(2), ConnAdmission::ActiveShare, "active 2 at the share of 2");
+        for value in 2..4 {
+            slab.insert_with(|_| value).expect("a slot under the cap");
+        }
+        slab.draining = 3;
+        assert_eq!(slab.admits(2), ConnAdmission::Occupied, "active 1 under 2, occupied 4 at 4");
+        let mut past: ConnSlab<u32> = ConnSlab::new(4);
+        past.insert_with(|_| 0).expect("a slot under the cap");
+        past.draining = 2;
+        assert_eq!(past.admits(2), ConnAdmission::Occupied, "2 draining of 1 occupied refuses");
     }
 
     #[test]
