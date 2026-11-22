@@ -1051,7 +1051,7 @@ pub fn ok() {}
 EOF
 root=$(printf '%s' "$body" | fixture stale)
 first=${CELL_CRATE_EXCLUDE[0]%%|*}
-[ -n "$first" ] && [ -n "$root" ] && [ -d "$root/$first" ] && rm -rf "$root/$first"
+[ -n "$first" ] && [ -n "$root" ] && [ -d "$root/$first" ] && rm -rf "${root:?}/${first:?}"
 expect red "deny-list: exclusion naming a missing directory fails" env INF_CHECK_ROOT="$root" $DENY
 
 # Each banned family, planted in production code.
@@ -3428,7 +3428,7 @@ echo "inf_canary_fixture crate-test fake/uring,extra test:suite the_row" >"$dir/
 expect green "canaries: a row's package features reach both legs" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 echo "inf_canary_fixture crate-test fake test:suite the_row" >"$dir/rows"
 expect_red_because "canaries: on Linux a row without the test's feature judged nothing" "red: judged nothing on the lane's host: inf_canary_fixture crate-test the_row (no test the_row ran)" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
-for token in fake/ fake/uring, fake/,uring fake//uring; do
+for token in fake/ 'fake/uring,' fake/,uring fake//uring; do
     echo "inf_canary_fixture crate-test $token test:suite the_row" >"$dir/rows"
     expect_red_because "canaries: a crate-test package token '$token' is malformed" "malformed row" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
 done
@@ -5075,6 +5075,86 @@ expect_red_because "waker probe: a probe whose controls were deleted is red" \
     "probe declares 0 clean, 0 off-path and 1 boundary controls (expected exactly 1, 1 and 1)" \
     env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" INF_WAKER_LIVE=off \
     "$work/wk/scripts/check-waker-atomics.sh"
+# The probe's asm is the probe crate's codegen alone: each build gives the asm flag to the
+# scanned crate's rustc (`cargo rustc --lib -- --emit asm=…`), so no other crate of the build
+# writes the file. RUSTFLAGS reaches every crate, so the codegen that ends last owns it. A rustc
+# wrapper lands the nested crate's codegen last on demand: an asm that crate is asked for goes
+# aside, and is copied over the path once the probe crate's rustc has exited, a fifo ordering
+# the two (cargo starts the probe from the nested crate's metadata while its codegen still
+# runs; a marker the nested wrapper lays before its rustc starts tells the probe's to wait).
+# The nested side writes the fifo from a background writer and exits, so neither cargo's one
+# job (the driver's CARGO_BUILD_JOBS=1) nor its pipelining waits on the other; each case's
+# fifo is opened read-write after it, ending a writer no probe read. The probe builds for real
+# here, cold, in the gate's own fresh directory.
+cat >"$work/waker-rustc-last.sh" <<'SH'
+#!/usr/bin/env bash
+set -u
+rustc=$1
+shift
+crate= asm= prev=
+for a in "$@"; do
+    [ "$prev" = --crate-name ] && crate=$a
+    if [ "$prev" = --emit ]; then
+        case $a in asm=*) asm=${a#asm=} ;; esac
+    fi
+    prev=$a
+done
+case "$crate:$asm" in
+    waker_atomics_probe_nested:?*)
+        : >"${WAKER_ORDER:?}.asked"
+        args=()
+        for a in "$@"; do
+            if [ "$a" = "asm=$asm" ]; then args+=("asm=$asm.nested"); else args+=("$a"); fi
+        done
+        "$rustc" "${args[@]}"
+        rc=$?
+        # Its own stdio, so cargo, reading the wrapper's to EOF, is not held by it.
+        (echo done >"$WAKER_ORDER") </dev/null >/dev/null 2>&1 &
+        exit "$rc" ;;
+    waker_atomics_probe:?*)
+        "$rustc" "$@"
+        rc=$?
+        if [ -e "${WAKER_ORDER:?}.asked" ]; then
+            read -r _ <"$WAKER_ORDER"
+            cp "$asm.nested" "$asm"
+        fi
+        exit "$rc" ;;
+esac
+exec "$rustc" "$@"
+SH
+chmod +x "$work/waker-rustc-last.sh"
+order="$work/waker-order-built"
+mkfifo "$order"
+expect green "waker probe: the nested crate's codegen landing last leaves the probe's asm the probe's (the built form asks that crate for none)" \
+    env INF_WAKER_ASM="$tree" RUSTC_WRAPPER="$work/waker-rustc-last.sh" WAKER_ORDER="$order" $WAKER
+: <>"$order"
+# The plant: the old form (RUSTFLAGS reaching both crates) in a copy, under the same wrapper.
+mkdir -p "$work/wk-old/scripts"
+cp scripts/asm-waker-scan.awk scripts/probe-target.sh scripts/source-files.sh \
+    scripts/target-root.sh "$work/wk-old/scripts/"
+cp -R scripts/waker-atomics-probe "$work/wk-old/scripts/"
+awk '/target_root_cargo_fresh "\$work\/ptarget" cargo rustc/ {
+        print "        target_root_cargo_fresh \"$work/ptarget\" env RUSTFLAGS=\"--emit asm=$PASM\" cargo build --release --quiet --target \"$target\" \\"
+        print "            --manifest-path \"$work/probe/Cargo.toml\" >\"$work/probe.log\" 2>&1 || {"
+        skip = 2; next
+    }
+    skip > 0 { skip--; next }
+    { print }' scripts/check-waker-atomics.sh >"$work/wk-old/scripts/check-waker-atomics.sh"
+chmod +x "$work/wk-old/scripts/check-waker-atomics.sh"
+order="$work/waker-order-old"
+mkfifo "$order"
+expect_red_because "waker probe: the old form (RUSTFLAGS) lets the nested crate's codegen write the probe's asm: red" \
+    "the probe's asm holds a body of waker_atomics_probe_nested" \
+    env INF_CHECK_ROOT="$PWD" INF_WAKER_ASM="$tree" INF_WAKER_LIVE=off \
+    RUSTC_WRAPPER="$work/waker-rustc-last.sh" WAKER_ORDER="$order" \
+    "$work/wk-old/scripts/check-waker-atomics.sh"
+: <>"$order"
+expect_output "waker probe: the plant's copy holds the old form" 'env RUSTFLAGS="--emit asm=$PASM" cargo build' \
+    cat "$work/wk-old/scripts/check-waker-atomics.sh"
+# Both builds give the flag after `--`, and no RUSTFLAGS names the asm (the tree's build has the
+# same shape when a dependency rebuilds; its build is the gate's run, not a case's).
+expect green "waker: both builds pass --emit asm to the scanned crate alone" \
+    sh -c '[ "$(grep -c -- "-- --emit \"asm=" scripts/check-waker-atomics.sh)" -eq 2 ] && ! grep -q "RUSTFLAGS=\"--emit" scripts/check-waker-atomics.sh'
 pasm=$(PSYM=v0 probe_fixture waker-probe-v0 'bl\t__aarch64_cas8_acq_rel' 'bl\t__aarch64_ldadd8_acq_rel' \
     'stlr\tx9, [x8]' 'bl\t__aarch64_ldadd8_acq_rel')
 expect_output "waker probe: v0-mangled names match their own symbols" \
@@ -6154,7 +6234,7 @@ ls_case() {
 # self-test here instead of running no case.
 LS_RULES=$(env INF_LINT_RULES=1 INF_CHECK_ROOT="$root" "$LINTSCOPES")
 [ -n "$LS_RULES" ] || { echo "selftest: the gate listed no lint rule" >&2; exit 2; }
-while IFS=$'\t' read -r lint scope cls; do
+while IFS=$'\t' read -r lint _ cls; do
     cls=${cls%:}
     if [ "$cls" = - ]; then
         # No class: a reasoned allow at any scope is red too (ADR-0144 A2).
@@ -10223,7 +10303,8 @@ rm -rf "${TR_PNA:?}/target"
 # A root nested as the per-variable rule made it: <A>/target/checkout-<kB>,
 # holding B's marker and outputs, in a root from before the rule (no marker).
 tr_nested_by_hand() {
-    local nest="$TR_PNA/target/checkout-$(tr_key "$TR_NB")"
+    local nest
+    nest="$TR_PNA/target/checkout-$(tr_key "$TR_NB")" || return 1
     mkdir -p "$nest/debug"
     tr_phys "$TR_NB" >"$nest/.checkout-path"
     printf 'built by B\n' >"$nest/debug/b-bin"

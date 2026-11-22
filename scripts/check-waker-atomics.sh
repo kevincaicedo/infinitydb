@@ -175,7 +175,11 @@ if [ -n "${INF_WAKER_ASM:-}" ]; then
 else
     need_target
     tree_target=$target
-    RUSTFLAGS="--emit asm=$ASM" cargo rustc -p inf-runtime --release --lib --target "$target" \
+    # The asm flag goes to inf-runtime's own rustc alone (flags after `--` reach the final
+    # crate): the file holds one crate's codegen. RUSTFLAGS would reach every crate the build
+    # compiles, each writing this one path, so a dependency rebuilt beside it could leave its
+    # codegen there, whichever ended last.
+    cargo rustc -p inf-runtime --release --lib --target "$target" -- --emit "asm=$ASM" \
         >"$work/build.log" 2>&1 || {
         echo "WAKER SCOPE ERROR: inf-runtime release build failed:"; sed 's/^/    | /' "$work/build.log"; exit 2
     }
@@ -290,11 +294,16 @@ else
         cp -R "$PROBE_SRC/." "$work/probe"
         # Built from this directory, not the copy's: the same toolchain and
         # target as the tree, so the probe proves the scan of that codegen. It
-        # builds cold, in a directory no earlier run wrote (ADR-0204 D4).
+        # builds cold, in a directory no earlier run wrote (ADR-0204 D4). The
+        # asm flag goes to the probe crate's rustc alone (`cargo rustc --lib
+        # -- --emit`), as the tree's does: RUSTFLAGS reaches every crate of
+        # the build, so the nested crate would write the same path and the
+        # codegen that ends last would own the file.
         # shellcheck source=target-root.sh
         . "$SCRIPT_DIR/target-root.sh"
-        target_root_cargo_fresh "$work/ptarget" env RUSTFLAGS="--emit asm=$PASM" cargo build --release --quiet --target "$target" \
-            --manifest-path "$work/probe/Cargo.toml" >"$work/probe.log" 2>&1 || {
+        target_root_cargo_fresh "$work/ptarget" cargo rustc --release --quiet --target "$target" \
+            --manifest-path "$work/probe/Cargo.toml" --lib -- --emit "asm=$PASM" \
+            >"$work/probe.log" 2>&1 || {
             echo "WAKER SCOPE ERROR: the probe did not build:"; sed 's/^/    | /' "$work/probe.log"; exit 2
         }
     fi
@@ -310,6 +319,19 @@ else
     # would let a clean nested `waker_drop::inner` stand in for `waker_drop`.
     crate=$(sed -n 's/^name = "\(.*\)"$/\1/p' "$PROBE_SRC/Cargo.toml" | tr - _)
     [ -n "$crate" ] || { echo "WAKER SCOPE ERROR: no package name in the probe's Cargo.toml"; exit 1; }
+    # The file holds the probe crate's codegen and no other crate's: a body of the nested crate
+    # (whose one function stays out of line, never in the probe's asm) means another crate's
+    # rustc wrote this path, so the probe's verdicts would read a codegen they do not describe.
+    nested=$(sed -n 's/^name = "\(.*\)"$/\1/p' "$PROBE_SRC/nested/Cargo.toml" | tr - _)
+    [ -n "$nested" ] || { echo "WAKER SCOPE ERROR: no package name in the nested crate's Cargo.toml"; exit 1; }
+    if awk -v k="${#nested}$nested" '$1 == "BODY" && index($2, k) { f = 1 } END { exit !f }' "$work/pfacts"; then
+        echo "WAKER SCOPE ERROR: the probe's asm holds a body of $nested: another crate's codegen wrote the file"
+        exit 1
+    fi
+    if ! awk -v k="${#crate}$crate" '$1 == "BODY" && index($2, k) { f = 1 } END { exit !f }' "$work/pfacts"; then
+        echo "WAKER SCOPE ERROR: the probe's asm holds no body of $crate: its codegen is not in the file"
+        exit 1
+    fi
     # probe_hit <atomic|clean|scanned|carries|boundary|unlisted> <name> <facts|verdict file>:
     # `atomic`, an owner-lane body on a path from the root `name` carries an atomic; `boundary`,
     # a boundary function reached from it carries one; `unlisted`, an unlisted callee is on a
