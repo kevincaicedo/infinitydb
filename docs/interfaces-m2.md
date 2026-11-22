@@ -932,9 +932,11 @@ the module docs; `inf-server` adopts it at S08):
   seq, assigned when the record is staged, because a record's LSN exists
   only once LOG seals its frame; frames are FIFO, so seq order is LSN
   order, and the plane advances the gate to the last seq of a frame the
-  watermark covers. There an `always` reply's task makes its wait when
-  its pump reaches that reply (`wait_for(seq)`), one at a time, and the
-  plane wakes the covered waits in key order, at most
+  watermark covers. There a task makes its wait when it reaches the
+  reply, one at a time (`wait_for(seq)`): a connection's pump at its
+  front `always` reply, and the cell's gated task, which holds its
+  replies to other cells' durable applies, at its smallest pending seq.
+  The plane wakes the covered waits in key order, at most
   `ACK_WAKES_PER_TURN` (1,024) between two LOG steps of a cell, each
   batch run under the EXECUTE budget (ADR-0177 D5, A2). On either plane,
   waits at one key wake in the gate's heap order, deterministic but not
