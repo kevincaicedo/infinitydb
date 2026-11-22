@@ -1273,12 +1273,9 @@ fn slow_reader(server: &mut TcpStream, key: &str) -> (usize, bool) {
 
 /// A slow reader is answered whole on both engines, then closed: the node
 /// counts a reply it sends as activity, so `timeout` judges the read's
-/// gaps, never the request's age (ADR-0193 D3). Redis's largest gap between
+/// gaps, never the request's age (ADR-0193 D2). Redis's largest gap between
 /// two writes is 0.501 s here, the node's the reader's 0.25 s pace.
 #[test]
-#[ignore = "timeout judges a connection by its receive clock alone, so the node closes a slow \
-            reader a timeout after its request with most of the reply unsent; red until a reply \
-            sent is activity and a connection the server owes bytes is never judged"]
 fn timeout_spares_a_slow_reader_like_redis() {
     let Some((_node_guard, mut node)) = infinityd(1, scratch_base()) else {
         eprintln!("SKIPPED: INFINITYD_BIN unset — real-node compat lane not run");

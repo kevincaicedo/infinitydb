@@ -10450,10 +10450,6 @@ fn timeout_closes_idle_connections_but_not_subscribers() {
 /// stall's own sweep judges a connection from the later of its clock and the
 /// stall's end, so the close comes after the reply, never in its place.
 #[test]
-#[ignore = "timeout judges a connection by its receive clock while its cell sleeps, so the \
-            issuer of DEBUG SLEEP 3 under timeout 1 is closed with its +OK unsent; red until a \
-            connection the server owes a reply is never judged and a stall's end restarts its \
-            clock"]
 fn timeout_answers_a_reply_its_cell_held() {
     let node = Node::start(2);
     let mut admin = node.connect();

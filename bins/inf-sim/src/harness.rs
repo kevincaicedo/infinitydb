@@ -217,7 +217,7 @@ pub struct Scenario {
     /// exceed its share, and the folded `rejected_connections` must equal
     /// the refused count.
     pub maxclients: u32,
-    /// `timeout` seconds seeded into every cell's config (ADR-0123 D2;
+    /// `timeout` seconds seeded into every cell's config (ADR-0193 D3;
     /// 0 = off): the idle phase's deadline.
     pub timeout_secs: u32,
     /// Idle phase (runs once every regular client is done and every
@@ -583,10 +583,10 @@ pub struct SimReport {
     /// Disclosed so a fairness run that never exhausted a budget cannot
     /// pass as coverage.
     pub fabric_skip_streak_max: u32,
-    /// Admission oracle coverage (ADR-0123): clients refused at accept,
-    /// idle clients the server closed at their `timeout` deadline, idle
-    /// subscribers that outlived it. Disclosed so a run that never
-    /// refused or never reaped cannot pass as coverage.
+    /// Admission oracle coverage (ADR-0123 D1, ADR-0193 D1): clients
+    /// refused at accept, idle clients the server closed at their
+    /// `timeout` deadline, idle subscribers that outlived it. Disclosed so
+    /// a run that never refused or never reaped cannot pass as coverage.
     pub refused_clients: u64,
     pub idle_closed: u64,
     pub idle_survived: u64,
@@ -1461,9 +1461,10 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         let pool = BufferPool::new(128, 1024);
         // Sim wall anchor stays (0, 0): wall time == virtual time, fully
         // deterministic; the RANDOMKEY stream is seeded from the scenario.
-        // ADR-0123: the admission and idle knobs are boot config here (the
-        // plane reads them at assembly — D5); `maxclients` is the node's boot
-        // capacity, as `infinityd --maxclients` sets it (A1).
+        // ADR-0123, ADR-0193 D3: the admission and idle knobs are boot config
+        // here (the plane reads them at assembly — ADR-0123 D5); `maxclients`
+        // is the node's boot capacity, as `infinityd --maxclients` sets it
+        // (ADR-0123 A1).
         let mut config = inf_server::ConfigStore::default();
         if scenario.maxclients != 0 {
             let cells = inf_foundation::CellCount::new(scenario.cells).expect("a scenario's cells");
@@ -1894,7 +1895,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             }
         }
 
-        // Idle phase (ADR-0123 D2): once every regular client is done and
+        // Idle phase (ADR-0193 D1): once every regular client is done and
         // every server-side connection unwound, idle clients connect,
         // speak once, and go silent under `timeout`.
         let idle_phase_done = drive_idle_phase(

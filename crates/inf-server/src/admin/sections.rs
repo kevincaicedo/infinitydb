@@ -383,9 +383,12 @@ fn stats_section(
         text,
         &format!("client_output_buffer_limit_disconnections:{}", node.cob_disconnections.get()),
     );
-    // ADR-0123 D2: idle closes under `timeout` (cell scope, like the
+    // ADR-0193 D4: idle closes under `timeout`, and the sweep's visits that
+    // kept a connection the server owes past it (cell scope, like the
     // output-cap kills above).
     push(text, &format!("idle_disconnections:{}", node.idle_disconnections.get()));
+    let deferrals = node.idle_sweep_deferrals_cell.get();
+    push(text, &format!("idle_sweep_deferrals_cell:{deferrals}"));
     // ADR-0123 A2, ADR-0196: a close's drain (cell scope).
     push(text, &format!("closed_queue_commands:{}", node.closed_queue_commands.get()));
     push(text, &format!("closed_reader_entries:{}", node.closed_reader_entries.get()));

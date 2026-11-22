@@ -260,9 +260,14 @@ pub struct NodeState {
     /// (ADR-0192 D3). Cell scope; 0 by the reserve's proof, so any other
     /// reading is a finding (`INFO` `# Tripwires`).
     pub fabric_reserve_refused_cell: Cell<u64>,
-    /// Idle connections closed by `timeout` (ADR-0123 D2; `INFO stats
+    /// Idle connections closed by `timeout` (ADR-0193 D4; `INFO stats
     /// idle_disconnections`, cell scope).
     pub idle_disconnections: Cell<u64>,
+    /// Sweep visits that found a connection the server owes work past
+    /// `timeout` by its clock, and kept it (ADR-0193 D4; `INFO stats
+    /// idle_sweep_deferrals_cell`). Its unit is visits, one per such
+    /// connection per MAINTAIN, not connections.
+    pub idle_sweep_deferrals_cell: Cell<u64>,
     /// A close's drain (ADR-0123 A2, ADR-0196; `INFO stats`, cell scope):
     /// commands dequeued from a closing or draining slot; inbox entries a
     /// draining slot's parser parsed; `Peer` run-outs that found no take of

@@ -304,8 +304,9 @@ impl Default for ConfigStore {
             // cell like `maxmemory`; admission-only (lowering it
             // never evicts standing reservations).
             e("tiered-reserved-va-limit", ReloadClass::HotPerCell, Kind::Memory, "274877906944"),
-            // ADR-0123 D2: idle unsubscribed connections close in
-            // the MAINTAIN sweep; 0 = off.
+            // ADR-0193 D1, D3: a connection the server owes nothing,
+            // unsubscribed, closes once idle this many seconds, judged
+            // at the MAINTAIN sweep; 0 = off.
             e(
                 "timeout",
                 ReloadClass::HotPerCell,

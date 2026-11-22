@@ -136,17 +136,19 @@ pub(super) struct Link {
     /// Staged reply bytes awaiting RESPOND, one reply opened at a time.
     pub(super) out: ReplyStream,
     /// One in-flight Send max: two outstanding sends on one socket have no
-    /// kernel ordering guarantee.
-    pub(super) send_inflight: bool,
+    /// kernel ordering guarantee. Written only by [`Link::send_issued`] and
+    /// [`Link::send_completed`], which store `timeout`'s clock with it.
+    send_inflight: bool,
     /// Injected-clock ms since the staged output first exceeded the pub/sub
     /// soft cap (M1-S11); 0 = under the soft limit.
     pub(super) cob_soft_since_ms: u64,
     /// The output-cap kill was already requested (idempotent counter guard).
     pub(super) cob_kill_sent: bool,
-    /// Injected-clock ms of the last received buffer (accept counts); the
-    /// `timeout` reaper's input (ADR-0123 D2): one store per buffer PARSE
-    /// takes, never per command.
-    pub(super) last_active_ms: u64,
+    /// `timeout`'s clock (ADR-0193 D2), injected-clock ms of the last
+    /// interaction: the admission, each received buffer PARSE takes, each
+    /// send issued and each send completed. One store per buffer and per
+    /// send, never per command; [`Link::touch`] is its one writer.
+    last_active_ms: u64,
     /// The publisher's own frames a tagged fan leg delivered, keyed by
     /// sequence; the pump emits each right after that publish's count
     /// reply (ADR-0101 D3/D4). Bounded by the in-flight window and empty
@@ -169,6 +171,108 @@ impl Link {
 
     fn bytes(&self) -> usize {
         self.out.capacity() + self.self_push.iter().map(|(_, f)| f.capacity() + 32).sum::<usize>()
+    }
+
+    /// Whether a send of this slot's bytes is in flight.
+    pub(super) fn send_inflight(&self) -> bool {
+        self.send_inflight
+    }
+
+    /// A send built from `out` went out: the server's write attempt is an
+    /// interaction, so the transport has a whole `timeout` from the offer
+    /// (ADR-0193 D2).
+    pub(super) fn send_issued(&mut self, now: Nanos) {
+        self.send_inflight = true;
+        // Canary: the offer is no activity.
+        if !cfg!(inf_canary_timeout_send_not_activity) {
+            self.touch(now);
+        }
+    }
+
+    /// The send in flight completed: bytes moved, Redis's write that sent
+    /// bytes, so the clock restarts (ADR-0193 D2).
+    pub(super) fn send_completed(&mut self, now: Nanos) {
+        self.send_inflight = false;
+        // Canary: a completed send is no activity.
+        if !cfg!(inf_canary_timeout_send_not_activity) {
+            self.touch(now);
+        }
+    }
+
+    /// Stores `timeout`'s clock: an interaction at `now`.
+    pub(super) fn touch(&mut self, now: Nanos) {
+        let now_ms = now.as_millis();
+        debug_assert!(now_ms >= self.last_active_ms, "the injected clock ran backwards");
+        self.last_active_ms = now_ms;
+    }
+}
+
+// ---- `timeout`'s answer (ADR-0193) ----------------------------------------------
+
+/// The instant one MAINTAIN sweep judges at and the cell's two facts
+/// `timeout` reads beside it, built once a sweep by its one constructor from
+/// the plane's own state, so no caller judges a slot with a stall it did not
+/// read (ADR-0193 D2).
+pub(super) struct SweepClock {
+    now: Nanos,
+    /// The end of the cell's last stall (`DEBUG SLEEP`), in the past once it
+    /// ended. Before it PARSE and RESPOND pause, so the server owes every
+    /// client of the cell.
+    stall_end: Nanos,
+    /// PARSE's completed takes of the inbox: a `Peer` slot stamped at this
+    /// count may still have an entry waiting unparsed.
+    inbox_takes: u64,
+}
+
+impl SweepClock {
+    pub(super) fn new<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static>(
+        now: Nanos,
+        shared: &Shared<O, F>,
+    ) -> SweepClock {
+        // Canary: the sweep reads no stall, so it judges a stalled cell.
+        let stall_end = if cfg!(inf_canary_timeout_judges_stalled_cell) {
+            Nanos(0)
+        } else {
+            shared.stall_until.get()
+        };
+        SweepClock { now, stall_end, inbox_takes: shared.inbox_takes.get() }
+    }
+
+    /// Whether `timeout_ms` has passed since `since_ms`, in whole
+    /// milliseconds of the injected clock (ADR-0193 D3): the deferral
+    /// count's compare and [`IdleSince::expired`]'s.
+    pub(super) fn past(&self, since_ms: u64, timeout_ms: u64) -> bool {
+        self.now.as_millis().saturating_sub(since_ms) >= timeout_ms
+    }
+}
+
+/// `timeout`'s one answer for a slot (ADR-0193 D1, D3): the MAINTAIN sweep
+/// reads it and nothing else of the connection, beside the knob.
+pub(super) enum Idleness {
+    /// Closing or Draining: its close is in flight or done, so it is not
+    /// judged.
+    Closing,
+    /// Subscribed to a channel or a pattern: never closed by `timeout`, as
+    /// in Redis.
+    Subscribed,
+    /// The server owes the connection work, so it is not judged. `since_ms`
+    /// is its clock, read only to count a deferral.
+    Serving { since_ms: u64 },
+    /// The server owes it nothing: closed once idle for `timeout`.
+    Idle(IdleSince),
+}
+
+/// When an idle slot became idle: the later of its clock and the end of its
+/// cell's last stall (ADR-0193 D2). Its field is this file's, so only
+/// [`Conn::idleness`] makes one.
+pub(super) struct IdleSince {
+    since_ms: u64,
+}
+
+impl IdleSince {
+    /// `timeout`'s one compare for a close: idle for at least `timeout_ms`.
+    pub(super) fn expired(&self, clock: &SweepClock, timeout_ms: u64) -> bool {
+        clock.past(self.since_ms, timeout_ms)
     }
 }
 
@@ -498,6 +602,79 @@ impl Conn {
         }
         end_reader(by);
         Some(RunOut::Ended)
+    }
+
+    /// Whether the server owes this connection anything: `timeout`'s one
+    /// answer (ADR-0193 D1). It destructures the entry, both states it
+    /// judges and their link whole, so a field that can hold work does not
+    /// compile without its term here. Bytes behind a send in flight are no
+    /// term: they wait on the client's read, and a client that does not read
+    /// its reply is closed, as Redis closes it.
+    pub(super) fn idleness(&self, clock: &SweepClock) -> Idleness {
+        let Conn {
+            cx,
+            queue,
+            pump: _,
+            pump_parked,
+            publish_seq: _,
+            slot,
+            #[cfg(inf_canary_closing_slot_sends)]
+                closing_fd: _,
+            #[cfg(inf_canary_mark_applied_late)]
+                late_mark: _,
+            #[cfg(inf_canary_registry_dropped_at_closed)]
+                closed_notes: _,
+            #[cfg(inf_canary_conn_owner_lost)]
+                owner_lost: _,
+        } = self;
+        // A partial frame in a parser waits on the client's bytes; a
+        // disarmed receive holds the queue at its high water, and a due
+        // re-arm is RESPOND's in this iteration.
+        let (link, unparsed) = match slot {
+            ConnSlot::Active { link, parser: _, recv: _ } => (link, false),
+            ConnSlot::Flushing { link, stream } => (link, stream_unparsed(stream, clock)),
+            ConnSlot::Closing { by: _ } | ConnSlot::Draining { by: _ } => {
+                return Idleness::Closing;
+            }
+        };
+        if !cx.sub_channels.is_empty() || !cx.sub_patterns.is_empty() {
+            return Idleness::Subscribed;
+        }
+        // The self-push stash holds frames only while the pump holds that
+        // publish's reply (ADR-0101 D4), which `pump_parked` reads.
+        let Link {
+            fd: _,
+            out,
+            send_inflight,
+            cob_soft_since_ms: _,
+            cob_kill_sent: _,
+            last_active_ms,
+            self_push: _,
+        } = link;
+        let stalled = clock.now < clock.stall_end;
+        let unoffered = !out.is_empty() && !*send_inflight;
+        if stalled || !*pump_parked || !queue.is_empty() || unoffered || unparsed {
+            return Idleness::Serving { since_ms: *last_active_ms };
+        }
+        // Canary: idle since the clock alone, the stall's end ignored.
+        let since_ms = if cfg!(inf_canary_timeout_since_ignores_stall) {
+            *last_active_ms
+        } else {
+            (*last_active_ms).max(clock.stall_end.as_millis())
+        };
+        Idleness::Idle(IdleSince { since_ms })
+    }
+}
+
+/// Whether a flushing slot's stream may hold an entry reaped before the end
+/// of stream that PARSE has not taken yet: a `Peer` parser stamped at the
+/// cell's current take count (ADR-0196 A1.1).
+fn stream_unparsed(stream: &PeerStream, clock: &SweepClock) -> bool {
+    match stream {
+        PeerStream::Ended { by: ClosedBy::Peer { parser: _, taken_at } } => {
+            *taken_at == clock.inbox_takes
+        }
+        PeerStream::Ended { by: ClosedBy::Plane } | PeerStream::Open => false,
     }
 }
 

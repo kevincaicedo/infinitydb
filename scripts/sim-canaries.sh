@@ -1499,6 +1499,24 @@ ordered_rows=(
   # bound against the class's slots: two censuses of one cell mint equal instances (ADR-0194
   # D5). Planted, the bound is skipped, and another executor's id reads past the header array.
   "inf_canary_task_id_index_unbounded crate-test inf-runtime test:executor an_id_another_class_minted_past_this_class_is_stale a header's index lies in its array"
+  # `timeout` judges no client of a stalled cell: the sweep reads the stall's end the plane
+  # keeps (ADR-0193 D1, D2). Planted, it reads none, and a client whose PING the stall holds
+  # unread is closed during the stall.
+  "inf_canary_timeout_judges_stalled_cell crate-test inf-sim lib timeout_spares_the_replies_of_a_stalled_cell reply-owed-close"
+  # `timeout` judges a connection only when the server owes it nothing (ADR-0193 D1). Planted,
+  # the sweep closes a slot the server owes past its clock, as the receive clock alone did:
+  # the client of a command held at a frozen peer, and of an `always` write held on the
+  # device's barrier, is closed before its reply, and no deferral is counted.
+  "inf_canary_timeout_receive_clock_only crate-test inf-sim lib timeout_spares_a_command_held_at_a_frozen_peer reply-owed-close"
+  "inf_canary_timeout_receive_clock_only crate-test inf-sim lib timeout_spares_an_always_write_held_on_its_fsync reply-owed-close"
+  # A send is activity: the offer and its completion restart the clock (ADR-0193 D2).
+  # Planted, neither stores it, and a client answered after a two-timeout hold is closed a
+  # step after its reply.
+  "inf_canary_timeout_send_not_activity crate-test inf-sim lib timeout_spares_a_command_held_at_a_frozen_peer reaped-before-window"
+  # A slot is idle since the later of its clock and its cell's last stall's end (ADR-0193 D2).
+  # Planted, the clock alone, and at the stall's end a client whose PING waits in the net for a
+  # receive buffer is closed with it unread.
+  "inf_canary_timeout_since_ignores_stall crate-test inf-sim lib timeout_spares_the_replies_of_a_stalled_cell reply-owed-close"
   # The io_uring driver dispatches a reap's completions in the kernel's order, so the bytes a
   # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
   # the reap is dispatched last first, and the end of stream comes before the bytes.

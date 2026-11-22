@@ -75,12 +75,12 @@ impl ParseInto<'_> {
 /// parser and the sink of a slot that holds one, and whether it is a
 /// draining slot's; `None` for a slot that releases the entry. An active or
 /// half-closed slot writes into its `out`, and its received buffer stores
-/// `timeout`'s clock; a closing or draining parser renders into a recycled
-/// sink, made by `make_sink`.
+/// `timeout`'s clock (ADR-0193 D2); a closing or draining parser renders
+/// into a recycled sink, made by `make_sink`.
 fn parse_target<'s>(
     slot: &'s mut ConnSlot,
     dropped_out: &'s mut Option<ReplyStream>,
-    now_ms: u64,
+    now: Nanos,
     make_sink: impl FnOnce() -> ReplyStream,
 ) -> Option<(&'s mut ConnParser, Sink<'s>, bool)> {
     // Canary: PARSE releases a `Peer` entry unparsed, flushing or closing.
@@ -99,7 +99,7 @@ fn parse_target<'s>(
             link,
             stream: PeerStream::Ended { by: ClosedBy::Peer { parser, .. } },
         } => {
-            link.last_active_ms = now_ms;
+            link.touch(now);
             Some((parser, Sink::Out(&mut link.out), false))
         }
         ConnSlot::Closing { by: ClosedBy::Peer { parser, .. } } => {
@@ -238,11 +238,11 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // While the pump is not parked it owns the connection's
             // order: every command defers behind what it holds.
             let pump_busy = !conn.pump_parked;
-            let now_ms = cx.now.as_millis();
+            let now = cx.now;
             let Conn { cx: conn_cx, slot, .. } = &mut *conn;
             let make_sink = || ReplyStream::new(self.shared.take_reply_buf());
             let Some((parser, sink, draining)) =
-                parse_target(slot, &mut dropped_out, now_ms, make_sink)
+                parse_target(slot, &mut dropped_out, now, make_sink)
             else {
                 return 0;
             };
@@ -493,16 +493,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 
     /// One `Send` from a slot's staged output, when a send buffer is free
-    /// and no send is in flight.
+    /// and no send is in flight. The offer stores `timeout`'s clock.
     fn send_out(cx: &mut LoopCx<'_>, key: ConnKey, link: &mut Link) {
-        if link.out.is_empty() || link.send_inflight {
+        if link.out.is_empty() || link.send_inflight() {
             return;
         }
         let Some(buf) = cx.pool.try_lease(LeaseKind::Send) else { return };
         let n = link.out.len().min(cx.pool.buf_size());
         cx.pool.bytes_mut(buf)[..n].copy_from_slice(&link.out.as_bytes()[..n]);
         link.out.consume(n);
-        link.send_inflight = true;
+        link.send_issued(cx.now);
         cx.push(IoOp::Send {
             fd: link.fd,
             buf,
@@ -642,11 +642,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
                     return;
                 }
                 // A send in flight when its slot closed returns its buffer
-                // alone: a closing or draining slot holds no send.
+                // alone: a closing or draining slot holds no send. A send that
+                // completed stores `timeout`'s clock.
                 let key = Self::key_of(c.token);
+                let now = cx.now;
                 self.shared.with_conn(key, |conn| {
                     if let Some(link) = conn.link_mut() {
-                        link.send_inflight = false;
+                        link.send_completed(now);
                     }
                 });
                 // Canary: once a reply has left an active slot whose pump is
@@ -1339,8 +1341,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             self.config_pushed = config_version;
             crate::admin::push_pressure(&mut self.shared.store.borrow_mut(), &self.shared.node);
             // The connection knobs ride the same hot-per-cell sweep
-            // (M1-S11 output caps; ADR-0123 `maxclients`/`timeout`/
-            // `tcp-keepalive`).
+            // (M1-S11 output caps; ADR-0123 `maxclients`/`tcp-keepalive`;
+            // ADR-0193 D3 `timeout`).
             self.shared.knobs.set(crate::config::conn_knobs(
                 &self.shared.node.config.borrow(),
                 self.shared.cells,
@@ -1538,22 +1540,47 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     }
 
     /// One MAINTAIN concern of `maintain`, in phase order:
-    ///  the connection sweep: the output caps, `timeout`, and the
+    ///  the connection sweep: `timeout`, the output caps, and the
     /// connection gauges.
     fn maintain_conn_sweep(&mut self, cx: &mut LoopCx<'_>) {
         let node = &self.shared.node;
         let knobs = self.shared.knobs.get();
         let now_ms = cx.now.as_millis();
+        let clock = SweepClock::new(cx.now, &self.shared);
         let mut conns = self.shared.conns.borrow_mut();
         let mut bytes = 0usize;
         let mut draining = 0usize;
         let mut idle: Vec<ConnKey> = Vec::new();
         conns.for_each_keyed_mut(|key, conn| {
             bytes += conn.state_bytes();
+            // `timeout` (ADR-0193 D1, D3): only a slot the server owes
+            // nothing is judged, idle since the later of its clock and the
+            // stall's end; one owed past its clock is counted, never closed.
+            // A closing or draining slot is not judged, so
+            // `idle_disconnections` counts each close once.
+            if knobs.timeout_ms != 0 {
+                match conn.idleness(&clock) {
+                    Idleness::Idle(since) if since.expired(&clock, knobs.timeout_ms) => {
+                        idle.push(key);
+                    }
+                    Idleness::Serving { since_ms } if clock.past(since_ms, knobs.timeout_ms) => {
+                        // Canary: the clock alone judges, the server's work unread.
+                        if cfg!(inf_canary_timeout_receive_clock_only) {
+                            idle.push(key);
+                        } else {
+                            let deferrals = &node.idle_sweep_deferrals_cell;
+                            deferrals.set(deferrals.get() + 1);
+                        }
+                    }
+                    Idleness::Closing
+                    | Idleness::Subscribed
+                    | Idleness::Serving { .. }
+                    | Idleness::Idle(_) => {}
+                }
+            }
             let Conn { cx: conn_cx, slot: state, .. } = conn;
-            // `timeout` and the output cap read the two states that hold
-            // the descriptor and `out`; a closing or draining slot is
-            // skipped, so `idle_disconnections` counts each close once.
+            // The output cap reads the two states that hold the descriptor
+            // and `out`; a closing or draining slot is skipped.
             let link = match state {
                 ConnSlot::Active { link, .. } | ConnSlot::Flushing { link, .. } => link,
                 ConnSlot::Closing { .. } => return,
@@ -1571,15 +1598,6 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let caps = if subscribed { knobs.cob_pubsub } else { knobs.cob_normal };
             if link.cob_soft_since_ms != 0 || caps != (0, 0, 0) {
                 enforce_output_cap(node, link, conn_cx.id, now_ms, caps);
-            }
-            // `timeout` (ADR-0123 D2): idle unsubscribed connections
-            // close, a flushing one as an active one (ADR-0193 D1);
-            // subscribers are exempt, as in Redis.
-            if knobs.timeout_ms != 0
-                && !subscribed
-                && now_ms.saturating_sub(link.last_active_ms) >= knobs.timeout_ms
-            {
-                idle.push(key);
             }
         });
         // The slab's draining count, which the accept's active share reads,

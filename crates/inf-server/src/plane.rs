@@ -99,8 +99,8 @@ mod split;
 
 pub use conn::OwnedOutcome;
 use conn::{
-    CONN_SLOT_CAP, ClosedBy, ConnAdmission, ConnSlab, ConnSlot, Emitted, Link, MAXCLIENTS_REFUSAL,
-    OwnedCmd, PeerStream, RecvArm, RunOut,
+    CONN_SLOT_CAP, ClosedBy, ConnAdmission, ConnSlab, ConnSlot, Emitted, Idleness, Link,
+    MAXCLIENTS_REFUSAL, OwnedCmd, PeerStream, RecvArm, RunOut, SweepClock,
 };
 use credit::{FanLegs, FanReserve, PlaneFabric, PointOp, PubFanArgv};
 pub use credit::{MeshConfigRefused, checked_mesh_config};
@@ -465,9 +465,9 @@ pub(super) struct Shared<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'sta
     /// made at plane start and never ending, takes it at its first poll and
     /// holds it for the cell's life, so one fan is open at a time.
     fan_reserve: Cell<Option<FanReserve>>,
-    /// The connection knobs (ADR-0123 D5): `maxclients` share, `timeout`,
-    /// `tcp-keepalive`, both output-buffer classes — read at assembly,
-    /// refreshed by the MAINTAIN config sweep.
+    /// The connection knobs (ADR-0123 D5, ADR-0193 D3): `maxclients` share,
+    /// `timeout`, `tcp-keepalive`, both output-buffer classes — read at
+    /// assembly, refreshed by the MAINTAIN config sweep.
     knobs: Cell<crate::config::ConnKnobs>,
     /// `proto-max-bulk-len` as parser limits (ADR-0122): taken by every
     /// accept, pushed to every live parser by the same sweep.

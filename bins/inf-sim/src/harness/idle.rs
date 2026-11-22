@@ -221,8 +221,9 @@ pub(super) fn drive_idle_phase(
         return false;
     }
     let timeout = Nanos(u64::from(scenario.timeout_secs) * 1_000_000_000);
-    // The plane stamps activity at the buffer's receipt (a step before the
-    // reply is observed) and compares whole milliseconds.
+    // The plane restarts a client's clock at each buffer it takes, at its
+    // reply's send and at the send's completion (ADR-0193 D2), each within a
+    // step of the reply's observation, and compares whole milliseconds.
     let lower = Nanos(timeout.0.saturating_sub(scenario.step_ns_max + 1_000_000));
     let upper = Nanos(timeout.0 + 4 * scenario.step_ns_max + 1_000_000);
     let now = clock.now();
