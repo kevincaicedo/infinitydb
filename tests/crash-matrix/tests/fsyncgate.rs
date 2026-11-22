@@ -97,6 +97,7 @@ fn start_node(
             device: Default::default(),
             fill: Default::default(),
             group: Default::default(),
+            ack_wakes_per_turn: inf_server::limits::ACK_WAKES_PER_TURN,
         };
         let (fixture_node, admission) = NodeInfo::try_default().expect("fixture cache allocation");
         let (mut plane, serve_mark, timer_set, executor) = ServerPlane::new(

@@ -1197,6 +1197,37 @@ rows=(
 # touch different lines and merge without a conflict.
 historical_rows=294
 ordered_rows=(
+  # A first poll's compare is the watermark gate's proof of coverage: Ready only when the
+  # watermark is at or above the wait's LSN (ADR-0177 D5). Planted, the compare answers covered
+  # for any LSN, and a wait above the watermark is Ready at its first poll.
+  "inf_canary_ack_wait_covered_early crate-test inf-runtime test:watermark_gate the_gate_wakes_exactly_the_models_covered_waits_in_lsn_order above the watermark"
+  # A queued watermark wait's drop removes its entry from the gate's heap at its node's position
+  # (ADR-0177 D5). Planted, the drop skips the removal and releases the node, so after the
+  # queued drops the heap holds more entries than the model's queued waits, the pool as many nodes.
+  "inf_canary_ack_wait_drop_keeps_entry crate-test inf-runtime test:watermark_gate every_drop_leaves_the_heap_and_the_pool_at_once the heap's and the pool's counts"
+  # The same plant where the product drops a queued wait, in its executor's drop: three writers
+  # parked, closed by a FIN and a reset, then the node dropped as the cut drops it. Planted, no
+  # removal runs, and the gate's view reads 3 queued where 0.
+  "inf_canary_ack_wait_drop_keeps_entry crate-test inf-sim lib a_task_its_executor_drops_with_its_wait_queued_leaves_the_heap waits-left-at-the-cut"
+  # The heap's hook stores each placed entry's position in its node, so a queued drop removes
+  # its own entry (ADR-0177 D5). Planted, the store is skipped, and a drop removes the entry at
+  # a position that names another.
+  "inf_canary_ack_wait_no_position crate-test inf-runtime test:watermark_gate every_drop_leaves_the_heap_and_the_pool_at_once a queued node's position names its entry"
+  # A pushed watermark entry sifts to its place by LSN, so the heap's minimum is the least
+  # queued LSN (ADR-0177 D5). Planted, every entry orders as one and none moves: in falling
+  # order an advance leaves a covered wait under a higher minimum.
+  "inf_canary_ack_wait_no_sift crate-test inf-runtime test:watermark_gate the_gate_wakes_exactly_the_models_covered_waits_in_lsn_order woke other than the model"
+  # A sync's batch draws on the turn's wake count, which the LOG step alone refills, so several
+  # syncs reaped in one turn wake at most the budget between two LOG steps (ADR-0177 A2.2).
+  # Planted, each sync's batch takes a full budget, and two covering completions in one turn
+  # leave 3 waits queued where 5.
+  "inf_canary_ack_wakes_allowance_ignored crate-test inf-sim lib several_covering_syncs_in_one_turn_wake_at_most_the_budget wakes-past-the-budget"
+  # The LOG step wakes the next batch of a sync's covered acks, so a storm's waits past the
+  # first batch leave a turn apart and an owing cell never parks (ADR-0177 A2.2). Planted, the
+  # LOG step wakes none: the waits after R read off the schedule, and R + 1 parks while owing.
+  # One row a witness, both in the bound row's one message.
+  "inf_canary_ack_wakes_log_batch_skipped crate-test inf-sim lib acks_past_the_budget_follow_the_loops_schedule_and_an_owing_cell_never_parks wakes-schedule"
+  "inf_canary_ack_wakes_log_batch_skipped crate-test inf-sim lib acks_past_the_budget_follow_the_loops_schedule_and_an_owing_cell_never_parks parked-owing"
   # A barrier hold keeps every barrier on the files it names: a standalone sync, a write's
   # linked sync and a write-through write, each whole until the hold lifts. Planted,
   # hold_barriers keeps standalone syncs alone, and the frame barriers complete while held.
@@ -1460,13 +1491,14 @@ ordered_rows=(
   # same step (ADR-0177 D5). Planted, the drop leaves the node linked: the pool keeps it, and a
   # thousand drops on one key fill the pool and starve the first polls after them.
   "inf_canary_wait_drop_keeps_node crate-test inf-runtime lib a_wait_dropped_while_queued_leaves_no_entry wait-node-kept"
-  # The cell's wait nodes are resident from the pool's build (ADR-0177 D5, D8 with A1), inside
-  # the gate row's per-cell remainder. Planted, the pool is built over (1 + k) T nodes, k the
-  # fewest counts of T whose node bytes pass ten times the idle-resident tool's 256 KiB control
-  # a cell: the idle node's resident memory a cell rises by k x T x s_node, 17 x 2,825 x 56 B
-  # at 4 cells. The bytes are that product at the stride the bill's test reads; a stride that
-  # moves moves them with it.
-  "inf_canary_wait_nodes_oversized binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 2689400 --control-bytes-cell 262144 --plant-row wait-nodes"
+  # The cell's wait nodes and its watermark gate's entry array, one entry a node, are resident
+  # from the pool's build (ADR-0177 D5, D8 with A1), inside the gate row's per-cell remainder.
+  # Planted, the pool and its array are built over (1 + k) T, k the fewest counts of T whose
+  # node and entry bytes pass ten times the idle-resident tool's 256 KiB control a cell: the
+  # idle node's resident memory a cell rises by k x T x (s_node + s_entry), 12 x 2,825 x
+  # (56 + 24) B at 4 cells. The bytes are that product at the strides the bill's test reads; a
+  # stride that moves moves them with it.
+  "inf_canary_wait_nodes_oversized binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 2712000 --control-bytes-cell 262144 --plant-row wait-nodes"
   # A word resolves its slot by the generation bits it carries, the low bits of the occupant's
   # (ADR-0194 D6 with A2). Planted, the whole generation is compared with the field, and from
   # a slot's 2²³-th use its word reads Stale.

@@ -137,6 +137,7 @@ fn base(scenario: &BackfillScenario) -> DurableScenario {
         ckpt_direct_refused_after: None,
         fill: Default::default(),
         group: Default::default(),
+        ack_wakes_per_turn: inf_server::limits::ACK_WAKES_PER_TURN,
         prelude: None,
         recycle_slots: 0,
         prealloc: inf_server::PreallocPolicy::DEFAULT,

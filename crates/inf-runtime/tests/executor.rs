@@ -61,7 +61,7 @@ const TEST_LIST_KEYS: Cap = Cap::entries::<8>("test-list-keys", CapFill::Assembl
 
 /// A pool of [`TEST_WAIT_NODES`] on `census`.
 fn wait_nodes(census: &Rc<CapCensus>) -> WaitNodes {
-    WaitNodes::build(TEST_WAIT_NODES, census).expect("a test pool")
+    WaitNodes::build(TEST_WAIT_NODES, census).expect("a test pool").nodes
 }
 
 /// A wait list holding `keys`, on a census and a pool of its own.
@@ -337,13 +337,33 @@ fn waitlist_is_idle_exactly_when_no_wait_is_queued_on_any_key() {
     drop(woken);
 }
 
+/// The watermark moved to `to` and every wait it covers woken: a gate with no plane calls
+/// `wake_covered` itself while it `owes()` (ADR-0177 A2.2), here at a budget of 64. The calls
+/// are bounded by the queued waits' batches and one call that finds none covered; a gate still
+/// owing after them is red, never a hung test.
+fn advance_and_wake(gate: &WatermarkGate, to: u64) {
+    const BUDGET: usize = 64;
+    gate.advance(to);
+    let calls = gate.waiting().div_ceil(BUDGET) + 1;
+    for _ in 0..calls {
+        if !gate.owes() {
+            break;
+        }
+        let woken = gate.wake_covered(BUDGET);
+        assert!(woken <= BUDGET, "a call woke {woken}, past its budget");
+    }
+    assert!(!gate.owes(), "wakes still owed after {calls} calls");
+}
+
 #[test]
 fn watermark_gate_wakes_at_or_below() {
     let mut ex = TestExecutor::new();
-    let gate = WatermarkGate::new();
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let gate =
+        WatermarkGate::build(WaitNodes::build(TEST_WAIT_NODES, &census).expect("a pool").seat);
     let acked = Rc::new(RefCell::new(Vec::new()));
     for lsn in [5u64, 10, 15] {
-        let waiter = gate.waiter(lsn);
+        let waiter = gate.wait_for(lsn);
         let acked = Rc::clone(&acked);
         ex.spawn_local(async move {
             waiter.await;
@@ -353,18 +373,21 @@ fn watermark_gate_wakes_at_or_below() {
     ex.run_ready(64);
     assert_eq!(gate.waiting(), 3);
 
-    assert_eq!(gate.advance(10), 2);
+    advance_and_wake(&gate, 10);
+    assert_eq!(gate.waiting(), 1);
     ex.run_ready(64);
     assert_eq!(*acked.borrow(), vec![5, 10]);
 
-    assert_eq!(gate.advance(7), 0, "watermark is monotonic");
-    assert_eq!(gate.advance(100), 1);
+    advance_and_wake(&gate, 7);
+    assert_eq!((gate.watermark(), gate.waiting()), (10, 1), "watermark is monotonic");
+    advance_and_wake(&gate, 100);
+    assert_eq!(gate.waiting(), 0);
     ex.run_ready(64);
     assert_eq!(*acked.borrow(), vec![5, 10, 15]);
     assert_eq!(ex.live_tasks(), 0);
 
     // At-or-below the current watermark: ready without suspending.
-    let mut ready = gate.waiter(50);
+    let mut ready = gate.wait_for(50);
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     assert!(Pin::new(&mut ready).poll(&mut cx).is_ready());

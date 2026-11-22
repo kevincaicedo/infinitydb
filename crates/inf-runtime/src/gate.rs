@@ -23,7 +23,6 @@ use core::marker::PhantomData;
 use core::num::NonZeroU64;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
-use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use inf_foundation::CellId;
@@ -38,6 +37,7 @@ use inf_foundation::LogHistogram;
 use inf_foundation::time::Nanos;
 
 use crate::driver::CompletionResult;
+use crate::heap::{ArrayBuilt, FixedArray, HeapEntry, HeapFull, IndexedHeap};
 use crate::token::CompletionToken;
 
 // ---- the holder both gates keep (ADR-0177 D4) ------------------------------
@@ -557,7 +557,10 @@ impl<V, C: Cleanup<V>> FabricGate<V, C> {
 }
 
 /// Steps a slab's build to its end; a refused build retires its prefix by
-/// steps before it answers.
+/// steps before it answers. Each build step allocates one chunk or one
+/// directory, and each retire step frees one, so each loop runs at most the
+/// slab's chunks and directories times: ⌈cap ÷ c⌉ chunks for its chunk of
+/// `c` slots, and the directories above them (ADR-0194 A1).
 fn build_slab<T>(
     mut builder: SlabBuilder<T, u32, WrapWithProof>,
 ) -> Result<CappedSlab<T, u32, WrapWithProof>, CapError> {
@@ -853,7 +856,7 @@ impl<K: GateKey, V, C: Cleanup<V>> KeyedGate<K, V, C> {
         let routes = match CappedMap::builder(cap, census).and_then(build_routes) {
             Ok(routes) => routes,
             Err(refused) => {
-                retire_holders(holders);
+                retire_slab(holders);
                 return Err(refused);
             }
         };
@@ -972,7 +975,10 @@ fn awaits<V>(state: &HolderState<V>) -> bool {
 }
 
 /// Steps a route map's build to its end; a refused build retires its
-/// prefix by steps before it answers.
+/// prefix by steps before it answers. Each build step allocates one chunk
+/// or one directory of one of the map's two stores, and each retire step
+/// frees one, so each loop runs at most both stores' chunks and directories
+/// times.
 fn build_routes(
     mut builder: MapBuilder<u64, SlotId<u32>>,
 ) -> Result<CappedMap<u64, SlotId<u32>>, CapError> {
@@ -990,10 +996,12 @@ fn build_routes(
     }
 }
 
-/// Retires a built holder slab by steps: a refused gate build frees what it
-/// built without a whole drop.
-fn retire_holders<V>(holders: HolderSlab<V>) {
-    let mut retiring = holders.retire();
+/// Retires a built slab by steps: a build refused after its slab, a gate's
+/// or the wait pool's, frees what it built without a whole drop. Each step
+/// frees one chunk or one directory, so the loop runs at most the slab's
+/// chunks and directories times.
+fn retire_slab<T>(slab: CappedSlab<T, u32, WrapWithProof>) {
+    let mut retiring = slab.retire();
     loop {
         retiring = match retiring.step() {
             Retiring::More(next) => next,
@@ -1181,15 +1189,47 @@ enum NodeState {
 }
 
 /// A parked wait (ADR-0177 D5): its task's waker, its place on its one list
-/// and its state. 48 B, a 56 B slot.
+/// or the watermark gate's heap, and its state. 48 B, a 56 B slot: the
+/// position sits in the padding the other fields leave.
+// In declaration order: the position just ahead of `next`, whose `None` is
+// a zero word at its start, so a list's publish writes the position's zero
+// and that `None` in one store, and the position costs a list wait no
+// instruction (ADR-0177 D5). The zero word is rustc's layout of `SlotId` at
+// the pinned toolchain: `SlotId` is not `repr(C)`, so its niche is the
+// compiler's to place, and a toolchain that moves it splits the store in
+// two, one instruction a list wait that no test sees. The executor bench's
+// `wait-wake` rows count it, so a toolchain bump that splits it reads there.
+#[repr(C)]
 struct WaitNode {
     waker: Option<Waker>,
     prev: Option<NodeId>,
+    /// Its entry's index on the watermark gate's heap, which the heap's hook
+    /// writes at every move, so a dropped wait removes its entry in one sift
+    /// (ADR-0177 D5). A list's node has no entry, and nothing reads its
+    /// position.
+    position: u32,
     next: Option<NodeId>,
     state: NodeState,
 }
 
 const _: () = assert!(size_of::<WaitNode>() == 48, "a wait node is 48 B");
+
+/// A queued watermark wait's entry on the gate's heap (ADR-0177 D5): the LSN
+/// it waits for and its node, 24 B, ordered by its LSN.
+#[derive(Clone, Copy)]
+struct WaitEntry {
+    lsn: u64,
+    node: NodeId,
+}
+
+impl HeapEntry for WaitEntry {
+    type Key = u64;
+
+    fn key(&self) -> u64 {
+        // Canary: every entry orders as one, so no sift moves an entry.
+        if cfg!(inf_canary_ack_wait_no_sift) { 0 } else { self.lsn }
+    }
+}
 
 /// What a pool's handles share: the slab and its counter.
 struct Pool {
@@ -1215,15 +1255,28 @@ impl WaitNodes {
     pub const NODE_SLOT_BYTES: usize = NodeSlab::SLOT_BYTES;
 
     /// The pool of `cap` nodes on the cell's `census`, its row registered and
-    /// its slab built whole by steps before the cell serves.
+    /// its slab built whole by steps before the cell serves, then its one
+    /// [`WatermarkGate`]'s entry array, one entry a node, by steps of its own;
+    /// answered with the seat of that gate, which carries the array
+    /// (ADR-0177 D5).
     ///
     /// # Errors
-    /// `CapError` from the slab's build or its census row; a refused build
-    /// retires its prefix first. Nothing is served.
-    pub fn build(cap: Cap, census: &Rc<CapCensus>) -> Result<WaitNodes, CapError> {
-        let nodes = build_slab(NodeSlab::builder(cap, census)?)?;
+    /// `CapError` from either build or the slab's census row; a refused slab
+    /// retires its prefix first, and a refused array the built slab, each by
+    /// steps. Nothing is served.
+    pub fn build(cap: Cap, census: &Rc<CapCensus>) -> Result<WaitPool, CapError> {
+        let mut nodes = build_slab(NodeSlab::builder(cap, census)?)?;
+        let entries = match build_entries(&mut nodes, cap.entries_max()) {
+            Ok(entries) => entries,
+            Err(refused) => {
+                retire_slab(nodes);
+                return Err(refused);
+            }
+        };
         let pool = Pool { nodes: RefCell::new(nodes), full: Cell::new(0) };
-        Ok(WaitNodes { pool: Rc::new(pool) })
+        let nodes = WaitNodes { pool: Rc::new(pool) };
+        let seat = WatermarkSeat { nodes: nodes.clone(), entries };
+        Ok(WaitPool { nodes, seat })
     }
 
     /// Nodes held by parked waits now (cell scope).
@@ -1249,6 +1302,125 @@ impl WaitNodes {
 impl core::fmt::Debug for WaitNodes {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "WaitNodes {{ len: {}, full: {} }}", self.len(), self.full())
+    }
+}
+
+/// A cell's pool as [`WaitNodes::build`] answers it: the handle every wait
+/// list of the cell takes, and the seat of the pool's one watermark gate.
+#[derive(Debug)]
+pub struct WaitPool {
+    /// The pool's handle; each wait list takes a clone.
+    pub nodes: WaitNodes,
+    /// The seat [`WatermarkGate::build`] consumes, with the gate's entry
+    /// array.
+    pub seat: WatermarkSeat,
+}
+
+/// The seat of a pool's one [`WatermarkGate`] (ADR-0177 D5): answered once,
+/// by the pool's build, and carrying its pool and the gate's entry array,
+/// which the pool built in its steps. It is move-only, with no
+/// `Clone`, and [`WatermarkGate::build`] consumes it, so a second gate on one
+/// pool does not type-check. One gate on one seat builds:
+///
+/// ```
+/// # use inf_foundation::bounded::{Cap, CapCensus, CapFill};
+/// # use inf_foundation::CellId;
+/// # use inf_runtime::{WaitNodes, WatermarkGate};
+/// let (census, _serve_mark) = CapCensus::new(CellId(0));
+/// let Ok(pool) = WaitNodes::build(Cap::entries::<4>("x", CapFill::Serving), &census) else {
+///     return;
+/// };
+/// let _gate = WatermarkGate::build(pool.seat);
+/// ```
+///
+/// A second gate on the same seat does not, the seat having moved into the
+/// first:
+///
+/// ```compile_fail
+/// # use inf_foundation::bounded::{Cap, CapCensus, CapFill};
+/// # use inf_foundation::CellId;
+/// # use inf_runtime::{WaitNodes, WatermarkGate};
+/// let (census, _serve_mark) = CapCensus::new(CellId(0));
+/// let Ok(pool) = WaitNodes::build(Cap::entries::<4>("x", CapFill::Serving), &census) else {
+///     return;
+/// };
+/// let _gate = WatermarkGate::build(pool.seat);
+/// let _second = WatermarkGate::build(pool.seat); // use of a moved seat
+/// ```
+///
+/// Nor does a copy of the seat to build a second gate on:
+///
+/// ```compile_fail
+/// # use inf_foundation::bounded::{Cap, CapCensus, CapFill};
+/// # use inf_foundation::CellId;
+/// # use inf_runtime::WaitNodes;
+/// let (census, _serve_mark) = CapCensus::new(CellId(0));
+/// let Ok(pool) = WaitNodes::build(Cap::entries::<4>("x", CapFill::Serving), &census) else {
+///     return;
+/// };
+/// let _copy = pool.seat.clone(); // the seat is not `Clone`
+/// ```
+pub struct WatermarkSeat {
+    nodes: WaitNodes,
+    /// The gate's heap entries, one a node of the pool, built in the pool's
+    /// steps and resident whole from them, whether or not a gate takes them.
+    entries: FixedArray<WaitEntry>,
+}
+
+impl core::fmt::Debug for WatermarkSeat {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let entries = self.entries.capacity();
+        write!(f, "WatermarkSeat {{ nodes: {:?}, entries: {entries} }}", self.nodes)
+    }
+}
+
+/// The most steps an entry array of `capacity` entries takes to build: a
+/// step allocates one chunk, which holds at least one entry, or one
+/// directory, each under the top one holding at least one chunk, and the top
+/// is one step, so `2 × capacity + 1`.
+const fn entry_steps_max(capacity: u32) -> u64 {
+    2 * capacity as u64 + 1
+}
+
+/// The gate's entry array for a pool of `capacity` nodes, built by steps
+/// after its slab, before the cell serves (ADR-0177 D5): the array is fixed
+/// at the pool's cap, in chunks of at most 64 KiB, and allocates nothing
+/// once built. Every element is filled with a handle the pool minted and
+/// never published. The fill is never looked up: the heap reads only the
+/// entries it holds, each placed by a push. It names no node at boot; once
+/// its slot's generation wraps it may name a live one, which nothing reads.
+/// Nothing may use the fill as a "no node" sentinel.
+///
+/// # Errors
+/// The array's `CapError`; a builder that asks for more steps than
+/// [`entry_steps_max`] has broken its own contract, and is refused as
+/// `Layout`. Nothing is served either way.
+fn build_entries(nodes: &mut NodeSlab, capacity: u32) -> Result<FixedArray<WaitEntry>, CapError> {
+    let fill = WaitEntry { lsn: 0, node: unpublished_node(nodes)? };
+    // A boot check: just minted, the fill names no node of the pool.
+    debug_assert!(matches!(nodes.get(fill.node), Lookup::Stale), "the fill names no node");
+    let mut builder = FixedArray::builder(capacity, fill)?;
+    for _ in 0..entry_steps_max(capacity) {
+        builder = match builder.step() {
+            ArrayBuilt::More(next) => next,
+            ArrayBuilt::Done(entries) => return Ok(entries),
+            ArrayBuilt::Refused(refused) => return Err(refused),
+        };
+    }
+    Err(CapError::Layout)
+}
+
+/// A handle of the pool that names no node when it is minted: a named
+/// reservation dropped unpublished, so its slot is left free at its next
+/// generation (ADR-0194 D1 with A2). A lookup by it reads `Stale` until the
+/// slot's `u32` generation wraps back to the handle's, after which it may
+/// name that slot's occupant. Nothing of the pool's counts or census row
+/// moves. A pool just built has a free slot, as its cap is at least one;
+/// were none free, the build is refused as `Layout` before the cell serves.
+fn unpublished_node(nodes: &mut NodeSlab) -> Result<NodeId, CapError> {
+    match nodes.reserve() {
+        SlabReserved::Slot(slot) => Ok(slot.named().id()),
+        SlabReserved::Full | SlabReserved::Exhausted => Err(CapError::Layout),
     }
 }
 
@@ -1371,25 +1543,25 @@ mod lists {
     /// The unit key's list keeps its one pair of ends in its own state, with no
     /// map: its ends' count is the list's count, one fact.
     impl Queues<()> for Ends {
-        // Folded always, as the keyed list's `ends` (ADR-0210 D1).
+        // Folded always, as the keyed list's `ends` (ADR-0211 D1).
         #[inline(always)]
         fn ends(&self, (): ()) -> Option<&Ends> {
             Some(self)
         }
 
-        // Folded always, as `ends` (ADR-0210 D1).
+        // Folded always, as `ends` (ADR-0211 D1).
         #[inline(always)]
         fn queued(&self) -> u32 {
             self.queued.get()
         }
 
-        // Folded always, as `ends` (ADR-0210 D1).
+        // Folded always, as `ends` (ADR-0211 D1).
         #[inline(always)]
         fn joined(&self, ends: &Ends) {
             ends.queued.set(ends.queued.get() + 1);
         }
 
-        // Folded always, as `ends` (ADR-0210 D1).
+        // Folded always, as `ends` (ADR-0211 D1).
         #[inline(always)]
         fn left(&self, ends: &Ends) {
             ends.queued.set(ends.queued.get() - 1);
@@ -1406,26 +1578,26 @@ mod lists {
 
     impl<K: ExactKey> Queues<K> for KeyedEnds<K> {
         // Folded always: under the keys' bodies a hint alone left it a body
-        // (ADR-0210 D1).
+        // (ADR-0211 D1).
         #[inline(always)]
         fn ends(&self, key: K) -> Option<&Ends> {
             self.by_key.as_ref()?.get(key)
         }
 
-        // Folded always, as `ends` (ADR-0210 D1).
+        // Folded always, as `ends` (ADR-0211 D1).
         #[inline(always)]
         fn queued(&self) -> u32 {
             self.queued.get()
         }
 
-        // Folded always, as `ends` (ADR-0210 D1).
+        // Folded always, as `ends` (ADR-0211 D1).
         #[inline(always)]
         fn joined(&self, ends: &Ends) {
             ends.queued.set(ends.queued.get() + 1);
             self.queued.set(self.queued.get() + 1);
         }
 
-        // Folded always, as `ends` (ADR-0210 D1).
+        // Folded always, as `ends` (ADR-0211 D1).
         #[inline(always)]
         fn left(&self, ends: &Ends) {
             ends.queued.set(ends.queued.get() - 1);
@@ -1449,7 +1621,7 @@ pub trait ListKey: ExactKey {
     type Queues: Queues<Self>;
 
     // The list's two bodies, each a method of a non-generic impl: one compiled
-    // copy a key, in this crate, which every binary links (ADR-0210 D1).
+    // copy a key, in this crate, which every binary links (ADR-0211 D1).
     /// [`ListWait`]'s poll at this key.
     #[doc(hidden)]
     fn poll_wait(wait: Pin<&mut ListWait<Self>>, cx: &mut Context<'_>) -> Poll<()>;
@@ -1463,13 +1635,13 @@ impl ListKey for () {
     type Queues = Ends;
 
     // A body, never folded: the one copy at this key that the bench and the
-    // server both call (ADR-0210 D1).
+    // server both call (ADR-0211 D1).
     #[inline(never)]
     fn poll_wait(wait: Pin<&mut ListWait<Self>>, cx: &mut Context<'_>) -> Poll<()> {
         wait.poll_in(cx)
     }
 
-    // A body, never folded, as `poll_wait` (ADR-0210 D1).
+    // A body, never folded, as `poll_wait` (ADR-0211 D1).
     #[inline(never)]
     fn wake_head_at(list: &List<Self>, key: Self) -> bool {
         list.wake_head_in(key)
@@ -1482,13 +1654,13 @@ macro_rules! keyed_list_key {
             type Queues = KeyedEnds<$key>;
 
             // A body, never folded: the one copy at this key that the bench and
-            // the server both call (ADR-0210 D1).
+            // the server both call (ADR-0211 D1).
             #[inline(never)]
             fn poll_wait(wait: Pin<&mut ListWait<Self>>, cx: &mut Context<'_>) -> Poll<()> {
                 wait.poll_in(cx)
             }
 
-            // A body, never folded, as `poll_wait` (ADR-0210 D1).
+            // A body, never folded, as `poll_wait` (ADR-0211 D1).
             #[inline(never)]
             fn wake_head_at(list: &List<Self>, key: Self) -> bool {
                 list.wake_head_in(key)
@@ -1586,7 +1758,7 @@ impl<K: ListKey> WaitList<K> {
     /// place, and dropped after an unread wake it passes the wake on, so a
     /// wake is never silently lost.
     // Folded always: neither binary holds a body of it, so the attribute holds
-    // that place against a neighbour's attribute (ADR-0210 D1).
+    // that place against a neighbour's attribute (ADR-0211 D1).
     #[inline(always)]
     pub fn wait(&self, key: K) -> ListWait<K> {
         ListWait { list: Rc::clone(&self.list), key, state: ListState::Fresh }
@@ -1594,7 +1766,7 @@ impl<K: ListKey> WaitList<K> {
 
     /// Wakes the longest-waiting task on `key`. Returns whether one was woken.
     // Folded always: with its head's placement moved, a bench outlined it where
-    // the server folded it; one place in both (ADR-0210 D1).
+    // the server folded it; one place in both (ADR-0211 D1).
     #[inline(always)]
     pub fn wake_one(&self, key: K) -> bool {
         // A wake that meets an idle list reads the count and leaves: no
@@ -1651,7 +1823,7 @@ impl<K: ListKey> core::fmt::Debug for WaitList<K> {
 
 impl<K: ListKey> List<K> {
     /// Unlinks and wakes `key`'s head; returns whether the key held one.
-    // Folded always: the body is its key's `wake_head_at` (ADR-0210 D1).
+    // Folded always: the body is its key's `wake_head_at` (ADR-0211 D1).
     #[inline(always)]
     fn wake_head(&self, key: K) -> bool {
         K::wake_head_at(self, key)
@@ -1660,7 +1832,7 @@ impl<K: ListKey> List<K> {
     /// [`List::wake_head`]'s body: the waker is taken in the access that
     /// marks the node woken, and the pool's borrow ends before `wake`, so a
     /// waker that reaches the pool finds it free.
-    // Folded always into its key's `wake_head_at`, its one body (ADR-0210 D1).
+    // Folded always into its key's `wake_head_at`, its one body (ADR-0211 D1).
     #[inline(always)]
     fn wake_head_in(&self, key: K) -> bool {
         let waker = {
@@ -1719,7 +1891,7 @@ impl<K: ListKey> ListWait<K> {
     }
 
     /// The wait's poll, the body of its `Future::poll`.
-    // Folded always into its key's `poll_wait`, its one body (ADR-0210 D1).
+    // Folded always into its key's `poll_wait`, its one body (ADR-0211 D1).
     #[inline(always)]
     fn poll_in(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = Pin::into_inner(self);
@@ -1755,8 +1927,14 @@ impl<K: ListKey> ListWait<K> {
             }
         };
         let tail = ends.tail.get();
-        let node =
-            WaitNode { waker: Some(waker), prev: tail, next: None, state: NodeState::Queued };
+        // A list's node has no heap entry, so its position is never read.
+        let node = WaitNode {
+            waker: Some(waker),
+            prev: tail,
+            next: None,
+            position: 0,
+            state: NodeState::Queued,
+        };
         let id = slot.publish(node);
         match tail {
             Some(tail) => live_mut(&mut nodes, tail).next = Some(id),
@@ -1844,7 +2022,7 @@ impl<K: ListKey> ListWait<K> {
 impl<K: ListKey> Future for ListWait<K> {
     type Output = ();
 
-    // Folded always: the body is its key's `poll_wait` (ADR-0210 D1).
+    // Folded always: the body is its key's `poll_wait` (ADR-0211 D1).
     #[inline(always)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         K::poll_wait(self, cx)
@@ -1862,153 +2040,414 @@ impl<K: ListKey> Drop for ListWait<K> {
 
 // ---- WatermarkGate ----------------------------------------------------------
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum WaiterState {
-    Queued,
-    Woken,
-    Cancelled,
+/// The proof a watermark wait's LSN is covered, which its Ready needs (ADR-0177 D5): made only
+/// by the compare against the watermark and by the read of a node a wake marked, in a module of
+/// its own, so no other code of the gate can make one.
+mod covered {
+    use super::{NodeState, WaitNode};
+
+    /// A watermark wait's LSN is at or below the watermark. Zero-sized, and made only here.
+    #[derive(Clone, Copy)]
+    pub(super) struct Covered(());
+
+    /// The compare's two sides by name: both are LSNs, and swapped, the compare would answer
+    /// covered for a wait above the watermark.
+    #[derive(Clone, Copy)]
+    pub(super) struct WatermarkCompare {
+        /// The LSN the wait waits for.
+        pub(super) lsn: u64,
+        /// The gate's watermark at the compare.
+        pub(super) watermark: u64,
+    }
+
+    impl Covered {
+        /// The compare: `lsn` at or below `watermark`, inclusive, with no `+ 1`.
+        // Inlined always, as each of the gate's own steps is: one caller's frame each.
+        #[inline(always)]
+        pub(super) fn by_watermark(compare: WatermarkCompare) -> Option<Covered> {
+            let WatermarkCompare { lsn, watermark } = compare;
+            // Canary: the compare answers covered for any LSN.
+            let covered = cfg!(inf_canary_ack_wait_covered_early) || lsn <= watermark;
+            covered.then_some(Covered(()))
+        }
+
+        /// The read of a queued wait's node: woken, so a wake popped its entry, which it
+        /// compared covered first.
+        #[inline(always)]
+        pub(super) fn by_wake(node: &WaitNode) -> Option<Covered> {
+            match node.state {
+                NodeState::Woken => Some(Covered(())),
+                NodeState::Queued => None,
+            }
+        }
+    }
 }
 
-struct Waiter {
-    state: Cell<WaiterState>,
-    waker: RefCell<Option<Waker>>,
-}
+use covered::{Covered, WatermarkCompare};
 
+/// The gate's state, which its handles and its waits share.
 struct WatermarkInner {
     watermark: Cell<u64>,
-    waiters: RefCell<BTreeMap<u64, Vec<Rc<Waiter>>>>,
+    /// Set by an `advance` that moves the watermark, and cleared only by a peek, under the
+    /// heap's borrow, that finds no covered minimum: never false while a covered wait is
+    /// queued (ADR-0177 A2.2). A drop, or a call that ends on its budget, may leave it set with
+    /// nothing covered; the next call clears it.
+    owed: Cell<bool>,
+    /// The queued waits' entries, a minimum heap by LSN over the seat's array.
+    heap: RefCell<IndexedHeap<WaitEntry>>,
+    /// The pool every queued wait holds a node of.
+    nodes: WaitNodes,
 }
 
-/// LSN-keyed gate: tasks wait for the durability watermark to reach their
-/// LSN; `advance` wakes every task at or below the new watermark (M2 group
-/// commit acks). A waiter at or below the current watermark is ready on its
-/// first poll.
+impl WatermarkInner {
+    /// The heap's entries: the queued waits, covered ones not yet woken among them.
+    #[inline]
+    fn waiting(&self) -> usize {
+        self.heap.borrow().len() as usize
+    }
+}
+
+/// A watermark gate's count, read-only ([`WatermarkGate::waiting_view`]): it holds the gate's
+/// state alive and answers [`waiting`](Self::waiting) alone.
+pub struct WaitingView {
+    inner: Rc<WatermarkInner>,
+}
+
+impl WaitingView {
+    /// Waits queued on the gate, as [`WatermarkGate::waiting`] reads them.
+    #[must_use]
+    #[inline]
+    pub fn waiting(&self) -> usize {
+        self.inner.waiting()
+    }
+}
+
+/// The durability watermark's gate (ADR-0177 D5 with A2): a task waits for the watermark to
+/// reach its LSN. A wait at or below the watermark is Ready at its first poll, with no node
+/// and no borrow; one above it takes a node of the pool and an entry of the gate's minimum
+/// heap by LSN at that poll, and leaves both at the poll that reads its wake or at its drop.
+/// `advance` moves the watermark and wakes nothing; `wake_covered` wakes the covered waits in
+/// LSN order, at most a budget a call, and `owes` says whether one may be left. One gate a
+/// pool, built on the pool's seat.
 #[derive(Clone)]
 pub struct WatermarkGate {
     inner: Rc<WatermarkInner>,
 }
 
-impl Default for WatermarkGate {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl WatermarkGate {
-    pub fn new() -> WatermarkGate {
-        WatermarkGate {
-            inner: Rc::new(WatermarkInner {
-                watermark: Cell::new(0),
-                waiters: RefCell::new(BTreeMap::new()),
-            }),
-        }
+    /// A heap entry's bytes: the stride the idle bill counts the gate's entry
+    /// array at, one entry a node of the pool, resident whole beside the
+    /// pool's slab (ADR-0177 D5, D8 with A1).
+    pub const ENTRY_BYTES: usize = size_of::<WaitEntry>();
+
+    /// The pool's one gate, on its `seat`: never refused, built before the
+    /// cell serves (ADR-0177 D5). Its heap is the seat's entry array, empty.
+    #[must_use]
+    pub fn build(seat: WatermarkSeat) -> WatermarkGate {
+        let WatermarkSeat { nodes, entries } = seat;
+        let inner = WatermarkInner {
+            watermark: Cell::new(0),
+            owed: Cell::new(false),
+            heap: RefCell::new(IndexedHeap::new(entries)),
+            nodes,
+        };
+        WatermarkGate { inner: Rc::new(inner) }
     }
 
+    /// The watermark: every LSN at or below it is durable. One load, no borrow.
+    #[must_use]
+    #[inline]
     pub fn watermark(&self) -> u64 {
         self.inner.watermark.get()
     }
 
-    /// Wait until the watermark reaches `lsn`.
-    pub fn waiter(&self, lsn: u64) -> WatermarkWait {
-        let waiter = Rc::new(Waiter {
-            state: Cell::new(if self.inner.watermark.get() >= lsn {
-                WaiterState::Woken
-            } else {
-                WaiterState::Queued
-            }),
-            waker: RefCell::new(None),
-        });
-        if waiter.state.get() == WaiterState::Queued {
-            self.inner.waiters.borrow_mut().entry(lsn).or_default().push(Rc::clone(&waiter));
-        }
-        WatermarkWait { waiter, done: false }
+    /// A wait until the watermark reaches `lsn`. Nothing is registered and nothing read until
+    /// its first poll (ADR-0177 D5).
+    // Inlined always: it fills a few words, as a list's `wait` (ADR-0211 D1).
+    #[inline(always)]
+    pub fn wait_for(&self, lsn: u64) -> WatermarkWait {
+        WatermarkWait { gate: self.clone(), state: WatermarkState::Fresh(lsn) }
     }
 
-    /// Advance the watermark (monotonic; lower values are no-ops) and wake
-    /// every waiter at or below it. Returns how many tasks were woken.
-    pub fn advance(&self, to: u64) -> usize {
+    /// Moves the watermark to `to` and sets [`owes`](Self::owes); a `to` at or below the
+    /// watermark moves nothing. It wakes no wait: [`wake_covered`](Self::wake_covered) does
+    /// (ADR-0177 A2.2).
+    // Inlined always: two loads and two stores (ADR-0211 D1).
+    #[inline(always)]
+    pub fn advance(&self, to: u64) {
         if to <= self.inner.watermark.get() {
-            return 0;
+            return;
         }
         self.inner.watermark.set(to);
-        let due = {
-            let mut waiters = self.inner.waiters.borrow_mut();
-            let still_waiting = waiters.split_off(&(to + 1));
-            core::mem::replace(&mut *waiters, still_waiting)
-        };
+        self.inner.owed.set(true);
+    }
+
+    /// Wakes the queued waits the watermark covers, in LSN order, at most `budget` of them, and
+    /// answers how many it woke (ADR-0177 A2.2). A wake is a peek and a pop under the heap's
+    /// and then the pool's borrow, its node marked woken and its waker taken in that access;
+    /// both borrows end before `wake`, so a waker that reaches the gate or the pool finds them
+    /// free, and the minimum is read again after it. A peek that finds no covered minimum
+    /// clears [`owes`](Self::owes); a call that ends on its budget leaves it as it is.
+    // One body, so the pop's sift compiles once (ADR-0211 D1).
+    #[must_use]
+    #[inline(never)]
+    pub fn wake_covered(&self, budget: usize) -> usize {
+        let inner = &*self.inner;
         let mut woken = 0;
-        for waiter in due.into_values().flatten() {
-            if waiter.state.get() == WaiterState::Queued {
-                waiter.state.set(WaiterState::Woken);
-                if let Some(w) = waiter.waker.borrow_mut().take() {
-                    w.wake();
-                }
-                woken += 1;
+        while woken < budget {
+            let waker = {
+                let mut heap = inner.heap.borrow_mut();
+                let mut nodes = inner.nodes.pool.nodes.borrow_mut();
+                let watermark = inner.watermark.get();
+                let covered = heap.peek().filter(|entry| {
+                    let compare = WatermarkCompare { lsn: entry.lsn, watermark };
+                    Covered::by_watermark(compare).is_some()
+                });
+                let Some(entry) = covered else {
+                    inner.owed.set(false);
+                    return woken;
+                };
+                let popped = heap.pop(
+                    #[inline(always)]
+                    |placed, at| WatermarkGate::place(&mut nodes, placed, at),
+                );
+                debug_assert!(
+                    popped.is_some_and(|popped| popped.node == entry.node),
+                    "the pop takes the peeked minimum"
+                );
+                let node = live_mut(&mut nodes, entry.node);
+                debug_assert_eq!(node.position, 0, "a popped node's position names the top");
+                // A node on the heap is on no list: no list linked it while it was there.
+                debug_assert!(node.prev.is_none(), "a node leaving the heap has no list's prev");
+                debug_assert!(node.next.is_none(), "a node leaving the heap has no list's next");
+                node.state = NodeState::Woken;
+                node.waker.take()
+            };
+            woken += 1;
+            if let Some(waker) = waker {
+                waker.wake();
             }
         }
         woken
     }
 
-    /// Live waiters (tests + leak asserts).
+    /// Whether a covered wait may be left queued for [`wake_covered`](Self::wake_covered)
+    /// (ADR-0177 A2.2): one load, no borrow.
+    // Inlined always: one load (ADR-0211 D1).
+    #[must_use]
+    #[inline(always)]
+    pub fn owes(&self) -> bool {
+        self.inner.owed.get()
+    }
+
+    /// Waits queued on the gate: the heap's entries, covered ones not yet woken among them
+    /// (gauges, tests, leak asserts).
+    #[must_use]
+    #[inline]
     pub fn waiting(&self) -> usize {
-        self.inner
-            .waiters
-            .borrow()
-            .values()
-            .flat_map(|v| v.iter())
-            .filter(|w| w.state.get() == WaiterState::Queued)
-            .count()
+        self.inner.waiting()
+    }
+
+    /// A read-only view of the gate's count, which keeps the gate's state alive past every
+    /// handle and every wait: a test reads through it what a teardown left queued. It can
+    /// wake, advance and wait on nothing.
+    #[must_use]
+    #[inline]
+    pub fn waiting_view(&self) -> WaitingView {
+        WaitingView { inner: Rc::clone(&self.inner) }
+    }
+
+    /// The heap's hook: an entry a sift places at `index` has its node's position stored,
+    /// through the pool's slab, so a dropped wait finds its entry in one read. An entry exists
+    /// only with its live node, so `live_mut`'s stop answers any other (ADR-0177 D5).
+    // Inlined always into each sift's instance: the hook's cost is read inside the sift's frame
+    // (ADR-0211 D1).
+    #[inline(always)]
+    fn place(nodes: &mut NodeSlab, entry: WaitEntry, index: u32) {
+        let node = live_mut(nodes, entry.node);
+        // Canary: the hook's store is skipped, so no node's position names its entry.
+        if !cfg!(inf_canary_ack_wait_no_position) {
+            node.position = index;
+        }
     }
 }
 
 impl core::fmt::Debug for WatermarkGate {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let capacity = self.inner.heap.borrow().capacity();
         write!(
             f,
-            "WatermarkGate {{ watermark: {}, waiting: {} }}",
+            "WatermarkGate {{ watermark: {}, owed: {}, waiting: {}, entries: {capacity} }}",
             self.watermark(),
-            self.waiting()
+            self.owes(),
+            self.waiting(),
         )
     }
 }
 
-/// Future returned by [`WatermarkGate::waiter`].
+/// A watermark wait's phase (ADR-0177 D5).
+#[derive(Clone, Copy)]
+enum WatermarkState {
+    /// Made, holding nothing: its first poll compares its LSN, and above the watermark queues.
+    Fresh(u64),
+    /// Holding its node: its entry on the heap, or popped by a wake its next poll reads.
+    Queued(NodeId),
+    /// Ready, by the proof it answered with.
+    Done(Covered),
+}
+
+/// Future returned by [`WatermarkGate::wait_for`]: Ready once the watermark reaches its LSN,
+/// and only then.
 pub struct WatermarkWait {
-    waiter: Rc<Waiter>,
-    done: bool,
+    gate: WatermarkGate,
+    state: WatermarkState,
+}
+
+impl WatermarkWait {
+    /// The first poll: Ready at once when the watermark covers the wait's LSN, with one load
+    /// and no borrow; else the wait takes a node and pushes its entry, sifted up with the hook
+    /// writing each placed node's position. With no node free it stays fresh, counted, and
+    /// wakes its own task, so a later poll compares again: never Ready early.
+    // Inlined always into `poll`, its one caller (ADR-0211 D1).
+    #[inline(always)]
+    fn poll_first(&mut self, lsn: u64, cx: &mut Context<'_>) -> Poll<Covered> {
+        let inner = &*self.gate.inner;
+        let compare = WatermarkCompare { lsn, watermark: inner.watermark.get() };
+        if let Some(covered) = Covered::by_watermark(compare) {
+            return Poll::Ready(covered);
+        }
+        // The clone runs before either borrow, so nothing of the gate is live across a
+        // waker's call.
+        let waker = cx.waker().clone();
+        let mut heap = inner.heap.borrow_mut();
+        let mut nodes = inner.nodes.pool.nodes.borrow_mut();
+        let slot = match nodes.reserve() {
+            SlabReserved::Slot(slot) => slot,
+            SlabReserved::Full | SlabReserved::Exhausted => {
+                drop(nodes);
+                drop(heap);
+                starve(&inner.nodes.pool, waker);
+                return Poll::Pending;
+            }
+        };
+        let node = WaitNode {
+            waker: Some(waker),
+            prev: None,
+            position: 0,
+            next: None,
+            state: NodeState::Queued,
+        };
+        let id = slot.publish(node);
+        let pushed = heap.push(
+            WaitEntry { lsn, node: id },
+            #[inline(always)]
+            |placed, at| WatermarkGate::place(&mut nodes, placed, at),
+        );
+        drop(nodes);
+        drop(heap);
+        match pushed {
+            Ok(()) => {}
+            Err(HeapFull) => unreachable!("the heap holds an entry for each node of its pool"),
+        }
+        self.state = WatermarkState::Queued(id);
+        Poll::Pending
+    }
+
+    /// A later poll: Ready once a wake popped the wait's entry and marked its node, which this
+    /// poll gives back to the pool; else Pending, a new waker stored in place of the old.
+    // Inlined always into `poll`, its one caller (ADR-0211 D1).
+    #[inline(always)]
+    fn poll_queued(&mut self, id: NodeId, cx: &mut Context<'_>) -> Poll<Covered> {
+        let pool = &*self.gate.inner.nodes.pool;
+        let mut nodes = pool.nodes.borrow_mut();
+        let node = live(&nodes, id);
+        if let Some(covered) = Covered::by_wake(node) {
+            // Its waker left it at the pop, so the release drops none.
+            release(&mut nodes, id);
+            return Poll::Ready(covered);
+        }
+        let same = node.waker.as_ref().is_some_and(|held| held.will_wake(cx.waker()));
+        drop(nodes);
+        if !same {
+            rewake(pool, id, cx);
+        }
+        Poll::Pending
+    }
+
+    /// A wait dropped while it holds its node (ADR-0177 D5). Queued, its entry leaves the heap
+    /// at the node's position in one sift; woken and unread, the pop took its entry already,
+    /// and no wake passes on, as every covered wait is woken. The waker leaves the node in the
+    /// access that releases it and drops once both borrows have ended.
+    #[cold]
+    #[inline(never)]
+    fn drop_queued(&mut self, id: NodeId) {
+        let inner = &*self.gate.inner;
+        let waker = {
+            let mut heap = inner.heap.borrow_mut();
+            let mut nodes = inner.nodes.pool.nodes.borrow_mut();
+            let node = live_mut(&mut nodes, id);
+            // A node on the heap is on no list: queued, it leaves the heap here; woken, it left
+            // at the pop, and no list linked it after.
+            debug_assert!(node.prev.is_none(), "a watermark wait's node has no list's prev");
+            debug_assert!(node.next.is_none(), "a watermark wait's node has no list's next");
+            let waker = node.waker.take();
+            let (state, at) = (node.state, node.position);
+            // Canary: a queued wait's drop skips its removal, its entry left on the heap.
+            if state == NodeState::Queued && !cfg!(inf_canary_ack_wait_drop_keeps_entry) {
+                let removed = heap.remove(
+                    at,
+                    #[inline(always)]
+                    |placed, index| WatermarkGate::place(&mut nodes, placed, index),
+                );
+                debug_assert!(
+                    removed.is_some_and(|entry| entry.node == id),
+                    "a queued node's position names its entry"
+                );
+            }
+            release(&mut nodes, id);
+            waker
+        };
+        drop(waker);
+    }
 }
 
 impl Future for WatermarkWait {
     type Output = ();
 
+    /// Ready only with the proof that the wait's LSN is covered, which one of its two phases
+    /// answers, and Ready again at each poll after.
+    // One body, so the push's sift compiles once (ADR-0211 D1).
+    #[inline(never)]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let this = Pin::into_inner(self);
-        match this.waiter.state.get() {
-            WaiterState::Woken => {
-                this.done = true;
+        let answered = match this.state {
+            WatermarkState::Fresh(lsn) => this.poll_first(lsn, cx),
+            WatermarkState::Queued(id) => this.poll_queued(id, cx),
+            WatermarkState::Done(covered) => Poll::Ready(covered),
+        };
+        match answered {
+            Poll::Ready(covered) => {
+                this.state = WatermarkState::Done(covered);
                 Poll::Ready(())
             }
-            WaiterState::Queued => {
-                *this.waiter.waker.borrow_mut() = Some(cx.waker().clone());
-                Poll::Pending
-            }
-            WaiterState::Cancelled => unreachable!("watermark waiters are never cancelled"),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl Drop for WatermarkWait {
     fn drop(&mut self) {
-        // Lazy cleanup: mark cancelled; `advance` skips dead entries. (The
-        // BTreeMap entry itself is removed when its LSN is crossed.)
-        if !self.done && self.waiter.state.get() == WaiterState::Queued {
-            self.waiter.state.set(WaiterState::Cancelled);
+        match self.state {
+            WatermarkState::Queued(id) => self.drop_queued(id),
+            WatermarkState::Fresh(_) | WatermarkState::Done(_) => {}
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use inf_foundation::bounded::CapFill;
     use inf_foundation::rng::Entropy;
@@ -2020,7 +2459,7 @@ mod tests {
 
     /// A pool of wait nodes on `census`.
     fn wait_nodes(census: &Rc<CapCensus>) -> WaitNodes {
-        WaitNodes::build(TEST_WAIT_NODES, census).expect("the test pool")
+        WaitNodes::build(TEST_WAIT_NODES, census).expect("the test pool").nodes
     }
 
     /// A list of `keys` on a census and a pool of its own, and the pool.
@@ -2832,7 +3271,7 @@ mod tests {
         const NODES: u32 = 100;
         const POOL: Cap = Cap::entries::<NODES>("test-pool-model", CapFill::Serving);
         let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
-        let pool = WaitNodes::build(POOL, &census).expect("the test pool");
+        let pool = WaitNodes::build(POOL, &census).expect("the test pool").nodes;
         let row = census.row("test-pool-model").expect("the pool's census row");
         assert_eq!((row.entries_max, row.capacity_now), (NODES, NODES), "built whole");
         assert_eq!((pool.len(), pool.full()), (0, 0), "a new pool holds no node");
@@ -2849,6 +3288,7 @@ mod tests {
                             waker: None,
                             prev: None,
                             next: None,
+                            position: 0,
                             state: NodeState::Queued,
                         };
                         live.push(slot.publish(node));
@@ -2874,6 +3314,63 @@ mod tests {
         assert_eq!(pool.full(), 0, "no first poll ran, so none starved");
     }
 
+    /// The pool builds its gate's entry array in its own steps, after its slab, and hands it to
+    /// its seat whole, which a gate built on the seat keeps: one entry a node of the cap at one
+    /// node, at one full chunk (2,730 entries of 24 B in 64 KiB), one past it (a directory and
+    /// two chunks) and at the default node's 2,825, each inside its steps' bound. The slab is
+    /// as a pool with no array leaves it: its row whole at the cap, with no high water and no
+    /// crossing, no node held and no first poll counted, so minting the fill took no node; the
+    /// build's own check holds that the fill names none. Oracle: the cap's count and the
+    /// census row.
+    #[test]
+    fn the_pool_builds_its_gates_entry_array_in_its_own_steps() {
+        const ONE: Cap = Cap::entries::<1>("test-entries-one", CapFill::Serving);
+        const CHUNK: Cap = Cap::entries::<2_730>("test-entries-chunk", CapFill::Serving);
+        const PAST_CHUNK: Cap = Cap::entries::<2_731>("test-entries-past", CapFill::Serving);
+        const DEFAULT: Cap = Cap::entries::<2_825>("test-entries-default", CapFill::Serving);
+        assert_eq!(WatermarkGate::ENTRY_BYTES, 24, "an entry is the 24 B the bill counts");
+        for cap in [ONE, CHUNK, PAST_CHUNK, DEFAULT] {
+            let (name, entries) = (cap.name(), cap.entries_max());
+            let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
+            let WaitPool { nodes, seat } = WaitNodes::build(cap, &census)
+                .unwrap_or_else(|refused| panic!("{name}: the pool refused: {refused}"));
+            assert_eq!(seat.entries.capacity(), entries, "{name}: one entry a node");
+            let row = census.row(name).expect("the pool's census row");
+            assert_eq!((row.entries_max, row.capacity_now), (entries, entries), "{name}: whole");
+            assert_eq!((row.high_water, row.crossings), (0, 0), "{name}: the fill took no node");
+            assert_eq!((nodes.len(), nodes.full()), (0, 0), "{name}: no node held or starved");
+            let gate = WatermarkGate::build(seat);
+            assert_eq!(
+                gate.inner.heap.borrow().capacity(),
+                entries,
+                "{name}: the gate keeps the array"
+            );
+            assert_eq!(gate.waiting(), 0, "{name}: nothing queued");
+        }
+    }
+
+    /// The watermark gate's accessors and a covered wait's poll take no borrow (ADR-0177 D5):
+    /// under held `borrow_mut`s of the gate's heap and of its pool, `watermark()` and `owes()`
+    /// answer, a first poll the watermark covers is Ready, and its drop takes none either.
+    #[test]
+    fn a_covered_poll_and_the_gates_accessors_take_no_borrow() {
+        let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
+        let pool = WaitNodes::build(TEST_WAIT_NODES, &census).expect("the test pool");
+        let gate = WatermarkGate::build(pool.seat);
+        gate.advance(9);
+        let heap = gate.inner.heap.borrow_mut();
+        let nodes = gate.inner.nodes.pool.nodes.borrow_mut();
+        assert_eq!(gate.watermark(), 9, "the watermark, read under held borrows");
+        assert!(gate.owes(), "the debt, read under held borrows");
+        let mut covered = gate.wait_for(9);
+        let ready = Pin::new(&mut covered).poll(&mut Context::from_waker(Waker::noop()));
+        assert!(ready.is_ready(), "a covered first poll is Ready under held borrows");
+        drop(covered);
+        drop(nodes);
+        drop(heap);
+        assert_eq!(gate.waiting(), 0, "the covered wait took no entry");
+    }
+
     /// A whole-list wake wakes every queued wait of its key, and the pool bounds them: with
     /// `T − 1` and `T` waits each takes a node and each is woken; the wait past `T` takes no
     /// node, its first poll counted (`wait_nodes_full`) and its task woken by itself, and the
@@ -2884,7 +3381,7 @@ mod tests {
         const POOL: Cap = Cap::entries::<T>("test-pool-t", CapFill::Serving);
         for waits in [T - 1, T, T + 1] {
             let (census, _mark) = CapCensus::new(inf_foundation::CellId(1));
-            let nodes = WaitNodes::build(POOL, &census).expect("the test pool");
+            let nodes = WaitNodes::build(POOL, &census).expect("the test pool").nodes;
             let list = WaitList::keyed(&nodes, Some(TEST_LIST_KEYS), &census, [7u32])
                 .expect("the test list");
             let mut cx = Context::from_waker(Waker::noop());

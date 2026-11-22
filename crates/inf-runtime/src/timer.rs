@@ -290,6 +290,8 @@ impl TimerSet {
         let heap = build_array(FixedArray::builder(positions, VACANT_ENTRY)?)?;
         let handles = build_array(FixedArray::builder(positions, None)?)?;
         let mut builder = CappedSlab::<OwnerSlot, u64, Retire>::builder(owners, census)?;
+        // One chunk or directory allocated a step: at most the slab's chunks and directories
+        // steps.
         let slots = loop {
             builder = match builder.step() {
                 Built::More(next) => next,
@@ -685,7 +687,10 @@ fn due_at(deadline_ms: u64, now: Nanos) -> bool {
     deadline_ms <= now_ms
 }
 
-/// Steps an array's build to its end.
+/// Steps an array's build to its end. Each step allocates one chunk or one
+/// directory, so the loop runs at most the array's chunks and directories
+/// times: ⌈positions ÷ e⌉ chunks of `e` entries and, past one chunk, the
+/// directories above them.
 fn build_array<E: Copy>(mut builder: FixedArrayBuilder<E>) -> Result<FixedArray<E>, CapError> {
     loop {
         builder = match builder.step() {
@@ -696,7 +701,9 @@ fn build_array<E: Copy>(mut builder: FixedArrayBuilder<E>) -> Result<FixedArray<
     }
 }
 
-/// Retires a refused slab's prefix by steps.
+/// Retires a refused slab's prefix by steps. Each step frees one chunk or
+/// one directory, so the loop runs at most the prefix's chunks and
+/// directories times.
 fn retire_prefix(mut prefix: SlabRetiring<OwnerSlot, u64, Retire>) {
     loop {
         prefix = match prefix.step() {

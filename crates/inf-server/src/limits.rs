@@ -1,5 +1,7 @@
 //! Runtime bounds owned by the server. Every crossing names its behavior here.
 
+use core::num::NonZeroU32;
+
 use inf_foundation::bounded::{Cap, CapError, CapFill};
 use inf_foundation::time::Nanos;
 
@@ -45,6 +47,18 @@ pub const ACK_MAP_ENTRIES: u32 = inf_log::limits::REORDER_WINDOW_FRAMES;
 /// The ack map's cap: `ACK_MAP_ENTRIES` entries under the census name
 /// `ack-map`, filled while the cell serves.
 pub const ACK_MAP: Cap = Cap::entries::<ACK_MAP_ENTRIES>("ack-map", CapFill::Serving);
+
+/// Watermark waits one cell's durable plane wakes between two of its LOG steps (ADR-0177
+/// A2.1): the first batch at a sync's completion, each later one at the head of the LOG step,
+/// one call of the ack gate's `wake_covered` each, drawn from one count the LOG step refills.
+/// Its reason is a batch's time, a sift a wake: 1,024 woken read 0.13 to 0.41 ms with up to
+/// 50,000 waits queued. At least one by its type, as a zero budget would strand every
+/// acknowledgment; at most the loop's default `exec_budget`, as waking more than one EXECUTE
+/// pass polls runs no task sooner (a test holds both). The durable config carries it, so a
+/// test may lower it. Unit: waits between two LOG steps of a cell. Owner: the cell's
+/// `DurableCell`. Crossing: pacing, the later LOG steps waking the rest in LSN order.
+// 1,024 built from the least non-zero count: a construction with no refusal to handle.
+pub const ACK_WAKES_PER_TURN: NonZeroU32 = NonZeroU32::MIN.saturating_add(1_024 - 1);
 
 /// Timer owner positions one server cell holds (ADR-0154 D1, D4): its roles'
 /// count, `TimerRole::COUNT` (one listener's accept retry, everysec, fill
@@ -549,20 +563,23 @@ pub const WAIT_NODES: Cap = Cap::entries::<WAIT_NODES_MAX>("wait-nodes", CapFill
 /// `CapError::Layout` when `T` passes [`WAIT_NODES_MAX`]; derived never.
 pub(crate) const fn wait_nodes(caps: &PlaneTaskCaps) -> Result<Cap, CapError> {
     let nodes = task_slots(caps);
-    // Canary: the pool is built over (1 + k) T nodes, k the fewest whose nodes' bytes pass
-    // ten times the idle-resident tool's 256 KiB control a cell, so the idle node's resident
-    // rise is one the tool gives a verdict on.
+    // Canary: the pool is built over (1 + k) T nodes, and the gate's entry array with it, k
+    // the fewest whose nodes' and entries' bytes pass ten times the idle-resident tool's
+    // 256 KiB control a cell, so the idle node's resident rise is one the tool gives a verdict
+    // on.
     #[cfg(inf_canary_wait_nodes_oversized)]
     let nodes = nodes * (1 + wait_nodes_oversized_k(nodes));
     Cap::derived(&WAIT_NODES, nodes)
 }
 
-/// The oversized-pool canary's `k` at `nodes`: the fewest counts of `nodes` whose node bytes
-/// pass ten times the idle-resident tool's 256 KiB control a cell, 2,621,440 B, at the stride
-/// the build reads.
+/// The oversized-pool canary's `k` at `nodes`: the fewest counts of `nodes` whose bytes, a
+/// node's slot and the watermark gate's entry each, pass ten times the idle-resident tool's
+/// 256 KiB control a cell, 2,621,440 B, at the strides the build reads. The entry array is
+/// built at the pool's cap (ADR-0177 D5), so the plant grows both.
 #[cfg(any(all(test, feature = "doc"), inf_canary_wait_nodes_oversized))]
 pub(crate) const fn wait_nodes_oversized_k(nodes: u32) -> u32 {
-    let stride = inf_runtime::WaitNodes::NODE_SLOT_BYTES as u64;
+    let stride =
+        (inf_runtime::WaitNodes::NODE_SLOT_BYTES + inf_runtime::WatermarkGate::ENTRY_BYTES) as u64;
     let per_count = nodes as u64 * stride;
     (WAIT_NODES_PLANT_FLOOR_BYTES / per_count + 1) as u32
 }
@@ -675,3 +692,228 @@ pub const GATED_REPLIES_PER_POLL: usize = 1_024;
 /// `checked_mesh_config`. Crossing: none at run time; a pair the check
 /// refuses fails the build.
 pub const FABRIC_RING_SLOTS_PER_PEER: usize = 4096;
+
+#[cfg(test)]
+mod tests {
+    use super::ACK_WAKES_PER_TURN;
+
+    /// The wake budget's two bounds (ADR-0177 A2.1): at most the loop's default EXECUTE budget,
+    /// which polls that many tasks a pass, so waking more runs nothing sooner; and the value the
+    /// limit's doc reasons from.
+    #[test]
+    fn the_wake_budget_is_at_most_one_execute_pass() {
+        let exec_budget = inf_runtime::LoopConfig::default().exec_budget;
+        let budget = usize::try_from(ACK_WAKES_PER_TURN.get()).expect("a u32 fits a usize here");
+        assert!(
+            budget <= exec_budget,
+            "{budget} wakes a turn past an EXECUTE pass's {exec_budget}"
+        );
+        assert_eq!(budget, 1_024, "the budget the limit's doc reads its batch time at");
+    }
+
+    /// Every copy of the wake budget in the workspace: the crates below this one cannot reach
+    /// the limit, so a source of theirs keeps its own `WAKE_BUDGET`. Every `.rs` file of each
+    /// workspace member's tree, as the root manifest's `members` name them, is read (a build's
+    /// output, by Cargo's `CACHEDIR.TAG`, and this file, whose planted strings name it, aside),
+    /// and one that names `WAKE_BUDGET` declares it once, as a literal equal to the limit: a
+    /// copy joins the tie by its name wherever it sits, a test module under `src/` among them,
+    /// with no list of files to extend. A copy that drifts, is declared twice, `pub`, commented
+    /// out or not a literal is red here, and so is a walk that finds no copy.
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "test-only: reads the workspace members' sources")]
+    fn every_copy_of_the_wake_budget_in_the_workspace_is_the_limit() {
+        let limit = u64::from(ACK_WAKES_PER_TURN.get());
+        let sources = member_sources();
+        let mut copies = 0_usize;
+        for path in &sources {
+            let source = std::fs::read_to_string(path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            if let Some(copy) = wake_budget_copy(&source) {
+                let file = path.display();
+                assert_eq!(copy, Ok(limit), "{file}'s wake budget is not ACK_WAKES_PER_TURN");
+                copies += 1;
+            }
+        }
+        let scanned = sources.len();
+        assert!(copies > 0, "VACUOUS no-copy: {scanned} sources name no WAKE_BUDGET");
+    }
+
+    /// The tie's planted reds: a copy one past the limit, a copy declared twice, a source with
+    /// no copy, a copy not a literal, and a source that names `WAKE_BUDGET` with its one
+    /// declaration `pub` or commented out are each refused, so the tie above can go red; a
+    /// source that never names it is no copy.
+    #[test]
+    fn the_wake_budget_tie_refuses_a_drifted_doubled_hidden_or_missing_copy() {
+        let limit = u64::from(ACK_WAKES_PER_TURN.get());
+        let drifted = format!("const WAKE_BUDGET: usize = {};\n", limit + 1);
+        assert_eq!(declared_wake_budget(&drifted), Ok(limit + 1), "the drifted value is read");
+        assert_ne!(declared_wake_budget(&drifted), Ok(limit), "a drifted copy is refused");
+        let doubled = "const WAKE_BUDGET: u64 = 1_024;\nconst WAKE_BUDGET: u64 = 1_024;\n";
+        assert_eq!(declared_wake_budget(doubled), Err("declared twice"));
+        assert_eq!(declared_wake_budget("const OTHER: u64 = 1;\n"), Err("not declared"));
+        assert_eq!(declared_wake_budget("const WAKE_BUDGET: u64 = x;\n"), Err("not a number"));
+        let public = "pub const WAKE_BUDGET: u64 = 1_024;\n";
+        assert_eq!(wake_budget_copy(public), Some(Err("not declared")), "a pub copy is refused");
+        let hidden = "// const WAKE_BUDGET: u64 = 1_024;\nfn f() { g(WAKE_BUDGET) }\n";
+        assert_eq!(wake_budget_copy(hidden), Some(Err("not declared")), "a hidden copy");
+        assert_eq!(wake_budget_copy("const BUDGET: u64 = 1_024;\n"), None, "no name, no copy");
+    }
+
+    /// A source's copy of the wake budget: none when it never names `WAKE_BUDGET`, else its
+    /// one declaration's value, or why it has none.
+    fn wake_budget_copy(source: &str) -> Option<Result<u64, &'static str>> {
+        source.contains("WAKE_BUDGET").then(|| declared_wake_budget(source))
+    }
+
+    /// The workspace members the root manifest's one `members = [...]` line names: a literal
+    /// path, or a `dir/*` glob for each directory under `dir` that holds a `Cargo.toml`. Any
+    /// other glob, or no such line, fails the test, so the walk never reads less than the
+    /// workspace without saying so.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test-only: reads the workspace's root manifest and lists its member globs"
+    )]
+    fn workspace_members(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml"))
+            .unwrap_or_else(|error| panic!("the root manifest: {error}"));
+        let line = manifest
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("members = ["))
+            .expect("the root manifest's one-line `members = [...]`");
+        let globs = line.strip_suffix(']').expect("the members on one line");
+        let mut members = Vec::new();
+        for glob in globs.split(',').map(str::trim).filter(|glob| !glob.is_empty()) {
+            let glob = glob.trim_matches('"');
+            let Some(parent) = glob.strip_suffix("/*") else {
+                assert!(!glob.contains('*'), "a members glob the walk does not read: {glob}");
+                members.push(root.join(glob));
+                continue;
+            };
+            for (path, is_dir) in listed(&root.join(parent)) {
+                if is_dir && path.join("Cargo.toml").is_file() {
+                    members.push(path);
+                }
+            }
+        }
+        assert!(!members.is_empty(), "the root manifest names no member");
+        members
+    }
+
+    /// Each entry of `dir` and whether it is a directory; a directory that cannot be listed
+    /// fails the test.
+    #[allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "test-only: lists the workspace members' directories"
+    )]
+    fn listed(dir: &std::path::Path) -> Vec<(std::path::PathBuf, bool)> {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+        entries
+            .map(|entry| {
+                let entry = entry.unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+                let kind = entry.file_type().unwrap_or_else(|error| panic!("{error}"));
+                (entry.path(), kind.is_dir())
+            })
+            .collect()
+    }
+
+    /// Every `.rs` file of each workspace member's whole tree but this file, whose planted
+    /// strings name the budget, and which the walk must meet exactly once.
+    fn member_sources() -> Vec<std::path::PathBuf> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let this_file = root.join(file!());
+        let (files, met) = rust_sources(workspace_members(&root), &this_file);
+        assert_eq!(met, 1, "the walk met {} {met} times, where once", this_file.display());
+        files
+    }
+
+    /// The `.rs` files under `trees` but `aside`, sorted, walked with a stack of directories,
+    /// and how many times the walk met `aside`. A directory is a build's output, and skipped,
+    /// only when it holds `CACHEDIR.TAG`, the cache-directory tag Cargo writes at the root of
+    /// each target directory it makes, as a regular file: a link of that name tags nothing, as
+    /// `find -type f` reads it in `scripts/source-files.sh`, whose rule this walk keeps itself
+    /// because the test has no shell in its path. A name never skips a directory, so a source
+    /// directory named `target` at any depth is read.
+    #[allow(clippy::disallowed_methods, reason = "test-only: reads each directory's cache tag")]
+    fn rust_sources(
+        mut trees: Vec<std::path::PathBuf>,
+        aside: &std::path::Path,
+    ) -> (Vec<std::path::PathBuf>, usize) {
+        let (mut files, mut met) = (Vec::new(), 0);
+        while let Some(dir) = trees.pop() {
+            for (path, is_dir) in listed(&dir) {
+                if is_dir {
+                    let tag = std::fs::symlink_metadata(path.join("CACHEDIR.TAG"));
+                    if !tag.is_ok_and(|tag| tag.file_type().is_file()) {
+                        trees.push(path);
+                    }
+                } else if path == aside {
+                    met += 1;
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        files.sort();
+        (files, met)
+    }
+
+    /// The walk's build-output rule, on a scratch tree: a directory named `target` that holds
+    /// no `CACHEDIR.TAG` is read, so its source is met; one named `target` that holds the tag,
+    /// and one under another name that holds it, are skipped, so neither's source is; one whose
+    /// `CACHEDIR.TAG` is a link to a tag is read, since a link tags nothing; the `aside` file is
+    /// met once and left out. A rule that skips by the name `target` leaves the untagged
+    /// directory's source unread, and one that follows the link leaves the linked one's.
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "test-only: builds the walk's scratch tree")]
+    fn the_tie_walk_skips_a_tagged_directory_and_reads_an_untagged_target() {
+        let root = std::env::temp_dir().join(format!("inf-limits-tie-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let member = root.join("member");
+        let untagged = member.join("target");
+        let (tagged, tagged_other) = (member.join("nested/target"), member.join("out"));
+        let linked = member.join("linked");
+        for dir in [&untagged, &tagged, &tagged_other, &linked] {
+            std::fs::create_dir_all(dir)
+                .unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+        }
+        let tag = "Signature: 8a477f597d28d172789f06886806bc55\n";
+        let (read, read_linked) = (untagged.join("read.rs"), linked.join("read.rs"));
+        let aside = member.join("aside.rs");
+        let files = [
+            (tagged.join("CACHEDIR.TAG"), tag),
+            (tagged_other.join("CACHEDIR.TAG"), tag),
+            (read.clone(), ""),
+            (read_linked.clone(), ""),
+            (tagged.join("skipped.rs"), ""),
+            (tagged_other.join("skipped.rs"), ""),
+            (aside.clone(), ""),
+        ];
+        for (file, contents) in &files {
+            std::fs::write(file, contents)
+                .unwrap_or_else(|error| panic!("{}: {error}", file.display()));
+        }
+        std::os::unix::fs::symlink(tagged.join("CACHEDIR.TAG"), linked.join("CACHEDIR.TAG"))
+            .unwrap_or_else(|error| panic!("the linked tag: {error}"));
+        let (sources, met) = rust_sources(vec![member], &aside);
+        let _ = std::fs::remove_dir_all(&root);
+        let want = [read_linked, read];
+        assert_eq!(sources, want, "the walk's sources, where the untagged and the linked ones");
+        assert_eq!(met, 1, "the walk met the aside file {met} times, where once");
+    }
+
+    /// The value of the one `const WAKE_BUDGET: <type> = <digits>;` line of `source`.
+    fn declared_wake_budget(source: &str) -> Result<u64, &'static str> {
+        let mut lines = source.lines().filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("const WAKE_BUDGET:")?;
+            let (_, value) = rest.split_once('=')?;
+            Some(value.trim().trim_end_matches(';').replace('_', ""))
+        });
+        let value = lines.next().ok_or("not declared")?;
+        if lines.next().is_some() {
+            return Err("declared twice");
+        }
+        value.parse().map_err(|_| "not a number")
+    }
+}

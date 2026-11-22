@@ -1,8 +1,9 @@
 //! The wait legs: the fixed stores the gates and the wait lists take, one
 //! operation or one round a step, beside the growable representations they
-//! replace; reported and never judged. They run the rate legs' loop
-//! (`rates::rate_loop`), so a leg's reading less `harness`'s is its step's
-//! own instructions, and a round leg's is read a wait: that over its waits.
+//! replace; reported and never judged. All but the wake steps run the rate
+//! legs' loop (`rates::rate_loop`), so a leg's reading less `harness`'s is
+//! its step's own instructions, and a round leg's is read a wait: that over
+//! its waits.
 //!
 //! - `slab-holder-get`, `-get-mut`, `-cycle`: on a slab of the fabric gate's
 //!   holders' generation and policy (a `u32` that wraps) and a 56 B holder,
@@ -36,11 +37,16 @@
 //!   map at the fabric gate's widths (a `u64` key and a 48 B slot) under the
 //!   integer hasher, 2^d even keys: a probe of a live one, or an insert and
 //!   a remove of the odd key beside one.
-//! - `heap-mark-rising-962`, `-2825`, `-16384` and `heap-mark-falling-*`: a
+//! - `heap-hook-rising-962`, `-2825`, `-16384` and `heap-hook-falling-*`: a
 //!   round on the indexed heap of 24 B wait entries (an LSN and a node's
-//!   handle), its hook empty: that many waits pushed in rising or falling
-//!   LSN order, then two advances, to the middle and to the last, each
-//!   popping every entry at or below it.
+//!   handle) over a pool of that many live wait nodes, each entry carrying
+//!   its own node's handle, with the watermark gate's hook (each placed
+//!   entry's node resolved by `get_mut` and its position word stored): that
+//!   many waits pushed in rising or falling LSN order, then two advances,
+//!   to the middle and to the last, each popping every entry at or below it.
+//! - `heap-hook-one-962`, `-2825`: one wait on the same stores, a far entry
+//!   parked throughout: an entry at the next LSN pushed under it and popped,
+//!   three moves with the hook.
 //! - `btree-mark-rising-*`, `btree-mark-falling-*`: the same round on the
 //!   watermark gate before its fixed stores, each wait polled once before
 //!   the advances and once after.
@@ -51,24 +57,41 @@
 //! - `mark-wait-for`: the watermark gate before its fixed stores, one far
 //!   wait parked: a wait at the next LSN and its poll, an advance to it, and
 //!   the poll that reads it ready.
+//! - `advance-hook-2825`, `-16384`, `-50000`, `wake-budget-*` and
+//!   `advance-btree-*`: the wake steps, one call over that many waits one
+//!   fsync covers, filled before it in rising LSN order: every covered wait
+//!   popped with the hook, its node marked and a waker woken; the first
+//!   1,024 of them, the durable cell's budget between two LOG steps; or the
+//!   B-tree gate's `advance` over all of them. Each op runs one call right
+//!   after its fill and one with 64 MB written after its fill. These legs
+//!   are read by a count collected inside the step's call alone (callgrind's
+//!   `--toggle-collect`) and by the call's wall time: they run no rate loop,
+//!   and their fills dwarf the step.
 //!
 //! The gates before their fixed stores are copied below, their wait paths
 //! as they stood, so these legs read the same code after the runtime's
 //! gates change.
 //!
 //! Plants: the single-op legs' `-plus-one`, one `nop` at the loop's top; the
-//! heap's rounds' `-plus-wait`, one `nop` a wait at the top of the push
-//! loop's body; the B-tree's rounds and the list and watermark legs'
-//! `-plus-hundred`, 100 `nop`s a wait. Those representations allocate a
-//! waiter on every wait, and the allocator's path moves with the plant's
-//! code by a few instructions, so their plant is read at a hundred.
+//! heap's rounds' `-plus-wait`, one `nop` a wait after its push's `expect`,
+//! a call that may unwind, so no pass runs the `nop` ahead of it (at the top
+//! of the push loop's body the optimizer runs it once a round); the hook's
+//! wake steps' `-plus-wait`, one `nop` after each pop's result is read; the
+//! B-tree's rounds and the list and watermark legs' `-plus-hundred`, 100
+//! `nop`s a wait. Those representations allocate a waiter on every wait, and
+//! the allocator's path moves with the plant's code by a few instructions,
+//! so their plant is read at a hundred. The B-tree's wake step has no plant:
+//! its `advance` is the copy's, unchanged, and pops nothing.
 //!
-//! Two readings outside the count:
+//! Three readings outside the count:
 //!
-//! - a heap leg writes its round's moves, its dry pass's (a round with a
-//!   counting hook before the counted loop, the same at every op count), as
-//!   `dry-pass-moves <moves>` on stderr, and asserts every round after the
-//!   loop places as many;
+//! - a heap leg writes its round's moves, its dry pass's (a round, or on the
+//!   one-wait legs an op, with a counting hook before the counted loop, the
+//!   same at every op count), as `dry-pass-moves <moves>` on stderr, and
+//!   asserts every round after the loop places as many;
+//! - a wake step leg writes each regime's calls, their median and their
+//!   worst wall time, as `step-ns <warm|evicted> calls <n> median <ns> worst
+//!   <ns>` on stderr;
 //! - `--walk-depth` on a counter leg replays its seed on its map for `--ops`
 //!   ops after its warm-up, in a process the count never runs, prints the
 //!   mean branch depth of the keys its ops admit and remove in the live
@@ -109,7 +132,9 @@ pub enum WaitLeg {
     Node { op: NodeOp },
     RouteCounter { routes: Routes, shape: RouteShape },
     HashGate { depth: u32, op: HashOp },
-    HeapMark { order: Order, waits: Waits },
+    HeapHook { order: Order, waits: Waits },
+    HeapHookOne { waits: Waits },
+    WakeStep { step: WakeStep, waits: Waits },
     BtreeMark { order: Order, waits: Waits },
     ListWaitWake { key: ListKey },
     MarkWaitFor,
@@ -160,6 +185,17 @@ pub enum HashOp {
     InsertRemove,
 }
 
+/// What a wake step leg's one call runs over the waits one fsync covers.
+#[derive(Clone, Copy)]
+pub enum WakeStep {
+    /// Every covered wait popped with the hook, in one call.
+    AdvanceHook,
+    /// The first `WAKE_BUDGET` of them: one budgeted call.
+    WakeBudget,
+    /// HEAD's `advance` on the bench's copy of its gate.
+    AdvanceBtree,
+}
+
 /// A wait list's key: a list of one unit key, or of `u32` keys.
 #[derive(Clone, Copy)]
 pub enum ListKey {
@@ -174,13 +210,15 @@ pub enum Order {
     Falling,
 }
 
-/// A round's waits: the wait nodes at one cell (962) and at four (2,825), and
-/// the most one directory level of the heap's entries holds (16,384).
+/// A round's waits: the wait nodes at one cell (962) and at four (2,825), the
+/// most one directory level of the heap's entries holds (16,384), and the
+/// storm one fsync releases on the wake step legs (50,000).
 #[derive(Clone, Copy)]
 pub enum Waits {
     OneCell,
     FourCells,
     OneDirectory,
+    Storm,
 }
 
 const _: () = assert!(ONE_LEVEL_SLOTS == 16_384, "the heap legs' names carry 16,384");
@@ -191,12 +229,14 @@ impl Waits {
             Waits::OneCell => 962,
             Waits::FourCells => 2_825,
             Waits::OneDirectory => ONE_LEVEL_SLOTS as u64,
+            Waits::Storm => 50_000,
         }
     }
 }
 
 /// Drives `ops` steps of `leg` with `nops` planted: per op on the single-op
-/// legs, per wait on the round legs. A plant the leg does not take panics,
+/// legs, per wait on the round legs and the hook's wake steps, each of whose
+/// ops is one call in each regime. A plant the leg does not take panics,
 /// and so does the window, which is read by its walk depth alone: the table
 /// of legs names each leg's plant once.
 #[inline(never)]
@@ -223,8 +263,25 @@ pub fn drive(leg: WaitLeg, nops: u8, ops: u64) -> u64 {
         }
         (WaitLeg::HashGate { depth, op }, 0) => drive_hash_gate::<0>(depth, op, ops),
         (WaitLeg::HashGate { depth, op }, 1) => drive_hash_gate::<1>(depth, op, ops),
-        (WaitLeg::HeapMark { order, waits }, 0) => drive_heap_mark::<0>(order, waits, ops),
-        (WaitLeg::HeapMark { order, waits }, 1) => drive_heap_mark::<1>(order, waits, ops),
+        (WaitLeg::HeapHook { order, waits }, 0) => drive_heap_hook::<0>(order, waits, ops),
+        (WaitLeg::HeapHook { order, waits }, 1) => drive_heap_hook::<1>(order, waits, ops),
+        (WaitLeg::HeapHookOne { waits }, 0) => drive_heap_hook_one::<0>(waits, ops),
+        (WaitLeg::HeapHookOne { waits }, 1) => drive_heap_hook_one::<1>(waits, ops),
+        (WaitLeg::WakeStep { step: WakeStep::AdvanceHook, waits }, 0) => {
+            drive_wake_hook::<0>(false, waits, ops)
+        }
+        (WaitLeg::WakeStep { step: WakeStep::AdvanceHook, waits }, 1) => {
+            drive_wake_hook::<1>(false, waits, ops)
+        }
+        (WaitLeg::WakeStep { step: WakeStep::WakeBudget, waits }, 0) => {
+            drive_wake_hook::<0>(true, waits, ops)
+        }
+        (WaitLeg::WakeStep { step: WakeStep::WakeBudget, waits }, 1) => {
+            drive_wake_hook::<1>(true, waits, ops)
+        }
+        (WaitLeg::WakeStep { step: WakeStep::AdvanceBtree, waits }, 0) => {
+            drive_wake_btree(waits, ops)
+        }
         (WaitLeg::BtreeMark { order, waits }, 0) => drive_btree_mark::<0>(order, waits, ops),
         (WaitLeg::BtreeMark { order, waits }, 100) => drive_btree_mark::<100>(order, waits, ops),
         (WaitLeg::ListWaitWake { key: ListKey::Unit }, 0) => drive_list::<0, ()>((), ops),
@@ -747,13 +804,12 @@ fn drive_hash_gate<const NOPS: u8>(depth: u32, op: HashOp, ops: u64) -> u64 {
     accumulator
 }
 
-// ---- the wait nodes' heap ---------------------------------------------------------------------
+// ---- the wait nodes' heap, with the gate's hook -----------------------------------------------
 
 /// A wait's heap entry: its LSN and its node's handle, 24 B.
 #[derive(Clone, Copy)]
 struct WaitEntry {
     lsn: u64,
-    #[allow(dead_code, reason = "the node's handle gives the entry its size; no hook reads it")]
     node: SlotId<u32>,
 }
 
@@ -767,24 +823,66 @@ impl HeapEntry for WaitEntry {
 
 const _: () = assert!(size_of::<WaitEntry>() == 24, "a wait entry is 24 B");
 
-/// The heap rounds' one node, whose handle every entry carries.
-const NODES_1: Cap = Cap::entries::<1>("bench-nodes-1", CapFill::Serving);
+// The stand-in's entry is the product gate's, byte for byte, so the hook legs read the stride
+// the gate's entry array is built at; an entry that grows or shrinks fails this build.
+const _: () = assert!(
+    size_of::<WaitEntry>() == inf_runtime::WatermarkGate::ENTRY_BYTES,
+    "the bench's wait entry is the gate's"
+);
 
-/// The heap's rounds: the heap, the handle each entry carries, the LSN the
-/// next round starts above, its waits and their order.
-struct HeapRounds {
+/// The node words the hook and a wake write: the heap position the hook
+/// stores, and the state a wake marks.
+const NODE_POSITION: usize = 5;
+const NODE_STATE: usize = 4;
+
+/// A pool of each round's waits, every node live: the nodes at one cell
+/// (962), at four (2,825), one directory of entries (16,384) and the storm
+/// one fsync releases on the wake step legs (50,000).
+const NODES_962: Cap = Cap::entries::<962>("bench-nodes-962", CapFill::Serving);
+const NODES_2825: Cap = Cap::entries::<2_825>("bench-nodes-2825", CapFill::Serving);
+const NODES_16384: Cap = Cap::entries::<16_384>("bench-nodes-16384", CapFill::Serving);
+const NODES_50000: Cap = Cap::entries::<50_000>("bench-nodes-50000", CapFill::Serving);
+
+impl Waits {
+    fn node_cap(self) -> Cap {
+        match self {
+            Waits::OneCell => NODES_962,
+            Waits::FourCells => NODES_2825,
+            Waits::OneDirectory => NODES_16384,
+            Waits::Storm => NODES_50000,
+        }
+    }
+}
+
+/// The gate's hook: an entry a sift places at `index` has its node's
+/// position word stored, through the pool's `get_mut`. An entry exists only
+/// with its live node, so any other answer is a broken invariant, as the
+/// gate's resolve stops on it.
+#[inline(always)]
+fn place(nodes: &mut NodeSlab, entry: WaitEntry, index: u32) {
+    match nodes.get_mut(entry.node) {
+        LookupMut::Live(node) => node[NODE_POSITION] = u64::from(index),
+        LookupMut::Stale | LookupMut::Vacant => unreachable!("an entry's node is live"),
+    }
+}
+
+/// The hook's rounds: the heap, the pool every entry's hook resolves, each
+/// wait's own node, the LSN the next round starts above, its waits and their
+/// order.
+struct HookRounds {
     heap: IndexedHeap<WaitEntry>,
-    node: SlotId<u32>,
+    nodes: NodeSlab,
+    handles: Vec<SlotId<u32>>,
     base: u64,
     waits: u64,
     order: Order,
 }
 
-/// A heap of `waits` entries' capacity, built by steps before the loop, and
-/// one node's handle.
-fn heap_rounds(order: Order, waits: Waits) -> (HeapRounds, NodeSlab, Rc<CapCensus>) {
+/// A pool of `waits` nodes at the pool's slot, every one live, and a heap of
+/// as many entries, both built by steps before the loop.
+fn hook_rounds(order: Order, waits: Waits) -> (HookRounds, Rc<CapCensus>) {
     let (census, _serve_mark) = CapCensus::new(CellId(0));
-    let mut builder = NodeSlab::builder(NODES_1, &census).expect("registered");
+    let mut builder = NodeSlab::builder(waits.node_cap(), &census).expect("registered");
     let mut nodes = loop {
         match builder.step() {
             Built::More(next) => builder = next,
@@ -792,10 +890,13 @@ fn heap_rounds(order: Order, waits: Waits) -> (HeapRounds, NodeSlab, Rc<CapCensu
             Built::Refused(_, refused) => panic!("{refused}"),
         }
     };
-    let SlabReserved::Slot(slot) = nodes.reserve() else { panic!("a free slot") };
-    let node = slot.publish([0; 6]);
     let count = waits.count();
-    let fill = WaitEntry { lsn: 0, node };
+    let mut handles = Vec::with_capacity(usize::try_from(count).expect("a round's waits"));
+    for _ in 0..count {
+        let SlabReserved::Slot(slot) = nodes.reserve() else { panic!("a free slot") };
+        handles.push(slot.publish([0; 6]));
+    }
+    let fill = WaitEntry { lsn: 0, node: handles[0] };
     let capacity = u32::try_from(count).expect("a round's waits fit a u32");
     let mut array = FixedArray::builder(capacity, fill).expect("a heap's layout");
     let entries = loop {
@@ -805,32 +906,42 @@ fn heap_rounds(order: Order, waits: Waits) -> (HeapRounds, NodeSlab, Rc<CapCensu
             ArrayBuilt::Refused(refused) => panic!("{refused}"),
         }
     };
-    let rounds = HeapRounds { heap: IndexedHeap::new(entries), node, base: 0, waits: count, order };
-    (rounds, nodes, census)
+    let heap = IndexedHeap::new(entries);
+    (HookRounds { heap, nodes, handles, base: 0, waits: count, order }, census)
 }
 
-/// One round: the waits pushed in the round's order, `WAIT_NOPS` planted
-/// each, then the advances to the middle and to the last, each popping every
-/// entry at or below it; `moved` hears every entry a sift places. Returns
-/// the waits woken.
+/// One round: the waits pushed in the round's order, each entry carrying its
+/// own node's handle and `WAIT_NOPS` planted after its push's `expect` (a
+/// call that may unwind, so no pass runs the plant ahead of it), then the
+/// advances to the middle and to the last, each popping every entry at or
+/// below it; the hook writes each placed entry's position. Returns the waits
+/// woken.
 #[inline(always)]
-fn heap_round<const WAIT_NOPS: u8>(
-    rounds: &mut HeapRounds,
-    mut moved: impl FnMut(WaitEntry, u32),
-) -> u64 {
-    let (base, waits, node) = (rounds.base, rounds.waits, rounds.node);
+fn hook_round<const WAIT_NOPS: u8>(rounds: &mut HookRounds) -> u64 {
+    let (base, waits, order) = (rounds.base, rounds.waits, rounds.order);
+    let HookRounds { heap, nodes, handles, .. } = rounds;
     for index in 0..waits {
-        plant::<WAIT_NOPS>();
-        let lsn = match rounds.order {
+        let lsn = match order {
             Order::Rising => base + 1 + index,
             Order::Falling => base + waits - index,
         };
-        rounds.heap.push(WaitEntry { lsn, node }, &mut moved).expect("room for every wait");
+        let entry = WaitEntry { lsn, node: handles[index as usize] };
+        heap.push(
+            entry,
+            #[inline(always)]
+            |entry, at| place(nodes, entry, at),
+        )
+        .expect("room for every wait");
+        plant::<WAIT_NOPS>();
     }
     let mut woken = 0;
     for to in [base + waits / 2, base + waits] {
-        while rounds.heap.peek().is_some_and(|entry| entry.lsn <= to) {
-            woken += u64::from(rounds.heap.pop(&mut moved).is_some());
+        while heap.peek().is_some_and(|entry| entry.lsn <= to) {
+            let popped = heap.pop(
+                #[inline(always)]
+                |entry, at| place(nodes, entry, at),
+            );
+            woken += u64::from(popped.is_some());
         }
     }
     rounds.base = base + waits;
@@ -840,67 +951,418 @@ fn heap_round<const WAIT_NOPS: u8>(
 // The round's step and its plant's, each one body (a generic step would be
 // two bodies under one name, which the site's-shape control refuses to read).
 #[inline(never)]
-fn step_heap_mark(rounds: &mut HeapRounds) -> u64 {
-    heap_round::<0>(rounds, |_, _| {})
+fn step_heap_hook(rounds: &mut HookRounds) -> u64 {
+    hook_round::<0>(rounds)
 }
 
 #[inline(never)]
-fn step_heap_mark_plus_wait(rounds: &mut HeapRounds) -> u64 {
-    heap_round::<1>(rounds, |_, _| {})
+fn step_heap_hook_plus_wait(rounds: &mut HookRounds) -> u64 {
+    hook_round::<1>(rounds)
 }
 
-/// A dropped wait's removal at its position, the last entry sifted into its
-/// place: the heap's `remove` at the wait entry's instance, its own step.
-#[inline(never)]
-fn step_heap_remove(heap: &mut IndexedHeap<WaitEntry>, position: u32) -> u64 {
-    u64::from(heap.remove(position, |_, _| {}).is_some())
-}
-
-/// A round of drops: the round's waits pushed, then each removed from the
-/// middle of the heap until none is left. Returns the waits removed.
-fn heap_drop_round(rounds: &mut HeapRounds) -> u64 {
-    let (base, waits, node) = (rounds.base, rounds.waits, rounds.node);
+/// A round's moves: the entries its sifts place, heard by a counting hook
+/// that writes each position as the gate's does.
+fn hook_round_moves(rounds: &mut HookRounds) -> u64 {
+    let (base, waits, order) = (rounds.base, rounds.waits, rounds.order);
+    let HookRounds { heap, nodes, handles, .. } = rounds;
+    let mut moves = 0u64;
+    let mut counted = |entry: WaitEntry, at: u32| {
+        place(nodes, entry, at);
+        moves += 1;
+    };
     for index in 0..waits {
-        let lsn = base + 1 + index;
-        rounds.heap.push(WaitEntry { lsn, node }, |_, _| {}).expect("room for every wait");
+        let lsn = match order {
+            Order::Rising => base + 1 + index,
+            Order::Falling => base + waits - index,
+        };
+        let entry = WaitEntry { lsn, node: handles[index as usize] };
+        heap.push(entry, &mut counted).expect("room for every wait");
+    }
+    let mut woken = 0u64;
+    for to in [base + waits / 2, base + waits] {
+        while heap.peek().is_some_and(|entry| entry.lsn <= to) {
+            woken += u64::from(heap.pop(&mut counted).is_some());
+        }
+    }
+    assert_eq!(woken, waits, "a counted round woke every wait");
+    rounds.base = base + waits;
+    moves
+}
+
+/// A dropped wait's removal at the position its node holds, the last entry
+/// sifted into its place with the hook: the heap's `remove` at the wait
+/// entry's instance, its own step.
+#[inline(never)]
+fn step_heap_hook_remove(heap: &mut IndexedHeap<WaitEntry>, nodes: &mut NodeSlab, at: u32) -> u64 {
+    let removed = heap.remove(
+        at,
+        #[inline(always)]
+        |entry, at| place(nodes, entry, at),
+    );
+    u64::from(removed.is_some())
+}
+
+/// A round of drops: the round's waits pushed with the hook, then the wait
+/// in the middle of the heap removed at the position its node holds, until
+/// none is left. Every position read is the entry's own, so the hook wrote
+/// each one. Returns the waits removed.
+fn hook_drop_round(rounds: &mut HookRounds) -> u64 {
+    let (base, waits) = (rounds.base, rounds.waits);
+    let HookRounds { heap, nodes, handles, .. } = rounds;
+    for index in 0..waits {
+        let entry = WaitEntry { lsn: base + 1 + index, node: handles[index as usize] };
+        heap.push(entry, |entry, at| place(nodes, entry, at)).expect("room for every wait");
     }
     let mut removed = 0;
-    while !rounds.heap.is_empty() {
-        let middle = rounds.heap.len() / 2;
-        removed += step_heap_remove(&mut rounds.heap, middle);
+    while !heap.is_empty() {
+        let middle = heap.get(heap.len() / 2).expect("an entry in the middle");
+        let at = match nodes.get(middle.node) {
+            Lookup::Live(node) => u32::try_from(node[NODE_POSITION]).expect("a position"),
+            Lookup::Stale | Lookup::Vacant => panic!("an entry's node is live"),
+        };
+        assert_eq!(at, heap.len() / 2, "the node holds its entry's position");
+        removed += step_heap_hook_remove(heap, nodes, at);
     }
     rounds.base = base + waits;
     removed
 }
 
-/// A round's moves: the entries its sifts place, heard by a counting hook.
-fn heap_round_moves(rounds: &mut HeapRounds) -> u64 {
-    let mut moves = 0u64;
-    let woken = heap_round::<0>(rounds, |_, _| moves += 1);
-    assert_eq!(woken, rounds.waits, "a counted round woke every wait");
-    moves
-}
-
 /// One round a step, `WAIT_NOPS` planted a wait.
-fn drive_heap_mark<const WAIT_NOPS: u8>(order: Order, waits: Waits, ops: u64) -> u64 {
-    let (mut rounds, _nodes, _census) = heap_rounds(order, waits);
+fn drive_heap_hook<const WAIT_NOPS: u8>(order: Order, waits: Waits, ops: u64) -> u64 {
+    let (mut rounds, _census) = hook_rounds(order, waits);
     // The dry pass: a round with a counting hook, before the counted loop.
     // Its moves go to the run's log, where the rows' hook term reads them.
-    let dry_moves = heap_round_moves(&mut rounds);
+    let dry_moves = hook_round_moves(&mut rounds);
     eprintln!("dry-pass-moves {dry_moves}");
     let rounds = black_box(&mut rounds);
     let accumulator = match WAIT_NOPS {
-        0 => rate_loop::<0>(ops, MASK_14, |_| step_heap_mark(rounds)),
-        _ => rate_loop::<0>(ops, MASK_14, |_| step_heap_mark_plus_wait(rounds)),
+        0 => rate_loop::<0>(ops, MASK_14, |_| step_heap_hook(rounds)),
+        _ => rate_loop::<0>(ops, MASK_14, |_| step_heap_hook_plus_wait(rounds)),
     };
     // Engagement, after the counted loop, the same at every op count: every
-    // wait woken, the heap empty, a round from here places the entries the
-    // dry pass placed, and a round of drops removes every wait it pushed.
+    // wait woken, the heap empty and every node live, a round from here
+    // places the entries the dry pass placed, and a round of drops removes
+    // every wait at the position the hook wrote.
     assert_eq!(accumulator, ops * rounds.waits, "every wait woken");
     assert!(rounds.heap.is_empty(), "every entry popped");
-    assert_eq!(heap_round_moves(rounds), dry_moves, "a round's moves are its dry pass's");
-    assert_eq!(heap_drop_round(rounds), rounds.waits, "every dropped wait removed");
+    assert_eq!(u64::from(rounds.nodes.len()), rounds.waits, "every node live");
+    assert_eq!(hook_round_moves(rounds), dry_moves, "a round's moves are its dry pass's");
+    assert_eq!(hook_drop_round(rounds), rounds.waits, "every dropped wait removed");
     accumulator
+}
+
+/// The watermark's one wait with the gate's hook: a pool and a heap of a
+/// round's size, a far entry parked throughout, the op's own node, and the
+/// LSN of its last wait.
+struct HookOne {
+    heap: IndexedHeap<WaitEntry>,
+    nodes: NodeSlab,
+    node: SlotId<u32>,
+    lsn: u64,
+}
+
+/// One wait: an entry at the next LSN pushed under the far one and popped
+/// while the minimum is at or below it, three moves, each with the hook.
+#[inline(never)]
+fn step_heap_hook_one(one: &mut HookOne) -> u64 {
+    let HookOne { heap, nodes, node, lsn } = one;
+    *lsn += 1;
+    let to = *lsn;
+    let entry = WaitEntry { lsn: to, node: *node };
+    heap.push(
+        entry,
+        #[inline(always)]
+        |entry, at| place(nodes, entry, at),
+    )
+    .expect("room under the far entry");
+    let mut woken = 0;
+    while heap.peek().is_some_and(|entry| entry.lsn <= to) {
+        let popped = heap.pop(
+            #[inline(always)]
+            |entry, at| place(nodes, entry, at),
+        );
+        woken += u64::from(popped.is_some());
+    }
+    woken
+}
+
+/// One op's moves, heard by a counting hook outside the count.
+fn hook_one_moves(one: &mut HookOne) -> u64 {
+    let HookOne { heap, nodes, node, lsn } = one;
+    let mut moves = 0u64;
+    let mut counted = |entry: WaitEntry, at: u32| {
+        place(nodes, entry, at);
+        moves += 1;
+    };
+    *lsn += 1;
+    let to = *lsn;
+    heap.push(WaitEntry { lsn: to, node: *node }, &mut counted).expect("room under the far entry");
+    while heap.peek().is_some_and(|entry| entry.lsn <= to) {
+        assert!(heap.pop(&mut counted).is_some(), "a counted op popped its entry");
+    }
+    moves
+}
+
+/// A wait for the next LSN a step, a far entry parked.
+fn drive_heap_hook_one<const NOPS: u8>(waits: Waits, ops: u64) -> u64 {
+    let (rounds, _census) = hook_rounds(Order::Rising, waits);
+    let HookRounds { mut heap, mut nodes, handles, .. } = rounds;
+    let far = WaitEntry { lsn: u64::MAX / 2, node: handles[1] };
+    heap.push(far, |entry, at| place(&mut nodes, entry, at)).expect("room for the far entry");
+    let mut one = HookOne { heap, nodes, node: handles[0], lsn: 0 };
+    // The dry pass: one op with a counting hook, before the counted loop.
+    let dry_moves = hook_one_moves(&mut one);
+    eprintln!("dry-pass-moves {dry_moves}");
+    let one = black_box(&mut one);
+    let accumulator = rate_loop::<NOPS>(ops, MASK_14, |_| step_heap_hook_one(one));
+    // Engagement, after the counted loop: each op's entry popped, the far
+    // entry alone left at the root with its position written, every node
+    // live, and an op from here places the dry pass's three moves.
+    assert_eq!(dry_moves, 3, "a push under the far entry and its pop place three");
+    assert_eq!(accumulator, ops, "every op's entry popped");
+    assert_eq!(one.heap.len(), 1, "the far entry alone is left");
+    match one.nodes.get(far.node) {
+        Lookup::Live(node) => assert_eq!(node[NODE_POSITION], 0, "the far entry at the root"),
+        Lookup::Stale | Lookup::Vacant => panic!("the far entry's node is live"),
+    }
+    assert_eq!(u64::from(one.nodes.len()), waits.count(), "every node live");
+    assert_eq!(hook_one_moves(one), dry_moves, "an op's moves are its dry pass's");
+    accumulator
+}
+
+// ---- the wake step: one call over the waits one fsync covers ----------------------------------
+
+/// The durable cell's wakes between two LOG steps (ADR-0177 A2.1): the
+/// budgeted step wakes this many of a storm's covered waits.
+const WAKE_BUDGET: u64 = 1_024;
+/// Bytes written after a fill, so the evicted call finds the fill's stores
+/// out of the near caches.
+const EVICT_BYTES: usize = 64 << 20;
+
+/// A wake step's waits, filled before every call in rising LSN order with
+/// the hook, all covered by the call's watermark.
+fn fill_rising(rounds: &mut HookRounds) {
+    let (base, waits) = (rounds.base, rounds.waits);
+    let HookRounds { heap, nodes, handles, .. } = rounds;
+    for index in 0..waits {
+        let entry = WaitEntry { lsn: base + 1 + index, node: handles[index as usize] };
+        heap.push(entry, |entry, at| place(nodes, entry, at)).expect("room for every wait");
+    }
+    rounds.base = base + waits;
+}
+
+/// The gate's wake loop over the covered waits, at most `budget`: a peek, a
+/// pop with the hook, the popped node marked with `to` and a waker woken,
+/// `WAIT_NOPS` planted after each pop's result is read. `BUDGETED` gives
+/// each step a closure type of its own, as each gate body has, so no two
+/// steps share a sift's instance.
+#[inline(always)]
+fn wake_covered<const BUDGETED: bool, const WAIT_NOPS: u8>(
+    rounds: &mut HookRounds,
+    to: u64,
+    budget: u64,
+) -> u64 {
+    let HookRounds { heap, nodes, .. } = rounds;
+    let waker = Waker::noop();
+    let mut woken = 0;
+    while woken < budget && heap.peek().is_some_and(|entry| entry.lsn <= to) {
+        let popped = heap.pop(
+            #[inline(always)]
+            |entry, at| place(nodes, entry, at),
+        );
+        let Some(entry) = popped else { break };
+        plant::<WAIT_NOPS>();
+        match nodes.get_mut(entry.node) {
+            LookupMut::Live(node) => node[NODE_STATE] = to,
+            LookupMut::Stale | LookupMut::Vacant => unreachable!("a popped entry's node is live"),
+        }
+        waker.wake_by_ref();
+        woken += 1;
+    }
+    woken
+}
+
+// Each step one body: every covered wait, or the budget's first; and HEAD's
+// `advance` on the bench's copy of its gate.
+#[inline(never)]
+fn step_advance_hook(rounds: &mut HookRounds, to: u64) -> u64 {
+    wake_covered::<false, 0>(rounds, to, u64::MAX)
+}
+
+#[inline(never)]
+fn step_advance_hook_plus_wait(rounds: &mut HookRounds, to: u64) -> u64 {
+    wake_covered::<false, 1>(rounds, to, u64::MAX)
+}
+
+#[inline(never)]
+fn step_wake_budget(rounds: &mut HookRounds, to: u64) -> u64 {
+    wake_covered::<true, 0>(rounds, to, WAKE_BUDGET)
+}
+
+#[inline(never)]
+fn step_wake_budget_plus_wait(rounds: &mut HookRounds, to: u64) -> u64 {
+    wake_covered::<true, 1>(rounds, to, WAKE_BUDGET)
+}
+
+#[inline(never)]
+fn step_advance_btree(gate: &WatermarkGate, to: u64) -> u64 {
+    gate.advance(to) as u64
+}
+
+/// The waits a budgeted step left covered, woken outside the step.
+fn drain_covered(rounds: &mut HookRounds, to: u64) -> u64 {
+    let HookRounds { heap, nodes, .. } = rounds;
+    let mut woken = 0;
+    while heap.peek().is_some_and(|entry| entry.lsn <= to) {
+        let entry = heap.pop(|entry, at| place(nodes, entry, at)).expect("a covered entry");
+        match nodes.get_mut(entry.node) {
+            LookupMut::Live(node) => node[NODE_STATE] = to,
+            LookupMut::Stale | LookupMut::Vacant => unreachable!("a popped entry's node is live"),
+        }
+        woken += 1;
+    }
+    woken
+}
+
+/// Writes every cache line of `scratch`, so the stores a fill touched leave
+/// the near caches before the evicted call.
+#[inline(never)]
+fn evict(scratch: &mut [u8], salt: u8) -> u64 {
+    let mut sum = 0u64;
+    for (index, byte) in scratch.iter_mut().enumerate().step_by(64) {
+        *byte = salt.wrapping_add(index as u8);
+        sum += u64::from(*byte);
+    }
+    black_box(sum)
+}
+
+/// The cache state a wake step's call starts in: right after its fill, or
+/// with `EVICT_BYTES` written after the fill.
+#[derive(Clone, Copy)]
+enum Regime {
+    Warm,
+    Evicted,
+}
+
+/// One call of `step`, its wall time read around it by the monotonic clock.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "clock: the wake step legs' time is a wall clock read around one call, \
+              outside any cell"
+)]
+#[inline(always)]
+fn timed(step: impl FnOnce() -> u64) -> (u64, u64) {
+    let began = std::time::Instant::now();
+    let woken = step();
+    let nanos = began.elapsed().as_nanos();
+    (woken, u64::try_from(nanos).expect("a call under 584 years"))
+}
+
+/// The median and the worst of a regime's calls, on stderr: `step-ns
+/// <regime> calls <n> median <ns> worst <ns>`.
+fn report(regime: Regime, mut nanos: Vec<u64>) {
+    if nanos.is_empty() {
+        return;
+    }
+    let label = match regime {
+        Regime::Warm => "warm",
+        Regime::Evicted => "evicted",
+    };
+    nanos.sort_unstable();
+    let (calls, median, worst) = (nanos.len(), nanos[nanos.len() / 2], nanos[nanos.len() - 1]);
+    eprintln!("step-ns {label} calls {calls} median {median} worst {worst}");
+}
+
+/// Each op, in each regime: `waits` waits filled and covered, one call of
+/// the step timed, the rest woken outside it; `WAIT_NOPS` planted after each
+/// of the step's pops.
+fn drive_wake_hook<const WAIT_NOPS: u8>(budgeted: bool, waits: Waits, ops: u64) -> u64 {
+    let step: fn(&mut HookRounds, u64) -> u64 = match (budgeted, WAIT_NOPS) {
+        (false, 0) => step_advance_hook,
+        (false, _) => step_advance_hook_plus_wait,
+        (true, 0) => step_wake_budget,
+        (true, _) => step_wake_budget_plus_wait,
+    };
+    let (mut rounds, _census) = hook_rounds(Order::Rising, waits);
+    let mut scratch = vec![0u8; EVICT_BYTES];
+    let calls = usize::try_from(ops).expect("a call count");
+    let (mut warm, mut evicted) = (Vec::with_capacity(calls), Vec::with_capacity(calls));
+    let first = if budgeted { WAKE_BUDGET.min(rounds.waits) } else { rounds.waits };
+    let mut total = 0;
+    for op in 0..ops {
+        for regime in [Regime::Warm, Regime::Evicted] {
+            fill_rising(&mut rounds);
+            if let Regime::Evicted = regime {
+                evict(&mut scratch, op as u8);
+            }
+            let to = rounds.base;
+            let rounds = black_box(&mut rounds);
+            let (woken, nanos) = timed(|| step(rounds, to));
+            // Engagement, each call: the step woke its waits, the rest are
+            // woken outside it, the heap is empty and every node is marked.
+            assert_eq!(woken, first, "the step woke its waits");
+            assert_eq!(drain_covered(rounds, to), rounds.waits - first, "the rest woken after");
+            assert!(rounds.heap.is_empty(), "every entry popped");
+            let marked = |handle: &SlotId<u32>| match rounds.nodes.get(*handle) {
+                Lookup::Live(node) => node[NODE_STATE] == to,
+                Lookup::Stale | Lookup::Vacant => false,
+            };
+            assert!(rounds.handles.iter().all(marked), "every node live and marked");
+            total += woken;
+            match regime {
+                Regime::Warm => warm.push(nanos),
+                Regime::Evicted => evicted.push(nanos),
+            }
+        }
+    }
+    report(Regime::Warm, warm);
+    report(Regime::Evicted, evicted);
+    total
+}
+
+/// Each op, in each regime: `waits` waits made on the bench's copy of the
+/// B-tree gate and polled once, one `advance` over all of them timed, then
+/// each polled ready and dropped.
+fn drive_wake_btree(waits: Waits, ops: u64) -> u64 {
+    let count = waits.count();
+    let gate = WatermarkGate::new();
+    let mut pending = Vec::with_capacity(usize::try_from(count).expect("a round's waits"));
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut scratch = vec![0u8; EVICT_BYTES];
+    let calls = usize::try_from(ops).expect("a call count");
+    let (mut warm, mut evicted) = (Vec::with_capacity(calls), Vec::with_capacity(calls));
+    let (mut base, mut total) = (0u64, 0u64);
+    for op in 0..ops {
+        for regime in [Regime::Warm, Regime::Evicted] {
+            for index in 0..count {
+                let mut wait = gate.waiter(base + 1 + index);
+                let parked = Pin::new(&mut wait).poll(&mut cx).is_pending();
+                assert!(parked, "a wait above the watermark parks");
+                pending.push(wait);
+            }
+            base += count;
+            if let Regime::Evicted = regime {
+                evict(&mut scratch, op as u8);
+            }
+            let gate = black_box(&gate);
+            let (woken, nanos) = timed(|| step_advance_btree(gate, base));
+            // Engagement, each call: the advance woke every wait, each reads
+            // ready, and the gate holds none.
+            assert_eq!(woken, count, "the advance woke every wait");
+            for mut wait in pending.drain(..) {
+                assert!(Pin::new(&mut wait).poll(&mut cx).is_ready(), "a woken wait is ready");
+            }
+            assert_eq!(gate.waiting(), 0, "no waiter left");
+            total += woken;
+            match regime {
+                Regime::Warm => warm.push(nanos),
+                Regime::Evicted => evicted.push(nanos),
+            }
+        }
+    }
+    report(Regime::Warm, warm);
+    report(Regime::Evicted, evicted);
+    total
 }
 
 // ---- the watermark gate before its fixed stores: rounds and one wait --------------------------

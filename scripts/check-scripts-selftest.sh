@@ -444,6 +444,15 @@ expect_red_because "driver: a pool that is no fifo: path is refused" \
 expect_red_because "driver: a pool whose FIFO is gone is refused" \
     "a pool the driver cannot open: 'fifo:$work/drv-gone/p'" \
     env -u INF_SELFTEST_CASE_LOG CARGO_MAKEFLAGS="-j --jobserver-auth=fifo:$work/drv-gone/p" "$f"
+# fx_lock and fx_unlock build paths under $work; with $work empty each refuses before it
+# builds one, so a path outside every fixture keeps its mode. The lib, sourced alone, holds an
+# empty $work.
+: >"$work/fx-victim"
+expect_red_because "fx_lock: an empty work directory is refused" "fx_lock: no work directory" \
+    bash -c '. "$1"; fx_lock "$2"' fx "$SCRIPT_DIR/selftest-lib.sh" "$work/fx-victim"
+expect green "fx_lock: the refused path keeps its mode" test -r "$work/fx-victim"
+expect_red_because "fx_unlock: an empty work directory is refused" "fx_unlock: no work directory" \
+    bash -c '. "$1"; FX_LOCKED="$2"; fx_unlock' fx "$SCRIPT_DIR/selftest-lib.sh" "$work/fx-victim"
 }
 
 group_stage() {
@@ -2640,6 +2649,57 @@ for shipping in infinityd inf; do
         env -u INF_CHECK_ROOT PATH="$work/ship-cargo:$PATH" SHIP_PLANT= \
         SHIP_PLANT_ONE="$shipping/inf-server:fault-points" $SHIP
 done
+
+# A build's output is a directory holding Cargo's CACHEDIR.TAG, never one named `target`
+# (scripts/source-files.sh): a violating manifest under an untagged `target` is read and red;
+# one under a tagged directory, `target` or another name, is left out, the clean one scanned.
+IFS= read -r -d '' ship_clean <<'EOF' || true
+[package]
+name = "fake"
+
+[dependencies]
+inf-foundation = { workspace = true }
+EOF
+IFS= read -r -d '' ship_normal <<'EOF' || true
+[package]
+name = "fake"
+
+[dependencies]
+inf-foundation = { workspace = true, features = ["fault-points"] }
+EOF
+root=$(printf '%s' "$ship_clean" | manifest ship-target-untagged)
+mkdir -p "$root/crates/fake/target"
+printf '%s' "$ship_normal" >"$root/crates/fake/target/Cargo.toml"
+expect_red_because "shipping: a manifest under a directory named target with no tag is read" \
+    "SHIPPING-FEATURE violation: crates/fake/target/Cargo.toml" env INF_CHECK_ROOT="$root" $SHIP
+root=$(printf '%s' "$ship_clean" | manifest ship-target-tagged)
+mkdir -p "$root/crates/fake/target/debug" "$root/crates/out"
+for dir in "$root/crates/fake/target" "$root/crates/out"; do
+    printf 'Signature: 8a477f597d28d172789f06886806bc55\n' >"$dir/CACHEDIR.TAG"
+done
+printf '%s' "$ship_normal" >"$root/crates/fake/target/debug/Cargo.toml"
+printf '%s' "$ship_normal" >"$root/crates/out/Cargo.toml"
+expect green "shipping: a directory holding CACHEDIR.TAG is left out, whatever its name" \
+    env INF_CHECK_ROOT="$root" $SHIP
+expect_output "shipping: the tagged directories' manifests are not scanned" "1 manifests scanned" \
+    env INF_CHECK_ROOT="$root" $SHIP
+# The walk fails closed (scripts/source-files.sh): a manifest whose path holds a newline would
+# read as two names that do not exist, so the walk refuses it; a directory the walk cannot read
+# fails the fence. Each is red, never "OK" over a short listing.
+root=$(printf '%s' "$ship_clean" | manifest ship-newline)
+mkdir -p "$root/crates/"$'two\nlines'
+printf '%s' "$ship_normal" >"$root/crates/"$'two\nlines'"/Cargo.toml"
+expect_red_because "shipping: a manifest whose path holds a newline is refused" \
+    "SOURCE-FILES SCOPE ERROR" env INF_CHECK_ROOT="$root" $SHIP
+if [ "$(id -u)" -ne 0 ]; then
+root=$(printf '%s' "$ship_clean" | manifest ship-unreadable)
+mkdir -p "$root/crates/locked"
+printf '%s' "$ship_normal" >"$root/crates/locked/Cargo.toml"
+fx_lock "$root/crates/locked"
+expect_red_because "shipping: a directory the walk cannot read fails the fence" \
+    "SHIPPING-FEATURE SCOPE ERROR: the walk of crates/ failed" env INF_CHECK_ROOT="$root" $SHIP
+fx_unlock
+fi
 }
 
 # ------------------------------------------------ planted-bug canary driver
@@ -4497,7 +4557,8 @@ expect_output "waker probe: the arm64 Linux shape is 8 plants red, 3 controls gr
 expect green "waker probe: the arm64 Linux shape passes" env INF_WAKER_ASM="$tree" INF_WAKER_PROBE_ASM="$pasm" $WAKER
 # The controls are exact: a probe copy with both control lines deleted is red.
 mkdir -p "$work/wk/scripts"
-cp scripts/check-waker-atomics.sh scripts/asm-waker-scan.awk scripts/probe-target.sh "$work/wk/scripts/"
+cp scripts/check-waker-atomics.sh scripts/asm-waker-scan.awk scripts/probe-target.sh \
+    scripts/source-files.sh "$work/wk/scripts/"
 cp -R scripts/waker-atomics-probe "$work/wk/scripts/"
 sed -i.bak '/WAKER-PROBE: expect-clean/d; /WAKER-PROBE: expect-unscanned/d' \
     "$work/wk/scripts/waker-atomics-probe/src/lib.rs"
@@ -4598,6 +4659,54 @@ printf '// RawWakerVTable, in a comment only\n' >"$root/crates/inf-runtime/src/e
 expect_red_because "waker census: an entry that names the vtable type nowhere is red" \
     "WAKER CENSUS: crates/inf-runtime/src/executor.rs is an entry that names RawWakerVTable nowhere" \
     env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+# A build's output is a directory holding Cargo's CACHEDIR.TAG, never one named `target`
+# (scripts/source-files.sh): a file naming the vtable type under an untagged `target` is read,
+# counted and red; under a tagged directory, `target` or another name, it is neither.
+root=$(census_root target-untagged)
+mkdir -p "$root/crates/x/target"
+printf 'pub static W: core::task::RawWakerVTable = w();\n' >"$root/crates/x/target/lib.rs"
+expect_red_because "waker census: a file under a directory named target with no tag is read" \
+    "WAKER CENSUS: crates/x/target/lib.rs names RawWakerVTable outside the census's entries" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+expect_output "waker census: the untagged target's file is counted" "census: 3 .rs files read" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+root=$(census_root target-tagged)
+mkdir -p "$root/crates/x/target/debug" "$root/crates/out"
+for dir in "$root/crates/x/target" "$root/crates/out"; do
+    printf 'Signature: 8a477f597d28d172789f06886806bc55\n' >"$dir/CACHEDIR.TAG"
+    printf 'pub static W: core::task::RawWakerVTable = w();\n' >"$dir/w.rs"
+done
+expect green "waker census: a directory holding CACHEDIR.TAG is left out, whatever its name" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+expect_output "waker census: the tagged directories' files are not counted" \
+    "census: 2 .rs files read" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+# The census fails closed (scripts/source-files.sh): a file whose path holds a newline is
+# refused, and a directory the walk cannot read, or a listed file grep cannot read, fails it,
+# never leaving that file unnamed.
+root=$(census_root newline)
+mkdir -p "$root/crates/"$'two\nlines'
+printf 'pub static W: core::task::RawWakerVTable = w();\n' >"$root/crates/"$'two\nlines'"/w.rs"
+expect_red_because "waker census: a file whose path holds a newline is refused" \
+    "SOURCE-FILES SCOPE ERROR" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+if [ "$(id -u)" -ne 0 ]; then
+root=$(census_root unreadable-dir)
+mkdir -p "$root/crates/locked"
+printf 'pub static W: core::task::RawWakerVTable = w();\n' >"$root/crates/locked/w.rs"
+fx_lock "$root/crates/locked"
+expect_red_because "waker census: a directory the walk cannot read fails the census" \
+    "WAKER SCOPE ERROR: the census's walk failed" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+fx_unlock
+root=$(census_root unreadable-file)
+printf 'pub static W: core::task::RawWakerVTable = w();\n' >"$root/crates/x/src/w.rs"
+fx_lock "$root/crates/x/src/w.rs"
+expect_red_because "waker census: a listed file grep cannot read fails the census" \
+    "WAKER SCOPE ERROR: the census could not read every listed file" \
+    env INF_CHECK_ROOT="$root" INF_WAKER_ASM="$tree" INF_WAKER_PROBE=off $WAKER
+fx_unlock
+fi
 }
 
 # ------------------------------------------------------- fault points (D9)
@@ -4955,6 +5064,46 @@ printf '// %s\n' "$(printf 'z%.0s' $(seq 1 120))" >"$root/tests/t/t.rs"
 expect red "line-width: tests/ is in scope" env INF_CHECK_ROOT="$root" $LINEW
 [ -n "$root" ] && [ -d "$root/tests" ] && rm -rf "$root/tests"
 expect red "line-width: a missing tests/ is a scope error" env INF_CHECK_ROOT="$root" $LINEW
+# The gate reads scripts/source-files.sh's walk: a file under a directory named target with no
+# tag is read; a directory holding Cargo's CACHEDIR.TAG is left out, whatever its name; and a
+# directory the walk cannot read fails the gate.
+lw_wide=$(printf '// %s\n' "$(printf 'x%.0s' $(seq 1 98))")
+root=$(style_root lw-target)
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+mkdir -p "$root/crates/fake/src/target"
+printf '%s\n' "$lw_wide" >"$root/crates/fake/src/target/wide.rs"
+expect_red_because "line-width: a file under a directory named target with no tag is read" \
+    "LINE-WIDTH violation: crates/fake/src/target/wide.rs" env INF_CHECK_ROOT="$root" $LINEW
+root=$(style_root lw-tagged)
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+for dir in "$root/crates/fake/target" "$root/crates/fake/src/out"; do
+    mkdir -p "$dir"
+    printf 'Signature: 8a477f597d28d172789f06886806bc55\n' >"$dir/CACHEDIR.TAG"
+    printf '%s\n' "$lw_wide" >"$dir/wide.rs"
+done
+expect green "line-width: a directory holding CACHEDIR.TAG is left out, whatever its name" \
+    env INF_CHECK_ROOT="$root" $LINEW
+expect_output "line-width: the tagged directories' files are not counted" \
+    "line-width OK: 3 files" env INF_CHECK_ROOT="$root" $LINEW
+# The listing is split on newlines alone, as the helper writes it: a name holding a carriage
+# return is one file, read and counted, not two names that do not exist.
+root=$(style_root lw-carriage-return)
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+printf 'fn g() {}\n' >"$root/crates/fake/src/"$'a\rb.rs'
+expect green "line-width: a file whose name holds a carriage return is read" \
+    env INF_CHECK_ROOT="$root" $LINEW
+expect_output "line-width: the carriage-return file is counted once" \
+    "line-width OK: 4 files" env INF_CHECK_ROOT="$root" $LINEW
+if [ "$(id -u)" -ne 0 ]; then
+root=$(style_root lw-unreadable)
+printf 'pub fn f() {}\n' >"$root/crates/fake/src/lib.rs"
+mkdir -p "$root/crates/fake/src/locked"
+printf 'fn g() {}\n' >"$root/crates/fake/src/locked/g.rs"
+fx_lock "$root/crates/fake/src/locked"
+expect_red_because "line-width: a directory the walk cannot read fails the gate" \
+    "LINE-WIDTH SCOPE: source_files" env INF_CHECK_ROOT="$root" $LINEW
+fx_unlock
+fi
 }
 
 # ------------------------------------------------------------ lint-ratchet
@@ -5524,6 +5673,35 @@ expect_output "lint-scopes: every allow is listed on the OK line" "allow: crates
 pub fn f() {}" >/dev/null
     echo "$root"
 )"
+# The suppression audit reads scripts/source-files.sh's walk: a file under a directory named
+# target with no tag is audited and its whole-function filesystem allow red; under a directory
+# holding Cargo's CACHEDIR.TAG, whatever its name, it is left out.
+ls_fs_allow='#[allow(clippy::disallowed_methods, reason = "boot: filesystem setup")]
+pub fn f() {}'
+root=$(ls_root ls-target-untagged)
+mkdir -p "$root/crates/fake/src/target"
+printf '%s\n' "$ls_fs_allow" >"$root/crates/fake/src/target/bad.rs"
+expect_red_because "lint-scopes: a file under a directory named target with no tag is audited" \
+    "crates/fake/src/target/bad.rs" ls_run "$root"
+root=$(ls_root ls-target-tagged)
+for dir in "$root/crates/fake/target" "$root/crates/fake/src/out"; do
+    mkdir -p "$dir"
+    printf 'Signature: 8a477f597d28d172789f06886806bc55\n' >"$dir/CACHEDIR.TAG"
+    printf '%s\n' "$ls_fs_allow" >"$dir/bad.rs"
+done
+expect green "lint-scopes: a directory holding CACHEDIR.TAG is left out, whatever its name" \
+    ls_run "$root"
+# A walk that fails fails the audit, never a shorter audit: a directory under crates/ that
+# the walk cannot read is the scope error.
+if [ "$(id -u)" -ne 0 ]; then
+root=$(ls_root ls-unreadable)
+mkdir -p "$root/crates/fake/src/locked"
+printf '%s\n' "$ls_fs_allow" >"$root/crates/fake/src/locked/bad.rs"
+fx_lock "$root/crates/fake/src/locked"
+expect_red_because "lint-scopes: a directory the walk cannot read fails the audit" \
+    "LINT-SCOPES SCOPE ERROR: source_files" ls_run "$root"
+fx_unlock
+fi
 }
 
 group_lint_scopes_table() {

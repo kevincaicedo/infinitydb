@@ -11,7 +11,8 @@
 //!    real `WatermarkGate` + executor machinery. Oracles: RAM residency
 //!    ≤ budget + one slice at every round, `tail_alloc_stalls` visible,
 //!    zero out-of-memory verdicts, and progress continues (the ADR-0053
-//!    D5 deadlock-freedom argument, exercised).
+//!    D5 deadlock-freedom argument, exercised): a phase in which the gate
+//!    wakes no stalled write is `VACUOUS`.
 //! 2. **Wedged phase** — the device stops entirely for longer than the
 //!    stall timeout: parked writers surface the **typed timeout** (the
 //!    ADR-0053 D4 `STALLED` class), RSS stays bounded, the loop keeps
@@ -52,7 +53,9 @@ use inf_log::{
     TIER_FRAME_BYTES, TierFlush, TierFlushConfig, TierIoMode, tier_extract, tier_frame_offset,
     tier_frame_span,
 };
-use inf_runtime::{CellExecutor, ExecutorLayout, TaskAdmission, WatermarkGate, WatermarkWait};
+use inf_runtime::{
+    CellExecutor, ExecutorLayout, TaskAdmission, WaitNodes, WatermarkGate, WatermarkWait,
+};
 use inf_store::{
     AddressSpaceConfig, DemotionConfig, KeyHasher, Keyspace, LogicalAddr, NsId, StoreConfig,
     TieredLookup, TieredTable,
@@ -168,6 +171,9 @@ pub struct PressureReport {
     pub violations: Violations,
     pub stalls: u64,
     pub stall_timeouts: u64,
+    /// Stalled writes the gate woke by progress in the throttled phase, before
+    /// the wedge: the gate's wake engaged, else `VACUOUS`.
+    pub throttled_progress: u64,
     /// Virtual stall latencies (park → wake), nanoseconds.
     pub stall_p50_ns: u64,
     pub stall_p99_ns: u64,
@@ -257,6 +263,8 @@ struct World {
     model: BTreeMap<Vec<u8>, Vec<u8>>,
     stalls: u64,
     timeouts: u64,
+    /// Stalls that ended `Progress` in a round before the wedge.
+    throttled_progress: u64,
     stall_latencies_ns: Vec<u64>,
     oom_verdicts: u64,
     writers_done: usize,
@@ -328,7 +336,7 @@ async fn write_until_done(world: &Rc<RefCell<World>>, key: &[u8], value: &[u8], 
                         world.wedge_from = Some(round_now + 2);
                     }
                     let wait = StallWait {
-                        gate: world.gate.waiter(target.to_raw()),
+                        gate: world.gate.wait_for(target.to_raw()),
                         now: Rc::clone(&world.now),
                         deadline_ns: started_ns + STALL_TIMEOUT_NS,
                         round_wakers: Rc::clone(&world.round_wakers),
@@ -342,6 +350,10 @@ async fn write_until_done(world: &Rc<RefCell<World>>, key: &[u8], value: &[u8], 
         world.stall_latencies_ns.push(world.now.get() - started_ns);
         match outcome {
             StallOutcome::Progress => {
+                let round = world.now.get() / ROUND_NS;
+                if world.wedge_from.is_none_or(|from| round < from) {
+                    world.throttled_progress += 1;
+                }
                 // Woken: with the gate keyed on the post-release head,
                 // the retry fits by arithmetic. The guard bounds the
                 // loop anyway (put a limit on everything).
@@ -510,17 +522,20 @@ fn build_world(leg: PressureLeg, seed: u64) -> Rc<RefCell<World>> {
         )
         .is_ok()
     );
+    let pool = WaitNodes::build(crate::limits::PRESSURE_WAIT_NODES, &census)
+        .expect("the leg's wait nodes");
     Rc::new(RefCell::new(World {
         ks,
         leg,
         shape,
         device_credit: 0,
-        gate: WatermarkGate::new(),
+        gate: WatermarkGate::build(pool.seat),
         now: Rc::new(Cell::new(0)),
         round_wakers: Rc::new(RefCell::new(Vec::new())),
         model: BTreeMap::new(),
         stalls: 0,
         timeouts: 0,
+        throttled_progress: 0,
         stall_latencies_ns: Vec::new(),
         oom_verdicts: 0,
         writers_done: 0,
@@ -582,6 +597,7 @@ fn run_round(
         // SPIN_GUARD documents).
         let head = world.table().space().head().to_raw();
         world.gate.advance(head);
+        wake_owed(&world.gate);
         let committed = world.table().space().report().committed_bytes;
         report.peak_committed_bytes = report.peak_committed_bytes.max(committed);
         let budget = world.shape.budget;
@@ -623,6 +639,25 @@ fn drain(world: &Rc<RefCell<World>>, fleet: &mut TierFleet) {
     while world.table().release_slice() > 0 {}
     let head = world.table().space().head().to_raw();
     world.gate.advance(head);
+    wake_owed(&world.gate);
+}
+
+/// The stalled writers the gate's last advance covers, woken as a gate with
+/// no durable cell wakes them itself (ADR-0177 A2.2), at most the pool's every
+/// wait a call. The calls are bounded by the queued waits' batches and one call
+/// that finds none covered; a gate still owing after them stops the run.
+fn wake_owed(gate: &WatermarkGate) {
+    let budget =
+        usize::try_from(crate::limits::PRESSURE_WAIT_NODES.entries_max()).unwrap_or(usize::MAX);
+    let calls = gate.waiting().div_ceil(budget) + 1;
+    for _ in 0..calls {
+        if !gate.owes() {
+            break;
+        }
+        let woken = gate.wake_covered(budget);
+        assert!(woken <= budget, "a call woke {woken}, past its budget {budget}");
+    }
+    assert!(!gate.owes(), "wakes still owed after {calls} calls");
 }
 
 /// Liveness/typed-outcome oracles + the byte-exact content audit.
@@ -634,6 +669,13 @@ fn audit(world: &Rc<RefCell<World>>, fleet: &TierFleet, report: &mut PressureRep
     }
     if world.timeouts == 0 {
         report.violations.push("wedged phase produced no typed timeouts".into());
+    }
+    if world.throttled_progress == 0 {
+        report.violations.push(
+            "VACUOUS pressure-progress-unengaged: no stalled write in the throttled phase was \
+             woken by the gate"
+                .into(),
+        );
     }
     if world.oom_verdicts > 0 {
         report
@@ -670,6 +712,7 @@ fn audit(world: &Rc<RefCell<World>>, fleet: &TierFleet, report: &mut PressureRep
     }
     report.stalls = world.stalls;
     report.stall_timeouts = world.timeouts;
+    report.throttled_progress = world.throttled_progress;
     let mut latencies = world.stall_latencies_ns.clone();
     latencies.sort_unstable();
     let pick = |p: f64| match latencies.len() {

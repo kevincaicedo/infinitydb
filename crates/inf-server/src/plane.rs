@@ -58,7 +58,7 @@ use inf_runtime::{CellExecutor, ExecutorLayout, GroupClass, TaskId, park};
 use inf_runtime::{
     CellPlane, Completion, CompletionResult, CompletionToken, Delivery, FabricAdmission,
     FabricGate, GatePermit, GateUnits, GateWait, IoClass, IoOp, Issue, LoopCx, OwnerPhase, RawFd,
-    TimerNotice, TimerOutcome, TimerSet, TokenClass, WaitList, WaitNodes,
+    TimerNotice, TimerOutcome, TimerOwner, TimerSet, TokenClass, WaitList, WaitNodes, WaitPool,
 };
 #[cfg(feature = "doc")]
 use inf_store::JsonLogDecision;
@@ -153,7 +153,7 @@ use crate::control::{
     BoardSweep, CellIssuer, CheckpointEpoch, CkptFinalCredit, CkptQuota, ControlHandle,
     IssuerRefused, RecoveryBoard,
 };
-use crate::durable::{DrainHold, DurableCell, DurableConfig};
+use crate::durable::{DrainHold, DurableCell, DurableConfig, DurableOwners};
 #[cfg(feature = "doc")]
 use crate::exec::DocLogAdmission;
 use crate::exec::{
@@ -776,10 +776,15 @@ pub struct ServerPlane<
     /// Last CONFIG-store version pushed into the keyspace (M1-E3
     /// `hot-per-cell` sweep — one u64 compare per MAINTAIN, no re-parse).
     config_pushed: u64,
-    /// The cell's timer owners, one per role (ADR-0154 D4), reserved by
-    /// `new` before the loop exists: the accept retry's, and the durable
-    /// roles' until the durable plane takes them.
-    timers: ServerTimers,
+    /// The accept retry's timer owner (ADR-0154 D4), reserved by `new`
+    /// before the loop exists.
+    accept_retry: TimerOwner,
+    /// What the durable plane takes once, at its build: the durable roles'
+    /// timer owners, reserved with the accept retry's, and the seat of the
+    /// cell's one ack gate, answered by the pool's build (ADR-0177 D5).
+    /// `None` from then on; a cell whose durable plane is never enabled
+    /// keeps them unused.
+    durable_owners: Option<DurableOwners>,
     /// Accepted fds are TCP sockets (`infinityd`, the e2e harness): the
     /// plane sets `tcp-keepalive` on them (ADR-0123 D3). The DST models
     /// no TCP stack and leaves this off.
@@ -1035,7 +1040,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         let mut executor = layout.build().map_err(PlaneBuildError::Executor)?;
         // The cell's wait nodes, one for each task slot, before any wait list (ADR-0177 D5).
         let node_cap = crate::limits::wait_nodes(&caps).map_err(PlaneBuildError::WaitNodes)?;
-        let wait_nodes = WaitNodes::build(node_cap, &census).map_err(PlaneBuildError::WaitNodes)?;
+        let WaitPool { nodes: wait_nodes, seat: ack_seat } =
+            WaitNodes::build(node_cap, &census).map_err(PlaneBuildError::WaitNodes)?;
         let store = seed.build(&census).map_err(PlaneBuildError::Seed)?;
         let (timer_set, timers) = ServerTimers::build(&census).map_err(PlaneBuildError::Timers)?;
         let parked = ParkedDeques::build(cell, cells, fabric.data_credits(), &census)
@@ -1160,7 +1166,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             expiry_lag: 0,
             // MAX forces one push on the first MAINTAIN (boot-time config).
             config_pushed: u64::MAX,
-            timers,
+            accept_retry: timers.accept_retry,
+            durable_owners: Some(DurableOwners { timers: timers.durable, ack_seat }),
             tcp_transport: false,
             ckpt_epoch_seen: 0,
             early_fabric_flush: false,
@@ -1395,7 +1402,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// geometry (ADR-0191 D4).
     ///
     /// The durable plane takes the plane's three durable timer owners
-    /// (everysec, fill hold, group hold), which it holds for the cell's life.
+    /// (everysec, fill hold, group hold), which it holds for the cell's life,
+    /// and with them the seat its ack gate is built on (ADR-0177 D5).
     ///
     /// # Errors
     /// Checkpoint-directory scan failure (boot-time listing), with the
@@ -1409,7 +1417,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         rotor: SegmentRotor<F>,
         recovered: Option<crate::RecoveredManifest>,
     ) -> std::io::Result<()> {
-        let Some(owners) = self.timers.durable.take() else {
+        let Some(owners) = self.durable_owners.take() else {
             return Err(std::io::Error::other("the durable plane is enabled once"));
         };
         let shard_dir = cfg.data_dir.join(format!("shard-{cell_id}"));
@@ -1418,7 +1426,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         {
             Ok(ckpt) => ckpt,
             Err(err) => {
-                self.timers.durable = Some(owners);
+                self.durable_owners = Some(owners);
                 return Err(err);
             }
         };
@@ -1787,6 +1795,20 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// tests: used only between scheduler steps.
     pub fn ack_waiters_for_sim(&self) -> usize {
         self.shared.durable.borrow().as_ref().map_or(0, |cell| cell.ack_gate.waiting())
+    }
+
+    /// Whether this cell's durability watermark gate owes a wake (a covered `always` ack may
+    /// be left queued; false on a cell with no durable plane), for the simulator's loop-tier
+    /// tests: used only between scheduler steps.
+    pub fn ack_wakes_owed_for_sim(&self) -> bool {
+        self.shared.durable.borrow().as_ref().is_some_and(|cell| cell.ack_gate.owes())
+    }
+
+    /// A read-only view of this cell's durability watermark waits (`None` on a cell with no
+    /// durable plane), which outlives the cell: the simulator reads through it what a
+    /// teardown left queued. Used only between scheduler steps.
+    pub fn ack_waiting_view_for_sim(&self) -> Option<inf_runtime::WaitingView> {
+        self.shared.durable.borrow().as_ref().map(|cell| cell.ack_gate.waiting_view())
     }
 
     /// Cold-read members this cell's turns have yet to visit (its cold

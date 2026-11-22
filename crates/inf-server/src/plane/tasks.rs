@@ -303,6 +303,23 @@ mod tests {
         chunks * chunk as u64 * stride as u64 + directories * 2_048
     }
 
+    /// One fixed array's resident bill at its build, as `inf_runtime::heap` lays it out: its
+    /// elements exact, in chunks of as many as one backing allocation holds; past one chunk, a
+    /// directory of 16 B chunk pointers, one a chunk; past one directory's chunks, as many as
+    /// one backing allocation of pointers holds, a top directory of 24 B directory headers, one
+    /// a directory (ADR-0177 D5).
+    #[cfg(feature = "doc")]
+    fn array_bill(capacity: u32, element: usize) -> u64 {
+        let backing = inf_foundation::limits::MAP_BACKING_ALLOCATION_BYTES_MAX;
+        let pointer = size_of::<Box<[u8]>>();
+        let header = size_of::<Vec<Box<[u8]>>>();
+        let chunks = u64::from(capacity).div_ceil((backing / element) as u64);
+        let chunks_directory = (backing / pointer) as u64;
+        let pointers = if chunks > 1 { chunks * pointer as u64 } else { 0 };
+        let headers = if chunks > chunks_directory { chunks.div_ceil(chunks_directory) } else { 0 };
+        u64::from(capacity) * element as u64 + pointers + headers * header as u64
+    }
+
     /// The `--plant-bytes-cell` value of `cfg`'s row in the canary table.
     #[cfg(feature = "doc")]
     fn plant_bytes(table: &str, cfg: &str) -> u64 {
@@ -320,9 +337,10 @@ mod tests {
     /// slab and the fabric gate's holders. The gate row's threshold and the `binary` canaries'
     /// planted bytes (`conn` slots and gate holders doubled, the wait nodes oversized) are these
     /// strides' products, so a stride that moves turns this red until they move with it. The
-    /// pool of wait nodes' resident bill is computed beside the bill and sits in its per-cell
-    /// remainder, so it moves no threshold. The bill is the shipped node's, built with its
-    /// default features: a slim build's strides are its own.
+    /// pool of wait nodes' resident bill and its watermark gate's entry array are computed
+    /// beside the bill and sit in its per-cell remainder, so they move no threshold. The bill
+    /// is the shipped node's, built with its default features: a slim build's strides are its
+    /// own.
     #[test]
     #[cfg(feature = "doc")]
     fn the_idle_bill_and_its_plants_follow_the_strides() {
@@ -407,26 +425,34 @@ mod tests {
         let node_chunk =
             inf_foundation::limits::chunk_slots_for(node_bytes).expect("a wait node's chunk");
         let pool = slab_bill(nodes, node_bytes, node_chunk);
+        // The watermark gate's entry array: one entry a node, built at the pool's cap in its
+        // steps and resident whole from them, `T x s_entry` and its directories (ADR-0177 D5).
+        let entry_bytes = inf_runtime::WatermarkGate::ENTRY_BYTES;
+        let entries = array_bill(nodes, entry_bytes);
         println!(
             "the_idle_bill_and_its_plants_follow_the_strides: wait nodes T {nodes}, node \
-             {node_bytes} B, c {node_chunk}, pool {pool} B a cell"
+             {node_bytes} B, c {node_chunk}, pool {pool} B a cell; entry {entry_bytes} B, \
+             entries {entries} B a cell; pool and entries {} B a cell",
+            pool + entries
         );
         assert!(
-            pool < REMAINDER_BYTES_CELL,
-            "the pool's {pool} B a cell pass the per-cell remainder, {REMAINDER_BYTES_CELL} B"
+            pool + entries < REMAINDER_BYTES_CELL,
+            "the pool's {pool} B and its entries' {entries} B a cell pass the per-cell \
+             remainder, {REMAINDER_BYTES_CELL} B"
         );
-        // The oversized-pool canary: the pool over (1 + k) T, k the fewest counts of T whose
-        // node bytes pass ten times the idle-resident tool's 256 KiB control a cell.
+        // The oversized-pool canary: the pool and its entry array over (1 + k) T, k the fewest
+        // counts of T whose node and entry bytes pass ten times the idle-resident tool's
+        // 256 KiB control a cell.
         let k = crate::limits::wait_nodes_oversized_k(nodes);
-        let count_bytes = u64::from(nodes) * node_bytes as u64;
+        let count_bytes = u64::from(nodes) * (node_bytes + entry_bytes) as u64;
         let pool_plant = u64::from(k) * count_bytes;
         let floor = crate::limits::WAIT_NODES_PLANT_FLOOR_BYTES;
-        assert!(pool_plant > floor, "k x T x s_node passes ten controls");
+        assert!(pool_plant > floor, "k x T x (s_node + s_entry) passes ten controls");
         assert!(pool_plant - count_bytes <= floor, "k is the fewest that does");
         assert_eq!(
             plant_bytes(canaries, "inf_canary_wait_nodes_oversized"),
             pool_plant,
-            "k x T x s_node"
+            "k x T x (s_node + s_entry)"
         );
     }
 }

@@ -457,14 +457,18 @@ fn a_refused_map_build_step_retires_its_prefix_by_steps() {
 const WAIT_POOL: Cap = Cap::entries::<64>("alloc-wait-nodes", CapFill::Serving);
 const WAIT_KEYS: Cap = Cap::entries::<3>("alloc-wait-keys", CapFill::Assembly);
 
-/// The wait lists on the cell's pool (ADR-0177 D5): zero allocator calls after the pool's and
-/// the keyed list's build across waits made and polled, woken one at a time and whole, read,
-/// dropped while queued and dropped after an unread wake (the baton), on a unit list and a
-/// keyed one. A wait's node is the pool's, never an allocation of its own.
+/// The wait lists and the watermark gate on the cell's pool (ADR-0177 D5): zero allocator calls
+/// after the pool's, the gate's and the keyed list's build across waits made and polled, woken
+/// one at a time and whole, read, dropped while queued and dropped after an unread wake (the
+/// baton), on a unit list and a keyed one; and across watermark waits queued, advanced over,
+/// woken by a budgeted call and read, dropped while queued, and covered at their first poll. A
+/// wait's node is the pool's and its entry the gate's array, never an allocation of its own.
 #[test]
 fn no_allocator_call_after_build_across_waits_wakes_and_drops() {
     let (census, _serve_mark) = CapCensus::new(CellId(2));
-    let nodes = inf_runtime::WaitNodes::build(WAIT_POOL, &census).expect("the pool");
+    let pool = inf_runtime::WaitNodes::build(WAIT_POOL, &census).expect("the pool");
+    let nodes = pool.nodes;
+    let gate = inf_runtime::WatermarkGate::build(pool.seat);
     let unit = inf_runtime::WaitList::unit(&nodes);
     let keyed = inf_runtime::WaitList::keyed(&nodes, Some(WAIT_KEYS), &census, [1u32, 2, 3])
         .expect("the keyed list");
@@ -490,8 +494,74 @@ fn no_allocator_call_after_build_across_waits_wakes_and_drops() {
         assert!(std::pin::Pin::new(&mut fourth).poll(&mut cx).is_pending());
         drop(fourth);
         assert_eq!(keyed.wake_all(key), 0, "no wait is left on the key");
+        // A watermark wait queued and woken, one dropped while queued, one covered at once.
+        let lsn = 2 * i + 2;
+        let mut parked = gate.wait_for(lsn);
+        let mut dropped = gate.wait_for(lsn + 1);
+        assert!(std::pin::Pin::new(&mut parked).poll(&mut cx).is_pending());
+        assert!(std::pin::Pin::new(&mut dropped).poll(&mut cx).is_pending());
+        drop(dropped);
+        gate.advance(lsn);
+        assert_eq!(gate.wake_covered(4), 1, "the parked wait alone is covered");
+        ready += u64::from(std::pin::Pin::new(&mut parked).poll(&mut cx).is_ready());
+        ready += u64::from(std::pin::Pin::new(&mut gate.wait_for(lsn)).poll(&mut cx).is_ready());
     }
     assert_eq!(ALLOC.thread_allocations(), before, "an allocator call after the build");
-    assert_eq!(ready, 2 * CHURN, "every woken wait read its wake");
+    assert_eq!(ready, 4 * CHURN, "every woken wait read its wake");
+    assert_eq!(gate.waiting(), 0, "no watermark wait is left on the gate");
     assert_eq!(nodes.len(), 0, "every node back in the pool");
+}
+
+/// The default node's pool, `T` = 2,825 (ADR-0177 D5): its slab in chunks of 64 nodes under one
+/// directory, then its watermark gate's entry array in two chunks under one directory.
+const WAIT_POOL_DEFAULT: Cap = Cap::entries::<2_825>("alloc-wait-nodes-t", CapFill::Serving);
+
+/// A refusal planted at each allocation of the pool's build, its slab's steps and then its
+/// gate's entry array's: the build answers `Alloc`, and every allocation before the refusal is
+/// freed, a refused array retiring the built slab by steps. A refused request is counted as
+/// requested and never freed, so the window of the refusal at allocation `k + 1` frees exactly
+/// what the window of the refusal at `k` requested, the first frees nothing, and the chain
+/// closes on the slab's and the array's bytes, counted here from their layouts: the slab's
+/// chunks of `c` slots and its directory of 256 child pointers, the array's entries exact and
+/// its directory of one 16 B pointer a chunk. The build's one allocation past them, the pool's
+/// shared handle, is infallible, so a refusal there would abort: it is counted, not refused.
+#[test]
+fn a_wait_pool_refused_at_any_build_step_leaves_nothing_behind() {
+    let nodes = u64::from(WAIT_POOL_DEFAULT.entries_max());
+    let slot = inf_runtime::WaitNodes::NODE_SLOT_BYTES;
+    let chunk = chunk_slots_for(slot).expect("a node's chunk");
+    let slab_chunks = nodes.div_ceil(chunk as u64);
+    let directory_children = inf_foundation::limits::MAP_DIRECTORY_CHILDREN_MAX;
+    assert!(slab_chunks > 1, "the slab is past one chunk");
+    assert!(slab_chunks <= directory_children as u64, "under one directory");
+    let slab_directory = directory_children * size_of::<Option<Box<u8>>>();
+    let slab_bytes = slab_chunks * (chunk * slot) as u64 + slab_directory as u64;
+    let entry = inf_runtime::WatermarkGate::ENTRY_BYTES;
+    let array_chunks = nodes.div_ceil((MAP_BACKING_ALLOCATION_BYTES_MAX / entry) as u64);
+    assert_eq!(array_chunks, 2, "the array is two chunks under one directory");
+    let array_bytes = nodes * entry as u64 + array_chunks * size_of::<Box<[u8]>>() as u64;
+    let steps = slab_chunks + 1 + array_chunks + 1;
+    let (census, _serve_mark) = CapCensus::new(CellId(3));
+    let (requests, requested) = (ALLOC.thread_allocations(), ALLOC.thread_bytes());
+    let built = inf_runtime::WaitNodes::build(WAIT_POOL_DEFAULT, &census).expect("the pool");
+    let build = (ALLOC.thread_allocations() - requests, ALLOC.thread_bytes() - requested);
+    drop(built);
+    assert_eq!(build.0, steps + 1, "the slab's and the array's steps, then the pool's handle");
+    let mut requested_before = 0;
+    for refused_at in 0..steps {
+        let (requested, freed) = (ALLOC.thread_bytes(), ALLOC.thread_freed_bytes());
+        let guard = ALLOC.refuse_after(refused_at).expect("no refusal armed");
+        let outcome = inf_runtime::WaitNodes::build(WAIT_POOL_DEFAULT, &census).map(drop);
+        assert!(guard.was_triggered(), "allocation {refused_at} reached the allocator");
+        drop(guard);
+        assert_eq!(outcome, Err(CapError::Alloc), "refused at allocation {refused_at}");
+        let freed = ALLOC.thread_freed_bytes() - freed;
+        assert_eq!(
+            freed, requested_before,
+            "refused at allocation {refused_at}: an allocation before the refusal was kept"
+        );
+        requested_before = ALLOC.thread_bytes() - requested;
+    }
+    assert_eq!(requested_before, slab_bytes + array_bytes, "the chain closes on the layouts");
+    assert!(build.1 > requested_before, "the pool's handle is the build's one more allocation");
 }

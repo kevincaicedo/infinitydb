@@ -241,6 +241,9 @@ pub struct DurableScenario {
     /// seed on `Buffered` K = 1 seeds (the class it targets); the
     /// durability, quiescence and budget oracles run unchanged.
     pub group: inf_server::GroupHoldConfig,
+    /// The ack gate's wakes between two LOG steps (ADR-0177 A2.1): the
+    /// node's limit, which a test may lower so a few writers cross it.
+    pub ack_wakes_per_turn: core::num::NonZeroU32,
     /// A first life in another barrier class (ADR-0086 D4 as amended,
     /// 2026-08-21): the cell boots in `prelude.io_mode`, the writers run
     /// `prelude.ops_per_writer` ops, the log quiesces to full durability,
@@ -691,6 +694,7 @@ impl DurableScenario {
             } else {
                 Default::default()
             },
+            ack_wakes_per_turn: inf_server::limits::ACK_WAKES_PER_TURN,
             prelude: None,
             // M4.5-S39b (ADR-0090 A7.5): the product default on `Direct`
             // seeds, off on every fourth of them (seeds ≡ 5 mod 8) so the
@@ -1083,6 +1087,7 @@ impl DurableScenario {
             ckpt_direct_refused_after: None,
             fill: Default::default(),
             group: Default::default(),
+            ack_wakes_per_turn: inf_server::limits::ACK_WAKES_PER_TURN,
             prelude: None,
             // The budget scenario's zero-fill class must keep engaging
             // (its oracle counts deferrals): recycling off.
@@ -1258,6 +1263,7 @@ impl DurableScenario {
             ckpt_direct_refused_after: None,
             fill: Default::default(),
             group: Default::default(),
+            ack_wakes_per_turn: inf_server::limits::ACK_WAKES_PER_TURN,
             prelude: None,
             recycle_slots: 0,
             prealloc: inf_server::PreallocPolicy::DEFAULT,
@@ -2146,6 +2152,7 @@ fn durable_config(
         device: scenario.device,
         fill: scenario.fill,
         group: scenario.group,
+        ack_wakes_per_turn: scenario.ack_wakes_per_turn,
     }
 }
 

@@ -156,6 +156,6 @@ fn one_holder_gate() -> FabricGate<u64> {
     const HOLDERS: Cap = Cap::entries::<1>("bench-gate-holders", CapFill::Serving);
     const WAIT_NODES: Cap = Cap::entries::<1>("bench-wait-nodes", CapFill::Serving);
     let (census, _mark) = CapCensus::new(CellId(0));
-    let nodes = inf_runtime::WaitNodes::build(WAIT_NODES, &census).expect("the bench's pool");
+    let nodes = inf_runtime::WaitNodes::build(WAIT_NODES, &census).expect("the bench's pool").nodes;
     FabricGate::build(0, 1, Some(HOLDERS), &census, &nodes).expect("the bench's gate")
 }

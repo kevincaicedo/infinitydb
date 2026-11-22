@@ -684,6 +684,9 @@ impl<F: Future<Output = ()> + 'static, const C: usize> ClassBuild for ClassBuild
         self.builder.instance()
     }
 
+    // Each build step allocates one chunk or one directory of the class's slab, and each
+    // retirement step frees one, so the outer loop runs at most the slab's chunks and
+    // directories times and the inner one at most the steps the outer took.
     fn build(self: Box<Self>) -> Result<(Box<dyn ClassObject>, TypeId), CapError> {
         let mut builder = self.builder;
         loop {

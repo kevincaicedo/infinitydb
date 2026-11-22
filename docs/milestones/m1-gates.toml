@@ -196,12 +196,12 @@ measured_by = "CI client-smoke job: redis-py, node-redis, go-redis, lettuce"
 # D_j its directories, none for a one-chunk class (ADR-0177 A1.1, ADR-0194
 # A1): conn T 2,500, 3,104 B, c 16, W 2,512, D 1: 7,799,296 B; ns-apply 3,
 # 1,504 B, c 32: 48,128 B; owner-pub 1, 1,208 B, c 32: 38,656 B; gated 1,
-# 80 B, c 64: 5,120 B; compact 64, 200 B, c 64: 12,800 B; shadow 256,
-# 264 B, c 64, D 1: 69,632 B; 7,973,632 B a cell, 30.417 MiB; gate holders
+# 96 B, c 64: 6,144 B; compact 64, 200 B, c 64: 12,800 B; shadow 256,
+# 264 B, c 64, D 1: 69,632 B; 7,974,656 B a cell, 30.421 MiB; gate holders
 # N × (W(H) × stride + D(H) × 2 KiB), every slot of each 64-slot chunk and
 # each directory written at the build (ADR-0177 D8 with A1.1): H 83,075
 # (2,500 × 32 + 3 units and 3 × 1,024 orphans), 48 B, W 83,136, D 7:
-# 4,004,864 B a cell, 15.278 MiB. Σ 146.194 MiB, rounded up to 0.01 MiB.
+# 4,004,864 B a cell, 15.278 MiB. Σ 146.198 MiB, rounded up to 0.01 MiB.
 # The task headers stay in the per-cell remainder. Each stride is the class slot's size as the build reads it;
 # a term is recomputed when a stride moves, never raised to a reading.
 # Scope: memory-only node; every cell's registration proven by VmPin over

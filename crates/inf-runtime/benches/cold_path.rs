@@ -67,7 +67,9 @@
 //! And the wait legs (`cold_path/waits.rs`), on the same loop, reported and
 //! never judged: the fixed stores the gates and the wait lists take, one
 //! operation or one round of waits a step, beside the representations they
-//! replace; a round leg's reading less the harness's is read a wait.
+//! replace; a round leg's reading less the harness's is read a wait. Of
+//! these the wake step legs alone run outside that loop, one call over the
+//! waits one fsync covers, read by a count inside the call and its time.
 //!
 //! The instrument: exact user-space instructions per op, `(I(n) − I(0)) /
 //! n`, read outside this binary (`perf stat -e instructions:u`) on one
@@ -140,7 +142,9 @@ use inf_runtime::{
 
 use cold::{ColdReadConfig, ColdReads, ColdWait, ReadClass, TierFileId};
 use rates::{PairWord, RateLeg, RetireOp, SlabLevels};
-use waits::{HashOp, HolderOp, ListKey, NodeOp, Order, RouteShape, Routes, WaitLeg, Waits};
+use waits::{
+    HashOp, HolderOp, ListKey, NodeOp, Order, RouteShape, Routes, WaitLeg, Waits, WakeStep,
+};
 
 /// One pool buffer, the server's cold window: four 4 KiB frames.
 const BUFFER_BYTES: usize = 4 * inf_alloc::TIER_READ_ALIGN;
@@ -221,8 +225,14 @@ const fn route(routes: Routes, shape: RouteShape) -> Leg {
 const fn hash_gate(depth: u32, op: HashOp) -> Leg {
     Leg::Wait(WaitLeg::HashGate { depth, op })
 }
-const fn heap_mark(order: Order, waits: Waits) -> Leg {
-    Leg::Wait(WaitLeg::HeapMark { order, waits })
+const fn heap_hook(order: Order, waits: Waits) -> Leg {
+    Leg::Wait(WaitLeg::HeapHook { order, waits })
+}
+const fn heap_hook_one(waits: Waits) -> Leg {
+    Leg::Wait(WaitLeg::HeapHookOne { waits })
+}
+const fn wake_step(step: WakeStep, waits: Waits) -> Leg {
+    Leg::Wait(WaitLeg::WakeStep { step, waits })
 }
 const fn btree_mark(order: Order, waits: Waits) -> Leg {
     Leg::Wait(WaitLeg::BtreeMark { order, waits })
@@ -236,7 +246,7 @@ const LIST_KEY: Leg = Leg::Wait(WaitLeg::ListWaitWake { key: ListKey::Word });
 const MARK_WAIT_FOR: Leg = Leg::Wait(WaitLeg::MarkWaitFor);
 
 /// The one table of leg names: `--variant` is parsed against it.
-const LEGS: [(&str, Leg, u8); 185] = [
+const LEGS: [(&str, Leg, u8); 204] = [
     ("enqueue-cancel-64", Leg::EnqueueCancel { depth: 64, background: 64 }, 0),
     ("enqueue-cancel-64-plus-one", Leg::EnqueueCancel { depth: 64, background: 64 }, 1),
     ("enqueue-cancel-16384", Leg::EnqueueCancel { depth: 4096, background: 16_384 }, 0),
@@ -392,18 +402,37 @@ const LEGS: [(&str, Leg, u8); 185] = [
     ("hash-gate-insert-remove-10-plus-one", hash_gate(10, HashOp::InsertRemove), 1),
     ("hash-gate-insert-remove-16", hash_gate(16, HashOp::InsertRemove), 0),
     ("hash-gate-insert-remove-16-plus-one", hash_gate(16, HashOp::InsertRemove), 1),
-    ("heap-mark-rising-962", heap_mark(Order::Rising, Waits::OneCell), 0),
-    ("heap-mark-rising-962-plus-wait", heap_mark(Order::Rising, Waits::OneCell), 1),
-    ("heap-mark-rising-2825", heap_mark(Order::Rising, Waits::FourCells), 0),
-    ("heap-mark-rising-2825-plus-wait", heap_mark(Order::Rising, Waits::FourCells), 1),
-    ("heap-mark-rising-16384", heap_mark(Order::Rising, Waits::OneDirectory), 0),
-    ("heap-mark-rising-16384-plus-wait", heap_mark(Order::Rising, Waits::OneDirectory), 1),
-    ("heap-mark-falling-962", heap_mark(Order::Falling, Waits::OneCell), 0),
-    ("heap-mark-falling-962-plus-wait", heap_mark(Order::Falling, Waits::OneCell), 1),
-    ("heap-mark-falling-2825", heap_mark(Order::Falling, Waits::FourCells), 0),
-    ("heap-mark-falling-2825-plus-wait", heap_mark(Order::Falling, Waits::FourCells), 1),
-    ("heap-mark-falling-16384", heap_mark(Order::Falling, Waits::OneDirectory), 0),
-    ("heap-mark-falling-16384-plus-wait", heap_mark(Order::Falling, Waits::OneDirectory), 1),
+    ("heap-hook-rising-962", heap_hook(Order::Rising, Waits::OneCell), 0),
+    ("heap-hook-rising-962-plus-wait", heap_hook(Order::Rising, Waits::OneCell), 1),
+    ("heap-hook-rising-2825", heap_hook(Order::Rising, Waits::FourCells), 0),
+    ("heap-hook-rising-2825-plus-wait", heap_hook(Order::Rising, Waits::FourCells), 1),
+    ("heap-hook-rising-16384", heap_hook(Order::Rising, Waits::OneDirectory), 0),
+    ("heap-hook-rising-16384-plus-wait", heap_hook(Order::Rising, Waits::OneDirectory), 1),
+    ("heap-hook-falling-962", heap_hook(Order::Falling, Waits::OneCell), 0),
+    ("heap-hook-falling-962-plus-wait", heap_hook(Order::Falling, Waits::OneCell), 1),
+    ("heap-hook-falling-2825", heap_hook(Order::Falling, Waits::FourCells), 0),
+    ("heap-hook-falling-2825-plus-wait", heap_hook(Order::Falling, Waits::FourCells), 1),
+    ("heap-hook-falling-16384", heap_hook(Order::Falling, Waits::OneDirectory), 0),
+    ("heap-hook-falling-16384-plus-wait", heap_hook(Order::Falling, Waits::OneDirectory), 1),
+    ("heap-hook-one-962", heap_hook_one(Waits::OneCell), 0),
+    ("heap-hook-one-962-plus-one", heap_hook_one(Waits::OneCell), 1),
+    ("heap-hook-one-2825", heap_hook_one(Waits::FourCells), 0),
+    ("heap-hook-one-2825-plus-one", heap_hook_one(Waits::FourCells), 1),
+    ("advance-hook-2825", wake_step(WakeStep::AdvanceHook, Waits::FourCells), 0),
+    ("advance-hook-2825-plus-wait", wake_step(WakeStep::AdvanceHook, Waits::FourCells), 1),
+    ("advance-hook-16384", wake_step(WakeStep::AdvanceHook, Waits::OneDirectory), 0),
+    ("advance-hook-16384-plus-wait", wake_step(WakeStep::AdvanceHook, Waits::OneDirectory), 1),
+    ("advance-hook-50000", wake_step(WakeStep::AdvanceHook, Waits::Storm), 0),
+    ("advance-hook-50000-plus-wait", wake_step(WakeStep::AdvanceHook, Waits::Storm), 1),
+    ("wake-budget-2825", wake_step(WakeStep::WakeBudget, Waits::FourCells), 0),
+    ("wake-budget-2825-plus-wait", wake_step(WakeStep::WakeBudget, Waits::FourCells), 1),
+    ("wake-budget-16384", wake_step(WakeStep::WakeBudget, Waits::OneDirectory), 0),
+    ("wake-budget-16384-plus-wait", wake_step(WakeStep::WakeBudget, Waits::OneDirectory), 1),
+    ("wake-budget-50000", wake_step(WakeStep::WakeBudget, Waits::Storm), 0),
+    ("wake-budget-50000-plus-wait", wake_step(WakeStep::WakeBudget, Waits::Storm), 1),
+    ("advance-btree-2825", wake_step(WakeStep::AdvanceBtree, Waits::FourCells), 0),
+    ("advance-btree-16384", wake_step(WakeStep::AdvanceBtree, Waits::OneDirectory), 0),
+    ("advance-btree-50000", wake_step(WakeStep::AdvanceBtree, Waits::Storm), 0),
     ("btree-mark-rising-962", btree_mark(Order::Rising, Waits::OneCell), 0),
     ("btree-mark-rising-962-plus-hundred", btree_mark(Order::Rising, Waits::OneCell), 100),
     ("btree-mark-rising-2825", btree_mark(Order::Rising, Waits::FourCells), 0),

@@ -171,6 +171,42 @@ fx_only() {
     ! grep -n 'git -C "\$' "$1" | grep -v -e ' init -q$' -e '^[0-9]*:    git -C "\$root" "\$@"$'
 }
 
+# fx_lock <path>: a fixture path under $work set to mode 000, for a case
+# whose gate must fail on what it cannot read, and recorded: fx_unlock gives
+# every recorded path its owner's access back, and the group's EXIT trap
+# calls it before it removes $work, which a directory at 000 would refuse.
+# Root reads through mode 000, so a caller runs its locked cases only when
+# `id -u` is not 0. Each checks $work first (fx_work): with $work empty,
+# "$work"/?* is /?* and would pass any absolute path to chmod.
+FX_LOCKED=
+fx_work() { # <caller>
+    [ -n "$work" ] && [ -d "$work" ] ||
+        { echo "$1: no work directory to build a path under (work='$work')" >&2; exit 2; }
+}
+fx_lock() {
+    fx_work fx_lock
+    case $1 in
+    "$work"/?*) ;;
+    *) echo "fx_lock: '$1' is not a fixture path under $work" >&2; exit 2 ;;
+    esac
+    FX_LOCKED="$FX_LOCKED$1
+"
+    chmod 000 "$1" || { echo "fx_lock: chmod 000 $1 failed" >&2; exit 2; }
+}
+fx_unlock() {
+    local path
+    [ -n "$FX_LOCKED" ] || return 0
+    fx_work fx_unlock
+    while IFS= read -r path; do
+        case $path in
+        "") ;;
+        "$work"/?*) chmod u+rwx "$path" ;;
+        *) echo "fx_unlock: '$path' is not a fixture path under $work" >&2 ;;
+        esac
+    done <<<"$FX_LOCKED"
+    FX_LOCKED=
+}
+
 # ---------------------------------------------------------------- the driver
 # selftest_defined <file>: the groups its definition lines name, in file order.
 selftest_defined() {
@@ -268,7 +304,7 @@ selftest_run_group() {
     esac
     work=$(mktemp -d)
     [ -n "$work" ] && [ -d "$work" ] || { echo "selftest: mktemp failed" >&2; exit 2; }
-    trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
+    trap 'fx_unlock; [ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
     SELFTEST_GROUP=$name
     began=$(selftest_clock)
     if [ -n "${INF_SELFTEST_CASE_LOG:-}" ]; then

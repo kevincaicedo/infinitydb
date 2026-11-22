@@ -30,7 +30,7 @@ const FIELD: u32 = 1 << GATE_KEY_GENERATION_BITS;
 fn every_value_reaches_its_own_wait_past_the_generation_field() {
     let (census, _mark) = CapCensus::new(CellId(2));
     let cap = Cap::entries::<{ HOLDERS }>("test-gate-holders", CapFill::Serving);
-    let nodes = WaitNodes::build(WAIT_NODES, &census).expect("the test pool");
+    let nodes = WaitNodes::build(WAIT_NODES, &census).expect("the test pool").nodes;
     let gate = RefCell::new(
         FabricGate::<u64>::build_at_generation(2, HOLDERS, Some(cap), &census, &nodes, FIELD - 2)
             .expect("the test gate"),
@@ -82,7 +82,7 @@ fn a_dropped_permit_at_the_last_generation_leaves_its_slot_at_the_first() {
     let generation = |key: u64| (key >> GATE_KEY_INDEX_BITS) & u64::from(FIELD - 1);
     let (census, _mark) = CapCensus::new(CellId(2));
     let cap = Cap::entries::<{ HOLDERS }>("test-gate-holders", CapFill::Serving);
-    let nodes = WaitNodes::build(WAIT_NODES, &census).expect("the test pool");
+    let nodes = WaitNodes::build(WAIT_NODES, &census).expect("the test pool").nodes;
     let gate = RefCell::new(
         FabricGate::<u64>::build_at_generation(2, HOLDERS, Some(cap), &census, &nodes, u32::MAX)
             .expect("the test gate"),

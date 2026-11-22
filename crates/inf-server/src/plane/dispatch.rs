@@ -886,7 +886,7 @@ pub(super) async fn settle_reply<O: PlaneObserver + 'static, F: SegmentFs + Clon
             let waiter = {
                 let durable = shared.durable.borrow();
                 let cell = durable.as_ref().expect("a durable entry implies the durable plane");
-                cell.ack_gate.waiter(seq)
+                cell.ack_gate.wait_for(seq)
             };
             waiter.await;
             reply

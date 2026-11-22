@@ -317,7 +317,7 @@ impl<K: ExactKey, V> CappedMap<K, V> {
     /// The value under `key`, if present.
     #[must_use]
     // Folded always: compiled into a caller's own module, as the runtime's keyed
-    // wait list does, a hint alone left it a body (ADR-0210 D1).
+    // wait list does, a hint alone left it a body (ADR-0211 D1).
     #[inline(always)]
     pub fn get(&self, key: K) -> Option<&V> {
         let leaf = self.leaf(self.nearest(self.root?, key));

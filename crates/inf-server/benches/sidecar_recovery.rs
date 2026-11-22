@@ -79,6 +79,7 @@ fn cfg(data_dir: PathBuf) -> DurableConfig {
         device: Default::default(),
         fill: Default::default(),
         group: Default::default(),
+        ack_wakes_per_turn: inf_server::limits::ACK_WAKES_PER_TURN,
     }
 }
 
