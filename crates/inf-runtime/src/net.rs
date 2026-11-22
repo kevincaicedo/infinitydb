@@ -428,6 +428,10 @@ mod tests {
     /// One close, its number released: on Linux the descriptor's entry is
     /// gone, or names another file once a later open reused the number.
     #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test-only: the descriptor table in /proc witnesses the close"
+    )]
     fn close_reporting_closes_its_descriptor_once() {
         use std::os::fd::AsRawFd as _;
         let fd = std::os::fd::OwnedFd::from(listen_reuseport(0).expect("listener"));
