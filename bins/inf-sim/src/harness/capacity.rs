@@ -378,6 +378,9 @@ impl Rig {
         &self.cells[cell].1
     }
 
+    /// Records a violation under its caller's check, so each clause's first
+    /// entry is printed whatever the run's count.
+    #[track_caller]
     fn violate(&mut self, text: String) {
         self.violations.push(text);
     }
