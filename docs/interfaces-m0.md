@@ -145,7 +145,7 @@ impl Arena {
 > `Occupied`, `Vacant` or `Full`, and a vacant slot fixes the key and
 > every tree position before the payload is built (ADR-0151 D1, D2).
 
-> **Accepted 2026-10-19, implementation open — ADR-0177:** the executor
+> **Accepted 2026-10-19, built — ADR-0177:** the executor
 > and the gates, as this decision rebuilds them, change the ADR-0149
 > note above and, for the fabric gate only, what the ADR-0151 note says
 > of gate keys. A task class is an erased `TaskClass` id from
@@ -172,11 +172,14 @@ impl Arena {
 > with its units, minted keys and orphaned holders, and the keyed gates'
 > holds, `has_waiter` deleted; and D7's generation policies. A keyed
 > gate's key is a `GateKey`, its exact `u64` word: `u64`,
-> `CompletionToken` or the cold gate's `LogicalId`. Of D5, the wait lists
-> are built. A cell builds one `WaitNodes` pool before it serves: `T` nodes,
-> one for each task slot of its classes, on its census (row
-> `wait-nodes`), and each of its `WaitList`s takes the pool at its
-> constructor. A wait takes its node at its first poll, not at
+> `CompletionToken` or the cold gate's `LogicalId`. D5 is built. A cell
+> builds one wait-node pool before it serves: `WaitNodes::build` answers
+> its `T` nodes, one for each task slot of its classes, on its census
+> (row `wait-nodes`), with the seat of its one `WatermarkGate`, the gate's
+> heap entries built in the pool's steps. Each of the cell's `WaitList`s
+> takes the pool at its constructor, and `WatermarkGate::build(seat)`
+> consumes the seat, which is move-only, so a pool has one gate. A
+> list's wait takes its node at its first poll, not at
 > `wait(key)`, so a key's FIFO is in first-poll order, and returns it at
 > the poll that reads its wake or at its drop; dropped while queued, it
 > unlinks in O(1). `WaitList::unit` keeps the unit key's one pair of ends
@@ -188,17 +191,21 @@ impl Arena {
 > free node, or no entry for its key, counts `wait_nodes_full` in
 > `INFO tripwires`, wakes its task and is Ready at its next poll with no
 > wake landed: `ListWait::starved()` says so, and a caller that counts
-> on a wake waits again. `WatermarkGate` on the pool is not yet built. The
-> executor's and the gate module's lines below are as built but
-> `WatermarkGate`'s, which does not establish that the replacement is
+> on a wake waits again. The watermark gate is a minimum heap by LSN over
+> the same pool: a wait at or below the watermark is Ready at its first
+> poll with no node; above it, it takes a node and a heap entry at that
+> poll and gives both back at the poll that reads its wake or at its
+> drop, so no cancelled state exists (`interfaces-m2` section 2 holds
+> its rows). The executor's and the gate module's lines below are as
 > built.
 
-> **Accepted 2026-11-20, implementation open — ADR-0177 A2:**
+> **Accepted 2026-11-20, built — ADR-0177 A2:**
 > `WatermarkGate`'s wake is budgeted. `advance(lsn)` moves the watermark
 > and wakes nothing; `wake_covered(budget)` wakes the queued waits at or
-> below it in LSN order, at most `budget` a call; `owes()` says whether a
-> covered wait may be left. The sketch line below, "advance(lsn) wakes
-> all ≤ lsn", does not establish that the replacement is built.
+> below it in LSN order, at most `budget` a call, and answers how many;
+> `owes()` says whether a covered wait may be left. The durable plane
+> calls it at a sync's completion and at the head of each LOG step, at
+> most `ACK_WAKES_PER_TURN` (1,024) between two LOG steps of a cell.
 
 > **Accepted 2026-10-19, built — ADR-0003 A1:** a standard
 > `Waker` is thread-safe. Its data names a `Sync` wake bridge whose only
@@ -561,9 +568,12 @@ pub type IoGate = KeyedGate<CompletionToken, CompletionResult>;  // M7 seam, exi
 pub struct WaitList<K: ListKey>;   // key-keyed FIFO; wake_one/wake_all; baton-pass on drop;
                                    // unit(&nodes) or keyed(&nodes, cap, &census, keys)
                                    // -> Result<_, KeysRefused>; a ListWait reads starved()
-pub struct WatermarkGate;          // LSN-keyed; advance(lsn) wakes all ≤ lsn
+pub struct WatermarkGate;          // LSN-keyed min-heap over the pool: build(seat); wait_for(lsn);
+                                   // advance(to) wakes none; wake_covered(budget) -> woken, in
+                                   // LSN order; owes() -> bool (ADR-0177 D5, A2)
 // Not a suspension primitive: the cell's wait-node pool, taken by every WaitList (ADR-0177 D5).
-pub struct WaitNodes;              // build(cap, &census) -> Result<_, CapError>; T nodes a cell
+pub struct WaitNodes;              // build(cap, &census) -> Result<WaitPool, CapError>; T nodes
+pub struct WaitPool { pub nodes: WaitNodes, pub seat: WatermarkSeat }  // seat: move-only, one gate
 
 // Reactor loop skeleton: the 10 steps with budgets + always-on iteration histogram.
 pub trait CellPlane {
