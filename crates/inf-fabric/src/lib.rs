@@ -19,6 +19,7 @@
 )]
 
 mod codec;
+pub mod limits;
 #[cfg(not(loom))]
 mod mesh;
 mod msg;

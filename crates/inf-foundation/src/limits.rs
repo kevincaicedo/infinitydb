@@ -214,3 +214,15 @@ pub const TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX: usize = 64;
 // A position is a `u8`, and the lane a position carries leaves a flush
 // token's slot room for its 8-bit op index.
 const _: () = assert!(TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX <= 256, "a position fits a u8");
+
+/// Tier-file cleanup jobs one cell holds out at once (ADR-0156 D2, ADR-0157
+/// D1): 8 job positions, each from its offer to its consumed result, and
+/// the slots of each of the cell's two retained rings (requests to the
+/// control thread, results back), so a ring slot is free whenever a
+/// position is. Owner: the cell's job table; `inf-fabric` sizes the
+/// retained ring by it. Crossing: an offer with no position free is
+/// deferred, its owner left where it is, until a result is consumed.
+pub const TIER_RETIRE_JOBS_PER_CELL: usize = 8;
+
+// The retained ring indexes its slots by mask.
+const _: () = assert!(TIER_RETIRE_JOBS_PER_CELL.is_power_of_two(), "ring slots are a power of two");
