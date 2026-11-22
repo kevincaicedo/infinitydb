@@ -390,6 +390,7 @@ name = "inf-fabric"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "inf-alloc",
  "inf-foundation",
  "loom",
  "proptest",

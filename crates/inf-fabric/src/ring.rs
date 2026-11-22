@@ -27,6 +27,13 @@ use core::mem::MaybeUninit;
 
 use inf_foundation::CachePadded;
 
+mod retained;
+
+pub use retained::{
+    Permit, RETAINED_RING_SLOTS, Reservation, RetainedConsumer, RetainedProducer, RetainedRing,
+    RetireCause, RingBlock, RingLayoutRefused, RingPhase, RingSteps,
+};
+
 /// Atomics/cells, swapped wholesale for loom's model-checked versions under
 /// `--cfg loom` (type-alias module pattern).
 #[cfg(loom)]
