@@ -218,7 +218,9 @@ fn a_draining_slot_counts_against_the_boot_share_alone() {
 /// The control at the boot value: three clients and a pattern subscriber fill cell 0's share of
 /// 4 (`C`), and the subscriber is reset while cell 1 withholds its ack, so its slot drains. The
 /// next client is refused, the draining slot holding its place (occupied 4 = `C`: today's
-/// refusal, which A1 keeps); once the slot vacates, the next is admitted.
+/// refusal, which A1 keeps); once the slot vacates, the next is admitted. The refusal is the
+/// accept's own, before the `conn` class is asked: the class's backstop sends the same frame,
+/// so cell 0's `conn-tasks` row reads no crossing.
 #[test]
 fn a_draining_slot_holds_its_place_at_the_boot_share() {
     let mut rig = Rig::with_maxclients(2, 8);
@@ -238,4 +240,7 @@ fn a_draining_slot_holds_its_place_at_the_boot_share() {
     until(&mut rig, "slot-unvacated", |rig| rig.cells[0].plane.connections() == 3);
     rig.offer(0, fd(5));
     assert!(admitted(&rig, fd(5)), "the vacated slot admits: read {:?}", sent(&rig, fd(5)));
+    let row = rig.cells[0].plane.cap_census().row(crate::limits::CONN_TASKS.name());
+    let crossings = row.expect("cell 0's conn class row").crossings;
+    assert_eq!(crossings, 0, "the conn class refused an accept the occupied compare admitted");
 }
