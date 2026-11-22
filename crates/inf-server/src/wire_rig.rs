@@ -203,7 +203,13 @@ impl Rig {
     /// The same, every cell's keyspace also holding `namespaces`, created
     /// uncataloged at boot.
     pub(super) fn with_namespaces(cells: u16, namespaces: &[inf_store::NsSpec]) -> Rig {
-        Rig::with_config(cells, namespaces, LoopConfig::default())
+        Rig::with_config(cells, namespaces, LoopConfig::default(), None)
+    }
+
+    /// [`new`](Self::new) with the node's boot capacity `maxclients`, as `infinityd
+    /// --maxclients` sets it (ADR-0123 A1): each cell's share and `conn` class are `C`.
+    pub(super) fn with_maxclients(cells: u16, maxclients: u32) -> Rig {
+        Rig::with_config(cells, &[], LoopConfig::default(), Some(maxclients))
     }
 
     /// [`new`](Self::new) with the loop's remote-first ordering on: futures
@@ -213,14 +219,31 @@ impl Rig {
             cells,
             &[],
             LoopConfig { remote_first_execute: true, ..LoopConfig::default() },
+            None,
         )
     }
 
-    fn with_config(cells: u16, namespaces: &[inf_store::NsSpec], config: LoopConfig) -> Rig {
+    fn with_config(
+        cells: u16,
+        namespaces: &[inf_store::NsSpec],
+        config: LoopConfig,
+        maxclients: Option<u32>,
+    ) -> Rig {
         let clock = Rc::new(VirtualClock::default());
         let fabrics = Mesh::new(cells, MeshConfig::default());
         let built = fabrics.into_iter().enumerate().map(|(cell, fabric)| {
-            let (node, admission) = NodeInfo::try_default().expect("fixture cache allocation");
+            let (node, admission) = match maxclients {
+                None => NodeInfo::try_default(),
+                Some(maxclients) => {
+                    let count = inf_foundation::CellCount::new(cells).expect("a cell count");
+                    let boot = crate::config::BootCapacity::new(maxclients, count)
+                        .expect("a fixture's boot capacity");
+                    NodeInfo::try_new(
+                        crate::config::ConfigStore::default().with_boot_capacity(boot),
+                    )
+                }
+            }
+            .expect("fixture cache allocation");
             let node = Rc::new(node);
             let (plane, serve_mark, timer_set, executor) = ServerPlane::new(
                 CellId(u16::try_from(cell).expect("a u16 cell")),
@@ -286,10 +309,17 @@ impl Rig {
     /// Delivers an accept of `fd` to `cell` and runs the node until its
     /// receive is armed.
     pub(super) fn accept(&mut self, cell: usize, fd: RawFd) {
-        self.deliver(cell, Delivery::Accepted(fd));
-        self.rounds(2);
+        self.offer(cell, fd);
         let armed = self.cells[cell].reactor.driver().script.borrow().armed.clone();
         assert!(armed.iter().any(|(armed, _)| *armed == fd), "the accept arms a receive");
+    }
+
+    /// Delivers an accept of `fd` to `cell` and runs the node two rounds:
+    /// admitted, its receive is armed; refused, the `maxclients` frame is
+    /// sent on it and it is closed.
+    pub(super) fn offer(&mut self, cell: usize, fd: RawFd) {
+        self.deliver(cell, Delivery::Accepted(fd));
+        self.rounds(2);
     }
 
     /// Queues `bytes` on `fd`'s receive, one buffer a completion, for the
