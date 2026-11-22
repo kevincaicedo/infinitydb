@@ -1151,9 +1151,10 @@ impl Rig {
             let reply = self.call(id, &[b"SET", name, b"1"]);
             let refused = reply == REFUSAL_FRAME;
             if n < SHARE && refused {
+                let active = admitted.len();
                 self.violate(format!(
-                    "draining-slot-refused: cell {X} refused client {n} with {n} active under \
-                     the share of {SHARE}, the first wave's slots draining"
+                    "draining-slot-refused: cell {X} refused client {n} with {active} active \
+                     under the share of {SHARE}, the first wave's slots draining"
                 ));
             } else if n < SHARE {
                 self.judge_replies(id, 0, &oks(1), "an admitted client");
