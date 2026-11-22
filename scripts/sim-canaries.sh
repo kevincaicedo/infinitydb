@@ -1232,6 +1232,12 @@ ordered_rows=(
   # linked sync and a write-through write, each whole until the hold lifts. Planted,
   # hold_barriers keeps standalone syncs alone, and the frame barriers complete while held.
   "inf_canary_barrier_hold_standalone_only crate-test inf-sim test:disk a_barrier_hold_keeps_every_barrier_until_it_lifts barrier-completed-while-held"
+  # The capped slab's admission compare on the `conn` class, whose cap is the cell's share
+  # (ADR-0177 D2), at its control: the fan leg's share of clients on one cell. One task short,
+  # the class holds 3 of its 4 and the last client's accept is refused there, so the leg reads
+  # the row unfilled and crossed, each clause by its own token.
+  "inf_canary_cap_minus_one m0-capacity cap-row-unfilled --close-leg fan"
+  "inf_canary_cap_minus_one m0-capacity cap-row-crossed --close-leg fan"
   # A slot takes the largest power-of-two chunk one 64 KiB allocation holds, at most 64 slots,
   # and the builder takes no other count (ADR-0194 A1). Planted, chunk_slots_for answers 64 at
   # every width, the fixed chunk, and a slab of 1,032 B slots in chunks of 32 is refused.
