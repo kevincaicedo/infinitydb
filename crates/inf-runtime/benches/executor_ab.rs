@@ -100,9 +100,9 @@ const SLOTS_10000: Cap = Cap::entries::<10_000>("executor-ab-10000", CapFill::Se
 /// P's planted instructions per op: each row's bound plus one, the planted red its rule must
 /// refuse. Each row's bound is fixed before any count of the row is read, outside this file;
 /// each value copies that bound plus one and sets none of its own. The suspend rows' bounds
-/// differ by size, so each size has its own. The eight watermark rows' bounds are not fixed yet:
-/// each holds 1 until its bound is, and no P leg of theirs is read before. A heap row's `k` is
-/// planted a wait.
+/// differ by size, so each size has its own. The watermark rows' bounds are fixed as the others
+/// are, and one at 0 plants 1, the least count its rule refuses. A heap row's `k` is planted a
+/// wait.
 const K_FAST_2500: u16 = 78;
 const K_DEFERRED_2500: u16 = 52;
 const K_FAST_10000: u16 = 89;
@@ -117,11 +117,11 @@ const K_WAIT_WAKE_KEYS_15: u16 = 344;
 const K_WATERMARK_WAIT: u16 = 1;
 const K_WATERMARK_WAIT_2825: u16 = 1;
 const K_HEAP_RISING_962: u16 = 1;
-const K_HEAP_FALLING_962: u16 = 1;
-const K_HEAP_RISING_2825: u16 = 1;
-const K_HEAP_FALLING_2825: u16 = 1;
-const K_HEAP_RISING_16384: u16 = 1;
-const K_HEAP_FALLING_16384: u16 = 1;
+const K_HEAP_FALLING_962: u16 = 368;
+const K_HEAP_RISING_2825: u16 = 361;
+const K_HEAP_FALLING_2825: u16 = 1_288;
+const K_HEAP_RISING_16384: u16 = 615;
+const K_HEAP_FALLING_16384: u16 = 1_813;
 
 /// `NOPS` operand-free `nop`s: the count must read exactly `NOPS` more an op.
 #[inline(always)]
