@@ -284,10 +284,12 @@ fn timeout_spares_a_command_held_ten_timeouts_at_a_frozen_peer() {
 
 /// Cell 1 frozen for one step under the timeout: the client's clock restarts
 /// at its reply's send, so it is reaped a timeout after the reply, not a
-/// timeout after its request (`reaped-before-window`).
+/// timeout after its request (`reaped-before-window`); a hold under the
+/// timeout is no deferral.
 #[test]
 fn timeout_restarts_at_a_reply_held_a_step_under_the_timeout() {
-    held_at_a_frozen_peer(PeerHold::StepUnderTimeout);
+    let deferred = held_at_a_frozen_peer(PeerHold::StepUnderTimeout);
+    assert_eq!(deferred, 0, "deferral-in-control: a hold under the timeout was counted as owed");
 }
 
 /// The control: cell 1 never frozen. The reply comes within steps, the
@@ -340,7 +342,8 @@ fn always_writer(secs: &[u8]) -> (Quiet, MiniClient, Watched) {
 /// is owed replies throughout, so no sweep closes it; once the hold lifts it
 /// reads all 1,101 `+OK`s and is reaped a timeout after. Engagement: the
 /// device held the write's frame barrier, else `VACUOUS
-/// frame-barrier-unheld`, and the hold outlasted the timeout.
+/// frame-barrier-unheld`; the hold outlasted the timeout; and the queue's
+/// high water disarmed the receive, else `VACUOUS disarm-unengaged`.
 #[test]
 fn timeout_spares_an_always_write_held_on_its_fsync() {
     const PIPELINED: usize = 1_100;
@@ -357,6 +360,8 @@ fn timeout_spares_an_always_write_held_on_its_fsync() {
     }
     let behind = quiet.clock.now();
     step_until(&mut quiet, Nanos(behind.0 + TIMEOUT.0 / 2), &mut [("the writer", &mut client)]);
+    let disarmed = quiet.node.nets[0].borrow().recv_disarmed(client.fd);
+    assert!(disarmed, "VACUOUS disarm-unengaged: the pipelined SETs left the receive armed");
     quiet.disk.hold_barriers(None);
     step_until_answered(&mut quiet, &mut [("the writer", &mut client)]);
     let oks = client.replies.iter().filter(|reply| reply.as_slice() == b"+OK\r\n").count();

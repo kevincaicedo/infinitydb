@@ -1504,6 +1504,10 @@ ordered_rows=(
   # bound against the class's slots: two censuses of one cell mint equal instances (ADR-0194
   # D5). Planted, the bound is skipped, and another executor's id reads past the header array.
   "inf_canary_task_id_index_unbounded crate-test inf-runtime test:executor an_id_another_class_minted_past_this_class_is_stale a header's index lies in its array"
+  # The sweep counts each visit that keeps a connection the server owes past its clock
+  # (`idle_sweep_deferrals_cell`, ADR-0193 D4), the instrument's liveness. Planted, the visit
+  # is kept and not counted, and the held client's test reads no deferral.
+  "inf_canary_timeout_deferral_uncounted crate-test inf-sim lib timeout_spares_a_command_held_at_a_frozen_peer deferrals-unread"
   # `timeout` judges no client of a stalled cell: the sweep reads the stall's end the plane
   # keeps (ADR-0193 D1, D2). Planted, it reads none, and a client whose PING the stall holds
   # unread is closed during the stall.

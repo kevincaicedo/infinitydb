@@ -1567,7 +1567,8 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                         // Canary: the clock alone judges, the server's work unread.
                         if cfg!(inf_canary_timeout_receive_clock_only) {
                             idle.push(key);
-                        } else {
+                        } else if !cfg!(inf_canary_timeout_deferral_uncounted) {
+                            // Canary: the deferral is kept, never counted.
                             let deferrals = &node.idle_sweep_deferrals_cell;
                             deferrals.set(deferrals.get() + 1);
                         }
