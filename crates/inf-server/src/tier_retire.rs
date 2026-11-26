@@ -656,8 +656,12 @@ impl<J: SegmentFile + FinalClose> RetireWorker<J> {
         let (mut visits, mut jobs) = (0, 0);
         // Canary `inf_canary_retire_worker_unpaced`: the pass ignores its 8
         // jobs, so one pass unlinks every ready job its 64 visits reach.
+        // Canary `inf_canary_retire_worker_one_job`: a pass runs one job, so
+        // the node retires a file a step and a window's bound is missed.
         let jobs_max = if cfg!(inf_canary_retire_worker_unpaced) {
             usize::MAX
+        } else if cfg!(inf_canary_retire_worker_one_job) {
+            1
         } else {
             RETIRE_WORKER_JOBS_PER_PASS
         };

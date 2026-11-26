@@ -1820,6 +1820,23 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.shared.tier.borrow().as_ref().and_then(|tier| tier.retire_role(timers))
     }
 
+    /// What keeps this cell from quiescence for a retirement window's
+    /// opening, read between scheduler steps: its tiered half's counts (none
+    /// without a tier), whether its commit ledger has settled every entry,
+    /// and whether no checkpoint streams and no MANIFEST swap is pending.
+    pub fn quiescence_for_sim(&self) -> (crate::tier_cell::TierQuiescence, bool, bool) {
+        let control = self.shared.control.borrow().clone();
+        let durable = self.shared.durable.borrow();
+        let settled =
+            |fence| durable.as_ref().is_none_or(|cell| cell.commit.settled_through(fence));
+        let persisted = |epoch| control.as_ref().is_none_or(|control| control.persisted(epoch));
+        let tier = self.shared.tier.borrow();
+        let q = tier.as_ref().map(|tier| tier.quiescence(persisted, settled)).unwrap_or_default();
+        let ledger = durable.as_ref().is_none_or(|cell| cell.commit.settled_through(u64::MAX));
+        let idle = durable.as_ref().is_none_or(DurableCell::ckpt_transition_idle);
+        (q, ledger, idle)
+    }
+
     /// The cell's tier-file jobs out (0 without a tier), read from its part
     /// for the simulator's held-worker cycle between scheduler steps.
     pub fn tier_retire_jobs_out_for_sim(&self) -> u64 {

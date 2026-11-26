@@ -56,6 +56,28 @@ pub(crate) struct RetireGauges {
     pub(crate) residues: u64,
 }
 
+/// What keeps a cell's tiered half from quiescence, each a count: flush
+/// rounds out, cold reads queued or in flight, extent readers' holds,
+/// extent fences the commit ledger has not settled, and dropped owners
+/// whose drop is not yet durable. A harness opens a retirement window only
+/// where every count is zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TierQuiescence {
+    pub rounds_out: u32,
+    pub cold_reads: u64,
+    pub extent_holds: u32,
+    pub fences_unsettled: u32,
+    pub releases_pending: u32,
+}
+
+impl TierQuiescence {
+    /// Every count zero.
+    #[must_use]
+    pub fn quiet(&self) -> bool {
+        *self == TierQuiescence::default()
+    }
+}
+
 /// One turn's allowance and what it examined.
 struct Turn {
     visits: u32,
@@ -281,6 +303,34 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             residues += u64::from(!matches!(t.flush.residue(), ResidueState::Empty));
         }
         RetireGauges { stats: self.retire_stats, jobs_out, pending, residues }
+    }
+
+    /// What keeps the cell from quiescence; `persisted` and `settled` as the
+    /// walk reads them.
+    pub(crate) fn quiescence(
+        &self,
+        persisted: impl Fn(u64) -> bool,
+        settled: impl Fn(u64) -> bool,
+    ) -> TierQuiescence {
+        let mut q = TierQuiescence::default();
+        if let Some(cold) = self.cold.as_ref() {
+            q.cold_reads = (cold.queue_depth() + cold.inflight_total()) as u64;
+        }
+        for position in &self.positions {
+            let t = match position {
+                Position::Live(t) => t,
+                Position::Draining { ns: t, release, .. } => {
+                    q.releases_pending += u32::from(!persisted(*release));
+                    t
+                }
+                Position::Vacant { .. } => continue,
+            };
+            q.rounds_out += u32::from(t.round.is_some());
+            q.extent_holds += u32::from(std::rc::Rc::strong_count(&t.holds) > 1);
+            let fence = t.extent_fence.get();
+            q.fences_unsettled += u32::from(fence != 0 && !settled(fence));
+        }
+        q
     }
 
     /// The owners and residues the last turn examined (F8's count).

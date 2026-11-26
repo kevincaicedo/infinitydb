@@ -128,6 +128,7 @@ pub use recover::{
     Recovery, RecoveryProgress, RecoveryUnit, STEP_FACT_FIELDS, StepBudget, StepFacts, UnitEntry,
     UnitPhase, open_cell_log,
 };
+pub use tier_cell::TierQuiescence;
 pub use tier_retire::{
     BootReservation, BootTerm, CellPart, CellWake, DetachedTier, FinalClose, JobKind, JobPos,
     RetireJob, RetireLane, RetireOutcome, RetireResult, RetireStep, RetireWorker, RetryCause,

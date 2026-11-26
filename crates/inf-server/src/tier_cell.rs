@@ -81,6 +81,7 @@ mod walk;
 pub(crate) use marks::EpochMarks;
 use retire_list::{RetireList, RetiringFile};
 use round::{FlushRound, RoundPhase, unsent};
+pub use walk::TierQuiescence;
 
 /// `errno` values the completion handler classifies (ADR-0084 D4).
 const ENOSPC: i32 = 28;
@@ -774,6 +775,12 @@ impl<F: SegmentFs> TierNs<F> {
                     None
                 }
             };
+            // Canary `inf_canary_commit_retirement_forgets`: the commit takes
+            // the file out of the catalog and drops its owner, so nothing
+            // ever unlinks it.
+            if cfg!(inf_canary_commit_retirement_forgets) {
+                return;
+            }
             let bytes = meta.disk_bytes();
             retiring.push(RetiringFile { meta, handle, due: Nanos(0), bytes });
             pushed += 1;
