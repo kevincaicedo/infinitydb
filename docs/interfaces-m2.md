@@ -1833,7 +1833,8 @@ count the arrivals that found it full.
      re-registration** (`ExtentRefs::register`) — the ADR-0057 D4
      at-least-once physics applied to the reclaim queue (found by the
      DST sweep; ADR-0061 D5).
-- **Accepted 2026-09-22, built — ADR-0148:** bounded tiered
+- **Accepted 2026-09-22, built but for D4's fallible boot reservation —
+  ADR-0148:** bounded tiered
   namespace lifetimes amends the namespace DDL contract below. The catalog
   writer reserves a tiered lifetime grant before publication;
   `CreateApplied` does not return it. Durable removal plus every cell's
@@ -1868,8 +1869,10 @@ count the arrivals that found it full.
   accepts that `CREATE` (a refusal spends none), past the last id every
   `CREATE` answers `-ERR namespace identity space exhausted` before any
   effect, and boot refuses a catalog whose counter is not past a live id
-  or that holds more than 64 live tiered definitions. The descriptions
-  below are the implemented contract.
+  or that holds more than 64 live tiered definitions. Not yet built: D4's
+  fallible boot reservation. Boot still builds each cell's receipt storage
+  infallibly, so a failed allocation there aborts the process instead of
+  refusing boot. The descriptions below are otherwise the implemented contract.
 - **ADR-0103 amendment (2026-09-01) — the `CREATE` choreography:
   persist-then-serve.**
   1. **Order** (`inf-server::plane::program_ns_ddl`): *parse → durable-
