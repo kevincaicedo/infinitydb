@@ -39,14 +39,14 @@ where
         self.tier.iterate(&fs);
     }
 
-    /// The cell's drain until nothing is out and nothing is offered: a
+    /// The cell's drain until nothing is out and no position is pending: a
     /// MAINTAIN, then the worker's iteration, at most `turns` times, at the
     /// injected time `now`. Returns the turns it took.
     pub(crate) fn drain_until_quiet(&mut self, now: Nanos, turns: u32) -> u32 {
         for turn in 0..turns {
-            let units = self.cell.maintain_draining(now, |_| true, |_| true);
-            let out = self.cell.retire_gauges().1;
-            if units == 0 && out == 0 {
+            self.cell.retire_walk(now, |_| true, |_| true);
+            let out = self.cell.retire_gauges().jobs_out;
+            if self.cell.walk_pending() == 0 && out == 0 {
                 return turn;
             }
             self.step_worker();
@@ -258,7 +258,9 @@ fn a_position_carries_its_round_sequence_to_its_next_owner() {
     cell.nth_mut(0).round_seq = 7;
     cell.drop_ns(NsId(16));
     assert_eq!(cell.live_count(), 0, "dropped");
-    assert_eq!(cell.maintain_draining(Nanos(0), |_| true, |_| true), 0, "no file to unlink");
+    let units = cell.retire_walk(Nanos(0), |_| true, |_| true);
+    assert_eq!(units, 2, "no file to retire: the round's flip and the terminal step");
+    assert_eq!(cell.retire_gauges().jobs_out, 0, "no file went out");
     assert_eq!(cell.draining(), (0, 0), "no round out: drained in one MAINTAIN");
     assert_eq!(cell.receipt_for(lane as usize), 16, "the receipt names the dropped id");
     assert_eq!(cell.reclaim_receipted(), 1, "the writer returns the position");
@@ -1231,13 +1233,13 @@ fn a_held_extent_read_or_an_unsettled_barrier_holds_the_drain() {
     let hold = LifetimeHold(Rc::clone(&cell.nth(0).holds));
     cell.nth(0).note_extent_barrier(7);
     cell.drop_ns(NsId(16));
-    cell.maintain_draining(Nanos(0), |_| true, |_| true);
+    cell.retire_walk(Nanos(0), |_| true, |_| true);
     assert_eq!(cell.draining(), (1, 0), "held by the extent reader's hold");
     drop(hold);
-    cell.maintain_draining(Nanos(0), |_| true, |fence| fence < 7);
+    cell.retire_walk(Nanos(0), |_| true, |fence| fence < 7);
     assert_eq!(cell.draining(), (1, 0), "held by the unsettled extent barrier");
     assert_eq!(cell.receipt_for(0), 0, "no receipt while held");
-    cell.maintain_draining(Nanos(0), |_| true, |fence| fence <= 7);
+    cell.retire_walk(Nanos(0), |_| true, |fence| fence <= 7);
     assert_eq!(cell.draining(), (0, 0), "both ended: drained");
     assert_eq!(cell.receipt_for(0), 16);
 }
@@ -1254,12 +1256,12 @@ fn a_draining_round_holds_its_position_until_terminal() {
     round.pending = 1;
     cell.nth_mut(0).round = Some(round);
     cell.drop_ns(NsId(16));
-    cell.maintain_draining(Nanos(0), |_| true, |_| true);
+    cell.retire_walk(Nanos(0), |_| true, |_| true);
     assert_eq!(cell.draining(), (1, 1), "held while an op is in flight");
     assert_eq!(cell.receipt_for(0), 0, "no receipt while it is held");
     let Position::Draining { ns, .. } = &mut cell.positions[0] else { panic!("Draining") };
     ns.round.as_mut().expect("the parked round").pending = 0;
-    cell.maintain_draining(Nanos(0), |_| true, |_| true);
+    cell.retire_walk(Nanos(0), |_| true, |_| true);
     assert_eq!(cell.draining(), (0, 0), "drained once its op is terminal");
     assert_eq!(cell.receipt_for(0), 16);
     assert_eq!(cell.reclaim_receipted(), 1);
@@ -1462,7 +1464,7 @@ fn a_dropped_namespace_drains_from_every_round_state() {
         let mut ops = Vec::new();
         cell.turn(&mut gone, 2, &mut ops, &mut NoBudget).expect("nothing to plan");
         assert!(ops.is_empty(), "{state:?}: no group of a parked round is pushed");
-        cell.maintain_draining(Nanos(0), |_| true, |_| true);
+        cell.retire_walk(Nanos(0), |_| true, |_| true);
         let parked = usize::from(!in_flight.is_empty());
         assert_eq!(cell.draining().1, parked, "{state:?}: parked while an op is in flight");
         for op in in_flight {
@@ -1769,7 +1771,7 @@ fn sixty_five_drops_with_held_rounds_stay_within_sixty_four_lifetimes() {
         // The drop: Retiring published, its release durable at once, so
         // only the held ops keep it.
         cell.drop_ns(ns);
-        cell.maintain_draining(Nanos(0), |_| true, |_| true);
+        cell.retire_walk(Nanos(0), |_| true, |_| true);
     }
     let (draining, parked) = cell.draining();
     let owners = cell.live_count() + draining;
@@ -1840,7 +1842,7 @@ fn a_cold_read_queued_before_a_drop_reads_its_own_file() {
         .expect("the read is queued");
     assert_eq!(cold.inflight_on(file), 1, "engagement: the queued read pins its file");
     cell.drop_ns(NsId(16));
-    cell.maintain_draining(Nanos(0), |_| true, |_| true);
+    cell.retire_walk(Nanos(0), |_| true, |_| true);
     assert_eq!(cell.live_count(), 0, "engagement: dropped with the read queued");
     let mut ops = Vec::new();
     cold.drain(|op| ops.push(op));
@@ -1885,16 +1887,16 @@ fn a_dropped_namespaces_failed_unlink_keeps_its_file_and_its_position() {
     let active = active.expect("engagement: the namespace has an active file");
     cell.drop_ns(NsId(16));
     inf_foundation::fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Nth(1));
-    cell.maintain_draining(Nanos(0), |_| true, |_| true);
+    cell.retire_walk(Nanos(0), |_| true, |_| true);
     cell.step_worker();
     let fired = inf_foundation::fault::fired(inf_log::fault::TIER_UNLINK_FAIL);
     inf_foundation::fault::disarm_all();
-    cell.maintain_draining(Nanos(0), |_| true, |_| true);
+    cell.retire_walk(Nanos(0), |_| true, |_| true);
     assert_eq!(fired, 1, "engagement: the drained file's unlink failed once");
     assert!(on_disk(&cell, &active), "a failed unlink left {} on the disk", active.display());
     assert_eq!(cell.draining(), (1, 0), "the position stays Draining while its file is kept");
     assert_eq!(cell.receipt_for(0), 0, "no receipt while a file of the owner is on the disk");
-    assert_eq!(cell.retire_gauges().0.errors_operator, 1, "an injected error's class");
+    assert_eq!(cell.retire_gauges().stats.errors_operator, 1, "an injected error's class");
     cell.drain_until_quiet(Nanos(999_999), 4);
     assert!(on_disk(&cell, &active), "not offered again before its due");
     cell.drain_until_quiet(Nanos(1_000_000), 16);
@@ -1929,13 +1931,16 @@ fn retired_files(files: u32) -> (Standalone<SimDisk>, Keyspace, Vec<PathBuf>) {
     for id in 0..files {
         let path = cold.join(inf_log::tier_file_name(id));
         drop(cell.fs.create_tier(&path, TierIoMode::Buffered).expect("a tier file"));
-        cell.nth_mut(0).note_retired(TierFileMeta {
-            id,
-            base: LogicalAddr::from_raw(u64::from(id) << 20).expect("fits"),
-            data_len: 1 << 20,
-            reason: inf_log::SealReason::Capacity,
-            path: path.clone(),
-        });
+        cell.retire_for_test(
+            0,
+            TierFileMeta {
+                id,
+                base: LogicalAddr::from_raw(u64::from(id) << 20).expect("fits"),
+                data_len: 1 << 20,
+                reason: inf_log::SealReason::Capacity,
+                path: path.clone(),
+            },
+        );
         paths.push(path);
     }
     (cell, ks, paths)
@@ -1947,82 +1952,79 @@ fn on_disk(cell: &TierCell<SimDisk>, path: &std::path::Path) -> bool {
 
 /// A tier file whose unlink fails keeps an owner and is unlinked again:
 /// the error is not fatal, so the file's record stays until an unlink of it
-/// answers. `tier_unlink_fail` fires once on the retired file's unlink;
-/// eight MAINTAINs follow with nothing armed. The driver steps the cell's
-/// MAINTAIN alone, where the unlink runs at this shape; once a cell never
-/// unlinks a tier file (`the_cell_leaves_tier_file_unlinks_to_the_control_thread`),
-/// the retry runs on the control thread, and the driver steps its pass too.
+/// answers. `tier_unlink_fail` fires once on the retired file's unlink; the
+/// cell's walk and the control thread's worker are stepped as the
+/// simulator steps them, two injected milliseconds a step, eight steps
+/// with nothing armed after the failure's.
 #[test]
-#[ignore = "a failed tier-file unlink is discarded after the file's record was removed, so the \
-            file stays on the disk with no owner and nothing retries it; red until a failed \
-            unlink returns its owner for a paced retry and only a removal or absence ends it"]
 fn a_failed_unlink_is_retried_until_the_file_is_gone() {
-    let (mut cell, mut ks, paths) = retired_files(1);
+    const STEP_NS: u64 = 2_000_000;
+    const TURNS_TO_FAIL_MAX: u64 = 4;
+    let (mut cell, _ks, paths) = retired_files(1);
     inf_foundation::fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Nth(1));
-    let first = cell
-        .maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
-        .map(|_| ());
+    let mut step = 0u64;
+    while step < TURNS_TO_FAIL_MAX
+        && inf_foundation::fault::fired(inf_log::fault::TIER_UNLINK_FAIL) == 0
+    {
+        cell.retire_walk(Nanos(step * STEP_NS), |_| true, |_| true);
+        cell.step_worker();
+        step += 1;
+    }
     let fired = inf_foundation::fault::fired(inf_log::fault::TIER_UNLINK_FAIL);
     inf_foundation::fault::disarm_all();
-    assert!(first.is_ok(), "a failed unlink is not fatal");
     assert_eq!(fired, 1, "engagement: the unlink failed once");
     assert!(on_disk(&cell, &paths[0]), "engagement: the failed unlink left the file");
-    for turn in 1..=8u64 {
-        cell.maintain_ns(
-            &mut ks,
-            0,
-            NO_DURABLE,
-            false,
-            turn * 2_000,
-            &mut TaskRoom::new(ROOMY, &Cell::new(0)),
-        )
-        .expect("MAINTAIN");
+    for turn in 0..8u64 {
+        cell.retire_walk(Nanos((step + turn) * STEP_NS), |_| true, |_| true);
+        cell.step_worker();
     }
     assert!(
         !on_disk(&cell, &paths[0]),
         "{} is still on the disk after tier_unlink_fail once and 8 more MAINTAINs, and {} \
          retiring record(s) name a file",
         paths[0].display(),
-        cell.nth(0).retired.len()
+        cell.retiring_at(0)
     );
+    assert_eq!(cell.retiring_at(0), 0, "the retry's Unlinked ends the owner");
+    assert_eq!(cell.retire_gauges().stats.errors_operator, 1, "the failure is counted");
 }
 
 /// A turn's retirement work is bounded and charged whatever the pins: a
 /// turn visits at most 64 owners, and each visit, a pinned file's included,
 /// is charged one Maintenance unit. 64 retired files are pinned by queued
-/// cold reads; a 65th, the last on the list, is not, so a turn that visits
-/// more than 64 owners reaches it. The table holds no record, so no other
-/// leg of the turn charges a unit. Both halves are read: the bound, here
-/// as the 65th file's unlink in the turn (a walk that hands files to the
-/// control thread reads it as its count of owners examined), and the
-/// charge, as the turn's units.
+/// cold reads; a 65th, the first on the list and so the last its pass
+/// visits, is not, so a turn that visits more than 64 owners reaches it.
+/// The first turn begins the list's pass; the second is read. Both halves
+/// are read: the bound, as the turn's count of owners examined (where a
+/// pin or a due is read, apart from the charge) and the 65th file's offer,
+/// and the charge, as the turn's units.
 #[test]
-#[ignore = "pinned retired files are passed with no charge and no bound, so one turn's work grows \
-            with the files pinned; red until a turn visits at most 64 owners and charges each"]
 fn a_turn_charges_its_retirement_visits_and_makes_at_most_sixty_four() {
     const VISITS_PER_TURN_MAX: u32 = 64;
     const PINNED: u32 = VISITS_PER_TURN_MAX;
-    let (mut cell, mut ks, paths) = retired_files(PINNED + 1);
+    let (mut cell, _ks, _paths) = retired_files(PINNED + 1);
     let cold = cell.cold.clone().expect("the cell's cold engine");
     let class = inf_runtime::ReadClass::Foreground;
-    let waits: Vec<_> = (0..PINNED)
+    let waits: Vec<_> = (1..=PINNED)
         .map(|id| {
             let file = TierFileId::new(id);
             cold.enqueue(-1, file, 0, inf_log::TIER_FRAME_BYTES, class, 0).expect("queued")
         })
         .collect();
-    let (units, _) = cell
-        .maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
-        .expect("MAINTAIN");
-    let pinned_left = paths[..PINNED as usize].iter().filter(|path| on_disk(&cell, path)).count();
-    let last_unlinked = !on_disk(&cell, &paths[PINNED as usize]);
+    let begun = cell.retire_walk(Nanos(0), |_| true, |_| true);
+    assert_eq!((begun, cell.walk_examined()), (0, 0), "the first turn begins the pass");
+    let units = cell.retire_walk(Nanos(0), |_| true, |_| true);
+    let examined = cell.walk_examined();
+    let offered = cell.retire_gauges().jobs_out;
+    let listed = cell.retiring_at(0);
     drop(waits);
-    assert_eq!(pinned_left, PINNED as usize, "engagement: no pinned file was unlinked");
     assert!(
-        !last_unlinked,
-        "one MAINTAIN over {PINNED} pinned retired files reached the unpinned file after them and \
-         unlinked it: the turn visited more than {VISITS_PER_TURN_MAX} owners"
+        examined <= VISITS_PER_TURN_MAX,
+        "one MAINTAIN over {PINNED} pinned retired files examined {examined} owners: a turn \
+         visits at most {VISITS_PER_TURN_MAX}"
     );
+    assert_eq!(offered, 0, "the unpinned file after the pinned ones is not reached this turn");
+    assert_eq!(listed, (PINNED + 1) as usize, "no owner left the list");
     assert_eq!(
         units, VISITS_PER_TURN_MAX,
         "one MAINTAIN over {PINNED} pinned retired files charged {units} unit(s): each of its \
@@ -2032,33 +2034,65 @@ fn a_turn_charges_its_retirement_visits_and_makes_at_most_sixty_four() {
 
 /// The cell neither closes nor unlinks a tier file on its own loop:
 /// unlinking a large file frees its extents in the kernel, the multi-ms
-/// class the control thread runs. A retired file's MAINTAIN and a dropped
-/// namespace's teardown each leave the file on the disk for that thread.
+/// class the control thread runs. A retired file's MAINTAIN and walk and a
+/// dropped namespace's walk each leave the file on the disk for that
+/// thread, offered as a job.
 #[test]
-#[ignore = "the cell unlinks retired and dropped tier files on its own loop, the blocking \
-            multi-ms class; red until the cell hands each file to the control thread, which \
-            closes and unlinks it"]
 fn the_cell_leaves_tier_file_unlinks_to_the_control_thread() {
     let (mut cell, mut ks, paths) = retired_files(1);
     cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
         .expect("MAINTAIN");
+    for turn in 0..2 {
+        cell.retire_walk(Nanos(turn), |_| true, |_| true);
+    }
     let retired_unlinked = !on_disk(&cell, &paths[0]);
+    let retired_offered = cell.retire_gauges().jobs_out;
     let (mut cell, _ks, _) = flushed_namespace();
     let active = cell.nth(0).flush.active().map(|(.., path)| path.to_path_buf());
     let active = active.expect("engagement: the namespace has an active file");
     cell.drop_ns(NsId(16));
-    cell.maintain_draining(Nanos(0), |_| true, |_| true);
+    cell.retire_walk(Nanos(0), |_| true, |_| true);
     let dropped_unlinked = !on_disk(&cell, &active);
     assert!(
         !retired_unlinked,
         "the cell's own loop unlinked the retired file {} in its MAINTAIN",
         paths[0].display()
     );
+    assert_eq!(retired_offered, 1, "engagement: the retired file went out as a job");
     assert!(
         !dropped_unlinked,
         "the cell's own loop unlinked the dropped namespace's active file {} in its teardown",
         active.display()
     );
+    assert_eq!(cell.retire_gauges().jobs_out, 1, "engagement: the active file went out as a job");
+}
+
+/// The lone namespace's pace (ADR-0156 D4): one namespace at position 0
+/// with 64 retiring owners, nothing pinned or failing, the worker stepped
+/// after each turn as the simulator steps it. The turn that begins the
+/// list's pass offers nothing; then each of 8 turns offers 8, its results
+/// consumed at the next turn's head; then nothing is left, and a turn with
+/// nothing pending and no job out examines no owner.
+#[test]
+fn a_lone_namespace_offers_eight_in_each_of_eight_turns() {
+    const OWNERS: u32 = 64;
+    let (mut cell, _ks, paths) = retired_files(OWNERS);
+    cell.retire_walk(Nanos(0), |_| true, |_| true);
+    assert_eq!(cell.retire_gauges().jobs_out, 0, "the first turn begins the pass");
+    let mut offered = Vec::new();
+    for turn in 1..=8u64 {
+        cell.retire_walk(Nanos(turn), |_| true, |_| true);
+        offered.push(cell.retire_gauges().jobs_out);
+        cell.step_worker();
+    }
+    assert_eq!(offered, [8; 8], "8 offers in each of 8 turns");
+    cell.retire_walk(Nanos(9), |_| true, |_| true);
+    assert_eq!(cell.retire_gauges().stats.files_retired, u64::from(OWNERS));
+    assert!(paths.iter().all(|path| !on_disk(&cell, path)), "every file is gone");
+    cell.retire_walk(Nanos(10), |_| true, |_| true);
+    assert_eq!(cell.walk_pending(), 0, "the empty list cleared its bit");
+    let units = cell.retire_walk(Nanos(11), |_| true, |_| true);
+    assert_eq!((units, cell.walk_examined()), (0, 0), "an idle turn examines no owner");
 }
 
 /// Namespaces 16 and 17 on one sim-disk cell, their tables empty, each with
@@ -2087,13 +2121,16 @@ fn same_numbered_retired_files(id: u32) -> (Standalone<SimDisk>, Keyspace, [Path
         cell.fs.create_dir_all(&cold).expect("the cold directory");
         let path = cold.join(inf_log::tier_file_name(id));
         drop(cell.fs.create_tier(&path, TierIoMode::Buffered).expect("a tier file"));
-        cell.nth_mut(index).note_retired(TierFileMeta {
-            id,
-            base: LogicalAddr::from_raw(u64::from(id) << 20).expect("fits"),
-            data_len: 1 << 20,
-            reason: inf_log::SealReason::Capacity,
-            path: path.clone(),
-        });
+        cell.retire_for_test(
+            index,
+            TierFileMeta {
+                id,
+                base: LogicalAddr::from_raw(u64::from(id) << 20).expect("fits"),
+                data_len: 1 << 20,
+                reason: inf_log::SealReason::Capacity,
+                path: path.clone(),
+            },
+        );
         path
     });
     (cell, ks, paths)
@@ -2111,21 +2148,24 @@ fn same_numbered_retired_files(id: u32) -> (Standalone<SimDisk>, Keyspace, [Path
             the same number; red until a pin names the namespace's lifetime with its file"]
 fn a_cold_read_defers_only_its_own_namespaces_file() {
     const FILE: u32 = 3;
-    let (mut cell, mut ks, _) = same_numbered_retired_files(FILE);
-    cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
-        .expect("MAINTAIN");
-    assert!(cell.nth(1).retired.is_empty(), "the control: 17's file 3 retires unread");
-    let (mut cell, mut ks, paths) = same_numbered_retired_files(FILE);
+    const TURNS: u64 = 4;
+    let walk = |cell: &mut Standalone<SimDisk>| {
+        for turn in 0..TURNS {
+            cell.retire_walk(Nanos(turn), |_| true, |_| true);
+            cell.step_worker();
+        }
+    };
+    let (mut cell, _ks, _) = same_numbered_retired_files(FILE);
+    walk(&mut cell);
+    assert_eq!(cell.retiring_at(1), 0, "the control: 17's file 3 retires unread");
+    let (mut cell, _ks, paths) = same_numbered_retired_files(FILE);
     let cold = cell.cold.clone().expect("the cell's cold engine");
     let class = inf_runtime::ReadClass::Foreground;
     let file = TierFileId::new(FILE);
     let wait = cold.enqueue(-1, file, 0, TIER_FRAME_BYTES, class, 0).expect("the read queued");
-    cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
-        .expect("MAINTAIN");
-    let own_kept = cell.nth(0).retired.len();
-    cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
-        .expect("MAINTAIN");
-    let other_kept = cell.nth(1).retired.len();
+    walk(&mut cell);
+    let own_kept = cell.retiring_at(0);
+    let other_kept = cell.retiring_at(1);
     drop(wait);
     assert_eq!(own_kept, 1, "engagement: the read keeps namespace 16's file 3 retiring");
     assert!(on_disk(&cell, &paths[0]), "engagement: 16's file 3 is still on the disk");
@@ -2139,67 +2179,6 @@ fn a_cold_read_defers_only_its_own_namespaces_file() {
     );
 }
 
-/// One drain-pace run: nine retired files on one Draining position, the
-/// cell's MAINTAIN and its worker stepped as the simulator steps them, the
-/// injected clock 201 µs a step, `tier_unlink_fail` armed once when
-/// `armed`. Returns the disk's unlink entries in call order, each with its
-/// path, result and mark time, the injected time of the step whose MAINTAIN
-/// consumed the `Retry` (if any), and the paths in id order.
-/// The disk's unlink entries a drain-pace run reads: path, result, mark time
-/// and the mark's phase (`None` unmarked).
-type UnlinkEntries =
-    Vec<(PathBuf, inf_log::fs::sim::CallResult, Nanos, Option<inf_log::fs::sim::DiskPhase>)>;
-
-fn drain_pace_run(armed: bool) -> (UnlinkEntries, Option<Nanos>, Vec<PathBuf>) {
-    use inf_log::fs::sim::{DiskCall, DiskPhase};
-    const STEP_NS: u64 = 201_000;
-    let (mut cell, _ks, paths) = retired_files(9);
-    cell.drop_ns(NsId(16));
-    if armed {
-        inf_foundation::fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Nth(1));
-    }
-    let mut consumed_at = None;
-    for step in 0..64u64 {
-        let now = Nanos(step * STEP_NS);
-        cell.fs.mark(DiskPhase::Cell(inf_foundation::CellId(0)), now);
-        let errors = cell.retire_gauges().0.errors_operator;
-        cell.maintain_draining(now, |_| true, |_| true);
-        if consumed_at.is_none() && cell.retire_gauges().0.errors_operator > errors {
-            consumed_at = Some(now);
-        }
-        cell.fs.mark(DiskPhase::Worker, now);
-        cell.step_worker();
-        if cell.draining() == (0, 0) {
-            break;
-        }
-    }
-    inf_foundation::fault::disarm_all();
-    let entries = cell
-        .fs
-        .logged_calls(0)
-        .into_iter()
-        .filter(|call| call.call == DiskCall::UnlinkTier)
-        .map(|call| {
-            let at = call.mark.map_or(Nanos(0), |mark| mark.at);
-            (call.path, call.result, at, call.mark.map(|mark| mark.phase))
-        })
-        .collect();
-    (entries, consumed_at, paths)
-}
-
-/// Every unlink of a drain-pace run is the worker's: its mark's phase.
-fn assert_worker_unlinks(entries: &UnlinkEntries, leg: &str) {
-    use inf_log::fs::sim::DiskPhase;
-    for (path, _, at, phase) in entries {
-        assert_eq!(
-            *phase,
-            Some(DiskPhase::Worker),
-            "UNLINK_ON_CELL: {leg}: {} unlinked at {at:?} under {phase:?}, not the worker's mark",
-            path.display()
-        );
-    }
-}
-
 /// The receipt waits for every job's result (ADR-0156 D3): with the worker
 /// held, a dropped namespace's three files go out as jobs and its catalog
 /// and lists empty, yet the owner stays Draining and no receipt names it;
@@ -2210,64 +2189,190 @@ fn a_drained_namespaces_receipt_waits_for_its_jobs_out() {
     let (mut cell, _ks, _paths) = retired_files(3);
     cell.drop_ns(NsId(16));
     for turn in 0..8u64 {
-        cell.maintain_draining(Nanos(turn), |_| true, |_| true);
+        cell.retire_walk(Nanos(turn), |_| true, |_| true);
     }
-    assert_eq!(cell.retire_gauges().1, 3, "VACUOUS: the three files went out as jobs");
+    assert_eq!(cell.retire_gauges().jobs_out, 3, "VACUOUS: the three files went out as jobs");
     assert_eq!(cell.draining(), (1, 0), "RECEIPT_WITH_JOBS_OUT: the owner left with jobs out");
     assert_ne!(cell.receipt_for(0), 16, "RECEIPT_WITH_JOBS_OUT: a receipt with jobs out");
     cell.step_worker();
-    cell.maintain_draining(Nanos(8), |_| true, |_| true);
-    assert_eq!(cell.retire_gauges().1, 0, "every result consumed");
+    cell.retire_walk(Nanos(8), |_| true, |_| true);
+    assert_eq!(cell.retire_gauges().jobs_out, 0, "every result consumed");
     assert_eq!(cell.draining(), (0, 0), "the owner left once its results were consumed");
     assert_eq!(cell.receipt_for(0), 16, "the receipt names the dropped namespace");
 }
 
-/// The drain's pace (ADR-0156 D3): a dropped namespace's retried file waits
-/// at least one injected millisecond after its `Retry`'s consumption and
-/// behind every other file of its position. Nine files: the first turn
-/// offers eight (its offers, the job positions), the worker's first unlink
-/// fails, so the failure is among those eight and the ninth waits for a
-/// free position; the ninth's unlink then precedes the failed path's
-/// second, which lies at least 1 ms after the consumption and answers `Ok`.
-/// Every time and order is the simulated disk's own entry under the test's
-/// marks. The control: nothing armed, each file unlinked once, at once.
-#[test]
-fn a_retried_drain_file_waits_its_due_behind_the_rest() {
-    use inf_log::fs::sim::CallResult;
-    let (control, retry, _) = drain_pace_run(false);
-    assert_eq!(control.len(), 9, "the control: nine unlinks");
-    assert!(control.iter().all(|(_, result, ..)| *result == CallResult::Ok), "{control:?}");
-    assert!(retry.is_none(), "the control consumed no Retry");
-    assert_worker_unlinks(&control, "the control");
+/// The state an aborted swap must leave alone: namespace 16's sealed ids,
+/// its handles' ids, its retiring owners and the cell's jobs out.
+fn retirement_state(cell: &TierCell<SimDisk>) -> (Vec<u32>, Vec<u32>, usize, u64) {
+    let t = cell.nth(0);
+    let sealed = t.flush.sealed().iter().map(|meta| meta.id).collect();
+    let handles = t.files.iter().map(|(id, _)| *id).collect();
+    (sealed, handles, cell.retiring_at(0), cell.retire_gauges().jobs_out)
+}
 
-    let (entries, consumed_at, paths) = drain_pace_run(true);
-    assert_worker_unlinks(&entries, "the armed run");
-    let point = CallResult::Injected(inf_log::fault::TIER_UNLINK_FAIL);
-    let failed = entries.iter().position(|(_, result, ..)| *result == point);
-    let failed = failed.expect("VACUOUS: no unlink met the armed point");
-    let failed_path = entries[failed].0.clone();
-    let consumed_at = consumed_at.expect("VACUOUS: no MAINTAIN consumed the Retry");
-    let ninth = &paths[0];
-    let ninth_at = entries.iter().position(|(path, ..)| path == ninth);
-    let ninth_at = ninth_at.expect("the ninth file was unlinked");
-    assert!(
-        entries[ninth_at].2 >= consumed_at,
-        "VACUOUS: the ninth was unlinked before the Retry was consumed, at {:?}",
-        entries[ninth_at].2
+/// An aborted swap moves nothing (ADR-0156 D1, ADR-0059 D3 phase 4): only
+/// the covering swap's commit moves a retiring file out of the catalog. The
+/// compaction fixture's namespace 16 has its first sealed file emptied by
+/// deletes before checkpoint 1 begins, so checkpoint 1's scan marks it
+/// retiring; the swap aborts (the transition-idle reconciliation clears the
+/// mark, as a `Backoff` that ends without a commit does), and MAINTAIN and
+/// the walk with its worker run: the catalog, the handles, the list and the
+/// jobs equal their before-state, and the file stays on the disk. The next
+/// scan marks the same file, and that swap's commit moves it, with its
+/// handle, onto the list, from which the walk and the worker retire it.
+#[test]
+fn an_aborted_swap_moves_nothing_and_a_later_swap_retires_the_mark() {
+    const TURNS_MAX: u32 = 16;
+    let (mut cell, mut ks) = compaction_fixture();
+    let first = cell.nth(0).flush.sealed()[0].clone();
+    let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+    let hasher = KeyHasher::default();
+    let probe = b"round:999999";
+    let probe_addr = table.insert(probe, &[0x5A; 200], hasher.hash(probe)).expect("fits");
+    let len = table.record(probe_addr).encoded_len;
+    table.delete(hasher.hash(probe), probe_addr, len);
+    let mut emptied = 0;
+    for index in 0.. {
+        let key = format!("round:{index:06}").into_bytes();
+        let hash = hasher.hash(&key);
+        match table.lookup(&key, hash, &[]) {
+            inf_store::TieredLookup::Cold(addr) => {
+                let at = addr.to_raw();
+                if at >= first.base.to_raw() && at < first.base.to_raw() + first.data_len {
+                    table.delete(hash, addr, len);
+                    emptied += 1;
+                }
+            }
+            inf_store::TieredLookup::Ram(_) => {}
+            inf_store::TieredLookup::Miss => break,
+        }
+    }
+    assert!(emptied > 0, "engagement: the first sealed file held records");
+    table.begin_ckpt_walk(1);
+    table.end_ckpt_walk();
+    let flush = &cell.nth(0).flush;
+    assert_eq!(table.retire_scan(1, flush), 1, "engagement: checkpoint 1 marks the file");
+    let before = retirement_state(&cell);
+    assert!(before.1.contains(&first.id), "engagement: the file's handle is held");
+    let room = Cell::new(0);
+    cell.maintain_ns(&mut ks, 0, NO_DURABLE, true, 0, &mut TaskRoom::new(ROOMY, &room))
+        .expect("MAINTAIN");
+    for turn in 0..4 {
+        cell.retire_walk(Nanos(turn), |_| true, |_| true);
+        cell.step_worker();
+    }
+    assert_eq!(retirement_state(&cell), before, "an aborted swap moved an owner");
+    assert!(on_disk(&cell, &first.path), "an aborted swap's file stays on the disk");
+    let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+    assert_eq!(table.retire_scan(1, &cell.nth(0).flush), 1, "the abort cleared the mark");
+    cell.commit_retirement(&mut ks);
+    let (sealed, handles, retiring, _) = retirement_state(&cell);
+    assert!(!sealed.contains(&first.id), "the commit takes the file out of the catalog");
+    assert!(!handles.contains(&first.id), "the commit takes its handle with it");
+    assert_eq!(retiring, 1, "the file and its handle join the list");
+    let turns = cell.drain_until_quiet(Nanos(10), TURNS_MAX);
+    assert!(turns < TURNS_MAX, "the walk settles within {TURNS_MAX} turns");
+    assert!(!on_disk(&cell, &first.path), "the later swap's commit retires the file");
+    assert_eq!(cell.retire_gauges().stats.files_retired, 1);
+}
+
+/// A standalone sim-disk cell with `namespaces` tiered namespaces, ids from
+/// 16, each at its own position (the lowest Vacant one, in creation order),
+/// and `files[i]` tier files on the disk retiring on namespace `i`'s list,
+/// ids from `first_id[i]`, each handle closed. Returns the cell and every
+/// namespace's paths.
+fn retiring_namespaces(
+    namespaces: usize,
+    files: impl Fn(usize) -> u32,
+    first_id: impl Fn(usize) -> u32,
+) -> (Standalone<SimDisk>, Vec<Vec<PathBuf>>) {
+    let mut cell = TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
+    let mut paths = Vec::new();
+    for index in 0..namespaces {
+        let ns = NsId(16 + u32::try_from(index).expect("at most 64"));
+        cell.create_ns(ns, &spec());
+        let at = cell.live().position(|t| t.ns == ns).expect("installed");
+        let cold = cell.nth(at).dir.join("cold");
+        cell.fs.create_dir_all(&cold).expect("the cold directory");
+        let mut own = Vec::new();
+        for id in first_id(index)..first_id(index) + files(index) {
+            let path = cold.join(inf_log::tier_file_name(id));
+            drop(cell.fs.create_tier(&path, TierIoMode::Buffered).expect("a tier file"));
+            let meta = TierFileMeta {
+                id,
+                base: LogicalAddr::from_raw(u64::from(id) << 20).expect("fits"),
+                data_len: 1 << 20,
+                reason: inf_log::SealReason::Capacity,
+                path: path.clone(),
+            };
+            cell.retire_for_test(at, meta);
+            own.push(path);
+        }
+        paths.push(own);
+    }
+    (cell, paths)
+}
+
+/// The walk moves its start past each turn's first position (ADR-0156 D4):
+/// position 0 holds 64 owners every one of which a queued cold read pins,
+/// position 1 one eligible owner. The first turn begins both lists' passes;
+/// the second starts at position 1 and offers its owner, though position
+/// 0's 64 visits alone would spend a turn that began at 0.
+#[test]
+fn a_pending_position_behind_sixty_four_pinned_owners_is_offered_by_the_second_turn() {
+    const PINNED: u32 = 64;
+    const ELIGIBLE_ID: u32 = 1_000;
+    let (mut cell, paths) = retiring_namespaces(
+        2,
+        |index| if index == 0 { PINNED } else { 1 },
+        |index| {
+            if index == 0 { 0 } else { ELIGIBLE_ID }
+        },
     );
-    let second =
-        entries.iter().enumerate().skip(failed + 1).find(|(_, (path, ..))| *path == failed_path);
-    let Some((second, (_, result, at, _))) = second else {
-        panic!("RETRY_LOST: the failed file {} was never unlinked again", failed_path.display())
-    };
-    assert!(
-        *at >= Nanos(consumed_at.0 + 1_000_000),
-        "RETRY_EARLY: the retry at {at:?}, within 1 ms of its consumption at {consumed_at:?}"
-    );
-    assert!(
-        ninth_at < second,
-        "RETRY_AHEAD: the retried file was unlinked again before the position's ninth file"
-    );
-    assert_eq!(*result, CallResult::Ok, "the retry removed it");
-    assert_eq!(entries.len(), 10, "nine files, one retried: {entries:?}");
+    let cold = cell.cold.clone().expect("the cell's cold engine");
+    let class = inf_runtime::ReadClass::Foreground;
+    let waits: Vec<_> = (0..PINNED)
+        .map(|id| {
+            let file = TierFileId::new(id);
+            cold.enqueue(-1, file, 0, inf_log::TIER_FRAME_BYTES, class, 0).expect("queued")
+        })
+        .collect();
+    cell.retire_walk(Nanos(0), |_| true, |_| true);
+    assert_eq!(cell.retire_gauges().jobs_out, 0, "the first turn begins both passes");
+    cell.retire_walk(Nanos(1), |_| true, |_| true);
+    let offered = cell.retire_gauges().jobs_out;
+    cell.step_worker();
+    drop(waits);
+    assert_eq!(offered, 1, "HEAD_STUCK: position 1's owner was not offered by the second turn");
+    assert!(!on_disk(&cell, &paths[1][0]), "the worker unlinked position 1's file");
+    assert_eq!(cell.retiring_at(0), PINNED as usize, "position 0's pinned owners stay listed");
+}
+
+/// Sixty-four Draining positions at once (ADR-0156 D4): every position
+/// granted, each with one retiring owner, every namespace dropped. Each turn
+/// makes at most 8 offers and 64 visits and examines at most 64 owners; the
+/// start moves each turn, so every position drains and publishes its receipt
+/// within the bound ⌈64 / 8⌉ + 5 turns of the lone cell, with the worker
+/// stepped after each turn.
+#[test]
+fn sixty_four_draining_positions_drain_at_eight_offers_a_turn() {
+    const POSITIONS_HELD: usize = 64;
+    const TURNS_MAX: u64 = 64 / 8 + 5;
+    let (mut cell, paths) = retiring_namespaces(POSITIONS_HELD, |_| 1, |_| 0);
+    for index in 0..POSITIONS_HELD {
+        cell.drop_ns(NsId(16 + u32::try_from(index).expect("at most 64")));
+    }
+    assert_eq!(cell.draining().0, POSITIONS_HELD, "engagement: every position Draining");
+    let mut turns = 0;
+    while cell.draining().0 > 0 && turns < TURNS_MAX {
+        let units = cell.retire_walk(Nanos(turns), |_| true, |_| true);
+        let offered = cell.retire_gauges().jobs_out;
+        assert!(units <= 64, "turn {turns}: {units} visits, above 64");
+        assert!(cell.walk_examined() <= 64, "turn {turns}: above 64 owners examined");
+        assert!(offered <= 8, "turn {turns}: {offered} offers, above 8");
+        cell.step_worker();
+        turns += 1;
+    }
+    assert_eq!(cell.draining().0, 0, "every Draining position drained in {TURNS_MAX} turns");
+    assert!(paths.iter().flatten().all(|path| !on_disk(&cell, path)), "every file is gone");
 }

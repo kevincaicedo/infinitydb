@@ -1042,18 +1042,12 @@ impl<F: SegmentFs> ManifestCell<F> {
             SwapPhase::DirSynced { manifest } => {
                 // Commit: the new recovery unit is fully durable. Files
                 // this swap's checkpoint retired are now unreferenced by
-                // every durable artifact — commit their retirement; the
-                // pin-gated unlink runs in the tiered MAINTAIN (M4-S26,
-                // ADR-0059 D3 phases 2-3).
+                // every durable artifact — commit their retirement: each
+                // joins its namespace's retirement list, which the walk
+                // hands to the control thread's worker once no cold read
+                // is pinned on it (ADR-0059 D3 phases 2-3, ADR-0156 D1).
                 if let Some(tc) = tier {
-                    tc.for_each_live_mut(|t| {
-                        let Some(table) = ks.tiered_store_mut(t.ns) else { return };
-                        for id in table.commit_retirement() {
-                            if let Some(meta) = t.flush.detach_sealed(id) {
-                                t.note_retired(meta);
-                            }
-                        }
-                    });
+                    tc.commit_retirement(ks);
                 }
                 self.floor = Some(manifest.floor());
                 self.named_ckpt = Some(manifest.ckpt_id);

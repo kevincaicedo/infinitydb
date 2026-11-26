@@ -9,7 +9,7 @@
 //! a fill episode, which the next record's frame (20 KiB padded) seals.
 //! `INFO persistence` on each cell then reads `timers_armed_max`: on the
 //! owning cell its everysec owner and its fill owner (the group hold holds
-//! packed frames only, and no accept fails), and at most the four roles on
+//! packed frames only, and no accept fails), and at most its roles on
 //! any cell; `INFO caps` reads the `timer-owners` row at its cap with no
 //! crossing.
 //!

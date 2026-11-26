@@ -1717,13 +1717,19 @@ count the arrivals that found it full.
   > and two liveness counters outside the zero set: the steps taken, and
   > the yields inside a unit by kind (frame, section, demote step). Not
   > built.
-- > **Accepted 2026-09-23, implementation open — ADR-0156:** bounded,
+- > **Accepted 2026-09-23, built — ADR-0156:** bounded,
   > acknowledged tier-file retirement replaces the plane-layer unlink
   > below with an owned cell→control job: eight positions per cell cover
   > request, worker and unconsumed result; the worker closes the final
   > handle then unlinks; `Unlinked` and `AlreadyAbsent` are terminal,
-  > `Retry` returns the owner for paced retry; one 64-visit allowance per
-  > turn. Eligibility is unchanged.
+  > `Retry` returns the owner for paced retry, no sooner than one
+  > injected millisecond after its consumption, the cell's retirement
+  > timer role waking it at its due; one 64-visit, 8-offer allowance per
+  > turn over every position's retiring owners, a dropped namespace's
+  > catalog and a failed create's residue, which its pipeline owns from
+  > before `create_tier` until its unlink answers, so a failed create
+  > spends no file id and its name is made again only after. Eligibility
+  > is unchanged.
 - **M4-S15 amendment (ADR-0059) — retirement + unlink lifecycle.** The
   deletion conjunction made mechanical, staged around the MANIFEST
   swap: `TieredTable::begin_ckpt_walk(ckpt_id: u64)` (signature grew

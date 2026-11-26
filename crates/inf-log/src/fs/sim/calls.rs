@@ -6,15 +6,18 @@
 //! entry: a rename onto `MANIFEST` that `manifest_rename_fail` refuses
 //! never reaches the disk.
 //!
-//! Four calls are logged: a checkpoint's staging create (`create_meta` or
+//! Six calls are logged: a checkpoint's staging create (`create_meta` or
 //! `create_meta_direct` on a `ckpt-NNNNNN.ick.new` name), with its result
 //! and whether the name exists after it; a rename onto a shard's
 //! `MANIFEST`, the recovery unit's commit point; a handle's final close
-//! (`SimFile::close_reporting`), where `tier_close_fail` fires; and a
-//! retired tier file's unlink (`unlink_tier`), where `tier_unlink_fail`
-//! fires. Each entry carries the harness's last [`DiskMark`]: the phase
-//! that ran and its injected time, so an oracle spaces two creates by the
-//! time the harness gave, never by a clock the cell under test keeps.
+//! (`SimFile::close_reporting`), where `tier_close_fail` fires; a retired
+//! tier file's unlink (`unlink_tier`), where `tier_unlink_fail` fires; a
+//! tier file's create (`create_tier`), where `tier_create_fail` and
+//! `tier_create_post_fail` fire, with whether the name exists after it;
+//! and a `remove_file` on a tier file's name. Each entry carries the
+//! harness's last [`DiskMark`]: the phase that ran and its injected time,
+//! so an oracle spaces two creates by the time the harness gave, never by
+//! a clock the cell under test keeps.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -58,6 +61,13 @@ pub enum DiskCall {
     /// logged is the one asked for, its result `NotFound` when no file had
     /// the name.
     UnlinkTier,
+    /// A tier file's create (`SegmentFs::create_tier`). `left_file`: the
+    /// name exists after the call, whatever its result.
+    CreateTier { left_file: bool },
+    /// A `remove_file` on a tier file's name (`tier-NNNNNN.itier`): the
+    /// boot sweeps' removes, and any tier-file unlink not made through
+    /// `unlink_tier`.
+    RemoveTier,
 }
 
 /// How a logged call ended.
@@ -133,6 +143,13 @@ pub(super) fn is_checkpoint_staging(path: &Path) -> bool {
         .and_then(|name| name.to_str())
         .and_then(crate::ckpt::parse_ick_staging_file_name)
         .is_some()
+}
+
+/// A tier file's name, `tier-NNNNNN.itier`.
+pub(super) fn is_tier_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("tier-") && name.ends_with(".itier"))
 }
 
 /// A shard's committed `MANIFEST` name.
@@ -255,6 +272,7 @@ mod tests {
         let made = disk.create_tier(&first, crate::fs::TierIoMode::Buffered).expect("first");
         let failing = disk.create_tier(&second, crate::fs::TierIoMode::Buffered).expect("second");
         assert_eq!(disk.open_files_named(tier), 2);
+        let from = disk.logged_calls(0).len();
         let mark = DiskMark { phase: DiskPhase::Cell(CellId(2)), at: Nanos(11) };
         disk.mark(mark.phase, mark.at);
         made.close_reporting().expect("a close no point refuses");
@@ -272,7 +290,7 @@ mod tests {
             entry(DiskCall::FinalClose, &first, CallResult::Ok, Some(mark)),
             entry(DiskCall::FinalClose, &second, point, Some(mark)),
         ];
-        assert_eq!(disk.logged_calls(0), expected, "each final close is logged once");
+        assert_eq!(disk.logged_calls(from), expected, "each final close is logged once");
     }
 
     /// A retired tier file's unlink is logged by the disk on every attempt:
@@ -287,6 +305,7 @@ mod tests {
         disk.create_dir_all(cold).expect("dirs");
         let path = cold.join("tier-000000.itier");
         drop(disk.create_tier(&path, crate::fs::TierIoMode::Buffered).expect("create"));
+        let from = disk.logged_calls(0).len();
         let mark = DiskMark { phase: DiskPhase::Worker, at: Nanos(21) };
         disk.mark(mark.phase, mark.at);
         fault::arm(crate::fault::TIER_UNLINK_FAIL, FaultSpec::Nth(1));
@@ -311,7 +330,58 @@ mod tests {
                 Some(mark),
             ),
         ];
-        assert_eq!(disk.logged_calls(0), expected, "each attempt is logged once");
+        assert_eq!(disk.logged_calls(from), expected, "each attempt is logged once");
+    }
+
+    /// A tier file's create is logged by the disk on every attempt, both
+    /// create points firing inside the call: `tier_create_fail` before the
+    /// file exists (no file left), `tier_create_post_fail` after it is made
+    /// and named (the file left, its handle closed); a create of the name
+    /// it left answers `EEXIST`; and a `remove_file` of a tier file's name
+    /// is logged beside the tier unlinks.
+    #[test]
+    fn each_tier_create_attempt_is_logged_with_its_result_and_file() {
+        use inf_foundation::fault::{self, FaultSpec};
+        let disk = SimDisk::new();
+        let cold = Path::new("shard-0/cold");
+        disk.create_dir_all(cold).expect("dirs");
+        let path = cold.join("tier-000003.itier");
+        let mark = DiskMark { phase: DiskPhase::Cell(CellId(0)), at: Nanos(5) };
+        disk.mark(mark.phase, mark.at);
+        let mode = crate::fs::TierIoMode::Buffered;
+        fault::arm(crate::fault::TIER_CREATE_FAIL, FaultSpec::Nth(1));
+        let before = disk.create_tier(&path, mode).map(drop);
+        fault::disarm_all();
+        fault::arm(crate::fault::TIER_CREATE_POST_FAIL, FaultSpec::Nth(1));
+        let after = disk.create_tier(&path, mode).map(drop);
+        fault::disarm_all();
+        let again = disk.create_tier(&path, mode).map(drop);
+        disk.remove_file(&path).expect("the left file removed");
+        assert!(before.expect_err("refused").to_string().contains("tier_create_fail"));
+        assert!(after.expect_err("refused").to_string().contains("tier_create_post_fail"));
+        assert_eq!(again.expect_err("the name is taken").kind(), io::ErrorKind::AlreadyExists);
+        let expected = vec![
+            entry(
+                DiskCall::CreateTier { left_file: false },
+                &path,
+                CallResult::Injected(crate::fault::TIER_CREATE_FAIL),
+                Some(mark),
+            ),
+            entry(
+                DiskCall::CreateTier { left_file: true },
+                &path,
+                CallResult::Injected(crate::fault::TIER_CREATE_POST_FAIL),
+                Some(mark),
+            ),
+            entry(
+                DiskCall::CreateTier { left_file: true },
+                &path,
+                CallResult::Failed(io::ErrorKind::AlreadyExists),
+                Some(mark),
+            ),
+            entry(DiskCall::RemoveTier, &path, CallResult::Ok, Some(mark)),
+        ];
+        assert_eq!(disk.logged_calls(0), expected, "each create attempt is logged once");
     }
 
     /// At the cap a call is counted, not kept: the log a reader sees is

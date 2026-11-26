@@ -131,6 +131,15 @@ rows=(
   "m4-tiered"
   "m4-ns-lifetimes --verify-determinism"
   "m4-ns-lifetimes --lifetimes-leg control"
+  # A retired file's close and its retry's unlink failing once each, on
+  # 200 µs steps, each retry 1 ms after its failure; failed tier-file
+  # creates before and after their file exists, on every attempt and under
+  # a drop, each name made again only after its residue's unlink; a live
+  # namespace's retired file failing every unlink, still counted against
+  # its disk budget until the worker removes it.
+  "m4-ns-lifetimes --lifetimes-leg pace --verify-determinism"
+  "m4-ns-lifetimes --lifetimes-leg create-fault --verify-determinism"
+  "m4-ns-lifetimes --lifetimes-leg disk --verify-determinism"
   # A tiered namespace dropped mid-checkpoint-walk, past its first pass.
   "m4-ns-lifetimes --seed 0x2"
   "m4-tiered --plant tier-read-eio"

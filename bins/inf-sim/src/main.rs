@@ -715,7 +715,10 @@ fn main() {
                  under cell 0's at the limit), drops across held extent I/O {}, cold reads {}, \
                  peer rounds {}, failed unlinks {} ({} while every attempt failed), drops with \
                  jobs held {}, {} churn cycles, {} disconnects, refused leg \
-                 {}, tombstones {} settled and {} after the rollback, trace {} bytes, hash \
+                 {}, tombstones {} settled and {} after the rollback, at most {} tier-file \
+                 unlinks a step, {} dropped namespaces read at the window, {} retries judged, \
+                 {} failed creates, {} disk-full refusals at the sim disk's bytes, windows of {} \
+                 and {} files ({} R0), stop drained {} reading {} drops, trace {} bytes, hash \
                  {:#018x}",
                 report.leg,
                 report.cells,
@@ -737,6 +740,16 @@ fn main() {
                 report.refused_leg,
                 report.tombstones_settled,
                 report.tombstones_after_rollback,
+                report.unlinks_step_max,
+                report.window_dropped,
+                report.retries_judged,
+                report.failed_creates,
+                report.disk_full_refusals,
+                report.window_files,
+                report.reboot_window_files,
+                report.reboot_r0_files,
+                report.stop_drained,
+                report.stop_dropped_read,
                 report.trace.len(),
                 report.trace_hash
             );

@@ -1317,6 +1317,10 @@ ordered_rows=(
   # A client row is inserted only through the plane's admission. Planted, SETNAME and the
   # state mirror insert, and a command run after Closed puts the closed client back.
   "inf_canary_command_registers_client m0-capacity ghost-client-row --close-leg registry-reset"
+  # ADR-0156 D1: a file a landed swap retired keeps its owner until its
+  # unlink answers. Planted, the commit drops the owner, and the life after
+  # the cut's R0 file is on the disk when its window closes.
+  "inf_canary_commit_retirement_forgets m4-ns-lifetimes RETIRE-R0"
   # A compaction read is taken only by spending a slot of its pass's room, so no namespace is
   # marked in flight with no task to run its chain (ADR-0177 D2). Planted, the read is taken
   # and marked first, the room asked after, and a one-slot pass marks its second namespace.
@@ -1344,6 +1348,16 @@ ordered_rows=(
   # Retired conn header (O1's leak clause). Planted, the pump keeps a clone of its own waker past
   # its return: the reset client's header stays Retired with every per-step clause green.
   "inf_canary_conn_waker_kept m0-capacity conn-retired-kept --close-leg close"
+  # ADR-0156 D1: a failed create spends no file id. Planted, the id moves
+  # before `create_tier`, so the create after a failure names a fresh path.
+  "inf_canary_create_id_spent_on_failure m4-ns-lifetimes FAILED-CREATE --lifetimes-leg create-fault"
+  # ADR-0156 D1: a failed create's file is owned until its unlink answers.
+  # Planted, the slot is left empty, so the next create meets the name: Ok
+  # with no unlink between, or `EEXIST` where the file was made.
+  "inf_canary_create_residue_dropped m4-ns-lifetimes FAILED-CREATE --lifetimes-leg create-fault"
+  # ADR-0156 D1: no create runs while its residue's job is out. Planted, a
+  # create runs with the residue's unlink held, before that unlink.
+  "inf_canary_create_while_residue_out m4-ns-lifetimes FAILED-CREATE --lifetimes-leg create-fault"
   # The credit wait list holds one key for each peer from its build, before the cell serves,
   # its map filled whole at assembly (ADR-0177 D5). Planted, the build also holds the cell's
   # own id, past the map's cap of `cells - 1`, and the plane's assembly refuses it.
@@ -1356,14 +1370,13 @@ ordered_rows=(
   # Planted, the queue alone diverts: a flat write runs inline while a tiered write of the same
   # origin holds its slot on a held cold read, and the flat write's open stops the cell.
   "inf_canary_divert_queue_only m0-capacity second-open-slot --close-leg gated-cold"
-  # ADR-0156 D3: a ready file uses the service while a failed one waits.
-  # Planted, the retried file goes back on the end of the retired list, so
-  # the visit ends at it until its due and offers it first.
-  "inf_canary_drain_retry_first crate-test inf-server lib a_retried_drain_file_waits_its_due_behind_the_rest RETRY_AHEAD:"
   # ADR-0156 D3: a dropped namespace's tier files leave only through the
-  # control thread's worker. Planted, the drain visit unlinks them on the
-  # cell, and the disk logs a cell-marked unlink after the DROP's `+OK`.
-  "inf_canary_drain_unlink_on_cell m4-ns-lifetimes DROP-CLAUSE"
+  # control thread's worker. Planted, the walk unlinks them on the cell, and
+  # the disk logs a cell-marked tier-file unlink after recovery.
+  "inf_canary_drain_unlink_on_cell m4-ns-lifetimes RETIRE-STEP"
+  # The same plant on m4-tiered's drop race: the dropped namespace's file is
+  # unlinked under a cell's mark after its DROP answered.
+  "inf_canary_drain_unlink_on_cell m4-tiered DROP-CLAUSE"
   # The slab's draining count, which the accept's active share reads, leaves with a draining
   # slot's removal (ADR-0123 A1). Planted, the removal keeps it, and MAINTAIN's sweep asserts
   # the count against its own walk once the first drained slot vacates: the lowered plane test
@@ -1559,6 +1572,10 @@ ordered_rows=(
   # Planted, it waits after any pass that took no job, with a later lane's
   # job queued and nothing left to wake it.
   "inf_canary_retire_block_after_empty_pass crate-test inf-server lib a_last_lanes_job_is_served_before_any_wait WAIT_UNWOKEN:"
+  # ADR-0156 D1: a retiring file's bytes count against its namespace's disk
+  # budget until its terminal result. Planted, a `Retry` leaves them out, so
+  # the budget at the sim disk's bytes refuses nothing.
+  "inf_canary_retire_charge_released_on_retry m4-ns-lifetimes RETIRE-CHARGE --lifetimes-leg disk"
   # ADR-0156 D3: a final close consumes its number on every outcome.
   # Planted, the retry after a close error closes that number again, which a
   # sentinel opened since has reused.
@@ -1570,9 +1587,15 @@ ordered_rows=(
   # ADR-0156 D4: a pass resumes at the lane after the last one it visited.
   # Planted, each pass starts at lane 0 and a later lane is never served.
   "inf_canary_retire_cursor_reset crate-test inf-server lib every_ready_lane_is_served_within_its_share_of_passes LANE_UNSERVED:"
+  # O3's stop clause: no file of a namespace dropped in the life is on the
+  # disk after its graceful stop. A premise plant, read in the simulator
+  # alone: a tier file no owner holds is made under a dropped namespace just
+  # before the stop.
+  "inf_canary_retire_drop_at_stop m4-ns-lifetimes RETIRE-STOP"
   # ADR-0156 D3: a retried file waits one injected millisecond after its
-  # `Retry`'s consumption. Planted, the visit offers it before its due.
-  "inf_canary_retire_due_ignored crate-test inf-server lib a_retried_drain_file_waits_its_due_behind_the_rest RETRY_EARLY:"
+  # `Retry`'s consumption. Planted, the walk offers it before its due, and
+  # the pace leg's retry lands within a 200 µs step of its failure.
+  "inf_canary_retire_due_ignored m4-ns-lifetimes RETRY-PACE --lifetimes-leg pace"
   # ADR-0156 D3, ADR-0157 D3: a cell releases its endpoints only with every
   # position Free. Planted, it releases them with a result unconsumed.
   "inf_canary_retire_join_early crate-test inf-server lib the_stop_releases_only_with_every_position_free OWNER_UNCONSUMED:"
@@ -1585,9 +1608,27 @@ ordered_rows=(
   # The same plant on one thread: a result published between the cell's final check and its
   # park wakes no cell.
   "inf_canary_retire_result_wake_silent crate-test inf-server lib a_result_published_between_the_check_and_the_park_wakes_the_cell WAKE_IN_GAP_LOST:"
+  # ADR-0154 A1: a consumed `Retry` arms the retirement role at its due.
+  # Planted, it arms nothing, and the idle cell's role stays Idle.
+  "inf_canary_retire_timer_unarmed crate-test inf-sim lib tf1_a_retried_files_due_arms_the_retirement_role TF1-ROLE:"
+  # ADR-0156 D4: a turn makes at most 64 visits, a pinned owner's included.
+  # Planted, a pinned visit is not charged, and the turn reaches the file
+  # behind 64 pinned ones.
+  "inf_canary_retire_walk_unpaced crate-test inf-server lib a_turn_charges_its_retirement_visits_and_makes_at_most_sixty_four examined"
+  # O3's window opens with no harness hold. A premise plant, read in the
+  # simulator alone: the worker stays held at the opening.
+  "inf_canary_retire_window_held_open m4-ns-lifetimes RETIRE-OPEN"
   # ADR-0156 D3: an idle worker waits on its wake. Planted, it never waits,
   # a busy loop on an idle node.
   "inf_canary_retire_worker_never_waits crate-test inf-server lib an_idle_worker_waits_after_one_empty_circuit NO_WAIT:"
+  # ADR-0156 D4: a window's files end within ⌈F / 8⌉ + 5c + 1 steps.
+  # Planted, a worker pass runs one job, so the full pass's 16 files and the
+  # life after the cut's 9 outlast their bounds.
+  "inf_canary_retire_worker_one_job m4-ns-lifetimes RETIRE-BOUND"
+  "inf_canary_retire_worker_one_job m4-ns-lifetimes REBOOT-BOUND"
+  # ADR-0156 D4: a worker pass runs at most 8 jobs. Planted, it ignores them,
+  # and the full pass's step unlinks 16 tier files.
+  "inf_canary_retire_worker_unpaced m4-ns-lifetimes RETIRE-STEP"
   # ADR-0157 D3: a backing owner dropped before its retirement leaks
   # silently instead of failing stop.
   "inf_canary_ring_drop_live_silent crate-test inf-fabric lib a_backing_dropped_before_its_retirement_fails_stop FAIL_STOP_MISSING:"
@@ -1677,8 +1718,9 @@ ordered_rows=(
   "inf_canary_timeout_since_ignores_stall crate-test inf-sim lib timeout_spares_the_replies_of_a_stalled_cell reply-owed-close"
   # ADR-0156 D3: only a consumed `Unlinked` or `AlreadyAbsent` drops a file's
   # owner. Planted, the cell drops it at any result, so a failed unlink is
-  # never retried.
-  "inf_canary_unlink_result_ignored crate-test inf-server lib a_retried_drain_file_waits_its_due_behind_the_rest RETRY_LOST:"
+  # never retried, and the dropped namespace's file is on the disk once
+  # every dropped owner has drained.
+  "inf_canary_unlink_result_ignored m4-ns-lifetimes RETIRE-WINDOW"
   # The io_uring driver dispatches a reap's completions in the kernel's order, so the bytes a
   # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
   # the reap is dispatched last first, and the end of stream comes before the bytes.

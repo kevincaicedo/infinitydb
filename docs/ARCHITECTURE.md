@@ -161,10 +161,11 @@ rollback apply on any cell only after that answer. A namespace id is
 reserved under the DDL ticket and committed by the writer when it accepts
 the `CREATE`; index ids come from shared atomic counters. The control thread also deletes truncated log
 segments and stale checkpoint files on behalf of the cells, because freeing a
-large file's pages is slow in the kernel, and it closes and unlinks a dropped
-namespace's tier files: each cell hands the files to the control thread's
-retirement worker as jobs over two eight-slot rings reserved at boot, and
-gets each file back in a result before its position is free. The main thread samples process
+large file's pages is slow in the kernel, and it closes and unlinks every
+tier file a serving cell retires: each cell hands its retired files, its
+dropped namespaces' files and its failed creates' files to the control
+thread's retirement worker as jobs over two eight-slot rings reserved at
+boot, and gets each file back in a result before its position is free. The main thread samples process
 gauges (RSS, CPU) and waits for the cells to exit.
 
 **Boot.** `main` parses flags (there is no config file), takes the data
@@ -425,10 +426,11 @@ seam; they happen in MAINTAIN, or, for blob extents, on the command path,
 bounded by the value's size. Their fsyncs still ride the ring. Deleting
 truncated log segments and stale checkpoint files is handed to the control
 thread through its bounded queue (a full queue keeps the path and retries on
-the next slice). A dropped namespace's tier files are closed and unlinked by
-the control thread's retirement worker, at most eight a turn offered by each
-cell; a live namespace's retired tier files and blob files are unlinked
-inline, in bounded MAINTAIN slices. Boot recovery reads the checkpoint and the log with
+the next slice). Once a cell serves, every tier file is closed and unlinked
+by the control thread's retirement worker, at most eight a turn offered by
+each cell, a failed one retried no sooner than a millisecond later; blob
+files are unlinked inline, in bounded MAINTAIN slices, and the boot's sweeps
+remove the files no MANIFEST names before the cell serves. Boot recovery reads the checkpoint and the log with
 blocking I/O, in budgeted steps, while the node still answers `-LOADING`.
 
 **Idle.** After work stops, the loop spins for 64 iterations, then parks in

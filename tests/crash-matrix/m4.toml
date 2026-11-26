@@ -212,6 +212,16 @@ tier = "node"
 test = "crash-matrix::tier::tier_dir_open_fail_stages_nothing_and_the_sealed_file_recovers"
 expect = "creation-retried-round-owned"
 
+# A tier-file creation refused before its file exists (`create_new`
+# refused with no file: `EMFILE`, inode `ENOSPC`) stages nothing and spends
+# no file id; its name stays owned until its unlink answers, so the next
+# create is deferred, and a cut leaves no file of it.
+[[row]]
+point = "tier_create_fail"
+tier = "node"
+test = "crash-matrix::tier::tier_create_fail_stages_nothing_and_leaves_no_file"
+expect = "residue-held-no-file"
+
 # A tier-file creation that fails after the create made and named its
 # file (the simulated disk's stand-in for a failed `set_len`, `O_DIRECT`
 # probe or `sync_all`) stages nothing and spends no file id; the file it

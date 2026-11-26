@@ -31,15 +31,25 @@ pub enum TimerRole {
     FillHold,
     /// The FLUSH-class group hold's window (ADR-0092): the same shape.
     GroupHold,
+    /// The tier-file retirement's retry (ADR-0154 A1, ADR-0156 D3): armed at
+    /// a retried file's due when a consumed `Retry` finds it idle; its
+    /// callback compares the latest due with the turn, no I/O, and that
+    /// iteration's walk offers what is due.
+    TierRetire,
 }
 
 impl TimerRole {
     /// Every role in route order, the order their owners are reserved.
-    pub const ALL: [TimerRole; 4] =
-        [TimerRole::AcceptRetry, TimerRole::Everysec, TimerRole::FillHold, TimerRole::GroupHold];
+    pub const ALL: [TimerRole; 5] = [
+        TimerRole::AcceptRetry,
+        TimerRole::Everysec,
+        TimerRole::FillHold,
+        TimerRole::GroupHold,
+        TimerRole::TierRetire,
+    ];
 
     /// The roles, and so the server's timer positions per cell: one listener's
-    /// accept retry and the three durable roles.
+    /// accept retry, the three durable roles and the tier-file retirement's.
     pub const COUNT: u32 = TimerRole::ALL.len() as u32;
 
     /// The route the role's owner is reserved with.
@@ -62,6 +72,7 @@ impl TimerRole {
             TimerRole::Everysec => "everysec",
             TimerRole::FillHold => "fill-hold",
             TimerRole::GroupHold => "group-hold",
+            TimerRole::TierRetire => "tier-retire",
         }
     }
 }
@@ -115,17 +126,19 @@ pub(crate) struct DurableTimers {
 }
 
 /// A server cell's timer owners, one per role, as the assembly reserves
-/// them. The plane keeps the accept retry's, and the durable roles' with the
-/// seat of its ack gate until its durable plane takes them. No role closes
-/// its owner, so no position frees after the assembly.
+/// them. The plane keeps the accept retry's, the durable roles' with the
+/// seat of its ack gate until its durable plane takes them, and the tier
+/// retirement's until its tier cell takes it. No role closes its owner, so
+/// no position frees after the assembly.
 #[derive(Debug)]
 pub(crate) struct ServerTimers {
     pub(crate) accept_retry: TimerOwner,
     pub(crate) durable: DurableTimers,
+    pub(crate) tier_retire: TimerOwner,
 }
 
 impl ServerTimers {
-    /// The cell's timer set on `census` and its four owners, every one
+    /// The cell's timer set on `census` and its owners, one a role, every one
     /// reserved here, before the cell's loop exists. A refusal returns no
     /// set: what it built drops with it, while the census is still
     /// assembling, an abandoned assembly the census does not count.
@@ -134,7 +147,7 @@ impl ServerTimers {
     ) -> Result<(TimerSet, ServerTimers), TimerAssemblyError> {
         let mut set =
             TimerSet::build(SERVER_TIMER_OWNERS, census).map_err(TimerAssemblyError::Build)?;
-        let [accept_retry, everysec, fill_hold, group_hold] =
+        let [accept_retry, everysec, fill_hold, group_hold, tier_retire] =
             TimerRole::ALL.map(|role| reserve(&mut set, role));
         let timers = ServerTimers {
             accept_retry: accept_retry?,
@@ -147,6 +160,7 @@ impl ServerTimers {
                 #[cfg(inf_canary_hold_arms_nothing)]
                 dead_group: None,
             },
+            tier_retire: tier_retire?,
         };
         // Canary: each hold owner is armed and at once cancelled, one after
         // the other, before the loop exists; its episodes hold that dead arm.
@@ -189,7 +203,7 @@ mod tests {
     use inf_foundation::bounded::{CapFill, CensusPhase};
 
     /// Every role has its owner, routed by its index, and the census row is
-    /// full: four of four live before the mark, none after it violated.
+    /// full: every role's owner live before the mark, none after it violated.
     #[test]
     fn the_assembly_reserves_one_owner_per_role_and_fills_its_row() {
         let (census, mark) = CapCensus::new(CellId(3));
@@ -200,8 +214,9 @@ mod tests {
             durable.everysec.position(),
             durable.fill_hold.position(),
             durable.group_hold.position(),
+            timers.tier_retire.position(),
         ];
-        assert_eq!(positions, [0, 1, 2, 3]);
+        assert_eq!(positions, [0, 1, 2, 3, 4]);
         assert_eq!(set.capacity_now(), TimerRole::COUNT);
         let row = census.row(SERVER_TIMER_OWNERS.name()).expect("the timer-owners row");
         assert_eq!(row.fill, CapFill::Assembly);
