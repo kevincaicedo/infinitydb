@@ -33,7 +33,7 @@ Formats defined by ADR-0011 unless noted.
 | Crash matrix (definition-as-data + runner) | `tests/crash-matrix` | implemented (M2-S17, ADR-0020 — `m2.toml` rows × policies × workloads × seeds, kill-and-recover on `MemFs`; fsyncgate child-process row; per-PR via workspace tests + expanded-seed nightly) |
 | Sim disk (lose/tear/reorder) | `inf-log::fs::sim` | implemented (M2-S18, ADR-0020 — `SimDisk`: volatile-until-fsync data, dir-fsync-ordered metadata, seeded sector-granular power cuts; driver ops executed by the `inf-sim` `SimDriver`) |
 | Durable plane over `SegmentFs` (generic) | `inf-server` | implemented (M2-S19, ADR-0021 D1 — `ServerPlane<O, F = StdSegmentFs>`, `DurableCell/CkptCell/ManifestCell/BootRecovery<F>`; `begin_recovery(fs, …)`; monomorphized, zero std-tier change) |
-| Detached control plane (`ControlInbox`) | `inf-server` | implemented (M2-S19, ADR-0021 D2 — `ControlHandle::detached[_with_catalog]` + inline `drain(fs, dir)`: catalog swaps + unlinks inside the deterministic sim loop; `load_catalog_from<F>`) |
+| Detached control plane (`ControlInbox`) | `inf-server` | implemented (M2-S19, ADR-0021 D2 — `ControlHandle::detached[_with_catalog]` + inline `drain(fs, dir)`: catalog swaps + unlinks inside the deterministic sim loop; `load_catalog_from<F>`); the detached and spawned control planes take the cell's file system and return the worker and each cell's tier-file transport part (ADR-0156 D3, D5) |
 | Durability oracle + sweep (`m2-durable`) | `inf-sim` | implemented (M2-S19, ADR-0021 D3-D5 — ack-stream oracle incl. the survival audit on taxonomy-refused boots; `--sweep/--shard/--out`; 10k-seed gate artifact green; `Plant::FsyncLies` canary) |
 | Checkpoint board (`CkptBoard`/`CkptSlot`) | `inf-server::control` | implemented (M2-S20, ADR-0021 D6 — per-cell request/publication epoch slots; publication at the MANIFEST swap's dir-fsync commit; aborted swaps retry after backoff so `WAIT` cannot hang. ADR-0159 A1: an all-cell request word beside the slots, requests issued only by partition credits, cells observe the board through a bounded sweep) |
 | `INF.CKPT`/`BGSAVE`/`LASTSAVE` | `inf-wire`/`inf-server` | implemented (M2-S20 — registry grew to 68 (hash multipliers re-searched); pump-routed `program_ckpt`; compat entries + deviations declared) |
@@ -1840,8 +1840,7 @@ count the arrivals that found it full.
      re-registration** (`ExtentRefs::register`) — the ADR-0057 D4
      at-least-once physics applied to the reclaim queue (found by the
      DST sweep; ADR-0061 D5).
-- **Accepted 2026-09-22, built but for D4's fallible boot reservation —
-  ADR-0148:** bounded tiered
+- **Accepted 2026-09-22, built — ADR-0148:** bounded tiered
   namespace lifetimes amends the namespace DDL contract below. The catalog
   writer reserves a tiered lifetime grant before publication;
   `CreateApplied` does not return it. Durable removal plus every cell's
@@ -1865,21 +1864,26 @@ count the arrivals that found it full.
   the epoch, so a cell that reads the epoch reads the grant; a cell
   installs a tiered namespace's owner only at a Declared grant, and a
   `DROP` moves the owner to Draining at its position in the apply's step.
-  A Draining owner waits for its flush round's completions, then closes
-  and unlinks its tier files one at a time once no cold read is pinned on
-  each (a failed unlink keeps the file and the position), and frees the
-  position only once no blob extent reader holds it and every extent
-  barrier it registered has settled; only then does it publish the cell's
-  receipt, and the writer returns the position at the next tiered
+  A Draining owner waits for its flush round's completions, then offers
+  its tier files, each with its handle and once no cold read is pinned on
+  it, to the control thread's retirement worker, which closes and unlinks
+  each and returns it (a failed attempt returns the file to the position,
+  retried no sooner than an injected millisecond later), and frees the
+  position only once every file's result was consumed, no blob extent
+  reader holds it and every extent barrier it registered has settled; only
+  then does it publish the cell's receipt, and the writer returns the
+  position at the next tiered
   `CREATE` once every cell's receipt names the exact id. A `CREATE` reserves
   its id under the DDL ticket, the catalog writer commits it only when it
   accepts that `CREATE` (a refusal spends none), past the last id every
   `CREATE` answers `-ERR namespace identity space exhausted` before any
   effect, and boot refuses a catalog whose counter is not past a live id
-  or that holds more than 64 live tiered definitions. Not yet built: D4's
-  fallible boot reservation. Boot still builds each cell's receipt storage
-  infallibly, so a failed allocation there aborts the process instead of
-  refusing boot. The descriptions below are otherwise the implemented contract.
+  or that holds more than 64 live tiered definitions. Boot reserves the
+  directory, the receipts, the retirement board and each cell's two
+  retirement rings by checked arithmetic and fallible allocation before any
+  cell exists, and a refusal is a typed startup error naming its term. No
+  DDL program is cancelled: it runs to completion in its connection's task.
+  The descriptions below are the implemented contract.
 - **ADR-0103 amendment (2026-09-01) — the `CREATE` choreography:
   persist-then-serve.**
   1. **Order** (`inf-server::plane::program_ns_ddl`): *parse → durable-
