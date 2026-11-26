@@ -616,7 +616,8 @@ fn consume_result<F: SegmentFs>(
     let due = Nanos(now.0.saturating_add(TIER_RETIRE_RETRY_NS.0));
     match (kind, answer) {
         // The slot settles through its one function of the answer: only a
-        // terminal one empties it (F17).
+        // terminal one empties it, so a failed create's name is made again
+        // only after its file is gone.
         (JobKind::Residue, answer) => owner.flush.settle_residue(meta, answer, due),
         (JobKind::Retired, ResidueAnswer::Unlinked | ResidueAnswer::AlreadyAbsent) => {}
         (JobKind::Retired, ResidueAnswer::Retry) => {
