@@ -1346,6 +1346,9 @@ ordered_rows=(
   # control thread's worker. Planted, the walk unlinks them on the cell, and
   # the disk logs a cell-marked tier-file unlink after recovery.
   "inf_canary_drain_unlink_on_cell m4-ns-lifetimes RETIRE-STEP"
+  # The same plant on m4-tiered's drop race: the dropped namespace's file is
+  # unlinked under a cell's mark after its DROP answered.
+  "inf_canary_drain_unlink_on_cell m4-tiered DROP-CLAUSE"
   # The slab's draining count, which the accept's active share reads, leaves with a draining
   # slot's removal (ADR-0123 A1). Planted, the removal keeps it, and MAINTAIN's sweep asserts
   # the count against its own walk once the first drained slot vacates: the lowered plane test
