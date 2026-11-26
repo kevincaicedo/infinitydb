@@ -622,6 +622,32 @@ pub(crate) const fn credit_waiter_keys(cells: u16) -> Result<Option<Cap>, CapErr
     }
 }
 
+/// Lane visits one pass of the control thread's retirement worker makes
+/// (ADR-0156 D3, D4), an empty lane's visit included. Owner: the worker.
+/// Crossing: the pass ends, and the next resumes at the lane after the last
+/// one visited, so every lane is visited within `⌈cells / 64⌉` passes.
+pub const RETIRE_WORKER_VISITS_PER_PASS: usize = 64;
+
+/// Jobs one pass of the retirement worker runs: a file's final close and
+/// its unlink each. Owner: the worker. Crossing: the pass ends, the rest of
+/// a ready lane's jobs waiting in its ring for the next pass, so a message
+/// behind it waits at most one pass of 8 unlinks.
+pub const RETIRE_WORKER_JOBS_PER_PASS: usize = 8;
+
+/// Injected time a tier file whose close or unlink failed waits before its
+/// next offer, from the consumption of that failure (ADR-0156 D3: no sooner
+/// than one injected millisecond). Owner: the file's position on its cell.
+/// Crossing: the file is passed until then, after every other file of its
+/// position, and offered at the first MAINTAIN past it.
+pub const TIER_RETIRE_RETRY_NS: Nanos = Nanos(1_000_000);
+
+/// Waits a threaded test fixture's retirement of one cell's transport takes
+/// at most, each the caller's own (about a millisecond in every fixture).
+/// Owner: `retire_with`, which alone waits on it. Crossing: the fixture's
+/// test fails naming the cell, and its backings are not dropped.
+#[cfg(any(test, feature = "test-support"))]
+pub const RETIRE_ATTEMPTS_MAX: u32 = 5_000;
+
 /// A pool of wait nodes for a test's own gates and lists.
 #[cfg(test)]
 pub(crate) const TEST_WAIT_NODES: Cap = Cap::entries::<64>("test-wait-nodes", CapFill::Serving);

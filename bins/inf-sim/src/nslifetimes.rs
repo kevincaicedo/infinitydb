@@ -233,6 +233,9 @@ struct Run {
     refused: Vec<Vec<u8>>,
     /// The next key ordinal: every key of the run is a fresh name.
     next_key: u64,
+    /// The drop clause (ADR-0156 D3): every dropped namespace's tier-file
+    /// unlink after its `+OK` is the worker's.
+    drops: crate::harness::drop_clause::DropClause,
 }
 
 /// A blob extent file, by its name.
@@ -272,6 +275,9 @@ impl Run {
         self.node
             .step(&mut self.rng, &self.clock, &self.disk, self.step_ns_max)
             .map_err(|e| format!("step failed: {e}"))?;
+        for breach in self.drops.judge(&self.disk) {
+            self.fail(breach);
+        }
         let bound = self.report.leg.bound();
         for (shard, dirs) in self.disk.open_ns_dirs() {
             self.report.open_dirs_max = self.report.open_dirs_max.max(dirs);
@@ -515,9 +521,13 @@ impl Run {
 
     /// `INF.NS DROP name`, answered `+OK`.
     fn drop_ns(&mut self, client: &mut MiniClient, name: &[u8]) -> Result<(), String> {
+        let id = self.node.plane(0).keyspace().ns_get(name).map(|spec| spec.id.0);
         let reply = self.call(client, &[b"INF.NS", b"DROP", name])?;
         if reply != OK {
             return Err(format!("DROP {} answered {reply:?}", String::from_utf8_lossy(name)));
+        }
+        if let Some(id) = id {
+            self.drops.note_drop(id, self.clock.now());
         }
         self.live.remove(name);
         Ok(())
@@ -961,6 +971,7 @@ fn run_observed(seed: u64, leg: LifetimesLeg, observer: TraceObserver) -> NsLife
         live: BTreeMap::new(),
         refused: Vec::new(),
         next_key: 0,
+        drops: crate::harness::drop_clause::DropClause::default(),
     };
     if let Err(err) = phases(&mut run) {
         run.fail(err);
@@ -993,6 +1004,7 @@ fn reboot(
         live,
         refused,
         next_key,
+        drops,
     } = run;
     drop(node);
     observer.power_cut(&disk, run_clock.now(), seed ^ 0x11FE_0C07);
@@ -1015,6 +1027,7 @@ fn reboot(
         live,
         refused,
         next_key,
+        drops,
     };
     if let Err(err) = after_cut(&mut run) {
         run.fail(err);
@@ -1131,6 +1144,9 @@ fn engagement(run: &mut Run) {
     let missed: Vec<&str> = clauses.iter().filter(|(met, _)| !met).map(|(_, what)| *what).collect();
     for what in missed {
         run.fail(format!("VACUOUS: not met: {what}"));
+    }
+    if let Some(vacuous) = run.drops.engagement() {
+        run.fail(vacuous);
     }
 }
 

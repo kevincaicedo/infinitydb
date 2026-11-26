@@ -138,6 +138,54 @@ impl GrantPos {
     }
 }
 
+/// Grant positions in a caller's order, inline: at most [`POSITIONS`], so
+/// a cell's order of its owners allocates nothing of its own (ADR-0148 D4's
+/// local owner state). Dereferences to the positions in order.
+#[derive(Debug)]
+pub struct GrantOrder {
+    order: [GrantPos; POSITIONS],
+    len: usize,
+}
+
+impl Default for GrantOrder {
+    fn default() -> GrantOrder {
+        GrantOrder { order: [GrantPos(0); POSITIONS], len: 0 }
+    }
+}
+
+impl GrantOrder {
+    /// Inserts `pos` at `at`, shifting the rest; `false`, nothing changed,
+    /// when the order is full or `at` is past its end.
+    pub fn insert(&mut self, at: usize, pos: GrantPos) -> bool {
+        if self.len == POSITIONS || at > self.len {
+            return false;
+        }
+        self.order.copy_within(at..self.len, at + 1);
+        self.order[at] = pos;
+        self.len += 1;
+        true
+    }
+
+    /// Removes the position at `at`, shifting the rest; `None` past the end.
+    pub fn remove(&mut self, at: usize) -> Option<GrantPos> {
+        if at >= self.len {
+            return None;
+        }
+        let pos = self.order[at];
+        self.order.copy_within(at + 1..self.len, at);
+        self.len -= 1;
+        Some(pos)
+    }
+}
+
+impl core::ops::Deref for GrantOrder {
+    type Target = [GrantPos];
+
+    fn deref(&self) -> &[GrantPos] {
+        &self.order[..self.len]
+    }
+}
+
 /// What the directory holds at one position.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum GrantSlot {
@@ -378,7 +426,14 @@ impl ReceiptPayload {
         let Some(len) = cells.checked_mul(POSITIONS) else {
             return Err(PayloadRefused { payload: GrantsPayload::Receipts, bytes: None });
         };
-        let receipts = reserved(len, GrantsPayload::Receipts, || AtomicU32::new(0))?;
+        // Canary `inf_canary_boot_payload_infallible`: the receipts made by
+        // an infallible `collect`, so a refused allocation aborts the boot
+        // instead of returning its term.
+        let receipts = if cfg!(inf_canary_boot_payload_infallible) {
+            (0..len).map(|_| AtomicU32::new(0)).collect()
+        } else {
+            reserved(len, GrantsPayload::Receipts, || AtomicU32::new(0))?
+        };
         let taken = reserved(cells, GrantsPayload::ReceiptsTaken, || AtomicBool::new(false))?;
         Ok(ReceiptPayload { receipts, taken })
     }
@@ -464,6 +519,10 @@ pub struct RetireBoard {
     /// One word a cell, reserved at boot, never grown: set once, at the
     /// cell's stop, before it releases its two endpoints.
     closing: Vec<AtomicBool>,
+    /// The worker's passes and the jobs it ran, node scope: written by the
+    /// worker alone, read by every cell's `INFO`, deciding nothing.
+    worker_passes: AtomicU64,
+    worker_jobs: AtomicU64,
 }
 
 /// The cells' `closing` words, reserved before any cell: none set.
@@ -491,7 +550,30 @@ impl RetireBoard {
     #[must_use]
     pub fn new(payload: ClosingPayload) -> Arc<RetireBoard> {
         let ClosingPayload { closing } = payload;
-        Arc::new(RetireBoard { bell: Bell { rung: AtomicBool::new(false) }, closing })
+        Arc::new(RetireBoard {
+            bell: Bell { rung: AtomicBool::new(false) },
+            closing,
+            worker_passes: AtomicU64::new(0),
+            worker_jobs: AtomicU64::new(0),
+        })
+    }
+
+    /// The worker's pass, which ran `jobs` jobs (its one writer).
+    pub fn note_pass(&self, jobs: u64) {
+        self.worker_passes.fetch_add(1, Ordering::Relaxed);
+        self.worker_jobs.fetch_add(jobs, Ordering::Relaxed);
+    }
+
+    /// The worker's passes so far (`retire_worker_passes`).
+    #[must_use]
+    pub fn worker_passes(&self) -> u64 {
+        self.worker_passes.load(Ordering::Relaxed)
+    }
+
+    /// The jobs the worker ran so far (`retire_worker_jobs`).
+    #[must_use]
+    pub fn worker_jobs(&self) -> u64 {
+        self.worker_jobs.load(Ordering::Relaxed)
     }
 
     /// The node's one bell.
@@ -678,6 +760,28 @@ mod tests {
         assert!(!board.all_name(pos, 17), "an old receipt never returns a later grant");
         assert_eq!(first.receipt(pos), 16);
         assert_eq!(first.cell(), 0);
+    }
+
+    /// The order inserts and removes in place, refusing a 65th position
+    /// and an index past its end.
+    #[test]
+    fn an_order_holds_at_most_every_position_once_each() {
+        let (_directory, writer) =
+            GrantDirectory::new(DirectoryPayload::try_new().expect("the directory"));
+        let mut order = GrantOrder::default();
+        let all: Vec<GrantPos> = writer.positions().collect();
+        assert!(!order.insert(1, all[0]), "past the end");
+        for (at, &pos) in all.iter().enumerate() {
+            assert!(order.insert(at, pos));
+        }
+        assert!(!order.insert(0, all[0]), "full");
+        assert_eq!(&order[..], &all[..]);
+        assert_eq!(order.remove(1), Some(all[1]));
+        assert_eq!(order[1], all[2], "the rest shifts down");
+        assert!(order.insert(0, all[1]));
+        assert_eq!(order[0], all[1]);
+        assert_eq!(order.remove(POSITIONS), None);
+        assert_eq!(order.len(), POSITIONS);
     }
 
     /// A payload is one exact allocation filled within it, and a size that

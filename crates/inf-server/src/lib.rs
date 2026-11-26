@@ -60,7 +60,7 @@ pub use control::{
     CkptCredit, CkptFinalCredit, CkptIssuers, CkptQuota, CkptSpace, CkptTarget, ControlBootRefused,
     ControlHandle, ControlInbox, DROPPED_NS_MAX, DdlGauges, DdlTicket, DetachedControl,
     INDEX_SLOTS, IndexBoard, IssuerMismatch, IssuerRefused, LastSave, NsIdReservation,
-    RecoveryBoard, SweepStep, TombstoneGauges, load_catalog, load_catalog_from,
+    RecoveryBoard, SpawnedControl, SweepStep, TombstoneGauges, load_catalog, load_catalog_from,
     spawn as spawn_control, spawn_in as spawn_control_in,
 };
 pub use data_dir_lock::{DataDirLock, DataDirLockError, LOCK_FILE};
@@ -83,7 +83,7 @@ pub use inf_doc::limits::{
     PROGRAM_CACHE_ENTRIES_MAX, ProgramCacheCapacity, ProgramCacheCapacityError,
 };
 pub use inf_log::ckpt::{DEFAULT_CKPT_INTERVAL_BYTES, DEFAULT_REPLAY_BYTES_PER_S};
-pub use inf_log::fs::StdSegmentFs;
+pub use inf_log::fs::{StdSegmentFile, StdSegmentFs};
 #[cfg(feature = "doc")]
 pub use json::{JSON_REPLY_SHAPES, ReplyShape};
 #[doc(hidden)]
@@ -128,7 +128,31 @@ pub use recover::{
     Recovery, RecoveryProgress, RecoveryUnit, STEP_FACT_FIELDS, StepBudget, StepFacts, UnitEntry,
     UnitPhase, open_cell_log,
 };
-pub use tier_retire::FinalClose;
+pub use tier_retire::{
+    BootReservation, BootTerm, CellPart, CellWake, DetachedTier, FinalClose, JobPos, RetireJob,
+    RetireLane, RetireOutcome, RetireResult, RetireStep, RetireWorker, RetryCause, TierBoot,
+    TierLifetimeBoot, TierShared, TransportPhase,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use tier_retire::{cut_for_sim, retire_with};
+
+/// The tier lifetimes' measured terms beside the boot reservation's bill
+/// (ADR-0148 D4): bytes a cell's position table and the node's writer book
+/// take, inside the plane's and the writer's own allocations.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct TierMeasuredTerms {
+    pub position_table_bytes: usize,
+    pub writer_book_bytes: usize,
+}
+
+/// [`TierMeasuredTerms`] as built.
+#[must_use]
+pub const fn tier_measured_terms() -> TierMeasuredTerms {
+    TierMeasuredTerms {
+        position_table_bytes: tier_cell::position_table_bytes(),
+        writer_book_bytes: control::writer_book_bytes(),
+    }
+}
 pub use topology::{
     TOPOLOGY_FILE, TopologyError, TopologySource, create_topology, load_topology, parse_topology,
     render_topology, resolve_topology,

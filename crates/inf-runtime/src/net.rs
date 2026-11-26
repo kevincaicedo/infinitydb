@@ -253,6 +253,17 @@ pub fn close_reporting(fd: std::os::fd::OwnedFd) -> io::Result<()> {
     if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
+/// Canary `inf_canary_retire_close_twice` only: `close(2)` of a bare
+/// number, the second close of a number the final close already released,
+/// which closes whatever file or socket reused it. Compiled into that
+/// canary's build alone, so its oracle can see the double close.
+#[cfg(inf_canary_retire_close_twice)]
+pub fn close_number_planted(fd: std::os::fd::RawFd) {
+    // SAFETY: none: the planted violation itself, a close of a number this
+    // caller does not own; no other build contains it.
+    let _ = unsafe { libc::close(fd) };
+}
+
 /// The port a listener actually bound (port 0 = kernel-assigned; tests).
 ///
 /// # Errors

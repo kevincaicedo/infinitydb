@@ -466,6 +466,7 @@ dependencies = [
  "inf-foundation",
  "inf-log",
  "inf-runtime",
+ "inf-server",
  "inf-simd",
  "inf-store",
  "inf-wire",

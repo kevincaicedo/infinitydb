@@ -943,6 +943,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             flags[me].store(false, Ordering::Relaxed);
             return true;
         }
+        // The retirement worker's result wake pairs the same way (ADR-0156
+        // D3): it publishes, fences and reads the flag, so either it wakes
+        // this cell or this check sees its result, read while a job is out.
+        let results =
+            self.shared.tier.borrow_mut().as_mut().is_some_and(|t| t.retire_results_ready());
+        if results {
+            flags[me].store(false, Ordering::Relaxed);
+            return true;
+        }
         false
     }
 

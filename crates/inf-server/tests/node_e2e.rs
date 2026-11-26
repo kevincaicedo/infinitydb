@@ -850,22 +850,32 @@ impl Node {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let (control, issuers) = match &held_catalog {
-                None => {
-                    inf_server::spawn_control_in(dir.clone(), catalog.as_ref(), space, boot_unix_ms)
-                        .expect("the catalog boots")
-                }
+            let (control, issuers, parts) = match &held_catalog {
+                None => inf_server::spawn_control_in(
+                    inf_server::StdSegmentFs,
+                    dir.clone(),
+                    catalog.as_ref(),
+                    space,
+                    boot_unix_ms,
+                    None,
+                )
+                .expect("the catalog boots"),
                 Some(hold) => {
                     // The sim's detached writer, driven by a harness
                     // thread that honours `hold` — the same
                     // `CatalogWriter::answer`,
                     // same on-disk swap, no control thread.
-                    let (control, mut inbox, issuers) = inf_server::ControlHandle::detached_in(
-                        catalog.as_ref(),
-                        space,
-                        boot_unix_ms,
-                    )
-                    .expect("the catalog boots");
+                    let (control, mut inbox, issuers, mut tier) =
+                        inf_server::ControlHandle::detached_in::<inf_server::StdSegmentFs>(
+                            catalog.as_ref(),
+                            space,
+                            boot_unix_ms,
+                        )
+                        .expect("the catalog boots");
+                    // The cells' parts go to their threads; the pump keeps the
+                    // worker and steps it after each loop, held or not, so a
+                    // cell's transport retires while the pump lives.
+                    let parts = (0..cells).filter_map(|cell| tier.take_part(cell)).collect();
                     let hold = Arc::clone(hold);
                     let allow = Arc::new(std::sync::atomic::AtomicU32::new(0));
                     let pump_stop = Arc::new(AtomicBool::new(false));
@@ -885,22 +895,25 @@ impl Node {
                                         .expect("held-catalog META swap");
                                     allow.fetch_sub(landed, Ordering::AcqRel);
                                 }
+                                tier.iterate(&fs);
                                 #[allow(clippy::disallowed_methods)] // harness thread
                                 std::thread::sleep(Duration::from_millis(1));
                             }
                         })
                     };
                     catalog_pump = Some(CatalogPump { hold, allow, stop: pump_stop, handle });
-                    (control, issuers)
+                    (control, issuers, parts)
                 }
             };
-            ((dir, catalog, control), issuers)
+            ((dir, catalog, control), issuers, parts)
         });
-        let (boot, ckpt_host, mut cell_issuers) = match boot {
-            Some((boot, inf_server::CkptIssuers { host, cells })) => {
-                (Some(boot), Some(host), cells.into_iter().map(Some).collect::<Vec<_>>())
+        let (boot, ckpt_host, mut cell_issuers, mut cell_parts) = match boot {
+            Some((boot, inf_server::CkptIssuers { host, cells }, parts)) => {
+                let issuers = cells.into_iter().map(Some).collect::<Vec<_>>();
+                let parts = parts.into_iter().map(Some).collect::<Vec<_>>();
+                (Some(boot), Some(host), issuers, parts)
             }
-            None => (None, None, Vec::new()),
+            None => (None, None, Vec::new(), Vec::new()),
         };
         let mut handles = Vec::new();
         let clock_gates: Vec<Arc<ClockGate>> =
@@ -917,6 +930,7 @@ impl Node {
             let stop_holds = Arc::clone(&stop_holds);
             let boot = boot.clone();
             let issuer = cell_issuers.get_mut(i).and_then(Option::take);
+            let part = cell_parts.get_mut(i).and_then(Option::take);
             let faults = faults.clone();
             let holds = holds.clone();
             let default_ns = default_ns.clone();
@@ -1011,6 +1025,9 @@ impl Node {
                     false,
                 )
                 .expect("the server's timer owners fit their cap");
+                if let Some(part) = part {
+                    plane.hold_tier_part(part);
+                }
                 plane.set_tcp_transport(true);
                 plane.set_fabric_apply_prefetch(apply_prefetch);
                 plane.set_parse_batch_prefetch(parse_prefetch);
@@ -1074,6 +1091,18 @@ impl Node {
                         }
                     }
                 }
+                // A hard end (the crash-equivalent stop) retires the cell's
+                // transport here, on its own thread, while the control thread
+                // or the pump runs the worker; a drained stop already did.
+                inf_server::retire_with(
+                    i as u16,
+                    || plane.retire_step(),
+                    |_| {
+                        #[allow(clippy::disallowed_methods)] // harness thread
+                        std::thread::sleep(Duration::from_millis(1));
+                        true
+                    },
+                );
                 dir_marks::CellEnd::read(i as u16, plane.durable_stats(), at_default)
             }));
         }
@@ -7114,8 +7143,9 @@ fn ckpt_one_cell_exhausted_while_the_other_still_reserves() {
 #[test]
 fn set_control_refuses_the_checkpoint_issuer_of_another_cell() {
     let two = inf_foundation::CellCount::new(2).expect("two cells");
-    let (control, _inbox, issuers) =
-        inf_server::ControlHandle::detached(two, 0).expect("an empty catalog boots");
+    let (control, _inbox, issuers, _tier) =
+        inf_server::ControlHandle::detached::<inf_server::StdSegmentFs>(two, 0)
+            .expect("an empty catalog boots");
     let mut fabrics = Mesh::new(2, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
     let mut plane = |cell: u16| unwired_plane(cell, 2, fabrics.next().expect("a fabric per cell"));
     let (mut first, mut second) = (plane(0), plane(1));
@@ -7164,10 +7194,12 @@ fn unwired_plane(
 #[test]
 fn set_control_refuses_an_issuer_of_another_boot() {
     let two = inf_foundation::CellCount::new(2).expect("two cells");
-    let (control, _inbox, _issuers) =
-        inf_server::ControlHandle::detached(two, 0).expect("an empty catalog boots");
-    let (other, _other_inbox, other_issuers) =
-        inf_server::ControlHandle::detached(two, 0).expect("an empty catalog boots");
+    let (control, _inbox, _issuers, _tier) =
+        inf_server::ControlHandle::detached::<inf_server::StdSegmentFs>(two, 0)
+            .expect("an empty catalog boots");
+    let (other, _other_inbox, other_issuers, _other_tier) =
+        inf_server::ControlHandle::detached::<inf_server::StdSegmentFs>(two, 0)
+            .expect("an empty catalog boots");
     let mut fabrics = Mesh::new(2, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
     let mut plane = unwired_plane(0, 2, fabrics.next().expect("cell 0's fabric"));
     let foreign = other_issuers.cells.into_iter().next().expect("the other boot's cell 0");
@@ -7184,8 +7216,9 @@ fn set_control_refuses_an_issuer_of_another_boot() {
 #[test]
 fn set_control_refuses_a_board_of_another_cell_count() {
     let two = inf_foundation::CellCount::new(2).expect("two cells");
-    let (control, _inbox, issuers) =
-        inf_server::ControlHandle::detached(two, 0).expect("an empty catalog boots");
+    let (control, _inbox, issuers, _tier) =
+        inf_server::ControlHandle::detached::<inf_server::StdSegmentFs>(two, 0)
+            .expect("an empty catalog boots");
     let mut fabrics = Mesh::new(4, MeshConfig { ring_capacity: 64, data_credits: 16 }).into_iter();
     let mut plane = unwired_plane(0, 4, fabrics.next().expect("cell 0's fabric"));
     let zero = issuers.cells.into_iter().next().expect("cell 0's issuer");

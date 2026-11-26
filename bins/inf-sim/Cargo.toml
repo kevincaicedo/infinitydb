@@ -33,6 +33,9 @@ dst = [
     "inf-store/collision-oracle",
     # The fabric gate's first generation and wrap count (the near-wrap leg).
     "inf-server/fault-points",
+    # The node's custody of the tier-file transport at a life's end
+    # (`cut_tier_part`, `DetachedTier`'s cutting drop; ADR-0157 D3).
+    "inf-server/test-support",
 ]
 
 [dependencies]

@@ -64,8 +64,9 @@ fn writer(dir: &Path, seed: Option<&NsCatalog>) -> (Arc<ControlHandle>, ControlI
         inf_log::meta::write_meta(&StdSegmentFs, dir, &seed.encode()).expect("seed META");
     }
     let cells = inf_foundation::CellCount::new(2).expect("two cells");
-    let (control, inbox, _issuers) =
-        ControlHandle::detached_in(seed, CkptSpace::full(cells), 0).expect("the catalog boots");
+    let (control, inbox, _issuers, _tier) =
+        ControlHandle::detached_in::<StdSegmentFs>(seed, CkptSpace::full(cells), 0)
+            .expect("the catalog boots");
     (control, inbox)
 }
 
