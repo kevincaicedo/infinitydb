@@ -573,6 +573,10 @@ impl<T> RetainedRing<T> {
     }
 
     /// Takes the phase out, leaving a placeholder the caller replaces.
+    /// Nothing between the take and the write-back may panic once the ring
+    /// is split: an unwind there drops the moved-out phase, freeing blocks a
+    /// live endpoint may still reach, and the placeholder reads Terminal, so
+    /// a later drop of the owner would pass without its fail-stop.
     fn take_phase(&mut self) -> Phase<T> {
         mem::replace(&mut *self.phase, Phase::Terminal(RetireCause::Released))
     }
