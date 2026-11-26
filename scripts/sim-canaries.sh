@@ -1486,7 +1486,7 @@ ordered_rows=(
   "inf_canary_reserve_unguarded m0-capacity applies-high-water --close-leg small-credit"
   # ADR-0157 D3 (KR5): a backing owner dropped before its retirement leaks
   # silently instead of failing stop.
-  "inf_canary_ring_drop_live_silent crate-test inf-fabric lib a_backing_dropped_before_its_retirement_fails_stop"
+  "inf_canary_ring_drop_live_silent crate-test inf-fabric lib a_backing_dropped_before_its_retirement_fails_stop FAIL_STOP_MISSING:"
   # ADR-0157 D3: an endpoint touches nothing after its release. Planted, the producer's drop
   # writes a slot, or reads the header's `mask`, after its decrement; the model whose owner
   # retires before the fixture's thread join reports that access as a causality violation.

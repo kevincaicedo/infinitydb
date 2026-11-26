@@ -103,7 +103,8 @@ rests on these rules:
   `inf_canary_ring_release_before_write` (`JOIN_VISIBILITY_GAP`) and
   `inf_canary_ring_join_after_one` (`JOIN_WITH_HELD_ENDPOINT`), are rows of
   `scripts/sim-canaries.sh`; `inf_canary_ring_drop_live_silent` is the
-  class-I `Drop`'s, on its `should_panic` test.
+  class-I `Drop`'s, on the test that catches its panic and reads the
+  message.
 - **Loom, the retirement** (`loom_retained_retirement_before_the_thread_join`):
   the concurrent release again, the owner retiring to Terminal as soon as
   its join reads zero and before the fixture joins its threads, so only the

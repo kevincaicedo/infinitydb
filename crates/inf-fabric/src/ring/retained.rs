@@ -1007,13 +1007,21 @@ mod tests {
         retire_all(&mut at, &mut Vec::new());
     }
 
-    /// Canary `inf_canary_ring_drop_live_silent` (KR5): a backing owner
-    /// dropped before Terminal fails stop. Admitted and unbuilt, it holds
-    /// no block, so the test leaks nothing.
+    /// Canary `inf_canary_ring_drop_live_silent`: a backing owner dropped
+    /// before Terminal fails stop. Admitted and unbuilt, it holds no block,
+    /// so the test leaks nothing. The test catches the panic itself, so its
+    /// verdict line is the plain `test … ok` the canary lane reads, which a
+    /// `should_panic` test's suffixed line is not.
     #[test]
-    #[should_panic(expected = "retained ring dropped before its retirement")]
     fn a_backing_dropped_before_its_retirement_fails_stop() {
-        drop(RetainedRing::<u64>::admit().expect("within the bound"));
+        let unbuilt = RetainedRing::<u64>::admit().expect("within the bound");
+        let dropped = std::panic::catch_unwind(move || drop(unbuilt));
+        let panic = dropped.expect_err("FAIL_STOP_MISSING: the drop before Terminal returned");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"retained ring dropped before its retirement"),
+            "the class-I fail-stop's message"
+        );
     }
 
     /// A backing dropped in a caught unwind frees nothing and starts no
