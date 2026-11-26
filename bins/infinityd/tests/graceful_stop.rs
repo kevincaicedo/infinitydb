@@ -461,16 +461,17 @@ fn control_thread(pid: u32) -> Option<i32> {
 /// One thread of the node stopped alone by `PTRACE_SEIZE` and
 /// `PTRACE_INTERRUPT`; its exit, once the process ends, reaped with
 /// `__WALL`, without which the process's own exit would stay unreported.
-/// Its drop, before the node's (declared after it), lets the thread go, so
-/// a failed leg's unwind never waits on an exit only its tracer can reap.
+/// It borrows the node's `Server`, so it drops first, by type: its drop
+/// lets the thread go before the node's kill and reap, and a failed leg's
+/// unwind never waits on an exit only its tracer can reap.
 #[cfg(target_os = "linux")]
-struct HeldThread {
-    pid: i32,
+struct HeldThread<'server> {
+    server: &'server mut Server,
     tid: i32,
 }
 
 #[cfg(target_os = "linux")]
-impl Drop for HeldThread {
+impl Drop for HeldThread<'_> {
     fn drop(&mut self) {
         // SAFETY: ptrace(2) on the thread this test seized, no address or
         // data argument; it is in a ptrace-stop (never resumed), or gone.
@@ -479,20 +480,27 @@ impl Drop for HeldThread {
             return;
         }
         // Not detachable: the node is killed and its thread's exit reaped
-        // here, the one reap its parent's wait needs.
-        // SAFETY: kill(2) of this test's own child; waitpid(2) on the
-        // seized thread into a stack int.
-        unsafe {
-            libc::kill(self.pid, libc::SIGKILL);
+        // here, polled under a bound, the one reap its parent's wait needs.
+        let pid = i32::try_from(self.server.child.id()).expect("a pid fits an i32");
+        // SAFETY: kill(2) of this test's own child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
             let mut status = 0;
-            libc::waitpid(self.tid, &raw mut status, libc::__WALL);
+            // SAFETY: waitpid(2) on the seized thread into a stack int.
+            let reaped =
+                unsafe { libc::waitpid(self.tid, &raw mut status, libc::__WALL | libc::WNOHANG) };
+            if reaped != 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-impl HeldThread {
-    fn seize(pid: i32, tid: i32) -> HeldThread {
+impl<'server> HeldThread<'server> {
+    fn seize(server: &'server mut Server, tid: i32) -> HeldThread<'server> {
         // SAFETY: ptrace(2) requests on a thread of this test's own child,
         // with no address or data argument.
         let seized = unsafe { libc::ptrace(libc::PTRACE_SEIZE, tid, 0, 0) };
@@ -509,7 +517,7 @@ impl HeldThread {
         // SAFETY: waitpid(2) on the seized thread into a stack int.
         let waited = unsafe { libc::waitpid(tid, &raw mut status, libc::__WALL) };
         assert_eq!(waited, tid, "the seized thread's stop: {}", std::io::Error::last_os_error());
-        HeldThread { pid, tid }
+        HeldThread { server, tid }
     }
 
     /// Reaps the thread's report, if any, without waiting.
@@ -577,22 +585,23 @@ fn a_held_control_thread_ends_the_stop_at_its_deadline() {
     drop(c);
     let pid = server.child.id();
     let tid = control_thread(pid).expect("the node's inf-control thread");
-    let held = HeldThread::seize(pid.try_into().expect("a pid fits an i32"), tid);
+    let held = HeldThread::seize(&mut server, tid);
     let status = Command::new("kill").args(["-TERM", &pid.to_string()]).status().expect("kill(1)");
     assert!(status.success(), "kill -TERM failed");
     let deadline = Instant::now() + Duration::from_millis(2_000) + Duration::from_secs(10);
     let status = loop {
         held.reap();
-        if let Some(status) = server.child.try_wait().expect("try_wait") {
+        if let Some(status) = held.server.child.try_wait().expect("try_wait") {
             break status;
         }
         assert!(
             Instant::now() < deadline,
             "HELD_NODE_NO_EXIT: still running 12 s after SIGTERM with its control thread held: {}",
-            server.text()
+            held.server.text()
         );
         std::thread::sleep(Duration::from_millis(10));
     };
+    drop(held);
     let text = server.text();
     assert_eq!(status.code(), Some(1), "HELD_NODE_EXIT: {status}, not 1 — {text}");
     assert!(text.contains("stop drain timed out"), "HELD_NODE_EXIT: no timeout line: {text}");
