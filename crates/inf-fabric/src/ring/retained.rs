@@ -75,6 +75,32 @@ struct Header<T> {
     /// access its one `Release` decrement; it only goes down.
     endpoints: sync::AtomicUsize,
     slots: Vec<Slot<T>>,
+    tomb: Tomb,
+}
+
+/// The header's custody as the Loom models see it: every endpoint access
+/// reads this cell first ([`Tomb::visit`]) and every retirement step on the
+/// header writes it ([`Tomb::bury`]), so an endpoint access that the join
+/// did not order before the retirement is a causality violation Loom
+/// reports, a read of a plain field such as `mask` included, which Loom
+/// does not see by itself. Zero-sized outside the models: a visit compiles
+/// to nothing.
+struct Tomb(sync::UnsafeCell<()>);
+
+impl Tomb {
+    fn new() -> Tomb {
+        Tomb(sync::UnsafeCell::new(()))
+    }
+
+    #[inline]
+    fn visit(&self) {
+        self.0.with(|_| ());
+    }
+
+    #[inline]
+    fn bury(&self) {
+        self.0.with_mut(|_| ());
+    }
 }
 
 /// An endpoint's way to its header: the address in the owner's block.
@@ -89,7 +115,9 @@ impl<T> HeaderRef<T> {
         // the owner forms no `&mut` to the header in that interval, and
         // every mutation through this shared borrow is an atomic or a slot's
         // `UnsafeCell` (the ownership protocol on `Shared`).
-        unsafe { self.0.as_ref() }
+        let header = unsafe { self.0.as_ref() };
+        header.tomb.visit();
+        header
     }
 }
 
@@ -169,6 +197,15 @@ impl<T> Drop for RetainedProducer<T> {
             return;
         }
         release(&self.inner.backing);
+        // Canaries `inf_canary_ring_slot_after_release` and
+        // `inf_canary_ring_header_after_release`: a slot access, or a read
+        // of the header's own field, after the release.
+        if cfg!(inf_canary_ring_slot_after_release) {
+            self.inner.backing.slots()[1].with_mut(|_| ());
+        }
+        if cfg!(inf_canary_ring_header_after_release) {
+            core::hint::black_box(self.inner.backing.mask());
+        }
     }
 }
 
@@ -461,6 +498,7 @@ impl<T> Built<T> {
                     mask: RETAINED_RING_SLOTS - 1,
                     endpoints: sync::AtomicUsize::new(ENDPOINTS),
                     slots,
+                    tomb: Tomb::new(),
                 });
                 Phase::Ready(headers)
             }
@@ -624,6 +662,8 @@ impl<T> RetainedRing<T> {
         }
         match blocks {
             Blocks::Header(headers) => {
+                // Each step here reads or frees what an endpoint reached.
+                headers[0].tomb.bury();
                 if let Some(value) = take_queued(&mut headers[0]) {
                     sink(value);
                     return self.phase();
@@ -852,9 +892,14 @@ mod tests {
     }
 
     /// The last release on another thread: the owner's join waits for it,
-    /// and every value published is consumed or retired once.
+    /// then retires to Terminal at once, the endpoint threads perhaps still
+    /// inside their drops, and every value published is consumed or retired
+    /// once. The threads are joined only after the retirement, so nothing
+    /// but the join's `Acquire` orders their accesses before the owner's:
+    /// under Miri an endpoint access after its release is a data race or a
+    /// use after free.
     #[test]
-    fn a_join_waits_for_the_releases_made_on_other_threads() {
+    fn the_owner_retires_at_its_join_while_the_endpoint_threads_finish() {
         let mut ring = ready::<u32>();
         let (mut producer, mut consumer) = ring.split().expect("ready");
         let sender = std::thread::spawn(move || {
@@ -870,9 +915,12 @@ mod tests {
             waits += 1;
             std::thread::yield_now();
         }
+        let mut retired = Vec::new();
+        retire_all(&mut ring, &mut retired);
+        assert_eq!(ring.phase(), RingPhase::Terminal(RetireCause::Released));
         sender.join().expect("producer thread");
         let mut values = receiver.join().expect("consumer thread");
-        retire_all(&mut ring, &mut values);
+        values.append(&mut retired);
         assert_eq!(values, [0, 1, 2], "consumed or retired, once, in order (waits {waits})");
     }
 
@@ -1007,12 +1055,25 @@ mod loom_tests {
     use super::*;
 
     /// ADR-0157 D5's three programs: both endpoints released concurrently,
-    /// then each held by the fixture while the other releases.
+    /// then each held by the fixture while the other releases; and the
+    /// concurrent release again with the owner retiring to Terminal as soon
+    /// as its join reads zero, before the fixture's thread join.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Case {
         Concurrent,
         ProducerHeld,
         ConsumerHeld,
+        RetireBeforeThreadJoin,
+    }
+
+    impl Case {
+        /// Whether the fixture holds an endpoint at the owner's first join.
+        fn holds_an_endpoint(self) -> bool {
+            match self {
+                Case::ProducerHeld | Case::ConsumerHeld => true,
+                Case::Concurrent | Case::RetireBeforeThreadJoin => false,
+            }
+        }
     }
 
     /// What the explored executions observed before the fixture's thread
@@ -1063,9 +1124,8 @@ mod loom_tests {
                 None
             }
             RingPhase::Retiring(RetireCause::Released) => {
-                assert_eq!(
-                    case,
-                    Case::Concurrent,
+                assert!(
+                    !case.holds_an_endpoint(),
                     "JOIN_WITH_HELD_ENDPOINT: the owner joined while the fixture holds an endpoint"
                 );
                 census.prior_joined.fetch_add(1, CensusOrder::Relaxed);
@@ -1084,12 +1144,17 @@ mod loom_tests {
             assert_eq!(joined, RingPhase::Retiring(RetireCause::Released), "FINAL_JOIN_MISSING");
         }
         let mut values = consumed;
+        retire(&mut ring, &mut values);
+        assert_eq!(ring.phase(), RingPhase::Terminal(RetireCause::Released));
+        assert_eq!(values, published, "every value consumed or retired once, in order");
+    }
+
+    /// Retires a joined ring within one allowance, each value into `values`.
+    fn retire(ring: &mut RetainedRing<u32>, values: &mut Vec<u32>) {
         let mut steps = RingSteps::new(16);
         while matches!(ring.phase(), RingPhase::Retiring(_)) && steps.left() > 0 {
             ring.retire_step(&mut steps, |value| values.push(value));
         }
-        assert_eq!(ring.phase(), RingPhase::Terminal(RetireCause::Released));
-        assert_eq!(values, published, "every value consumed or retired once, in order");
     }
 
     fn program(case: Case, census: &Census) {
@@ -1123,6 +1188,19 @@ mod loom_tests {
                 sender.join().expect("producer");
                 drop(consumer);
                 finish(ring, Vec::new(), &[1, 2]);
+            }
+            Case::RetireBeforeThreadJoin => {
+                let sender = thread::spawn(move || publish_two(producer));
+                let receiver = thread::spawn(move || consume_one(consumer));
+                let mut retired = Vec::new();
+                if observe(&mut ring, case, census).is_some() {
+                    retire(&mut ring, &mut retired);
+                    assert_eq!(ring.phase(), RingPhase::Terminal(RetireCause::Released));
+                }
+                sender.join().expect("producer");
+                let mut values = receiver.join().expect("consumer");
+                values.append(&mut retired);
+                finish(ring, values, &[1, 2]);
             }
         }
         census.completed.fetch_add(1, CensusOrder::Relaxed);
@@ -1167,5 +1245,17 @@ mod loom_tests {
     fn loom_retained_join_waits_while_the_consumer_is_held() {
         let (_, joined, _) = explore(Case::ConsumerHeld);
         assert_eq!(joined, 0, "JOIN_WITH_HELD_ENDPOINT");
+    }
+
+    /// Both endpoints released concurrently, the owner retiring to Terminal
+    /// the moment its join reads zero, before any fixture thread is joined:
+    /// only the join's `Acquire` orders the endpoints' accesses before the
+    /// retirement's, and an endpoint access after its release, to a slot or
+    /// to the header's own fields (the header's tomb), is a causality
+    /// violation. Both outcomes of that first join are explored.
+    #[test]
+    fn loom_retained_retirement_before_the_thread_join() {
+        let (completed, joined, waiting) = explore(Case::RetireBeforeThreadJoin);
+        assert!(joined > 0 && waiting > 0, "PRE_JOIN_BRANCH_MISSING: {completed} {joined}");
     }
 }

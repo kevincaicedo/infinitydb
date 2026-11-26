@@ -104,11 +104,25 @@ rests on these rules:
   `inf_canary_ring_join_after_one` (`JOIN_WITH_HELD_ENDPOINT`), are rows of
   `scripts/sim-canaries.sh`; `inf_canary_ring_drop_live_silent` is the
   class-I `Drop`'s, on its `should_panic` test.
+- **Loom, the retirement** (`loom_retained_retirement_before_the_thread_join`):
+  the concurrent release again, the owner retiring to Terminal as soon as
+  its join reads zero and before the fixture joins its threads, so only the
+  join orders the endpoints' accesses before the retirement's. Under Loom
+  the header carries a tomb, a cell every `HeaderRef` access reads and
+  every retirement step on the header writes (zero-sized otherwise), so an
+  endpoint access after its release, to a slot or to a plain header field,
+  is a causality violation. Its plants, `inf_canary_ring_slot_after_release`
+  and `inf_canary_ring_header_after_release` (a slot write, a read of
+  `mask`, in the producer's drop after its decrement), are rows of
+  `scripts/sim-canaries.sh`.
 - **Miri**: the non-loom unit tests (including a two-thread stress test at
   reduced count) run under Miri in CI with strict provenance, the retained
-  ring's among them: both drop orders, the last release on another thread,
-  a failed startup transfer, full and queued rings, zero-sized and
-  over-aligned payloads, a cancel at every construction boundary, the
+  ring's among them: both drop orders, the last release on another thread
+  with the owner retiring before it joins the endpoint threads (a
+  post-release access is a data race or a use after free there; both
+  plants above are red under it), a failed startup transfer, full and
+  queued rings, zero-sized and over-aligned payloads, a cancel at every
+  construction boundary, the
   budgeted retirement; `tests/retained_ring.rs` refuses each block through
   `inf-alloc`'s counting allocator and reconciles requested and freed
   bytes. The two tests that leak a dropped backing by design are skipped
