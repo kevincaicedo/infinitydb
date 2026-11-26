@@ -312,8 +312,13 @@ impl<F: SegmentFs> TierFlush<F> {
     /// Creates the next tier file for a plan: the id first (no id is ever
     /// reused within a namespace lifetime, so the last one is refused before
     /// any effect), then the cold directory, its two directory handles and
-    /// the file. Consumes the id only when the file exists.
+    /// the file. Consumes the id only when the create succeeds; a create
+    /// that fails at or after `create_tier` leaves its name in the residue
+    /// slot, owned until its unlink answers.
     fn create_planned(&mut self) -> Result<CreatedFile<F>, TierFlushError> {
+        // A failed create's file is still owned: this create waits for its
+        // unlink's terminal result (ADR-0156 D1), before any effect.
+        self.admit_create()?;
         let cold = self.config.shard_dir.join("cold");
         let id = self.next_id;
         let Some(next) = id.checked_add(1) else {
@@ -333,12 +338,18 @@ impl<F: SegmentFs> TierFlush<F> {
         };
         let holds = [open(self.config.shard_dir.clone())?, open(cold.clone())?];
         let path = cold.join(tier_file_name(id));
-        let file = self
+        // The reactor drive's create writes nothing before the round's ops,
+        // so a failed create's residue charges no bytes.
+        self.begin_create(id, &path, 0);
+        if cfg!(inf_canary_create_id_spent_on_failure) {
+            self.next_id = next;
+        }
+        let created = self
             .fs
             .create_tier(&path, self.config.mode)
-            .map_err(|source| TierFlushError::Io { path: cold, source })?;
-        self.next_id = next;
-        Ok(CreatedFile { id, path, file, holds })
+            .map_err(|source| TierFlushError::Io { path: cold, source });
+        self.end_create(&created, next);
+        Ok(CreatedFile { id, path, file: created?, holds })
     }
 
     /// Stages an admitted plan: the rotation's seal, the created file's

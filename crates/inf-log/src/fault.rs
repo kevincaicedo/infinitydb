@@ -44,6 +44,10 @@
 //!   round keeps only ops whose handles the pipeline owns and the creation retries next slice; on
 //!   the seam drive the create refuses with no file left behind — at boot, the demote step's typed
 //!   refusal (ADR-0174 D5)
+//! - `tier_create_fail` — `SimDisk::create_tier`, before the file exists — typed I/O error with no
+//!   file made: the shape of a `create_new` refused with no file (`EMFILE`, inode `ENOSPC`,
+//!   `EACCES`). The create's residue is still owned and unlinked (`NotFound` answers it), since
+//!   whether a file exists is never inferred from the error. It fires in the simulated disk only
 //! - `tier_create_post_fail` — `SimDisk::create_tier`, after the file is made and named — typed
 //!   I/O error with the file left on the disk and its handle closed: the shape of a real create
 //!   whose `create_new` succeeded and whose `set_len`, `O_DIRECT` probe (a `/proc` open, so
@@ -122,6 +126,7 @@ pub const TIER_FSYNC_ERR: &str = "tier_fsync_err";
 pub const TIER_FOOTER_TORN: &str = "tier_footer_torn";
 pub const TIER_UNLINK_FAIL: &str = "tier_unlink_fail";
 pub const TIER_DIR_OPEN_FAIL: &str = "tier_dir_open_fail";
+pub const TIER_CREATE_FAIL: &str = "tier_create_fail";
 pub const TIER_CREATE_POST_FAIL: &str = "tier_create_post_fail";
 pub const TIER_CLOSE_FAIL: &str = "tier_close_fail";
 pub const BLOB_SHORT_WRITE: &str = "blob_short_write";
@@ -150,6 +155,7 @@ pub const ALL: &[&str] = &[
     TIER_FOOTER_TORN,
     TIER_UNLINK_FAIL,
     TIER_DIR_OPEN_FAIL,
+    TIER_CREATE_FAIL,
     TIER_CREATE_POST_FAIL,
     TIER_CLOSE_FAIL,
     BLOB_SHORT_WRITE,

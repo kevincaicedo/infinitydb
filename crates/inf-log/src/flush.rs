@@ -40,8 +40,11 @@ use crate::tier::{
 };
 
 mod plan;
+mod residue;
 
 pub use plan::{Planned, RoundPlan, Selection};
+use residue::ResidueSlot;
+pub use residue::ResidueState;
 
 /// How a pipeline's I/O reaches the device (M4.5-S31, ADR-0084 D1).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -133,6 +136,25 @@ pub struct TierFileMeta {
     pub path: PathBuf,
 }
 
+impl TierFileMeta {
+    /// The on-disk bytes a sealed file of this meta holds (header, whole
+    /// frames, footer), from the format arithmetic: the charge a retiring
+    /// file keeps on its namespace's disk usage until its terminal result.
+    #[must_use]
+    pub fn disk_bytes(&self) -> u64 {
+        tier_file_disk_bytes(self.data_len, true)
+    }
+}
+
+/// On-disk bytes of a tier file holding `data_len` data bytes: its header,
+/// its whole CRC frames and, sealed, its footer.
+fn tier_file_disk_bytes(data_len: u64, sealed: bool) -> u64 {
+    use crate::tier::{TIER_FOOTER_BYTES, TIER_FRAME_BYTES, TIER_FRAME_DATA, TIER_HEADER_BYTES};
+    (TIER_HEADER_BYTES as u64)
+        + data_len.div_ceil(TIER_FRAME_DATA as u64) * TIER_FRAME_BYTES as u64
+        + if sealed { TIER_FOOTER_BYTES as u64 } else { 0 }
+}
+
 /// Construction parameters for one namespace's flush pipeline.
 #[derive(Clone, Debug)]
 pub struct TierFlushConfig {
@@ -192,6 +214,15 @@ pub enum TierFlushError {
         /// The refused position.
         offset_bytes: u64,
     },
+    /// A create waits for its failed predecessor's file (ADR-0156 D1): the
+    /// pipeline's residue slot still owns that file, held or out for its
+    /// unlink, and the create of its name runs only once the unlink's
+    /// terminal result is consumed. Not fatal: the plane plans again at
+    /// its next turn. Not storage-full: no space was refused.
+    CreateDeferred {
+        /// The namespace's tier directory.
+        path: PathBuf,
+    },
     /// The pipeline's file ids are spent: the next id would wrap, and an id
     /// is never reused within a namespace lifetime. Refused before any
     /// effect and not fatal, but permanent for the lifetime: the flush
@@ -232,6 +263,11 @@ impl core::fmt::Display for TierFlushError {
                  {FILE_OFFSET_BYTES_MAX}, the largest a driver op may carry — cell must stop",
                 path.display()
             ),
+            TierFlushError::CreateDeferred { path } => write!(
+                f,
+                "tier file create deferred on {}: a failed create's file is still being removed",
+                path.display()
+            ),
             TierFlushError::FileIdsExhausted { path } => write!(
                 f,
                 "tier file ids exhausted on {}: the namespace flushes no further this lifetime",
@@ -261,6 +297,7 @@ impl TierFlushError {
             TierFlushError::Unaddressable { .. } => true,
             TierFlushError::SpanOverPool { .. } => true,
             TierFlushError::Io { .. } => false,
+            TierFlushError::CreateDeferred { .. } => false,
             TierFlushError::FileIdsExhausted { .. } => false,
         }
     }
@@ -279,6 +316,7 @@ impl TierFlushError {
             // A position fault refused no space (ADR-0167 D4); neither did
             // the id width or the pool's bound.
             TierFlushError::Unaddressable { .. }
+            | TierFlushError::CreateDeferred { .. }
             | TierFlushError::FileIdsExhausted { .. }
             | TierFlushError::SpanOverPool { .. } => false,
         }
@@ -337,6 +375,9 @@ pub struct TierFlush<F: SegmentFs> {
     /// The claim rule for the unsealed active file (ADR-0056 D5 live,
     /// ADR-0174 D2 rule 4 at boot).
     claim: ClaimRule,
+    /// A failed create's owner (ADR-0156 D1): at most one a pipeline, so
+    /// failed creates need no allocation of their own.
+    residue: ResidueSlot,
 }
 
 /// A seal staged but not yet completion-committed (ADR-0084 D2).
@@ -438,6 +479,7 @@ impl<F: SegmentFs> TierFlush<F> {
             round_dir_holds: None,
             pending_seals: holders.pending_seals,
             claim: ClaimRule::FullFrames,
+            residue: ResidueSlot::Empty,
         }
     }
 
@@ -750,19 +792,128 @@ impl<F: SegmentFs> TierFlush<F> {
     /// occupancy. Computed from the format arithmetic — header + whole
     /// CRC frames + (sealed) footer per file — so no `stat` syscalls on
     /// the scrape path.
+    /// A failed create's residue counts what its attempt may have written
+    /// until its file's terminal result (ADR-0156 D1).
     #[must_use]
     pub fn disk_bytes(&self) -> u64 {
-        use crate::tier::{
-            TIER_FOOTER_BYTES, TIER_FRAME_BYTES, TIER_FRAME_DATA, TIER_HEADER_BYTES,
-        };
-        let file_bytes = |data_len: u64, sealed: bool| {
-            (TIER_HEADER_BYTES as u64)
-                + data_len.div_ceil(TIER_FRAME_DATA as u64) * TIER_FRAME_BYTES as u64
-                + if sealed { TIER_FOOTER_BYTES as u64 } else { 0 }
-        };
+        let file_bytes = tier_file_disk_bytes;
         let sealed: u64 = self.sealed.iter().map(|m| file_bytes(m.data_len, true)).sum();
         let pending: u64 = self.pending_seals.iter().map(|s| file_bytes(s.data_len, true)).sum();
-        sealed + pending + self.writer.as_ref().map_or(0, |w| file_bytes(w.data_len(), false))
+        let active = self.writer.as_ref().map_or(0, |w| file_bytes(w.data_len(), false));
+        sealed + pending + active + self.residue.bytes()
+    }
+
+    /// The pipeline's catalog length: its sealed files, its staged seals
+    /// and its active file. A dropped namespace's retirement list reserves
+    /// it once, so the walk's moves never reallocate.
+    #[must_use]
+    pub fn catalog_len(&self) -> usize {
+        self.sealed.len() + self.pending_seals.len() + usize::from(self.writer.is_some())
+    }
+
+    /// Detaches every sealed file `ids` names (`ids` ascending), in one pass
+    /// over the catalog, handing each meta to `out` in id order: the
+    /// covering swap committed their retirement (ADR-0059 D3), so no durable
+    /// artifact names them. An id not in the catalog is skipped (a retried
+    /// commit is legal).
+    pub fn detach_retiring(&mut self, ids: &[u32], out: impl FnMut(TierFileMeta)) {
+        debug_assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "retiring ids ascend");
+        if ids.is_empty() {
+            return;
+        }
+        self.sealed.extract_if(.., |meta| ids.binary_search(&meta.id).is_ok()).for_each(out);
+    }
+
+    /// The residue slot as the walk reads it.
+    #[must_use]
+    pub fn residue(&self) -> ResidueState {
+        self.residue.state()
+    }
+
+    /// The held residue, once due at `now`, taken for its offer: the slot
+    /// turns `Out` and its meta goes into the job. `None` when nothing is
+    /// held or it is not yet due.
+    pub fn take_residue(&mut self, now: inf_foundation::time::Nanos) -> Option<TierFileMeta> {
+        match core::mem::take(&mut self.residue) {
+            ResidueSlot::Held { meta, due, bytes } if now >= due => {
+                self.residue = ResidueSlot::Out { bytes };
+                Some(meta)
+            }
+            kept @ (ResidueSlot::Empty
+            | ResidueSlot::Filling { .. }
+            | ResidueSlot::Held { .. }
+            | ResidueSlot::Out { .. }) => {
+                self.residue = kept;
+                None
+            }
+        }
+    }
+
+    /// The residue's job answered `Unlinked` or `AlreadyAbsent`: the name is
+    /// free, so the next create makes it again.
+    pub fn residue_terminal(&mut self) {
+        debug_assert!(
+            matches!(self.residue, ResidueSlot::Out { .. })
+                || cfg!(inf_canary_create_while_residue_out),
+            "a residue's terminal result answers its job out"
+        );
+        self.residue = ResidueSlot::Empty;
+    }
+
+    /// The residue's job answered `Retry`: the slot holds it again, due at
+    /// `due`, still charged.
+    pub fn residue_retry(&mut self, meta: TierFileMeta, due: inf_foundation::time::Nanos) {
+        let bytes = match self.residue {
+            ResidueSlot::Out { bytes } => bytes,
+            ResidueSlot::Empty | ResidueSlot::Filling { .. } | ResidueSlot::Held { .. } => {
+                debug_assert!(
+                    cfg!(inf_canary_create_while_residue_out),
+                    "a residue's retry answers its job out"
+                );
+                0
+            }
+        };
+        self.residue = ResidueSlot::Held { meta, due, bytes };
+    }
+
+    /// The create step's admission (ADR-0156 D1): a create runs only over an
+    /// empty slot. `Err` with the slot held or out, before any effect.
+    fn admit_create(&self) -> Result<(), TierFlushError> {
+        if self.residue.admits_create() {
+            return Ok(());
+        }
+        Err(TierFlushError::CreateDeferred { path: self.config.shard_dir.join("cold") })
+    }
+
+    /// The slot records the name the create makes, before `create_tier`, the
+    /// create's first file effect; `bytes` is what the attempt may write.
+    fn begin_create(&mut self, id: u32, path: &Path, bytes: u64) {
+        let meta = ResidueSlot::meta_of(id, path.to_path_buf());
+        self.residue = ResidueSlot::Filling { meta, bytes };
+    }
+
+    /// The create step's end: on success the slot empties and the file's
+    /// id is spent; on any error the name is held for its unlink, due at
+    /// once, and no id is spent (a planted canary,
+    /// `inf_canary_create_residue_dropped`, leaves the slot empty).
+    fn end_create<T>(&mut self, created: &Result<T, TierFlushError>, next: u32) {
+        let filling = core::mem::take(&mut self.residue);
+        let ResidueSlot::Filling { meta, bytes } = filling else {
+            debug_assert!(false, "a create step ends over its Filling slot");
+            return;
+        };
+        match created {
+            Ok(_) => {
+                if !cfg!(inf_canary_create_id_spent_on_failure) {
+                    self.next_id = next;
+                }
+            }
+            Err(_) if cfg!(inf_canary_create_residue_dropped) => {}
+            Err(_) => {
+                let due = inf_foundation::time::Nanos(0);
+                self.residue = ResidueSlot::Held { meta, due, bytes };
+            }
+        }
     }
 
     /// The active file, if any: `(id, base, data_len, durable_len, path)`.
@@ -928,6 +1079,7 @@ impl<F: SegmentFs> TierFlush<F> {
     }
 
     fn create_file(&mut self, base: LogicalAddr) -> Result<(), TierFlushError> {
+        self.admit_create()?;
         let id = self.next_id;
         // No id is ever reused within a namespace lifetime: the last one
         // is refused before any effect.
@@ -945,7 +1097,15 @@ impl<F: SegmentFs> TierFlush<F> {
                 source: crate::fault::injected(crate::fault::TIER_DIR_OPEN_FAIL),
             });
         }
-        let writer = TierWriter::create_with_capacity(
+        // The seam's create writes the header and syncs the directory after
+        // `create_tier`, so a failure may leave the header's bytes: the
+        // residue charges them until its unlink answers.
+        let path = self.config.shard_dir.join("cold").join(crate::tier::tier_file_name(id));
+        self.begin_create(id, &path, crate::tier::TIER_HEADER_BYTES as u64);
+        if cfg!(inf_canary_create_id_spent_on_failure) {
+            self.next_id = next;
+        }
+        let created = TierWriter::create_with_capacity(
             &self.fs,
             &self.config.shard_dir,
             id,
@@ -955,11 +1115,9 @@ impl<F: SegmentFs> TierFlush<F> {
             self.config.mode,
             self.config.file_capacity,
         )
-        .map_err(|source| TierFlushError::Io {
-            path: self.config.shard_dir.join("cold"),
-            source,
-        })?;
-        self.next_id = next;
+        .map_err(|source| TierFlushError::Io { path: self.config.shard_dir.join("cold"), source });
+        self.end_create(&created, next);
+        let writer = created?;
         self.active_id = id;
         self.writer = Some(writer);
         Ok(())
@@ -1830,15 +1988,16 @@ mod tests {
     /// namespace: the file the failed attempt made has an owner, and the
     /// create runs again only once that file is gone, so no retry meets the
     /// name it left. The rotation to B fails once after B is made and named;
-    /// eight more plans follow, as eight MAINTAINs would run them. Each
-    /// clause is read: no retry answers EEXIST, one of them makes the file,
+    /// a create while the residue is held is deferred; then up to eight
+    /// plans follow, each after the cell's walk and the control thread's
+    /// worker as one MAINTAIN runs them (the held residue offered, its file
+    /// unlinked, its result consumed). Each clause is read: no retry answers
+    /// EEXIST, one of them makes the file only after the residue's unlink,
     /// and that file is the one the failed create named, so no file id is
     /// spent.
     #[test]
-    #[ignore = "a create that fails after its file exists leaves that file with no owner, and \
-                every later create of the same name answers EEXIST; red until a failed create's \
-                file is owned from before the create and removed before its name is made again"]
     fn a_create_that_fails_after_its_file_exists_does_not_wedge_the_namespace() {
+        use inf_foundation::time::Nanos;
         const RETRIES: usize = 8;
         let disk = SimDisk::new();
         let mut flush = sim_pipeline(&disk, 1000);
@@ -1853,10 +2012,28 @@ mod tests {
         let b = Path::new("shard-0").join("cold").join(crate::tier::tier_file_name(1));
         assert!(disk.open_read(&b).is_ok(), "engagement: the failed create left B on the disk");
         assert_eq!(flush.next_file_id(), 1, "the failure spent no file id");
+        assert_eq!(flush.residue(), ResidueState::Held(Nanos(0)), "B's file is owned, due now");
+        let deferred = stage(&mut flush, span(600, 600, None), &[0xA1; 600]);
+        assert!(
+            matches!(deferred, Err(TierFlushError::CreateDeferred { .. })),
+            "a create over a held residue is deferred: {deferred:?}"
+        );
         let mut eexist = 0;
+        let mut unlinked_before_create = false;
         let mut created = false;
         let mut refusal_last = None;
         for _ in 0..RETRIES {
+            if let Some(meta) = flush.take_residue(Nanos(0)) {
+                assert_eq!(meta.path, b, "the residue names the failed create's path");
+                match disk.unlink_tier(&meta.path) {
+                    Ok(()) => {
+                        unlinked_before_create = true;
+                        flush.residue_terminal();
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => flush.residue_terminal(),
+                    Err(_) => flush.residue_retry(meta, Nanos(0)),
+                }
+            }
             match stage(&mut flush, span(600, 600, None), &[0xA1; 600]) {
                 Ok(()) => {
                     created = true;
@@ -1884,6 +2061,8 @@ mod tests {
             "none of {RETRIES} creates after the failed one made a file; the last refusal: \
              {refusal_last:?}"
         );
+        assert!(unlinked_before_create, "the residue's unlink removed B before its create");
+        assert_eq!(flush.residue(), ResidueState::Empty, "the slot is empty once B is made");
         let active = flush.active().map(|(.., path)| path.to_path_buf());
         assert_eq!(
             active,
