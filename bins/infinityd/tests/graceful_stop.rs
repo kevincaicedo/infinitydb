@@ -566,11 +566,19 @@ impl Drop for Watchdog {
     }
 }
 
+/// The held leg's stop deadline. Before its transport's rows the stop takes
+/// its checkpoint, whose begin marker waits for its frame's seal and an
+/// everysec sync (up to a second), then its swap's barriers; at 2 s the
+/// deadline sometimes fired inside that checkpoint, before the transport.
+/// 5 s leaves the checkpoint's bound and the box's load their margin.
+const HELD_STOP_DEADLINE_MS: u64 = 5_000;
+
 /// A durable node whose `inf-control` thread is stopped alone: its stop
-/// reaches the transport's rows, each cell's lane is never released by the
-/// held worker, so no cell reaches `Drained` and each cell's stop deadline
-/// fires: the node exits 1 with the timeout's text within the deadline and
-/// 10 s, never 101 (a backing dropped before its retirement) or 134.
+/// takes its checkpoint and reaches the transport's rows, each cell's lane
+/// is never released by the held worker, so no cell reaches `Drained` and
+/// each cell's stop deadline fires: the node exits 1 with the timeout's text
+/// naming the transport within the deadline and 10 s, never 101 (a backing
+/// dropped before its retirement) or 134.
 #[test]
 #[cfg(target_os = "linux")]
 fn a_held_control_thread_ends_the_stop_at_its_deadline() {
@@ -578,7 +586,8 @@ fn a_held_control_thread_ends_the_stop_at_its_deadline() {
     let dir = data_root("held-control");
     let node_pid = std::sync::Arc::new(AtomicU32::new(0));
     let _watchdog = Watchdog::arm(std::sync::Arc::clone(&node_pid), Duration::from_secs(40));
-    let mut server = Server::spawn(&dir, "2", &["--shutdown-timeout-ms", "2000"]);
+    let stop_deadline = HELD_STOP_DEADLINE_MS.to_string();
+    let mut server = Server::spawn(&dir, "2", &["--shutdown-timeout-ms", &stop_deadline]);
     node_pid.store(server.child.id(), Ordering::Relaxed);
     let mut c = Client::connect(server.port);
     c.ok(&[b"INF.NS", b"CREATE", b"held", b"MODE", b"durable", b"FSYNC", b"everysec"]);
@@ -588,7 +597,8 @@ fn a_held_control_thread_ends_the_stop_at_its_deadline() {
     let held = HeldThread::seize(&mut server, tid);
     let status = Command::new("kill").args(["-TERM", &pid.to_string()]).status().expect("kill(1)");
     assert!(status.success(), "kill -TERM failed");
-    let deadline = Instant::now() + Duration::from_millis(2_000) + Duration::from_secs(10);
+    let bound = Duration::from_millis(HELD_STOP_DEADLINE_MS) + Duration::from_secs(10);
+    let deadline = Instant::now() + bound;
     let status = loop {
         held.reap();
         if let Some(status) = held.server.child.try_wait().expect("try_wait") {
@@ -596,7 +606,8 @@ fn a_held_control_thread_ends_the_stop_at_its_deadline() {
         }
         assert!(
             Instant::now() < deadline,
-            "HELD_NODE_NO_EXIT: still running 12 s after SIGTERM with its control thread held: {}",
+            "HELD_NODE_NO_EXIT: still running {} s after SIGTERM with its control thread held: {}",
+            bound.as_secs(),
             held.server.text()
         );
         std::thread::sleep(Duration::from_millis(10));
