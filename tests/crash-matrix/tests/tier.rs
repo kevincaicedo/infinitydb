@@ -547,6 +547,53 @@ fn tier_dir_open_fail_stages_nothing_and_the_sealed_file_recovers() {
     receipt::verified("tier_dir_open_fail", "creation-retried-round-owned");
 }
 
+/// A tier-file creation refused before its file exists: the refused
+/// rotation stages nothing and spends no file id, its name is owned by the
+/// pipeline's residue slot (held, due at once), so the next create is
+/// deferred until its unlink answers, and nothing of it is on the disk, then
+/// or after a cut, while the manifested file recovers.
+#[test]
+fn tier_create_fail_stages_nothing_and_leaves_no_file() {
+    let full = 2 * TIER_FRAME_DATA + 400;
+    let config = TierFlushConfig {
+        shard_dir: Path::new("shard-0").to_path_buf(),
+        cell: 0,
+        ns: NS,
+        mode: TierIoMode::Buffered,
+        file_capacity: full as u64,
+        slice_bytes: PAGE,
+        record_len_max: 16 << 20,
+    };
+    let residue = Path::new("shard-0").join("cold").join("tier-000001.itier");
+    for seed in 0..crash_matrix::seed_count(3) {
+        let disk = SimDisk::new();
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+        let mut flush = TierFlush::new(disk.clone(), config.clone(), 0, &census);
+        flush.set_drive(TierDrive::Reactor);
+        stage_span(&mut flush, LogicalAddr::ZERO, &vec![0xC0; full], None).expect("stage A");
+        run_reactor_round(&disk, &mut flush, true);
+        apply_effects(&mut flush);
+        fault::arm("tier_create_fail", FaultSpec::Nth(1));
+        let at = LogicalAddr::from_raw(full as u64).expect("fits");
+        let err = stage_span(&mut flush, at, &[0xC1; 600], None).expect_err("B's create fails");
+        assert!(err.to_string().contains("tier_create_fail"), "typed + named: {err}");
+        assert!(fault::fired("tier_create_fail") >= 1, "the row is not vacuous");
+        assert!(!flush.round_active(), "seed {seed}: the refused plan staged nothing");
+        assert_eq!(flush.next_file_id(), 1, "seed {seed}: no file id is spent");
+        assert!(
+            matches!(flush.residue(), inf_log::flush::ResidueState::Held(_)),
+            "seed {seed}: the failed create's name is owned"
+        );
+        let deferred = stage_span(&mut flush, at, &[0xC1; 600], None).expect_err("deferred");
+        assert!(deferred.to_string().contains("deferred"), "seed {seed}: {deferred}");
+        assert!(disk.open_read(&residue).is_err(), "seed {seed}: no file was made");
+        disk.power_cut(0xC4EA_7F00 ^ seed);
+        assert!(disk.open_read(&residue).is_err(), "seed {seed}: no file after the cut");
+        fault::disarm_all();
+    }
+    receipt::verified("tier_create_fail", "residue-held-no-file");
+}
+
 /// A tier-file creation that fails after its file exists (the create made
 /// and named the file, then a later step of the same call failed): the
 /// refused rotation stages nothing and spends no file id, and the file it
