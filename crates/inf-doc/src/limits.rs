@@ -21,6 +21,35 @@ pub const DOC_BYTES_MAX: usize = 0xFF_FFFF;
 // compile, the format changed without its ADR.
 const _: () = assert!(DOC_BYTES_MAX <= 0xFF_FFFF);
 
+/// Bytes one serializer step may write past its byte budget: the one token
+/// it never splits, an escape sequence (6 B) or the text of a `null`, a
+/// boolean or a number. A string is never such a token. Crossing: none; a
+/// bounded serialization that refuses leaves at most this many bytes past
+/// its limit for its caller to roll back (ADR-0099 D3), and a fixed-capacity
+/// sink sizes itself to its step budget plus this.
+pub const EMIT_OVERSHOOT_BYTES_MAX: usize = 32;
+
+/// The longest escape sequence, `\u00xx`: what one serializer step may
+/// write past its byte budget inside a string, and the string source it
+/// may examine past it. Crossing: none; a step never splits an escape.
+pub const ESCAPE_BYTES_MAX: usize = 6;
+/// The longest UTF-8 character.
+pub(crate) const CHAR_BYTES_MAX: usize = 4;
+/// Bytes of string one step of the canonical check may examine past its
+/// byte budget: the tail of the one character its window ends inside.
+/// Crossing: none; the check resumes at that character's first byte.
+pub const CHECK_OVERSHOOT_BYTES_MAX: usize = CHAR_BYTES_MAX - 1;
+/// The longest `i64` text, `-9223372036854775808`.
+pub(crate) const I64_TEXT_BYTES_MAX: usize = 20;
+
+const _: () = assert!(EMIT_OVERSHOOT_BYTES_MAX >= ESCAPE_BYTES_MAX);
+const _: () = assert!(EMIT_OVERSHOOT_BYTES_MAX >= I64_TEXT_BYTES_MAX);
+const _: () = assert!(EMIT_OVERSHOOT_BYTES_MAX >= size_of::<zmij::Buffer>());
+// A serializer position is a `u32` offset into one value's bytes or into one
+// document's key dictionary: each lies inside a document of at most the cap,
+// so a token's 4-byte header and its body end below `u32::MAX`.
+const _: () = assert!(DOC_BYTES_MAX + 4 <= u32::MAX as usize);
+
 /// The document bounds one writer applies: nesting depth in containers and
 /// body bytes (the header excluded). The fields are private and `new`
 /// clamps each to [`DocLimits::FORMAT`], so configuration lowers a bound

@@ -67,7 +67,10 @@ missing_debug_implementations = "allow"
 # teeth. Never a Cargo feature, never reachable from a shipped binary.
 # One name a line, in byte order (`bins/inf-sim/tests/lanes.rs` checks
 # it), so two changes that each admit a cfg touch different lines.
+# `fuzzing` is no canary: cargo-fuzz sets it, and under it a library keeps
+# what its fuzz target reads (inf-doc's serializer steps, a step at a time).
 unexpected_cfgs = { level = "deny", check-cfg = [
+    'cfg(fuzzing)',
     'cfg(inf_canary_accept_close_resumes_any)',
     'cfg(inf_canary_accept_retry_at_once)',
     'cfg(inf_canary_accept_retry_late)',
@@ -286,6 +289,18 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_ring_slot_after_release)',
     'cfg(inf_canary_scan_chunk_of_one)',
     'cfg(inf_canary_seal_mark_stride_one)',
+    'cfg(inf_canary_ser_base_ignored)',
+    'cfg(inf_canary_ser_check_whole)',
+    'cfg(inf_canary_ser_check_window_end)',
+    'cfg(inf_canary_ser_drop_straddle)',
+    'cfg(inf_canary_ser_ignore_nodes)',
+    'cfg(inf_canary_ser_key_in_region)',
+    'cfg(inf_canary_ser_measure_skips_separators)',
+    'cfg(inf_canary_ser_options_unchecked)',
+    'cfg(inf_canary_ser_root_str_atomic)',
+    'cfg(inf_canary_ser_scan_to_escape)',
+    'cfg(inf_canary_ser_yield_early)',
+    'cfg(inf_canary_ser_yield_is_ok)',
     'cfg(inf_canary_serve_mark_first)',
     'cfg(inf_canary_serve_mark_skipped)',
     'cfg(inf_canary_settle_held_skipped)',

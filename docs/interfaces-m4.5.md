@@ -20,6 +20,7 @@ Status column tracks arrival.
 | Access-program form v1 | `inf-query` | implemented (M4.5-S09, ADR-0080 — `access::AccessProgram`: one access step + residual + page spec, serialized/versioned, `from_bytes` trust boundary; EXPLAIN rendering golden-pinned) |
 | PartiQL subset v1 (grammar + total compiler + statement cache) | `inf-query` | implemented (M4.5-S09, ADR-0080 — `partiql::compile`/`StatementCache`/`CatalogView`; contract: `docs/partiql-subset.md` + the 303-case golden suite) |
 | Predicate VM bytecode v1 | `inf-query` | implemented (M4.5-S07/S08, ADR-0079 — `predicate::PredicateProgram` + `PredicateVm`; this row lagged those stories and is corrected at S09) |
+| Resumable JSON serializer (a document's bytes stepped through check → measure → emit, each step under a byte budget and a work budget, into a caller's sink) | `inf-doc` | implemented (M4.5-S45 — `OwnedEmit<Check \| Measure \| Emit>`, `StepBudget { bytes_max, nodes_max }`, `EmitSink`, `EmitStep`, `EmitError`; a step passes its byte budget by at most `limits::EMIT_OVERSHOOT_BYTES_MAX` and its work budget by one value; the measured length is the emitted length; plain documents only, the interned form refused) |
 | `QueryOp` codec (fabric v1.2) | `inf-fabric` | pending (M4.5-S11) |
 | Cursor wire format (opaque, CRC + version + shape + {index id, generation} binding) | `inf-server` | pending (M4.5-S11 — the binding half exists as `validate_binding`, S03) |
 

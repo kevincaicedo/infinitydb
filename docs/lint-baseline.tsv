@@ -50,7 +50,6 @@ fn_length	1	crates/inf-doc/src/apply.rs
 fn_length	1	crates/inf-doc/src/json.rs
 fn_length	1	crates/inf-doc/src/merge.rs
 fn_length	1	crates/inf-doc/src/path/eval.rs
-fn_length	1	crates/inf-doc/src/ser.rs
 fn_length	1	crates/inf-doc/src/tape.rs
 fn_length	1	crates/inf-log/src/ckpt/read.rs
 fn_length	1	crates/inf-log/src/reader.rs

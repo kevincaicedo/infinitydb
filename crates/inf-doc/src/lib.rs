@@ -60,6 +60,13 @@ mod merge;
 pub mod model;
 pub mod path;
 pub mod ser;
+// The serializer as it stood before the resumable walk, and the tests that
+// hold the walk to it: test-only files, declared here so every gate that
+// reads production code leaves them out.
+#[cfg(test)]
+mod ser_frozen;
+#[cfg(test)]
+mod ser_tests;
 pub mod tape;
 
 pub use apply::{
@@ -76,10 +83,13 @@ pub use json::{JsonErrorKind, JsonParseError, JsonParser, ParseLimits, parse_num
 pub use limits::DocLimits;
 pub use path::{Matches, PathError, PathErrorKind, PathProgram, PathStep, PathSteps, ProgramCache};
 pub use ser::{
-    Reply, ReplyTooLarge, SerializeOpts, serialize_canonical_into, serialize_into,
+    Check, CheckStep, Emit, EmitError, EmitSink, EmitStep, Measure, MeasureStep, OwnedEmit, Reply,
+    ReplyTooLarge, SerializeOpts, StepBudget, serialize_canonical_into, serialize_into,
     serialize_into_bounded, serialize_number_text, serialize_reply_into,
     serialize_reply_into_bounded,
 };
+#[cfg(any(test, fuzzing))]
+pub use ser::{SlicedStep, measure_sliced, serialize_sliced};
 pub use tape::{CanonicalDoc, DocStr, TapeDoc};
 
 /// The build profile keeps what this crate's tests check. The workspace

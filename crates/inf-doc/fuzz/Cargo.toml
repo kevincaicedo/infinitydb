@@ -51,4 +51,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fuzz_ser_steps"
+path = "fuzz_targets/fuzz_ser_steps.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

@@ -42,5 +42,9 @@ harness = false
 name = "path_eval"
 harness = false
 
+[[bench]]
+name = "ser"
+harness = false
+
 [lints]
 workspace = true

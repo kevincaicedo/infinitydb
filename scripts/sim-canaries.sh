@@ -1507,6 +1507,34 @@ ordered_rows=(
   "inf_canary_ring_release_relaxed loom inf-fabric loom_retained_join_sees_both_endpoints_final_writes JOIN_VISIBILITY_GAP:"
   # The slot write after the release, on the same model as the header read above.
   "inf_canary_ring_slot_after_release loom inf-fabric loom_retained_retirement_before_the_thread_join Causality"
+  # The resumable JSON serializer: a step's rules, one plant each, read by the frozen serializer
+  # and the per-step holds of `inf-doc`'s `ser_tests`.
+  # A value's indentation starts at the depth of the wrapper it nests in. Planted, at 0.
+  "inf_canary_ser_base_ignored crate-test inf-doc lib the_reply_walk_agrees_with_the_frozen_walker the reply bytes differ"
+  # A check step stops at its budgets. Planted, it runs to the document's end.
+  "inf_canary_ser_check_whole crate-test inf-doc lib a_check_step_examines_at_most_its_budgets a check step examined past its budgets"
+  # A string check whose window ends inside a character resumes at the last boundary the
+  # window proved. Planted, at the window's end.
+  "inf_canary_ser_check_window_end crate-test inf-doc lib a_check_window_that_ends_inside_a_character_resumes_at_its_boundary the check's verdict on four-byte characters differs"
+  # A string resumes at its next source byte. Planted, at its first.
+  "inf_canary_ser_drop_straddle crate-test inf-doc lib a_string_of_escapes_straddles_every_step_edge the sliced bytes run past the whole run's length"
+  # A step yields at its work budget. Planted, the budget is not read.
+  "inf_canary_ser_ignore_nodes crate-test inf-doc lib a_step_visits_at_most_its_work_budget_and_one_value a step visited past its work budget"
+  # A tabled key's bytes lie in the dictionary. Planted, they are read from the region.
+  "inf_canary_ser_key_in_region crate-test inf-doc/doc-intern-keys lib a_tabled_key_straddles_every_step_edge the tabled key's bytes differ"
+  # The measure pass counts what the emit pass writes. Planted, it skips a break's indentation.
+  "inf_canary_ser_measure_skips_separators crate-test inf-doc lib the_measure_equals_the_emitted_length the measure differs"
+  # A step with option lengths other than the first measure step's is refused. Planted, taken.
+  "inf_canary_ser_options_unchecked crate-test inf-doc lib a_step_with_changed_option_lengths_is_refused changed options were measured"
+  # A root string is stepped like any string. Planted, it is one token, written whole.
+  "inf_canary_ser_root_str_atomic crate-test inf-doc lib a_root_string_is_stepped_at_every_entry a step wrote past its byte budget"
+  # A string's scan reads no further than its window. Planted, to the string's next escape.
+  "inf_canary_ser_scan_to_escape crate-test inf-doc lib a_step_scans_no_further_than_its_window a step examined past its window"
+  # A step that yields has written. Planted, the byte check reads one byte early, and a step of
+  # one byte yields before it writes.
+  "inf_canary_ser_yield_early crate-test inf-doc lib sliced_steps_equal_the_whole_run_at_every_budget_pair a yield wrote nothing"
+  # A step that yields under a bounded entry is not the value's end. Planted, it is taken for it.
+  "inf_canary_ser_yield_is_ok crate-test inf-doc lib the_bounded_mapping_agrees_with_the_frozen_walker_at_every_limit the bounded verdict differs"
   # A Pending first poll takes its class's spare as its task's slot, so no id names the spare
   # (ADR-0177 D2). Planted, the task takes the spare's handle but the spare stays set, and the
   # next first poll writes over the suspended task, at its address.

@@ -7,6 +7,9 @@
 # a target that enters no decoder says `none: <reason>` in the file column.
 # fuzz target<TAB>file[::item]<TAB>lints<TAB>tier
 inf-doc/fuzz_delta_apply	crates/inf-doc/src/delta.rs	cast,arith	deny
+inf-doc/fuzz_ser_steps	crates/inf-doc/src/ser/step.rs	cast,arith	deny
+inf-doc/fuzz_ser_steps	crates/inf-doc/src/tape.rs	cast,arith	deny
+inf-doc/fuzz_ser_steps	crates/inf-doc/src/ser.rs	cast,arith	deny
 inf-doc/idoc_decode	crates/inf-doc/src/tape.rs	cast,arith	deny
 inf-doc/idoc_decode	crates/inf-doc/src/model.rs	cast,arith	deny
 inf-doc/idoc_decode	crates/inf-doc/src/arena.rs	cast	deny
