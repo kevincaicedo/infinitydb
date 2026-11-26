@@ -76,10 +76,12 @@ use crate::resp::{Reply, SubFrame, parse_reply, parse_sub_frame, reply_len};
 pub mod accept_retry;
 mod audit;
 pub mod capacity;
+pub(crate) mod create_clause;
 pub(crate) mod drop_clause;
 mod idle;
 pub(crate) mod owners;
 mod pub_cross;
+pub(crate) mod retry_pace;
 pub mod shadow;
 
 use audit::{

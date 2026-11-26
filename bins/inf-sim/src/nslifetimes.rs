@@ -39,9 +39,24 @@
 //! 8. a power cut and a reboot: every live name served on every cell, the
 //!    refused ones on none, a drop and a `CREATE` taking the next id.
 //!
+//! Between the held-worker cycle and the churn, the full pass: eight
+//! namespaces, each with a tier file on cell 0 and one on cell 1, dropped
+//! with the worker held, so two cells each hold their 8 job positions out;
+//! the worker then runs, and its pass unlinks 8 of the 16 ready; their
+//! successors restore the node's 64.
+//!
 //! The `control` leg: 63 tiered `CREATE`s flushed on cell 0 and no churn,
 //! so no `CREATE` is refused and no more directories hold open files than
 //! namespaces live.
+//!
+//! The `pace` leg (O6's, steps of at most 201 µs): one namespace's one tier
+//! file dropped with `tier_close_fail` and `tier_unlink_fail` armed once, so
+//! its close fails, then its retry's unlink, then the next unlink removes
+//! it. The `create-fault` leg (O7's): a tiered namespace's first create
+//! refused by `tier_create_fail` once, another's by `tier_create_post_fail`
+//! once, each residue's unlink held across a MAINTAIN; a third's failing on
+//! every attempt `CREATE_EVERY_ATTEMPTS` times; a fourth dropped while its
+//! residue is out.
 //!
 //! Oracles, independent of the grant book, the positions and the drain:
 //! `LIFETIMES`, every step, from the sim disk's own tables: under every
@@ -52,8 +67,14 @@
 //! `CREATE` answers `+OK`, the taken-name error, a tiered or a catalog
 //! capacity line, never an internal error; `HELD-WORKER`: the held-worker
 //! cycle's successor answers `+OK` only once no tier file of the dropped
-//! namespace is left on the disk. Each engagement clause the run
-//! must meet is `VACUOUS` when missed (`engagement`).
+//! namespace is left on the disk; `RETIRE-STEP` (O3's per-step clause, every
+//! leg, every step after recovery): every tier-file unlink is the worker's
+//! pass's and a step makes at most 8; `RETIRE-WINDOW` (O3's window, the
+//! full leg): once every dropped owner has drained, no tier file of a
+//! namespace dropped in the life is on the disk; `RETRY-PACE` (O6, every
+//! leg): a failed close's or unlink's retry lies at least 1 ms after it;
+//! `FAILED-CREATE` (O7, the create-fault leg). Each engagement clause the
+//! run must meet is `VACUOUS` when missed (`engagement`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -64,7 +85,7 @@ use inf_foundation::hash64;
 use inf_foundation::limits::TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX as LIFETIMES;
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::time::{Clock, Nanos, VirtualClock};
-use inf_log::fs::sim::StallConfig;
+use inf_log::fs::sim::{CallResult, DiskCall, StallConfig};
 use inf_server::CkptTarget;
 
 use crate::driver::Violations;
@@ -110,6 +131,29 @@ const FANNED_STEPS: u32 = 24;
 /// Rounds of a settling wait (positions drained, tombstones retired).
 const SETTLE_ROUNDS: u32 = 64;
 const SETTLE_GAP_STEPS: u32 = 16;
+/// The full pass's namespaces: 8 a cell fill its 8 job positions.
+const FULL_PASS_VICTIMS: u32 = 8;
+/// The `pace` leg's largest step: O6's pace leg is judged at steps of at
+/// most 201 µs, so a retry the walk offers early lands within a step or two.
+const PACE_STEP_NS_MAX: u64 = 200_000;
+/// Failed creates the create-fault leg's every-attempt namespace meets
+/// (the record's 10⁴, each a round trip of two steps).
+const CREATE_EVERY_ATTEMPTS: u64 = 10_000;
+/// Steps a held residue's unlink is held after its failed create: more than
+/// one MAINTAIN, so a create runs while the residue's job is out.
+const RESIDUE_HELD_STEPS: u32 = 4;
+/// Steps the every-attempt namespace may take for its failures: two a
+/// failure, with room for the node's other work.
+const CREATE_EVERY_ATTEMPT_STEPS: u64 = 4 * CREATE_EVERY_ATTEMPTS;
+/// Write batches the disk leg may take to seal its first tier file: the
+/// 4 MiB ring wraps after about 22 batches of 64 × 3,000 B.
+const DISK_FILL_BATCHES_MAX: u32 = 64;
+/// Checkpoints the disk leg may request before its dead file retires: the
+/// first stamps the deaths, a later one's swap retires the file.
+const DISK_CKPTS_MAX: u32 = 8;
+/// Writes the disk leg tries at the clamped budget, each refused, and after
+/// the release, until one is admitted.
+const DISK_WRITES_MAX: u32 = 32;
 
 const OK: &[u8] = b"+OK\r\n";
 const LIMIT: &[u8] = b"-ERR tiered namespace limit reached\r\n";
@@ -147,17 +191,29 @@ pub enum LifetimesLeg {
     /// 63 tiered namespaces flushed on one cell and no churn: no refusal,
     /// and no more directories with open files than namespaces live.
     Control,
+    /// O6's pace leg: one retiring file's close and its retry's unlink fail
+    /// once each, on steps of at most 201 µs.
+    Pace,
+    /// O7's leg: failed creates, before and after their file exists, once,
+    /// on every attempt and under a drop.
+    CreateFault,
+    /// §6's disk row: a live namespace's retired file failing its unlink
+    /// on every attempt keeps its bytes counted against the disk budget.
+    Disk,
 }
 
 impl LifetimesLeg {
     /// The legs' names, as `--lifetimes-leg` takes them.
-    pub const NAMES: [&'static str; 2] = ["full", "control"];
+    pub const NAMES: [&'static str; 5] = ["full", "control", "pace", "create-fault", "disk"];
 
     #[must_use]
     pub fn parse(name: &str) -> Option<LifetimesLeg> {
         match name {
             "full" => Some(LifetimesLeg::Full),
             "control" => Some(LifetimesLeg::Control),
+            "pace" => Some(LifetimesLeg::Pace),
+            "create-fault" => Some(LifetimesLeg::CreateFault),
+            "disk" => Some(LifetimesLeg::Disk),
             _ => None,
         }
     }
@@ -165,7 +221,10 @@ impl LifetimesLeg {
     /// The most `ns-<id>` directories a shard may hold files open in.
     fn bound(self) -> usize {
         match self {
-            LifetimesLeg::Full => LIFETIMES,
+            LifetimesLeg::Full
+            | LifetimesLeg::Pace
+            | LifetimesLeg::CreateFault
+            | LifetimesLeg::Disk => LIFETIMES,
             LifetimesLeg::Control => LIFETIMES - 1,
         }
     }
@@ -222,6 +281,17 @@ pub struct NsLifetimesReport {
     /// `ns_drop_tombstones` before the peer refusal and right after it.
     pub tombstones_settled: u64,
     pub tombstones_after_rollback: u64,
+    /// The most tier-file unlinks one judged step made (O3's per-step
+    /// engagement reads 8).
+    pub unlinks_step_max: u64,
+    /// Dropped namespaces O3's window read with no file left.
+    pub window_dropped: u64,
+    /// Retries O6 judged: an attempt after a failure on its path.
+    pub retries_judged: u64,
+    /// Failed creates O7 read.
+    pub failed_creates: u64,
+    /// The disk leg's `DISKFULL` refusals whose `used` was the sim disk's.
+    pub disk_full_refusals: u64,
 }
 
 impl NsLifetimesReport {
@@ -248,8 +318,13 @@ struct Run {
     /// The next key ordinal: every key of the run is a fresh name.
     next_key: u64,
     /// The drop clause (ADR-0156 D3): every dropped namespace's tier-file
-    /// unlink after its `+OK` is the worker's.
+    /// unlink after its `+OK` is the worker's; with it, O3's per-step
+    /// clause.
     drops: crate::harness::drop_clause::DropClause,
+    /// O6: a failed close's or unlink's retry lies 1 ms after it.
+    pace: crate::harness::retry_pace::RetryPace,
+    /// O7: failed creates (the create-fault leg).
+    creates: crate::harness::create_clause::CreateClause,
 }
 
 /// A blob extent file, by its name.
@@ -290,6 +365,12 @@ impl Run {
             .step(&mut self.rng, &self.clock, &self.disk, self.step_ns_max)
             .map_err(|e| format!("step failed: {e}"))?;
         for breach in self.drops.judge(&self.disk) {
+            self.fail(breach);
+        }
+        for breach in self.pace.judge(&self.disk) {
+            self.fail(breach);
+        }
+        for breach in self.creates.judge(&self.disk) {
             self.fail(breach);
         }
         let bound = self.report.leg.bound();
@@ -601,22 +682,44 @@ impl Run {
         Err(format!("the cells never held {held} positions"))
     }
 
-    /// Steps until every cell recovered (bounded).
+    /// Steps until every cell recovered (bounded); from then on O3's and
+    /// O7's clauses judge the life's unlinks and creates.
     fn recover(&mut self) -> Result<(), String> {
-        self.step_until("recovery", |run| run.node.ready())
+        self.step_until("recovery", |run| run.node.ready())?;
+        self.drops.recovered(&self.disk);
+        self.creates.recovered(&self.disk);
+        Ok(())
+    }
+
+    /// The tier-file jobs out on `cell`.
+    fn jobs_out_on(&self, cell: usize) -> u64 {
+        self.node.plane(cell).tier_retire_jobs_out_for_sim()
+    }
+
+    /// Arms `point` once, as the leg's O6 point.
+    fn arm_retry_point(&mut self, point: &'static str) {
+        self.pace.armed(point);
+        inf_foundation::fault::arm(point, FaultSpec::Nth(1));
     }
 }
 
 /// The scenario's node: the m2 durable shape on two or four cells, 64 KiB
 /// segments, a checkpoint every 4 MiB of log, a device whose fsyncs take
-/// 20 ms against steps of at most 1 ms.
-fn scenario(seed: u64) -> DurableScenario {
+/// 20 ms against steps of at most 1 ms (the pace leg's, 200 µs).
+fn scenario(seed: u64, leg: LifetimesLeg) -> DurableScenario {
     let stall = StallConfig { base_ns: 20_000_000, ..m2_stall_config() };
+    let step_ns_max = match leg {
+        LifetimesLeg::Pace => PACE_STEP_NS_MAX,
+        LifetimesLeg::Full
+        | LifetimesLeg::Control
+        | LifetimesLeg::CreateFault
+        | LifetimesLeg::Disk => 1_000_000,
+    };
     DurableScenario {
         cells: if seed.is_multiple_of(2) { 2 } else { 4 },
         segment_bytes: 64 << 10,
         ckpt_interval_bytes: 4 << 20,
-        step_ns_max: 1_000_000,
+        step_ns_max,
         stall: Some(stall),
         ..DurableScenario::m2_durable(seed)
     }
@@ -744,7 +847,7 @@ fn pinned_cycle(
         readers.push(reader);
     }
     run.step_until("a cold read held", |run| run.held(0).1 > 0)?;
-    inf_foundation::fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Nth(1));
+    run.arm_retry_point(inf_log::fault::TIER_UNLINK_FAIL);
     run.drop_ns(admin, victim)?;
     if run.held(0).1 > 0 {
         run.report.cold_reads_across_drop += 1;
@@ -813,7 +916,10 @@ fn held_worker_cycle(
     run.report.unlink_every_attempt += failed;
     run.report.unlink_failures += failed;
     match reply? {
-        reply if reply == OK => held_worker_accepted(run, id, "with every unlink failing"),
+        reply if reply == OK => {
+            held_worker_accepted(run, id, "with every unlink failing");
+            return run.flush_on_cell_0(successor);
+        }
         reply if reply == BUSY => run.report.refused_busy += 1,
         reply => return Err(format!("a failing-unlink CREATE answered {reply:?}")),
     }
@@ -830,6 +936,58 @@ fn held_worker_accepted(run: &mut Run, id: u32, while_: &str) {
             "HELD-WORKER: the successor's CREATE answered +OK {while_}, {left} tier files of \
              dropped namespace {id} still on the disk"
         ));
+    }
+}
+
+/// Phase 4b, the full pass (O3's per-step engagement): `FULL_PASS_VICTIMS`
+/// live namespaces, each flushed on cell 1 beside its file on cell 0, are
+/// dropped with the worker held, until cells 0 and 1 each hold their 8 job
+/// positions out; the worker then runs, and one pass may unlink only 8 of
+/// the 16 ready (the per-step clause reads each step). Their successors
+/// restore the node's 64 lifetimes.
+fn full_pass_cycle(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
+    let victims: Vec<Vec<u8>> = (3..3 + FULL_PASS_VICTIMS).map(|index| name("t", index)).collect();
+    let mut ids = Vec::new();
+    for victim in &victims {
+        let before = run.dirs_on(1);
+        run.write_until(victim, 1, "flushed on cell 1", move |run| run.dirs_on(1) > before)?;
+        let id = run.node.plane(0).keyspace().ns_get(victim).map(|spec| spec.id.0);
+        ids.push(id.ok_or_else(|| "a full-pass victim is not live".to_string())?);
+    }
+    run.node.hold_retire = u64::MAX;
+    for victim in &victims {
+        run.drop_ns(admin, victim)?;
+    }
+    let full = u64::try_from(inf_foundation::limits::TIER_RETIRE_JOBS_PER_CELL).unwrap_or(8);
+    let held = run.step_until("two cells' job positions out", move |run| {
+        run.jobs_out_on(0) == full && run.jobs_out_on(1) == full
+    });
+    run.node.hold_retire = 0;
+    held?;
+    run.step_until("the full pass's files gone", move |run| {
+        ids.iter().all(|&id| run.tier_files_of(id) == 0)
+    })?;
+    for index in 0..FULL_PASS_VICTIMS {
+        run.create_until_ok(admin, &name("q", index))?;
+    }
+    Ok(())
+}
+
+/// O3's window on the full leg: once every dropped owner on every cell has
+/// drained (the caller's `wait_positions`), no tier file of a namespace
+/// dropped in this life is on the disk.
+fn retire_window(run: &mut Run) {
+    let dropped: Vec<u32> = run.drops.dropped().collect();
+    for id in dropped {
+        let left = run.tier_files_of(id);
+        if left > 0 {
+            run.fail(format!(
+                "RETIRE-WINDOW: {left} tier files of dropped namespace {id} on the disk once \
+                 every dropped owner drained"
+            ));
+        } else {
+            run.report.window_dropped += 1;
+        }
     }
 }
 
@@ -1044,24 +1202,28 @@ fn peer_refusal(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
     tombstones_to(run, admin, settled, settled + 1, rounds + 1).map(|_| ())
 }
 
-/// Runs one seeded `m4-ns-lifetimes` leg.
-fn run_observed(seed: u64, leg: LifetimesLeg, observer: TraceObserver) -> NsLifetimesReport {
-    let scenario = scenario(seed);
-    let clock = Rc::new(VirtualClock::new(Nanos(1)));
+/// A booted leg's run on `scenario`, or the report of its refused boot.
+fn new_run(
+    scenario: &DurableScenario,
+    seed: u64,
+    leg: LifetimesLeg,
+    observer: &TraceObserver,
+    clock: &Rc<VirtualClock>,
+) -> Result<Run, Box<NsLifetimesReport>> {
     let disk = build_disk(seed, scenario.stall.as_ref());
     let report = empty_report(scenario.cells, leg);
-    let node = match boot(&scenario, PathBuf::from("node"), &disk, &clock, &observer) {
+    let node = match boot(scenario, PathBuf::from("node"), &disk, clock, observer) {
         Ok(node) => node,
         Err(err) => {
             let mut report = report;
             report.violations.push(format!("boot failed: {err}"));
-            return finish(report, &observer, &clock);
+            return Err(Box::new(report));
         }
     };
-    let mut run = Run {
+    Ok(Run {
         node,
         rng: SplitMix64::new(seed ^ 0x11FE_7135),
-        clock: Rc::clone(&clock),
+        clock: Rc::clone(clock),
         disk: disk.clone(),
         step_ns_max: scenario.step_ns_max,
         report,
@@ -1069,17 +1231,32 @@ fn run_observed(seed: u64, leg: LifetimesLeg, observer: TraceObserver) -> NsLife
         live: BTreeMap::new(),
         refused: Vec::new(),
         next_key: 0,
-        drops: crate::harness::drop_clause::DropClause::default(),
+        drops: crate::harness::drop_clause::DropClause::per_step(),
+        pace: crate::harness::retry_pace::RetryPace::default(),
+        creates: crate::harness::create_clause::CreateClause::default(),
+    })
+}
+
+/// Runs one seeded `m4-ns-lifetimes` leg.
+fn run_observed(seed: u64, leg: LifetimesLeg, observer: TraceObserver) -> NsLifetimesReport {
+    let scenario = scenario(seed, leg);
+    let clock = Rc::new(VirtualClock::new(Nanos(1)));
+    let mut run = match new_run(&scenario, seed, leg, &observer, &clock) {
+        Ok(run) => run,
+        Err(report) => return finish(*report, &observer, &clock),
     };
     if let Err(err) = phases(&mut run) {
         run.fail(err);
         return finish(run.report, &observer, &clock);
     }
-    if leg == LifetimesLeg::Control {
-        control_checks(&mut run);
-        return finish(run.report, &observer, &clock);
+    match leg {
+        LifetimesLeg::Control => control_checks(&mut run),
+        LifetimesLeg::Pace | LifetimesLeg::CreateFault | LifetimesLeg::Disk => {
+            leg_engagement(&mut run);
+        }
+        LifetimesLeg::Full => return reboot(run, &scenario, seed, &observer, &clock),
     }
-    reboot(run, &scenario, seed, &observer, &clock)
+    finish(fold_report(run), &observer, &clock)
 }
 
 /// The cut and the reboot: the old node is gone before the disk is cut;
@@ -1102,9 +1279,13 @@ fn reboot(
         live,
         refused,
         next_key,
-        drops,
+        mut drops,
+        mut pace,
+        creates,
     } = run;
     drop(node);
+    drops.reboot();
+    pace.reboot(&disk);
     observer.power_cut(&disk, run_clock.now(), seed ^ 0x11FE_0C07);
     let node = match boot(scenario, PathBuf::from("node"), &disk, &run_clock, observer) {
         Ok(node) => node,
@@ -1126,12 +1307,14 @@ fn reboot(
         refused,
         next_key,
         drops,
+        pace,
+        creates,
     };
     if let Err(err) = after_cut(&mut run) {
         run.fail(err);
     }
     engagement(&mut run);
-    finish(run.report, observer, clock)
+    finish(fold_report(run), observer, clock)
 }
 
 fn empty_report(cells: u16, leg: LifetimesLeg) -> NsLifetimesReport {
@@ -1164,13 +1347,45 @@ fn empty_report(cells: u16, leg: LifetimesLeg) -> NsLifetimesReport {
         refused_leg: 0,
         tombstones_settled: 0,
         tombstones_after_rollback: 0,
+        unlinks_step_max: 0,
+        window_dropped: 0,
+        retries_judged: 0,
+        failed_creates: 0,
+        disk_full_refusals: 0,
     }
 }
 
-/// Phases 1–7 on one life (the control leg: phase 1 alone).
+/// The run's clause counts into its report.
+fn fold_report(run: Run) -> NsLifetimesReport {
+    let mut report = run.report;
+    report.unlinks_step_max = run.drops.unlinks_step_max();
+    report.retries_judged = run.pace.retries;
+    report
+}
+
+/// The pace and create-fault legs' engagement: O6's points, O7's points.
+fn leg_engagement(run: &mut Run) {
+    let vacuous = match run.report.leg {
+        LifetimesLeg::Pace | LifetimesLeg::Disk => run.pace.engagement(),
+        LifetimesLeg::CreateFault => run.creates.engagement(),
+        LifetimesLeg::Full | LifetimesLeg::Control => Vec::new(),
+    };
+    for what in vacuous {
+        run.fail(what);
+    }
+}
+
+/// Phases 1–7 on one life (the control leg: phase 1 alone; the pace and
+/// create-fault legs their own).
 fn phases(run: &mut Run) -> Result<(), String> {
     run.recover()?;
     let mut admin = MiniClient::connect(&mut run.node, 0);
+    match run.report.leg {
+        LifetimesLeg::Pace => return pace_leg(run, &mut admin),
+        LifetimesLeg::CreateFault => return create_fault_leg(run, &mut admin),
+        LifetimesLeg::Disk => return disk_leg(run, &mut admin),
+        LifetimesLeg::Full | LifetimesLeg::Control => {}
+    }
     fill(run, &mut admin)?;
     if run.report.leg == LifetimesLeg::Control {
         return run.idle(256);
@@ -1178,11 +1393,306 @@ fn phases(run: &mut Run) -> Result<(), String> {
     extent_cycle(run, &mut admin, b"t00", b"n00")?;
     pinned_cycle(run, &mut admin, b"t01", b"n01")?;
     held_worker_cycle(run, &mut admin, b"t02", b"n02")?;
+    full_pass_cycle(run, &mut admin)?;
     let last = churn(run, &mut admin, b"n02".to_vec())?;
     run.drop_ns(&mut admin, &last)?;
     run.wait_positions(LIFETIMES as u64 - 1)?;
+    retire_window(run);
     disconnects(run, &mut admin)?;
     peer_refusal(run, &mut admin)
+}
+
+/// O6's pace leg: one namespace flushed on cell 0, its one tier file
+/// dropped with `tier_close_fail` and `tier_unlink_fail` armed once: the
+/// worker's close fails, then its retry's unlink, then the next unlink
+/// removes the file. O6 judges each retry's distance from its failure.
+fn pace_leg(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
+    let ns = b"s00".to_vec();
+    if run.create(admin, &ns)? != OK {
+        return Err("the pace leg's CREATE was refused".to_string());
+    }
+    run.flush_on_cell_0(&ns)?;
+    let id = run.node.plane(0).keyspace().ns_get(&ns).map(|spec| spec.id.0);
+    let id = id.ok_or_else(|| "the pace leg's namespace is not live".to_string())?;
+    run.arm_retry_point(inf_log::fault::TIER_CLOSE_FAIL);
+    run.arm_retry_point(inf_log::fault::TIER_UNLINK_FAIL);
+    run.drop_ns(admin, &ns)?;
+    let gone = run.step_until("the paced file gone", move |run| run.tier_files_of(id) == 0);
+    let fired = [inf_log::fault::TIER_CLOSE_FAIL, inf_log::fault::TIER_UNLINK_FAIL]
+        .map(inf_foundation::fault::fired);
+    inf_foundation::fault::disarm_all();
+    gone?;
+    if fired != [1, 1] {
+        run.fail(format!(
+            "VACUOUS RETRY-PACE: the pace leg's points fired {fired:?}, not once each"
+        ));
+    }
+    run.report.unlink_failures += fired[1];
+    run.wait_positions(0)
+}
+
+/// Writes to `ns` on cell 0, the worker held, until `point` has failed a
+/// create; then holds the residue's unlink `RESIDUE_HELD_STEPS` more steps,
+/// each a MAINTAIN with the residue's job out, and releases the worker.
+fn fail_held_create(run: &mut Run, ns: &[u8], point: &'static str) -> Result<(), String> {
+    inf_foundation::fault::arm(point, FaultSpec::Nth(1));
+    run.node.hold_retire = u64::MAX;
+    let failed = run
+        .write_until(ns, 0, "met a create failure", move |_| {
+            inf_foundation::fault::fired(point) > 0
+        })
+        .and_then(|()| run.idle(RESIDUE_HELD_STEPS));
+    let out = run.jobs_out_on(0);
+    run.node.hold_retire = 0;
+    inf_foundation::fault::disarm(point);
+    failed?;
+    if out > 0 {
+        run.creates.held(point);
+    }
+    Ok(())
+}
+
+/// O7's create-fault leg: `f00`'s first create refused before its file
+/// exists, `f01`'s after, each residue's unlink held across a MAINTAIN;
+/// `f02`'s failing on every attempt `CREATE_EVERY_ATTEMPTS` times; `f03`
+/// dropped while its failed create's residue is out. Each namespace's file
+/// is then made under the name its failed create named.
+fn create_fault_leg(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
+    let points = [inf_log::fault::TIER_CREATE_FAIL, inf_log::fault::TIER_CREATE_POST_FAIL];
+    for (index, point) in points.into_iter().enumerate() {
+        let ns = name("f", index as u32);
+        if run.create(admin, &ns)? != OK {
+            return Err("a create-fault leg's CREATE was refused".to_string());
+        }
+        let before = run.dirs_on(0);
+        fail_held_create(run, &ns, point)?;
+        run.step_until("the failed create's name made", move |run| run.dirs_on(0) > before)?;
+    }
+    every_attempt(run, admin)?;
+    dropped_with_residue_out(run, admin)?;
+    run.idle(SETTLE_GAP_STEPS)?;
+    for breach in run.creates.left_files(&run.disk) {
+        run.fail(breach);
+    }
+    run.report.failed_creates = run.creates.failed_creates;
+    Ok(())
+}
+
+/// `f02`'s create on every attempt: `tier_create_post_fail` armed always
+/// until it fired `CREATE_EVERY_ATTEMPTS` times, one residue at a time,
+/// then disarmed; the next create makes the name every failure named.
+fn every_attempt(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
+    let point = inf_log::fault::TIER_CREATE_POST_FAIL;
+    let ns = name("f", 2);
+    if run.create(admin, &ns)? != OK {
+        return Err("the every-attempt CREATE was refused".to_string());
+    }
+    let before = run.dirs_on(0);
+    let fired_before = inf_foundation::fault::fired(point);
+    inf_foundation::fault::arm(point, FaultSpec::Always);
+    let failed = move |_: &Run| inf_foundation::fault::fired(point) > fired_before;
+    let mut tried = run.write_until(&ns, 0, "met a create failure", failed);
+    let mut steps = 0u64;
+    while tried.is_ok()
+        && inf_foundation::fault::fired(point) - fired_before < CREATE_EVERY_ATTEMPTS
+    {
+        if steps == CREATE_EVERY_ATTEMPT_STEPS {
+            tried = Err(format!(
+                "VACUOUS FAILED-CREATE: {} of {CREATE_EVERY_ATTEMPTS} failed creates in \
+                 {CREATE_EVERY_ATTEMPT_STEPS} steps",
+                inf_foundation::fault::fired(point) - fired_before
+            ));
+            break;
+        }
+        tried = run.step();
+        steps += 1;
+    }
+    inf_foundation::fault::disarm(point);
+    tried?;
+    run.step_until("the every-attempt name made", move |run| run.dirs_on(0) > before)
+}
+
+/// `f03` dropped while its failed create's residue is out: its owner drains
+/// only once the residue's result is consumed, and no file of it is left.
+fn dropped_with_residue_out(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
+    let point = inf_log::fault::TIER_CREATE_POST_FAIL;
+    let ns = name("f", 3);
+    if run.create(admin, &ns)? != OK {
+        return Err("the dropped residue's CREATE was refused".to_string());
+    }
+    let fired_before = inf_foundation::fault::fired(point);
+    inf_foundation::fault::arm(point, FaultSpec::Nth(1));
+    run.node.hold_retire = u64::MAX;
+    let failed = move |_: &Run| inf_foundation::fault::fired(point) > fired_before;
+    let tried = run.write_until(&ns, 0, "met a create failure", failed);
+    inf_foundation::fault::disarm(point);
+    let id = run.node.plane(0).keyspace().ns_get(&ns).map(|spec| spec.id.0);
+    let dropped = tried.and_then(|()| run.drop_ns(admin, &ns));
+    run.node.hold_retire = 0;
+    dropped?;
+    run.wait_positions(3)?;
+    if let Some(id) = id
+        && run.tier_files_of(id) > 0
+    {
+        run.fail(format!("FAILED-CREATE: a file of {id}, dropped with its residue out, is left"));
+    }
+    Ok(())
+}
+
+/// The bytes of namespace `id`'s tier files under `cell`'s shard, read from
+/// the sim disk's own files (each file's length).
+fn disk_tier_bytes(run: &Run, cell: usize, id: u32) -> u64 {
+    let (shard, dir) = (format!("shard-{cell}"), format!("ns-{id}"));
+    let named = run.disk.names_where(is_tier_file);
+    let under = |path: &&PathBuf| {
+        let parts: Vec<_> = path.components().map(|part| part.as_os_str().to_owned()).collect();
+        parts.iter().any(|part| *part == *shard) && parts.iter().any(|part| *part == *dir)
+    };
+    named
+        .iter()
+        .filter(under)
+        .filter_map(|path| {
+            use inf_log::fs::{SegmentFile, SegmentFs};
+            run.disk.open_read(path).ok()?.file_size().ok()
+        })
+        .sum()
+}
+
+/// §6's disk row (KF12's oracle), O6's points armed: a live namespace on
+/// cell 0 fills until its first tier file seals, every key is deleted, and
+/// checkpoints retire the dead file while `tier_unlink_fail` fails each of
+/// its unlinks. With the budget clamped to the sim disk's bytes of the
+/// namespace's tier files, a write is refused `DISKFULL` and the refusal's
+/// `used` is those bytes: the retiring file is still counted. Disarmed, the
+/// worker unlinks it, and a write is admitted again.
+fn disk_leg(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
+    let ns = b"d00".to_vec();
+    if run.create(admin, &ns)? != OK {
+        return Err("the disk leg's CREATE was refused".to_string());
+    }
+    let id = run.node.plane(0).keyspace().ns_get(&ns).map(|spec| spec.id.0);
+    let id = id.ok_or_else(|| "the disk leg's namespace is not live".to_string())?;
+    let mut client = run.use_ns(0, &ns)?;
+    let mut written = Vec::new();
+    for _ in 0..DISK_FILL_BATCHES_MAX {
+        if run.tier_files_of(id) >= 2 {
+            break;
+        }
+        let keys = run.owned_keys(0, "d", FLUSH_BATCH);
+        run.write_inline(&mut client, &keys)?;
+        written.extend(keys);
+        run.idle(FLUSH_SETTLE_STEPS)?;
+    }
+    if run.tier_files_of(id) < 2 {
+        return Err("VACUOUS RETIRE-CHARGE: the disk leg's first tier file never sealed".into());
+    }
+    for key in &written {
+        client.send(&mut run.node, &[b"DEL", key]);
+    }
+    for _ in &written {
+        run.reply(&mut client)?;
+    }
+    run.pace.armed(inf_log::fault::TIER_UNLINK_FAIL);
+    inf_foundation::fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Always);
+    let charged = disk_charge(run, admin, &mut client, id, &ns);
+    run.report.unlink_failures += inf_foundation::fault::fired(inf_log::fault::TIER_UNLINK_FAIL);
+    inf_foundation::fault::disarm(inf_log::fault::TIER_UNLINK_FAIL);
+    charged?;
+    disk_release(run, &mut client, id)
+}
+
+/// The disk leg's clamp, the retired file failing: checkpoints until a
+/// tier file of the namespace failed its unlink, then the budget set to the
+/// sim disk's bytes of its files, and a write refused with those bytes.
+fn disk_charge(
+    run: &mut Run,
+    admin: &mut MiniClient,
+    client: &mut MiniClient,
+    id: u32,
+    ns: &[u8],
+) -> Result<(), String> {
+    let point = CallResult::Injected(inf_log::fault::TIER_UNLINK_FAIL);
+    let dir = format!("ns-{id}");
+    let from = run.disk.logged_calls(0).len();
+    let failed = move |run: &Run| {
+        run.disk.logged_calls(from).iter().any(|entry| {
+            entry.call == DiskCall::UnlinkTier
+                && entry.result == point
+                && entry.path.components().any(|part| part.as_os_str() == dir.as_str())
+        })
+    };
+    for _ in 0..DISK_CKPTS_MAX {
+        if failed(run) {
+            break;
+        }
+        let reply = run.call(admin, &[b"INF.CKPT", b"WAIT"])?;
+        if reply != OK {
+            return Err(format!("INF.CKPT WAIT answered {reply:?}"));
+        }
+        run.idle(SETTLE_GAP_STEPS)?;
+    }
+    if !failed(run) {
+        return Err(
+            "VACUOUS RETIRE-CHARGE: no retired file of the disk leg failed its unlink".into()
+        );
+    }
+    run.idle(SETTLE_GAP_STEPS)?;
+    let actual = disk_tier_bytes(run, 0, id);
+    let budget = actual.to_string().into_bytes();
+    let reply = run.call(admin, &[b"INF.NS", b"SET", ns, b"DISK-BUDGET", &budget])?;
+    if reply != OK {
+        return Err(format!("DISK-BUDGET {actual} answered {reply:?}"));
+    }
+    // The clamp reaches admission at the namespace's next MAINTAIN.
+    run.idle(SETTLE_GAP_STEPS)?;
+    let value = vec![b'v'; INLINE_BYTES];
+    for _ in 0..DISK_WRITES_MAX {
+        let key = run.owned_keys(0, "dc", 1).remove(0);
+        let reply = run.call(client, &[b"SET", &key, &value])?;
+        let now = disk_tier_bytes(run, 0, id);
+        if !reply.starts_with(b"-DISKFULL") {
+            run.fail(format!(
+                "RETIRE-CHARGE: a write answered {:?} at a budget of the sim disk's {actual} \
+                 bytes, the retired file failing its unlink on the disk",
+                String::from_utf8_lossy(&reply)
+            ));
+            return Ok(());
+        }
+        let expected = format!("(used={now} budget={actual})");
+        if String::from_utf8_lossy(&reply).contains(&expected) {
+            run.report.disk_full_refusals += 1;
+        } else {
+            run.fail(format!(
+                "RETIRE-CHARGE: the refusal {:?} counts other than the sim disk's {now} bytes of \
+                 the namespace's tier files",
+                String::from_utf8_lossy(&reply)
+            ));
+            return Ok(());
+        }
+        run.idle(1)?;
+    }
+    Ok(())
+}
+
+/// The disk leg's release: the plant disarmed, the worker unlinks the
+/// retired file at its next retry, and a write is admitted again.
+fn disk_release(run: &mut Run, client: &mut MiniClient, id: u32) -> Result<(), String> {
+    let before = run.tier_files_of(id);
+    run.step_until("the retired file unlinked", move |run| run.tier_files_of(id) < before)?;
+    let value = vec![b'v'; INLINE_BYTES];
+    for _ in 0..DISK_WRITES_MAX {
+        let key = run.owned_keys(0, "dr", 1).remove(0);
+        let reply = run.call(client, &[b"SET", &key, &value])?;
+        if reply == OK {
+            return Ok(());
+        }
+        if !reply.starts_with(b"-DISKFULL") {
+            return Err(format!("a released write answered {reply:?}"));
+        }
+        run.idle(SETTLE_GAP_STEPS)?;
+    }
+    run.fail("RETIRE-CHARGE: admission never reopened once the retired file was gone".to_string());
+    Ok(())
 }
 
 /// The control leg's verdict: no refusal, and the directories holding open
@@ -1251,6 +1761,15 @@ fn engagement(run: &mut Run) {
     if let Some(vacuous) = run.drops.engagement() {
         run.fail(vacuous);
     }
+    if let Some(vacuous) = run.drops.step_engagement() {
+        run.fail(vacuous);
+    }
+    if run.report.window_dropped == 0 {
+        run.fail("VACUOUS RETIRE-WINDOW: no dropped namespace was read at the window".to_string());
+    }
+    for vacuous in run.pace.engagement() {
+        run.fail(vacuous);
+    }
 }
 
 fn finish(
@@ -1276,4 +1795,91 @@ pub fn run_ns_lifetimes_scenario(seed: u64, leg: LifetimesLeg) -> NsLifetimesRep
     report.cap_rows_crossed = sealed.census.rows_crossed;
     report.violations.extend(sealed.census.violations);
     report
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inf_runtime::OwnerPhase;
+
+    /// Steps TF1 waits for a disk entry or a role's phase: the run's own
+    /// step bound, far above the few steps each needs.
+    const TF1_STEPS_MAX: u32 = 4_096;
+
+    /// The position of the first entry from `from` on whose path is `path`
+    /// and which `wanted` accepts, stepping the run until it is logged.
+    fn await_entry(
+        run: &mut Run,
+        from: usize,
+        what: &str,
+        wanted: impl Fn(&inf_log::fs::sim::LoggedCall) -> bool,
+    ) -> inf_log::fs::sim::LoggedCall {
+        for _ in 0..TF1_STEPS_MAX {
+            if let Some(entry) = run.disk.logged_calls(from).into_iter().find(|entry| wanted(entry))
+            {
+                return entry;
+            }
+            run.step().expect("a step");
+        }
+        panic!("TF1: {what} never logged in {TF1_STEPS_MAX} steps");
+    }
+
+    /// TF1, the retirement role (ADR-0154 A1, ADR-0156 D3): an idle durable
+    /// cell whose one retiring owner, a dropped namespace's tier file,
+    /// failed its unlink once. At the step after the worker's failed
+    /// attempt the cell has consumed the `Retry`: its role is Armed on the
+    /// cell's timer set at a deadline in [due, due + 1 ms] (the set rounds
+    /// up to whole milliseconds), the heap's earliest deadline at or before
+    /// it. The walk then offers the file again once the delivery's turn is
+    /// past its due, and the worker unlinks it, `Ok`, at or after the due.
+    #[test]
+    fn tf1_a_retried_files_due_arms_the_retirement_role() {
+        const SEED: u64 = 0x2;
+        let leg = LifetimesLeg::Pace;
+        let scenario = scenario(SEED, leg);
+        let clock = Rc::new(VirtualClock::new(Nanos(1)));
+        let observer = TraceObserver::default();
+        let Ok(mut run) = new_run(&scenario, SEED, leg, &observer, &clock) else {
+            panic!("TF1: the node's boot was refused");
+        };
+        run.recover().expect("recovered");
+        let mut admin = MiniClient::connect(&mut run.node, 0);
+        assert_eq!(run.create(&mut admin, b"r00").expect("a reply"), OK);
+        run.flush_on_cell_0(b"r00").expect("flushed");
+        let from = run.disk.logged_calls(0).len();
+        inf_foundation::fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Nth(1));
+        run.drop_ns(&mut admin, b"r00").expect("dropped");
+        let point = CallResult::Injected(inf_log::fault::TIER_UNLINK_FAIL);
+        let failed = await_entry(&mut run, from, "the injected unlink failure", |entry| {
+            entry.call == DiskCall::UnlinkTier && entry.result == point
+        });
+        inf_foundation::fault::disarm_all();
+        run.step().expect("the step that consumes the Retry");
+        let timers = run.node.cell_loop(0).timer_set();
+        let (phase, due) = run
+            .node
+            .plane(0)
+            .tier_retire_role_for_sim(timers)
+            .expect("TF1-ROLE: the durable cell holds no retirement role");
+        let deadline = timers.next_deadline();
+        assert_eq!(
+            phase,
+            OwnerPhase::Armed,
+            "TF1-ROLE: the consumed Retry left the role {phase:?}, due {due:?}"
+        );
+        let deadline = deadline.expect("TF1-ROLE: no deadline armed");
+        assert!(
+            due <= deadline && deadline.0 <= due.0 + 1_000_000,
+            "TF1-ROLE: the role's deadline {deadline:?} is not within 1 ms after its due {due:?}"
+        );
+        let removed = await_entry(&mut run, from, "the retry's removal", |entry| {
+            entry.call == DiskCall::UnlinkTier
+                && entry.path == failed.path
+                && entry.result == CallResult::Ok
+        });
+        let at = removed.mark.map(|mark| mark.at).expect("a marked unlink");
+        assert!(at >= due, "TF1-ROLE: the retry's unlink at {at:?}, before its due {due:?}");
+        let breaches = run.report.violations.len();
+        assert_eq!(breaches, 0, "the run's own oracles: {:?}", run.report.violations);
+    }
 }

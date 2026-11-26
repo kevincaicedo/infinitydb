@@ -2463,6 +2463,13 @@ impl Node {
         &mut self.cells[cell].1
     }
 
+    /// `cell`'s loop, read between scheduler steps (its timer set's phases
+    /// and earliest deadline).
+    #[cfg(test)]
+    pub(crate) fn cell_loop(&self, cell: usize) -> &SimLoop {
+        &self.cells[cell].0
+    }
+
     /// `cell`'s sim driver, read between scheduler steps: the harness's own
     /// reading of the ops its device holds.
     pub(crate) fn driver(&self, cell: usize) -> &SimDriver {
