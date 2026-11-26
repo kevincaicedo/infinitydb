@@ -172,6 +172,13 @@ pub struct RetainedProducer<T> {
 /// dropping it releases it.
 ///
 /// ```compile_fail,E0277
+/// fn clone_it<T: Clone>(_: &T) {}
+/// fn check(consumer: &inf_fabric::RetainedConsumer<u64>) {
+///     clone_it(consumer);
+/// }
+/// ```
+///
+/// ```compile_fail,E0277
 /// fn send_it<T: Send>(_: T) {}
 /// fn check(consumer: inf_fabric::RetainedConsumer<std::rc::Rc<u8>>) {
 ///     send_it(consumer);
