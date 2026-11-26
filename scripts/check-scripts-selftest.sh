@@ -3226,13 +3226,16 @@ expect red "canaries: a shard past the last cfg holds no row" env INF_CANARY_SHA
 # canary_lane <dir> <row>… [-- <row>…]: a copy of the lane in the fixture
 # checkout <dir>, which builds in a root of its own there: the rows before
 # `--` are the table's first part, where a cfg's rows may stand apart, and
-# the rows after it the ordered part.
+# the rows after it the ordered part. The checkout holds one Rust file that
+# names no way out of a process group, for the lane's premise to read.
 canary_lane() {
     local dir=$1
     shift
     [ -n "$dir" ] && [ -d "$dir" ] && [ "$#" -gt 0 ] || { echo "canary_lane: no checkout or no row" >&2; exit 2; }
-    mkdir -p "$dir/scripts"
+    mkdir -p "$dir/scripts" "$dir/crates/fixture/src" "$dir/bins" "$dir/tests"
+    echo "pub fn fixture() {}" >"$dir/crates/fixture/src/lib.rs"
     cp ./scripts/target-root.sh "$dir/scripts/target-root.sh"
+    cp ./scripts/source-files.sh "$dir/scripts/source-files.sh"
     printf '%s\n' "$@" | awk '
         BEGIN { part = 0 }
         NR == FNR { if ($0 == "--") part = 1; else table[part, ++n[part]] = $0; next }
@@ -3339,6 +3342,28 @@ expect_output "canaries: a lane copy with a Loom row catches it" "sim-canaries: 
 expect green "canaries: the Loom plant built in its cfg's directory" grep -qx "cold canary-inf_canary_m" "$dir/planted-dirs"
 expect green "canaries: no planted directory is left after the Loom row" test -z "$(ls -d "$dir"/target/canary-* 2>/dev/null)"
 expect green "canaries: the plain Loom tree stays" test -d "$dir/target/loom"
+# The process-group premise: the lane's own table is read with its tree, and a
+# Rust file under crates/, bins/ or tests/ that spells a way out of a process
+# group is a scope error naming its line, each spelling, before any build.
+dir="$work/canary-group-premise"
+mkdir -p "$dir"
+lane_cargo "$dir/cargo"
+canary_lane "$dir" "inf_canary_a $row"
+expect_output "canaries: the table check reads the tree's Rust files for a way out of a process group" "table only: 1 rows well formed, the last 0 ordered by cfg; 1 Rust files read, none leaving its process group; nothing built or run" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_TABLE_ONLY=1 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+for spelling in setsid setpgid setpgrp process_group pre_exec; do
+    echo "fn spawn(command: &mut Command) { command.$spelling(0); }" >"$dir/tests/escape.rs"
+    expect_red_because "canaries: a Rust file naming $spelling is a scope error naming its line" "^tests/escape.rs:1: fn spawn(command: &mut Command) { command.$spelling(0); }$" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_TABLE_ONLY=1 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+done
+expect_red_because "canaries: the lane's run refuses the way out before its first build" "a Rust file names a way out of a process group" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+expect red "canaries: no planted build ran beside a way out of a process group" test -e "$dir/planted-dirs"
+echo "fn spawn(command: &mut Command) { command.arg(0); }" >"$dir/tests/escape.rs"
+expect_output "canaries: the premise reads every Rust file, two once one is added" "; 2 Rust files read, none leaving its process group;" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_TABLE_ONLY=1 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+mv "$dir/crates" "$dir/crates-aside"
+mv "$dir/tests" "$dir/tests-aside"
+mkdir -p "$dir/crates" "$dir/tests"
+expect_red_because "canaries: a tree with no Rust file to read is a scope error" "SCOPE ERROR — no Rust file to read" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_TABLE_ONLY=1 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+mv "$dir/bins" "$dir/bins-aside"
+expect_red_because "canaries: a tree missing a directory the premise lists is a scope error" "the process-group premise cannot list crates/, bins/ and tests/" env -u CARGO_TARGET_DIR -u INF_CANARY_HOST INF_CANARY_TABLE_ONLY=1 INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
 # The lane traps HUP, INT and TERM into an exit, so the exit trap's removal
 # waits for the build in the foreground to end: no stub can see that order,
 # so each of the three lines is read from the script, once.
@@ -3744,6 +3769,502 @@ echo "inf_canary_fixture loom fake the_row" >"$work/canary-short-loom-row"
 expect red "canaries: a loom row without its witness is a scope failure" env INF_CANARY_ROWS_FILE="$work/canary-short-loom-row" INF_CANARY_CARGO="$dir/cargo" $CANARY
 dir=$(loom_fixture loom-judged-nothing 'echo "running 0 tests"; exit 0' "$ok_line")
 expect_red_because "canaries: on Linux a loom model the planted build never ran is judged nothing" "red: judged nothing on the lane's host: inf_canary_fixture loom the_row (no test the_row ran)" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+}
+
+# ----------------------------- planted-bug canary driver: a red leg's text
+group_sim_canaries_red_text() {
+CANARY=./scripts/sim-canaries.sh
+export INF_CANARY_HOST=Linux
+export INF_CANARY_BUILDS=1
+# A red leg quotes its panics, each `panicked at` line and its message, not
+# only libtest's summary; at most four of them. The stub cargo answers a
+# test's build alone (`--no-run`) at once. Its plain test fails as libtest
+# prints a failure, with one panic, or six with `six-panics`; with
+# `planted-panics` the plain test passes and the planted one dies on a panic
+# with no verdict line, five lines before its end.
+dir="$work/red-text"
+mkdir -p "$dir"
+echo "inf_canary_fixture crate-test fake test:suite the_row WITNESS:" >"$dir/rows"
+cat >"$dir/cargo" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" != --version ] || exit 0
+case " $* " in *" --no-run "*) exit 0 ;; esac
+here=$(cd "$(dirname "$0")" && pwd)
+if [ -e "$here/planted-panics" ]; then
+    if [ -z "${RUSTFLAGS:-}" ]; then echo "test the_row ... ok"; exit 0; fi
+    echo "thread 'main' (77) panicked at src/harness.rs:12:5:"
+    echo "the harness could not open its fixture: Os { code: 2, kind: NotFound }"
+    echo "note: run with \`RUST_BACKTRACE=1\` environment variable to display a backtrace"
+    for line in 1 2 3 4 5; do echo "the harness's line $line after its panic"; done
+    exit 101
+fi
+echo "running 1 test"
+echo "test the_row ... FAILED"
+echo ""
+echo "failures:"
+echo ""
+echo "---- the_row stdout ----"
+panics=1
+[ ! -e "$here/six-panics" ] || panics=6
+while [ "$panics" -gt 0 ]; do
+    echo "thread 'the_row' (4242) panicked at tests/suite.rs:3$panics:10:"
+    echo "assertion \`left == right\` failed: HELD_NODE_EXIT: exit status: 101, not 1"
+    echo "  left: 101"
+    echo " right: 1"
+    echo "note: run with \`RUST_BACKTRACE=1\` environment variable to display a backtrace"
+    echo ""
+    panics=$((panics - 1))
+done
+echo "failures:"
+echo "    the_row"
+echo ""
+echo "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s"
+echo ""
+echo "error: test failed, to rerun pass \`--test suite\`"
+exit 101
+EOF
+chmod +x "$dir/cargo"
+expect_red_because "red text: a red control quotes its panic's place" "^thread 'the_row' (4242) panicked at tests/suite.rs:31:10:$" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+cp "$work/log" "$dir/run.log"
+expect green "red text: a red control quotes its panic's message" grep -qxF "assertion \`left == right\` failed: HELD_NODE_EXIT: exit status: 101, not 1" "$dir/run.log"
+expect green "red text: a red control quotes the message's later lines" grep -qx " right: 1" "$dir/run.log"
+expect red "red text: the quote ends before the note that closes a message" grep -q "^note: run with" "$dir/run.log"
+expect green "red text: libtest's summary follows the panics" grep -q "^test result: FAILED. 0 passed; 1 failed" "$dir/run.log"
+: >"$dir/six-panics"
+expect red "red text: a red control with six panics is red" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect green "red text: a red control quotes at most four panics" test "$(grep -c "panicked at tests/suite.rs" "$work/log")" -eq 4
+: >"$dir/planted-panics"
+expect_red_because "red text: a planted leg red for another reason quotes its panic's message" "^the harness could not open its fixture: Os { code: 2, kind: NotFound }$" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+cp "$work/log" "$dir/planted.log"
+expect green "red text: the planted red is red for another reason" grep -q "red for another reason (expected 'test the_row ... FAILED'):" "$dir/planted.log"
+expect green "red text: the planted red still ends on its log's last lines" grep -qx "the harness's line 5 after its panic" "$dir/planted.log"
+# Every quoted line is bounded: a panic's message at 7 lines after its
+# `panicked at` line, each line at 160 bytes with its control bytes dropped,
+# the log's last lines too, so a megabyte line (here the log's last) prints
+# 160 bytes.
+dir="$work/red-bounds"
+mkdir -p "$dir"
+echo "inf_canary_fixture crate-test fake test:suite the_row WITNESS:" >"$dir/rows"
+cat >"$dir/cargo" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" != --version ] || exit 0
+case " $* " in *" --no-run "*) exit 0 ;; esac
+echo "test the_row ... FAILED"
+echo "thread 'the_row' (4242) panicked at tests/suite.rs:9:9:"
+printf 'message line 1 \033[31m%0300d\n' 0
+for line in 2 3 4 5 6 7 8 9 10 11 12; do echo "message line $line"; done
+echo ""
+for line in 1 2 3 4 5 6; do echo "summary line $line"; done
+printf 'last line \033[31m'
+head -c 1048576 /dev/zero | tr '\000' z
+echo ""
+exit 101
+EOF
+chmod +x "$dir/cargo"
+expect_red_because "red text: a red control's panic message is quoted" "^message line 7$" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+cp "$work/log" "$dir/run.log"
+expect red "red text: a panic is quoted at 8 lines, its message's eighth left out" grep -q "^message line 8$" "$dir/run.log"
+expect green "red text: a panic's long line is quoted at 160 bytes" grep -qx "message line 1 \[31m0\{141\}" "$dir/run.log"
+expect red "red text: no quoted line holds a control byte" grep -q "$(printf '\033')" "$dir/run.log"
+expect green "red text: the log's megabyte last line is quoted at 160 bytes" grep -qx "last line \[31mz\{146\}" "$dir/run.log"
+expect green "red text: a red control's megabyte log prints under 8 KiB" test "$(wc -c <"$dir/run.log")" -lt 8192
+}
+
+# ------------------------------------ planted-bug canary driver: deadlines
+# Every run the lane makes has a deadline; past it the run's whole process
+# group ends and the row reads HUNG, red and never caught. The stub cargo, the
+# stub simulators and the stub inf-bench answer `--version`, a build and a
+# test's build alone (`--no-run`) at once, and log each call in `calls`, a
+# planted one (RUSTFLAGS naming a cfg) as `planted …`. A run whose leg a marker
+# file names hangs (`hang-plain`, `hang-planted`, `hang-sim-plain`,
+# `hang-sim-planted`, `hang-preflight`, `hang-run`): it starts a stub node,
+# records both process ids in `pids`, says it has been running, and waits on a
+# FIFO nobody writes, at most 30 s, the stubs' own hang bound, far past every
+# deadline here. With `deaf` the node ignores SIGTERM. A planted test prints
+# its witness and `FAILED` before it hangs, as a test whose harness cannot end
+# would; `hang-planted-<cfg>` hangs that cfg's planted test alone. A test's
+# build alone hangs with `hang-build` and takes 2 s with `slow-build`, a cargo
+# build (a simulator's, a node's) with `hang-cargo-build`; with
+# `leave-planted` a planted test that ends in time leaves its node running.
+deadline_fixture() { # <name> [<row>]: a fixture directory with the stub cargo, its node and a rows file
+    local name=$1 dir
+    [ -n "$name" ] && [ -n "$work" ] || { echo "deadline_fixture: empty name or work dir" >&2; exit 2; }
+    dir="$work/$name"
+    mkdir -p "$dir"
+    mkfifo "$dir/never"
+    : >"$dir/pids"
+    echo "${2:-inf_canary_fixture crate-test fake test:suite the_row WITNESS: deadline=1s}" >"$dir/rows"
+    cat >"$dir/node" <<'EOF'
+#!/usr/bin/env bash
+here=$(cd "$(dirname "$0")" && pwd)
+[ ! -e "$here/deaf" ] || trap '' TERM
+exec 6<>"$here/never"
+read -r -t 30 -u 6 _ || true
+echo "a node outlived its run" >>"$here/late"
+EOF
+    cat >"$dir/hang" <<'EOF'
+# hang <leg>: sourced by each stub; returns at once unless the leg hangs.
+hang() {
+    [ -e "$here/hang-$1" ] || return 0
+    "$here/node" &
+    echo "$! $$" >>"$here/pids"
+    echo "test the_row has been running for over 60 seconds"
+    exec 6<>"$here/never"
+    read -r -t 30 -u 6 _ || true
+    echo "a run outlived its deadline" >>"$here/late"
+    exit 0
+}
+# leave <leg>: a node the leg starts and never reaps.
+leave() {
+    [ -e "$here/leave-$1" ] || return 0
+    "$here/node" &
+    echo "$! $$" >>"$here/pids"
+}
+EOF
+    cat >"$dir/cargo" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" != --version ] || exit 0
+here=$(cd "$(dirname "$0")" && pwd)
+. "$here/hang"
+leg=plain
+case "${RUSTFLAGS:-}" in *inf_canary_*) leg=planted ;; esac
+echo "$leg $*" >>"$here/calls"
+case " $* " in
+*" --no-run "*)
+    hang build
+    if [ -e "$here/slow-build" ]; then exec 6<>"$here/never"; read -r -t 2 -u 6 _ || true; fi
+    exit 0
+    ;;
+esac
+if [ "$1" = build ]; then hang cargo-build; fi
+[ "$1" = test ] || exit 0
+if [ "$leg" = planted ]; then
+    echo "panicked: WITNESS: a stale effect"
+    echo "test the_row ... FAILED"
+    hang planted
+    hang "planted-${RUSTFLAGS##*--cfg }"
+    leave planted
+    exit 101
+fi
+hang plain
+echo "test the_row ... ok"
+exit 0
+EOF
+    chmod +x "$dir/node" "$dir/cargo"
+    echo "$dir"
+}
+deadline_stub() { # <dir> <path> <body>: an executable stub at <path> that knows its fixture and its hang
+    {
+        echo '#!/usr/bin/env bash'
+        echo "here='$1'"
+        echo '. "$here/hang"'
+        echo "$3"
+    } >"$2"
+    chmod +x "$2"
+}
+deadline_sims() { # <dir> <cfg>…: the plain stub simulator and each cfg's planted one under <dir>/target
+    local dir=$1 cfg
+    shift
+    mkdir -p "$dir/target/release"
+    deadline_stub "$dir" "$dir/target/release/inf-sim" \
+        'echo "sim $*" >>"$here/calls"; hang sim-plain; echo "inf-sim: scenario fake-scenario: green"'
+    for cfg in "$@"; do
+        mkdir -p "$dir/target/canary-$cfg/release"
+        deadline_stub "$dir" "$dir/target/canary-$cfg/release/inf-sim" \
+            'echo "inf-sim: ORACLE VIOLATION: TOKEN VIOLATION seed 0x1 cell 0: the rule broke"; hang sim-planted; exit 1'
+    done
+}
+deadline_alive() { # <dir>: zero when a process a stub recorded in <dir>/pids is alive (a zombie is not)
+    local pid stat
+    for pid in $(cat "$1/pids"); do
+        stat=$(ps -o stat= -p "$pid" 2>/dev/null) || continue
+        case "$stat" in *Z*) ;; *) return 0 ;; esac
+    done
+    return 1
+}
+deadline_lane() { # <dir> <kind> <seconds>: the lane copied into <dir>/scripts, its <kind> deadline <seconds>
+    mkdir -p "$1/scripts"
+    cp ./scripts/target-root.sh "$1/scripts/target-root.sh"
+    cp ./scripts/source-files.sh "$1/scripts/source-files.sh"
+    python3 -I - ./scripts/sim-canaries.sh "$1/scripts/sim-canaries.sh" "$2" "$3" <<'EOF'
+import re
+import sys
+source, target, kind, seconds = sys.argv[1:]
+text = open(source).read()
+line = re.compile(r"^    %s\) echo [1-9][0-9]* ;;$" % re.escape(kind), re.M)
+assert len(line.findall(text)) == 1, kind
+open(target, "w").write(line.sub("    %s) echo %s ;;" % (kind, seconds), text))
+EOF
+}
+lane_patched() { # <dir> <text> <new text>: the lane copied into <dir>/scripts, its one line <text> made <new text>
+    mkdir -p "$1/scripts"
+    cp ./scripts/target-root.sh "$1/scripts/target-root.sh"
+    cp ./scripts/source-files.sh "$1/scripts/source-files.sh"
+    python3 -I - ./scripts/sim-canaries.sh "$1/scripts/sim-canaries.sh" "$2" "$3" <<'EOF'
+import sys
+source, target, old, new = sys.argv[1:]
+text = open(source).read()
+assert text.count(old + "\n") == 1, old
+open(target, "w").write(text.replace(old + "\n", new + "\n"))
+EOF
+}
+
+group_sim_canaries_deadline() {
+CANARY=./scripts/sim-canaries.sh
+export INF_CANARY_HOST=Linux
+# These cases judge rows one cfg's build at a time (K = 1).
+export INF_CANARY_BUILDS=1
+# A plain control that never ends reads HUNG at its row's deadline, a red
+# control: its whole group, the node it started too, is gone, well before the
+# stub's own 30 s, and its plant is neither built nor run.
+dir=$(deadline_fixture deadline-plain)
+: >"$dir/hang-plain"
+began=$(selftest_clock)
+expect_red_because "deadline: a plain control that never ends reads HUNG, a red control" "HUNG after 1 s (the row's deadline) on the plain build: its process group is ended, and a canary needs a green control" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+ended=$(selftest_clock)
+cp "$work/log" "$dir/run.log"
+expect green "deadline: the hung control had started its node (the case's premise)" test -s "$dir/pids"
+expect red "deadline: no process of the hung control is left, its node's included" deadline_alive "$dir"
+expect green "deadline: the hung control ended within 10 s of its 1 s deadline" test $((ended - began)) -lt 100
+expect red "deadline: a row whose control hung builds and runs no plant" grep -q "^planted " "$dir/calls"
+expect green "deadline: the hung control's own last words are quoted" grep -qx "test the_row has been running for over 60 seconds" "$dir/run.log"
+expect green "deadline: the lane's verdict is FAILED" grep -qx "sim-canaries: FAILED" "$dir/run.log"
+# A planted leg that printed its witness and FAILED and then never ends is red
+# and never caught: a row is caught by its oracle alone, and a run that cannot
+# end stalls the lane.
+dir=$(deadline_fixture deadline-planted)
+: >"$dir/hang-planted"
+began=$(selftest_clock)
+expect_red_because "deadline: a planted leg that never ends reads HUNG" "HUNG after 1 s (the row's deadline) on the planted build: its process group is ended, and a hang is never a catch" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+ended=$(selftest_clock)
+cp "$work/log" "$dir/run.log"
+expect green "deadline: the hung planted leg had started its node (the case's premise)" test -s "$dir/pids"
+expect red "deadline: no process of the hung planted leg is left, its node's included" deadline_alive "$dir"
+expect green "deadline: the hung planted leg ended within 10 s of its 1 s deadline" test $((ended - began)) -lt 100
+expect red "deadline: a hung planted leg whose log holds its witness and FAILED is never caught" grep -q "caught:" "$dir/run.log"
+expect green "deadline: a hung planted leg fails the lane" grep -qx "sim-canaries: FAILED" "$dir/run.log"
+# Beside a caught row a hung planted leg still fails the lane: the summary is
+# never `caught` with a row red.
+dir=$(deadline_fixture deadline-beside "inf_canary_a crate-test fake test:suite the_row WITNESS: deadline=1s")
+echo "inf_canary_b crate-test fake test:suite the_row WITNESS: deadline=1s" >>"$dir/rows"
+: >"$dir/hang-planted-inf_canary_b"
+expect_red_because "deadline: a hung planted leg beside a caught row fails the lane" "^sim-canaries: FAILED$" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+cp "$work/log" "$dir/run.log"
+expect green "deadline: the row beside it was caught (the case's premise)" grep -q "^   caught: panicked: WITNESS: a stale effect$" "$dir/run.log"
+expect green "deadline: the other row read HUNG on its planted build" grep -q "HUNG after 1 s (the row's deadline) on the planted build" "$dir/run.log"
+expect red "deadline: no process of the hung row is left" deadline_alive "$dir"
+# The Loom kind's two legs, each held to the row's deadline.
+dir=$(deadline_fixture deadline-loom-plain "inf_canary_fixture loom fake the_row WITNESS: deadline=1s")
+: >"$dir/hang-plain"
+expect_red_because "deadline: a Loom model's control that never ends reads HUNG" "HUNG after 1 s (the row's deadline) on the plain build" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+cp "$work/log" "$dir/run.log"
+expect green "deadline: the hung Loom control had started its node (the case's premise)" test -s "$dir/pids"
+expect red "deadline: no process of the hung Loom control is left" deadline_alive "$dir"
+expect green "deadline: a hung Loom control fails the lane" grep -qx "sim-canaries: FAILED" "$dir/run.log"
+dir=$(deadline_fixture deadline-loom-planted "inf_canary_fixture loom fake the_row WITNESS: deadline=1s")
+: >"$dir/hang-planted"
+expect_red_because "deadline: a planted Loom model that never ends reads HUNG" "HUNG after 1 s (the row's deadline) on the planted build" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+cp "$work/log" "$dir/run.log"
+expect red "deadline: no process of the hung planted Loom model is left" deadline_alive "$dir"
+expect red "deadline: a hung planted Loom model is never caught" grep -q "caught:" "$dir/run.log"
+expect green "deadline: a hung planted Loom model fails the lane" grep -qx "sim-canaries: FAILED" "$dir/run.log"
+# A row without a deadline of its own is held to its kind's: a lane copy
+# whose crate-test deadline is 1 s reads the hung control HUNG at it.
+dir=$(deadline_fixture deadline-kind "inf_canary_fixture crate-test fake test:suite the_row WITNESS:")
+: >"$dir/hang-plain"
+deadline_lane "$dir" crate-test 1
+expect_red_because "deadline: a row with no deadline of its own is held to its kind's" "HUNG after 1 s (the crate-test deadline) on the plain build" env -u CARGO_TARGET_DIR INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+cp "$work/log" "$dir/run.log"
+expect red "deadline: no process of the row held to its kind's deadline is left" deadline_alive "$dir"
+expect green "deadline: a control hung at its kind's deadline fails the lane" grep -qx "sim-canaries: FAILED" "$dir/run.log"
+# A run that ends in time and leaves a node of its group alive has the node
+# named and its group ended: nothing a run starts outlives it, and the row's
+# verdict is still its run's.
+dir=$(deadline_fixture deadline-leftover)
+: >"$dir/leave-planted"
+expect_output "deadline: a run that leaves a node alive has it named and ended" "^   left behind: the run ended with processes of its group alive ([0-9][0-9]* [^)]*); the group is ended$" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+cp "$work/log" "$dir/run.log"
+expect green "deadline: the run had left its node (the case's premise)" test -s "$dir/pids"
+expect red "deadline: the node a run left is not left after the lane" deadline_alive "$dir"
+expect green "deadline: the row that left a node is still caught" grep -q "^sim-canaries: 1 canaries caught" "$dir/run.log"
+# A test's build alone is no run: a build slower than the row's deadline is
+# caught as it always was, and a build that never ends reads HUNG at the build
+# deadline (here a lane copy's 1 s).
+dir=$(deadline_fixture deadline-slow-build)
+: >"$dir/slow-build"
+expect_output "deadline: a 2 s build beside a row's 1 s deadline is no hang" "^sim-canaries: 1 canaries caught" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+dir=$(deadline_fixture deadline-hung-build)
+: >"$dir/hang-build"
+deadline_lane "$dir" build 1
+expect_red_because "deadline: a build that never ends reads HUNG at the build deadline" "HUNG after 1 s (the build deadline) on the plain build" env -u CARGO_TARGET_DIR INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+cp "$work/log" "$dir/run.log"
+expect green "deadline: a hung build fails the lane" grep -qx "sim-canaries: FAILED" "$dir/run.log"
+expect green "deadline: the hung build had started its node (the case's premise)" test -s "$dir/pids"
+expect red "deadline: no process of the hung build is left" deadline_alive "$dir"
+# A row whose runs end in time reads as it always did: its own deadline word
+# changes nothing it prints (its seconds aside), and its label and witness
+# leave the word out.
+dir=$(deadline_fixture deadline-normal)
+expect green "deadline: a row whose runs end within its deadline is caught" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+sed -e 's/: elapsed [0-9.]* s$/: elapsed s/' -e 's/ green in [0-9]* s / green in s /' "$work/log" >"$dir/own.log"
+echo "inf_canary_fixture crate-test fake test:suite the_row WITNESS:" >"$dir/rows"
+expect green "deadline: the same row on its kind's deadline is caught" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+sed -e 's/: elapsed [0-9.]* s$/: elapsed s/' -e 's/ green in [0-9]* s / green in s /' "$work/log" >"$dir/kind.log"
+expect green "deadline: a row's own deadline changes nothing the row prints" cmp "$dir/own.log" "$dir/kind.log"
+expect green "deadline: the caught line quotes the witness, the deadline word left out" grep -qx "   caught: panicked: WITNESS: a stale effect" "$dir/own.log"
+expect green "deadline: the row's label leaves the deadline word out" grep -q "^== canary inf_canary_fixture crate-test the_row: elapsed s$" "$dir/own.log"
+expect green "deadline: each test leg builds alone before its run" test "$(cut -d' ' -f1,2 "$dir/calls" | tr '\n' ' ')" = "plain test plain test planted test planted test plain test plain test planted test planted test "
+expect green "deadline: a leg's build is its run's command with --no-run" grep -qx "planted test -p fake --test suite --target-dir .*/canary-inf_canary_fixture --no-run" "$dir/calls"
+# The deadline word: the row's last, `deadline=<N>s` with N 1 to 99999 and no
+# leading zero, read before the first build; any other spelling is refused.
+dir=$(deadline_fixture deadline-grammar)
+for bad in "deadline=0s" "deadline=1" "deadline=01s" "deadline=100000s" "deadline=1m" "deadline=s" "deadline=1s WITNESS:" "deadline=1s deadline=2s"; do
+    echo "inf_canary_fixture crate-test fake test:suite the_row $bad" >"$dir/rows"
+    expect_red_because "deadline: a row ending '$bad' is refused before the first build" "malformed row: inf_canary_fixture crate-test fake test:suite the_row $bad" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+done
+expect red "deadline: no misspelt deadline reached a build" test -e "$dir/calls"
+echo "inf_canary_fixture loom fake the_row deadline=99999s" >"$dir/rows"
+expect_red_because "deadline: the deadline word is no part of a row's arity" "malformed row: inf_canary_fixture loom fake the_row deadline=99999s" env INF_CANARY_TABLE_ONLY=1 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+echo "inf_canary_fixture loom fake the_row WITNESS: deadline=99999s" >"$dir/rows"
+expect_output "deadline: the table check reads a row with its own deadline" "table only: 1 rows well formed" env INF_CANARY_TABLE_ONLY=1 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+# A row's words are split on tabs as on blanks, by the pre-pass and the run
+# alike: a misspelt deadline after a tab is refused, a sound one is the row's.
+printf 'inf_canary_fixture crate-test fake test:suite the_row WITNESS:\tdeadline=1\n' >"$dir/rows"
+expect_red_because "deadline: a misspelt deadline after a tab is refused before the first build" "malformed row: inf_canary_fixture crate-test fake test:suite the_row WITNESS:.deadline=1$" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+expect red "deadline: no misspelt deadline after a tab reached a build" test -e "$dir/calls"
+printf 'inf_canary_fixture loom fake the_row WITNESS:\tdeadline=99999s\n' >"$dir/rows"
+expect_output "deadline: a deadline after a tab is no part of a Loom row's arity" "table only: 1 rows well formed" env INF_CANARY_TABLE_ONLY=1 INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+dir=$(deadline_fixture deadline-tab)
+printf 'inf_canary_fixture crate-test fake test:suite the_row WITNESS:\tdeadline=1s\n' >"$dir/rows"
+: >"$dir/hang-plain"
+expect_red_because "deadline: a deadline after a tab holds the row's runs" "HUNG after 1 s (the row's deadline) on the plain build" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+}
+
+group_sim_canaries_deadline_kinds() {
+CANARY=./scripts/sim-canaries.sh
+export INF_CANARY_HOST=Linux
+export INF_CANARY_BUILDS=1
+# A hung run's node that ignores SIGTERM is ended by the SIGKILL 3 s after it:
+# nothing of the group is left.
+dir=$(deadline_fixture deadline-deaf)
+: >"$dir/hang-planted"
+: >"$dir/deaf"
+began=$(selftest_clock)
+expect_red_because "deadline: a hung run whose node ignores SIGTERM reads HUNG" "HUNG after 1 s (the row's deadline) on the planted build" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" $CANARY
+ended=$(selftest_clock)
+cp "$work/log" "$dir/run.log"
+expect green "deadline: the deaf node had started (the case's premise)" test -s "$dir/pids"
+expect red "deadline: the SIGKILL ended the node that ignores SIGTERM" deadline_alive "$dir"
+expect green "deadline: the deaf group ended within 15 s of its 1 s deadline" test $((ended - began)) -lt 150
+expect green "deadline: a hung run with a deaf node fails the lane" grep -qx "sim-canaries: FAILED" "$dir/run.log"
+# A scenario's plain run that never ends: HUNG, and so is each row on the
+# same leg, which reads it and does not run it again.
+dir=$(deadline_fixture deadline-sim-plain)
+deadline_sims "$dir" inf_canary_a inf_canary_b
+: >"$dir/hang-sim-plain"
+printf '%s\n' "inf_canary_a fake-scenario TOKEN deadline=1s" "inf_canary_b fake-scenario TOKEN deadline=1s" >"$dir/rows"
+expect_red_because "deadline: a scenario's plain run that never ends reads HUNG" "HUNG after 1 s (the row's deadline) on the plain build" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+cp "$work/log" "$dir/run.log"
+expect green "deadline: each row on the hung leg reads HUNG" test "$(grep -c "HUNG after 1 s (the row's deadline) on the plain build" "$dir/run.log")" -eq 2
+expect green "deadline: the second row reads the hung leg above" grep -q "^== canary inf_canary_b scenario fake-scenario: on the plain build: hung above, not run again$" "$dir/run.log"
+expect green "deadline: the hung plain leg ran once" test "$(grep -c "^sim " "$dir/calls")" -eq 1
+expect red "deadline: no process of the hung simulator is left" deadline_alive "$dir"
+expect green "deadline: a hung simulator fails the lane" grep -qx "sim-canaries: FAILED" "$dir/run.log"
+dir=$(deadline_fixture deadline-sim-planted "inf_canary_fixture fake-scenario TOKEN deadline=1s")
+deadline_sims "$dir" inf_canary_fixture
+: >"$dir/hang-sim-planted"
+expect_red_because "deadline: a planted simulator that never ends reads HUNG" "HUNG after 1 s (the row's deadline) on the planted build" env INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+cp "$work/log" "$dir/run.log"
+expect red "deadline: a hung planted simulator whose log names its token is never caught" grep -q "caught:" "$dir/run.log"
+expect red "deadline: no process of the hung planted simulator is left" deadline_alive "$dir"
+expect green "deadline: a hung planted simulator fails the lane" grep -qx "sim-canaries: FAILED" "$dir/run.log"
+# A binary row's instrument run, under the row's deadline, and its preflight,
+# under the binary kind's (here a lane copy's 1 s).
+bin_row="inf_canary_fixture binary idle-resident T-OVER --plant-bytes-cell 3145728 deadline=1s"
+bin_body='echo "bench $*" >>"$here/calls"
+case " $* " in *" --preflight "*) hang preflight; echo "host: Linux stub"; exit 0 ;; esac
+echo "T-OVER: reading 3200000 B a cell"
+hang run
+exit 1'
+dir=$(deadline_fixture deadline-bench-run "$bin_row")
+deadline_stub "$dir" "$dir/bench" "$bin_body"
+: >"$dir/hang-run"
+expect_red_because "deadline: an instrument run that never ends reads HUNG" "HUNG after 1 s (the row's deadline) on the planted build" env INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" $CANARY
+cp "$work/log" "$dir/run.log"
+expect red "deadline: a hung instrument run whose log holds its token is never caught" grep -q "caught:" "$dir/run.log"
+expect red "deadline: no process of the hung instrument run is left" deadline_alive "$dir"
+expect green "deadline: a hung instrument run fails the lane" grep -qx "sim-canaries: FAILED" "$dir/run.log"
+dir=$(deadline_fixture deadline-bench-preflight "$bin_row")
+deadline_stub "$dir" "$dir/bench" "$bin_body"
+: >"$dir/hang-preflight"
+deadline_lane "$dir" binary 1
+expect_red_because "deadline: a preflight that never ends reads HUNG at the binary kind's deadline" "HUNG after 1 s (the binary deadline) in the preflight: its process group is ended" env -u CARGO_TARGET_DIR INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+cp "$work/log" "$dir/run.log"
+expect red "deadline: a hung preflight builds no node" grep -q "build --release -p infinityd" "$dir/calls"
+expect red "deadline: no process of the hung preflight is left" deadline_alive "$dir"
+expect green "deadline: a hung preflight fails the lane" grep -qx "sim-canaries: FAILED" "$dir/run.log"
+# A state word no arm names is red, never read as green: a lane copy that
+# writes a plain leg's green, or a preflight's ok, misspelt.
+dir=$(deadline_fixture deadline-state-leg "inf_canary_fixture fake-scenario TOKEN")
+deadline_sims "$dir" inf_canary_fixture
+lane_patched "$dir" "      control_state+=(green)" "      control_state+=(gren)"
+expect_red_because "deadline: a plain leg's state no arm names is red" "red: the plain leg's state 'gren' is none the lane writes" env -u CARGO_TARGET_DIR INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" bash "$dir/scripts/sim-canaries.sh"
+dir=$(deadline_fixture deadline-state-preflight "inf_canary_fixture binary idle-resident T-OVER --plant-bytes-cell 3145728")
+deadline_stub "$dir" "$dir/bench" "$bin_body"
+lane_patched "$dir" "      preflight_state+=(ok)" "      preflight_state+=(okay)"
+expect_red_because "deadline: a preflight's state no arm names is red" "red: the preflight's state 'okay' is none the lane writes" env -u CARGO_TARGET_DIR INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+}
+
+# A build the lane runs in its own output, and a build ahead, under the build
+# deadline (the deadlines section's stubs).
+group_sim_canaries_deadline_builds() {
+CANARY=./scripts/sim-canaries.sh
+export INF_CANARY_HOST=Linux
+export INF_CANARY_BUILDS=1
+bin_body='echo "bench $*" >>"$here/calls"
+case " $* " in *" --preflight "*) hang preflight; echo "host: Linux stub"; exit 0 ;; esac
+echo "T-OVER: reading 3200000 B a cell"
+hang run
+exit 1'
+# A simulator or node build the lane runs in its own output that never ends
+# reads HUNG at the build deadline (a lane copy's 1 s), and is no build: the
+# rows on it are red, the lane fails, and nothing of the build is left.
+dir=$(deadline_fixture deadline-sim-build "inf_canary_fixture fake-scenario TOKEN")
+deadline_sims "$dir" inf_canary_fixture
+: >"$dir/hang-cargo-build"
+deadline_lane "$dir" build 1
+expect_red_because "deadline: a simulator build that never ends reads HUNG at the build deadline" "^   HUNG after 1 s (the build deadline) building the plain inf-sim: its process group is ended$" env -u CARGO_TARGET_DIR INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" INF_CANARY_SIM_TARGET="$dir/target" bash "$dir/scripts/sim-canaries.sh"
+cp "$work/log" "$dir/run.log"
+expect green "deadline: the row on a hung simulator build reads its build failed" grep -q "red for another reason (the plain build failed" "$dir/run.log"
+expect green "deadline: a hung simulator build fails the lane" grep -qx "sim-canaries: FAILED" "$dir/run.log"
+expect green "deadline: the hung simulator build had started its node (the case's premise)" test -s "$dir/pids"
+expect red "deadline: no process of the hung simulator build is left" deadline_alive "$dir"
+dir=$(deadline_fixture deadline-node-build "inf_canary_fixture binary idle-resident T-OVER --plant-bytes-cell 3145728")
+deadline_stub "$dir" "$dir/bench" "$bin_body"
+: >"$dir/hang-cargo-build"
+deadline_lane "$dir" build 1
+expect_red_because "deadline: a node build that never ends reads HUNG at the build deadline" "^   HUNG after 1 s (the build deadline) building the plain infinityd: its process group is ended$" env -u CARGO_TARGET_DIR INF_CANARY_BENCH="$dir/bench" INF_CANARY_ROWS_FILE="$dir/rows" INF_CANARY_CARGO="$dir/cargo" bash "$dir/scripts/sim-canaries.sh"
+cp "$work/log" "$dir/run.log"
+expect red "deadline: a binary row on a hung node build runs no instrument" grep -q "^bench idle-resident --base" "$dir/calls"
+expect green "deadline: a hung node build fails the lane" grep -qx "sim-canaries: FAILED" "$dir/run.log"
+expect red "deadline: no process of the hung node build is left" deadline_alive "$dir"
+# A build ahead that never ends is ended at the build deadline from its start
+# (a lane copy's 2 s), and its cfg's leg builds again, in order, under its own.
+dir=$(builds_lane deadline-ahead "$(test_row inf_canary_a)" "$(test_row inf_canary_b_hold)")
+python3 -I - "$dir/scripts/sim-canaries.sh" <<'EOF'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+line = "    build) echo 3600 ;;\n"
+assert text.count(line) == 1
+open(path, "w").write(text.replace(line, "    build) echo 2 ;;\n"))
+EOF
+expect_red_because "deadline: a build ahead that never ends is ended at the build deadline" "^== canary inf_canary_b_hold: its build ahead passed the build deadline (2 s from its start) and is ended" builds_run "$dir" 2 2
+cp "$work/log" "$dir/run.log"
+expect green "deadline: the build ahead was stopped mid-build" grep -qx "stopped inf_canary_b_hold" "$dir/events"
+expect green "deadline: the leg's own build then passed its deadline too" grep -q "HUNG after 2 s (the build deadline) on the planted build" "$dir/run.log"
+expect green "deadline: the row before it was caught" grep -q "^   caught: panicked: from-inf_canary_a$" "$dir/run.log"
+expect green "deadline: a hung build ahead fails the lane" grep -qx "sim-canaries: FAILED" "$dir/run.log"
 }
 
 # ---------------------------------------- planted-bug canary driver: nodes

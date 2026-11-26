@@ -79,8 +79,11 @@
 # instrument. Every row is read before the first build: a cfg that is not
 # `inf_canary_<name>`, the name of letters, digits and `_` (the cfg names
 # the row's planted directory), a wrong arity for its kind, an empty feature
-# list, a target neither `lib` nor `test:NAME`, or an instrument or token
-# spelled otherwise than letters, digits, `_` and `-` is a scope error.
+# list, a target neither `lib` nor `test:NAME`, an instrument or token
+# spelled otherwise than letters, digits, `_` and `-`, or a word beginning
+# `deadline=` that is not the row's last or not `deadline=<N>s` (below) is a
+# scope error. The deadline word is no part of the row's kind: the arity, the
+# label, a witness and a flag list are read without it.
 # A run that judged nothing is neither caught nor NOT CAUGHT: a crate test
 # or Loom model that exits 0 with no verdict line for its test (cargo built
 # no such test on this host), a scenario that exits 0 with a line beginning
@@ -96,6 +99,30 @@
 # its ring) is named as io_uring unavailable on this host.
 # A row's red never stops another: every build and run of every kind is
 # judged, and the lane's verdict waits for the last row.
+# Every run has a deadline, the plain control's and the planted leg's alike:
+# a crate test's or Loom model's run of its test, a simulator's run, an
+# instrument's run and its preflight. A test leg builds first, alone
+# (`--no-run`, the command its build ahead runs; a build that fails is the
+# leg's status and log, as a compile error was), so a run's deadline bounds
+# the test and never a compile. The deadline is the row kind's
+# (kind_deadline_s holds each value and the data it was read from) or, when
+# the row's last word is `deadline=<N>s` (N 1 to 99999, no leading zero; never
+# a witness word or a flag), the row's own. Every build has one too, the
+# build deadline: a leg's build, each simulator and node build, and a build
+# ahead from its start. A run or a build is a job in a process group of its
+# own; past its deadline that whole group (cargo, the test, every node it
+# started) is sent SIGTERM, then SIGKILL once 3 s pass, and the run reads
+# `HUNG after <N> s`: red on every host, on the plain leg a control that is
+# not green, on the planted one never a catch whatever its log holds, as a row
+# is caught by its oracle alone and a run that cannot end stalls the lane. A
+# build ahead past it is ended and the leg builds again. A run that ends in
+# time with a process of its group still alive (a node it did not reap) has
+# that process named and its group ended. The limit: a process that leaves the
+# group (a new session or group) is out of the lane's reach, so the pre-pass
+# refuses a Rust file that spells a way out (the process-group premise, below).
+# A red leg's log is quoted by its panics: each `panicked at` line and the
+# message lines after it (at most 4 panics of 8 lines, 160 bytes a line), then
+# its last 5 lines, libtest's summary.
 # Rows run grouped by cfg, each cfg at its first row's place in the table
 # and its rows in the table's order, so the output's order is not the
 # table's; each row keeps its own verdict. A planted cfg builds in
@@ -119,8 +146,9 @@
 # resident memory, a test's time bound or a rate it reads would move with a
 # build beside it.
 # At most K planted directories live at once. A run a signal stops sends
-# each build ahead's process group SIGTERM, then SIGKILL after 3 s, and waits
-# until every group is gone before their directories go.
+# each build ahead's process group and the row's run in flight SIGTERM, then
+# SIGKILL after 3 s, and waits until every group is gone before their
+# directories go.
 # The lane's compiles share J jobs: CARGO_BUILD_JOBS as cargo reads it (a
 # count, `default`, or a negative count taken from the host's processors),
 # else the host's processors; a cargo config's `build.jobs` is not read. At
@@ -1714,20 +1742,76 @@ binary_flags_ok() {
   [ "$plant" -eq 1 ]
 }
 
+# kind_deadline_s <kind>: a run's deadline in seconds on a row of that kind, `crate-test`,
+# `loom`, `binary` or a scenario's name, or, for the kind `build`, of each build the lane
+# runs. A deadline is a hang bound: it ends a run that would wait forever and never decides
+# pass or fail, so it sits far above the slowest run a sound build makes. A row kind's is 6
+# times the slowest row of that kind the lane timed on the dev box (24 cores, K = 4: the
+# whole lanes of 2026-11-19 and the rows of 2026-11-25 and 26), rounded up to a minute. A
+# row's elapsed holds both its legs, and on the table's first cfg its planted build too, so
+# one run takes at most that. The 6 is a guess at the nightly's hosted runner, untimed: 16 GB
+# on 4 vCPUs, or 7 GB on 2, as its workflow says, where the slowest tests run 10 threads, so
+# 2.5 or 5 times fewer cores, on slower ones; a hang then costs its shard minutes of the job's
+# 360.
+#   crate-test  96.2 s  inf_canary_recover_sweep_gone_counted's boot-at-size test   600 s
+#   loom        58.6 s  inf_canary_post_rings_no_wake's model                      360 s
+#   scenario    88.3 s  inf_canary_foreign_segment's m2-recycle --sweep 64         540 s
+#   binary      91 s    idle-resident's run (its catch line's second figure, 90 or  600 s
+#                       91 s in 22 runs; the row's 160.5 s holds the planted node's build)
+#   build       148.2 s the slowest build ahead (K = 4); an hour holds a cold one on  3600 s
+#                       the runner many times over, and ends a build that cannot end
+# 2026-11-26: the four row kinds' values are the dev box's; each is to be read again from the
+# first timed nightly's `<label>: elapsed` lines, as 6 times its kind's slowest there.
+# A row whose runs need more carries its own deadline, `deadline=<N>s` as its last word,
+# with the reason in its comment.
+kind_deadline_s() {
+  case "$1" in
+    crate-test) echo 600 ;;
+    loom) echo 360 ;;
+    binary) echo 600 ;;
+    build) echo 3600 ;;
+    *) echo 540 ;;
+  esac
+}
+
+# row_words <row>: sets `words`, the row's words (split as every reader of a row splits
+# it, on blanks and tabs) less a last `deadline=<N>s`, and row_deadline_s, that N, or empty
+# where the row takes its kind's (kind_deadline_s). Non-zero when a word begins `deadline=`
+# and is not the last one spelled `deadline=<N>s`, N 1 to 99999 with no leading zero: a
+# misspelt deadline read as a witness word or a flag would leave its row on the kind's
+# without a word. The pre-pass and the run read a row through it alone, so both read its
+# deadline one way; a row that holds no `deadline=` anywhere is its words already.
+row_words() {
+  local word count
+  # shellcheck disable=SC2206
+  words=($1)
+  row_deadline_s=''
+  case "$1" in *deadline=*) ;; *) return 0 ;; esac
+  count=${#words[@]}
+  if [ "$count" -gt 0 ] && [[ "${words[$((count - 1))]}" =~ ^deadline=([1-9][0-9]{0,4})s$ ]]; then
+    row_deadline_s=${BASH_REMATCH[1]}
+    words=("${words[@]:0:$((count - 1))}")
+  fi
+  for word in ${words[@]+"${words[@]}"}; do
+    case "$word" in deadline=*) return 1 ;; esac
+  done
+}
+
 # row_ok <row>: the row starts with its cfg, `inf_canary_<name>` with a name
 # of letters, digits and `_`, as the cfg names the row's planted directory
 # under the root: another spelling could name a path outside it or another
 # directory of it. Its words are its kind's: `<cfg> crate-test
 # <package[/features]> <lib|test:NAME> <test> [witness…]`, `<cfg> loom
 # <package> <test> <witness>`, `<cfg> binary <instrument> <token>
-# <flags…>`, or a scenario's `<cfg> <scenario> <expected> [flags…]`.
+# <flags…>`, or a scenario's `<cfg> <scenario> <expected> [flags…]`, each
+# with or without a last `deadline=<N>s` (row_words), read without it.
 cfg_spelled='^inf_canary_[A-Za-z0-9_]+ '
 binary_word='^[A-Za-z0-9][A-Za-z0-9_-]*$'
 row_ok() {
   local parts
   [[ "$1" =~ $cfg_spelled ]] || return 1
-  # shellcheck disable=SC2206
-  parts=($1)
+  row_words "$1" || return 1
+  parts=(${words[@]+"${words[@]}"})
   case "${parts[1]:-}" in
     crate-test)
       [ "${#parts[@]}" -ge 5 ] && crate_package_ok "${parts[2]}" \
@@ -1774,9 +1858,43 @@ if [ "${#ordered_rows[@]}" -gt 0 ] && misplaced=$(rows_out_of_order "${ordered_r
   echo "sim-canaries: SCOPE ERROR — a row out of its cfg's place: $misplaced"
   exit 1
 fi
+# The process-group premise (run_deadline): a run ends as its process group, so a process
+# that leaves the group (a new session or group) outlives the run's end, and the lane sees
+# nothing of it. No Rust file under crates/, bins/ or tests/ may spell a way out: `setsid`,
+# `setpgid`, `setpgrp`, `process_group` or `pre_exec` (which runs any code in the child) on
+# any line is a scope error naming it, until the lane ends such a process by another means.
+# It reads text: a name split in the text is review's. The lane's own table is read with the
+# tree it runs in; a rows file, the self-test's stub route, reads no tree.
+# shellcheck source=source-files.sh
+. scripts/source-files.sh
+group_scan=''
+if [ -z "${INF_CANARY_ROWS_FILE:-}" ]; then
+  rust_files=$(source_files '*.rs' crates bins tests) || {
+    echo "sim-canaries: SCOPE ERROR — the process-group premise cannot list crates/, bins/ and" \
+      "tests/"
+    exit 1
+  }
+  [ -n "$rust_files" ] || { echo "sim-canaries: SCOPE ERROR — no Rust file to read"; exit 1; }
+  IFS=$'\n' read -r -d '' -a rust_list <<<"$rust_files" || true
+  escape=$(LC_ALL=C awk '/setsid|setpgid|setpgrp|process_group|pre_exec/ {
+      print FILENAME ":" FNR ": " substr($0, 1, 120); found = 1
+    }
+    END { exit found ? 3 : 0 }' "${rust_list[@]}") || {
+    status=$?
+    if [ "$status" -eq 3 ]; then
+      echo "sim-canaries: SCOPE ERROR — a Rust file names a way out of a process group, which a" \
+        "run's end cannot reach:"
+      printf '%s\n' "$escape" | sed -n '1,5p'
+    else
+      echo "sim-canaries: SCOPE ERROR — the process-group premise could not read its files"
+    fi
+    exit 1
+  }
+  group_scan="; ${#rust_list[@]} Rust files read, none leaving its process group"
+fi
 if [ "$table_only" -eq 1 ]; then
   echo "sim-canaries: table only: ${#rows[@]} rows well formed, the last ${#ordered_rows[@]}" \
-    "ordered by cfg; nothing built or run"
+    "ordered by cfg$group_scan; nothing built or run"
   exit 0
 fi
 if [ -n "${INF_CANARY_SHARD:-}" ]; then
@@ -1849,22 +1967,60 @@ esac
 # process id, its start, and once it is waited for its exit status and the
 # wait, each empty before.
 ahead_pid=() ahead_began=() ahead_status=() ahead_waited=()
-# ahead_stop: every build ahead not yet waited for ends. Its process group
-# (cargo, and every compiler and linker it started) is sent SIGTERM, then
-# SIGKILL once 3 s pass, and the stop polls each group until no process of it
-# is left but a zombie, its tick a 1 s read of the `tick` FIFO nobody writes
-# (made with the pool; a tick that is no FIFO would read at once, so the stop
-# then sends SIGKILL at once); past 10 s it names the groups left. The poll
-# reads the process table (`ps`), a group alive while a process of it is
-# listed that is not a zombie, and `kill -0` only when the table cannot be
-# read: a killed process whose reaper is slow to collect it (an orphan left to
-# the user's service manager, say) answers `kill -0` until it is reaped, where
-# the table lists it as a zombie, so the poll ends at its next tick, whatever
-# the reaper's pace. Only then is each job waited for,
-# so a leader that ignores SIGTERM never holds the poll. A job started but not
-# yet recorded when a signal came is in `jobs -p`.
-ahead_stop() {
-  local j pid groups=' ' alive tick=0 kill_at=3 table
+# groups_end <what> <process group…>: each group ends: it is sent SIGTERM, then
+# SIGKILL once 3 s pass, and the end polls each group until no process of it
+# is left but a zombie, its tick a 1 s read of the `tick` FIFO nobody writes (a
+# tick that is no FIFO would read at once, so the end then sends SIGKILL at
+# once); past 10 s it names the groups left, red. The poll is group_alive's:
+# the process table (`ps`), a group alive while a process of it is listed that
+# is not a zombie, and `kill -0` only when the table cannot be read: a killed
+# process whose reaper is slow to collect it (an orphan left to the user's
+# service manager, say) answers `kill -0` until it is reaped, where the table
+# lists it as a zombie, so the poll ends at its next tick, whatever the
+# reaper's pace. Only then is each group's leader, a job of the lane, waited
+# for, so a leader that ignores SIGTERM never holds the poll.
+groups_end() {
+  local what=$1 pid alive tick=0 kill_at=3
+  shift
+  [ "$#" -gt 0 ] || return 0
+  for pid in "$@"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
+  if [ -p "$work/tick" ]; then exec 4<>"$work/tick"; else kill_at=0; fi
+  while :; do
+    alive=''
+    for pid in "$@"; do
+      group_alive "$pid" >/dev/null || continue
+      alive="$alive $pid"
+    done
+    [ -n "$alive" ] || break
+    if [ "$tick" -eq "$kill_at" ]; then
+      for pid in $alive; do kill -KILL -- "-$pid" 2>/dev/null || true; done
+    elif [ "$tick" -ge 10 ] || [ "$kill_at" -eq 0 ]; then
+      echo "   red: the process groups of $what$alive outlived SIGKILL"
+      fail=1
+      break
+    fi
+    if [ "$kill_at" -gt 0 ]; then read -r -t 1 -u 4 _ || true; fi
+    tick=$((tick + 1))
+  done
+  if [ "$kill_at" -gt 0 ]; then exec 4>&-; fi
+  for pid in "$@"; do wait "$pid" 2>/dev/null || true; done
+}
+# The run in flight (run_deadline, below): its process id, which names its
+# process group, and its deadline's watcher job, each empty between runs.
+run_pid='' run_watch=''
+# jobs_stop: every job of the lane still running ends: the deadline's watcher
+# at once (SIGKILL; it holds nothing), then, through groups_end, the run in
+# flight and every build ahead not yet waited for, each a whole process group
+# (cargo, and every compiler, linker, test and node it started). A job started
+# but not yet recorded when a signal came is in `jobs -p`.
+jobs_stop() {
+  local j pid groups=' '
+  if [ -n "$run_watch" ]; then
+    kill -KILL "$run_watch" 2>/dev/null || true
+    wait "$run_watch" 2>/dev/null || true
+    run_watch=''
+  fi
+  if [ -n "$run_pid" ]; then groups="$groups$run_pid "; fi
   for j in ${ahead_pid[@]+"${!ahead_pid[@]}"}; do
     [ -z "${ahead_status[$j]:-}" ] || continue
     ahead_status[$j]=stopped
@@ -1874,45 +2030,21 @@ ahead_stop() {
     case "$groups" in *" $pid "*) ;; *) groups="$groups$pid " ;; esac
   done
   [ -n "${groups// /}" ] || return 0
-  for pid in $groups; do kill -TERM -- "-$pid" 2>/dev/null || true; done
-  if [ -p "$work/tick" ]; then exec 4<>"$work/tick"; else kill_at=0; fi
-  while :; do
-    alive=''
-    table=$(ps -A -o pgid= -o stat= 2>/dev/null) || table=''
-    for pid in $groups; do
-      if [ -n "$table" ]; then
-        printf '%s\n' "$table" | LC_ALL=C awk -v g="$pid" '$1 == g && $2 !~ /^Z/ { live = 1 }
-          END { exit !live }' || continue
-      else
-        kill -0 -- "-$pid" 2>/dev/null || continue
-      fi
-      alive="$alive $pid"
-    done
-    [ -n "$alive" ] || break
-    if [ "$tick" -eq "$kill_at" ]; then
-      for pid in $alive; do kill -KILL -- "-$pid" 2>/dev/null || true; done
-    elif [ "$tick" -ge 10 ] || [ "$kill_at" -eq 0 ]; then
-      echo "   red: the process groups of builds ahead$alive outlived SIGKILL"
-      break
-    fi
-    if [ "$kill_at" -gt 0 ]; then read -r -t 1 -u 4 _ || true; fi
-    tick=$((tick + 1))
-  done
-  if [ "$kill_at" -gt 0 ]; then exec 4>&-; fi
-  for pid in $groups; do wait "$pid" 2>/dev/null || true; done
+  # shellcheck disable=SC2086 # the groups' ids, one word each
+  groups_end "the lane's jobs" $groups
 }
-# On any exit every build ahead ends first, its whole process group; then the
+# On any exit every job ends first, each whole process group; then the
 # work directory goes, and so do the planted directory of the cfg whose rows
 # were running and of each cfg a build ahead was started for (ahead_began, set
 # before the fork, so a build a signal stopped before its process id was
 # recorded is counted too; remove_planted, below), so a run a
 # signal stops leaves no planted build behind. The signals are trapped for the
-# order: bash runs a trapped signal's action once the build in the foreground
-# has ended, so the removal never runs beside a cargo still writing into the
-# directory, where an untrapped signal runs the exit trap at once. SIGKILL
-# runs no trap and leaves the builds.
+# order: the run or build in flight, a job, ends with the builds ahead before
+# anything is removed, so the removal never runs beside a cargo still writing
+# into the directory, where an untrapped signal runs the exit trap at once.
+# SIGKILL runs no trap and leaves the jobs.
 planted_cfg=
-trap 'ahead_stop
+trap 'jobs_stop
   case "$work" in */sim-canaries.??????) rm -rf -- "$work" ;; esac
   [ -z "$planted_cfg" ] || remove_planted "$planted_cfg"
   for j in ${ahead_began[@]+"${!ahead_began[@]}"}; do remove_planted "${cfg_order[$j]}"; done' EXIT
@@ -1921,13 +2053,16 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 log=$work/planted.log
 control=$work/control.log
-# The job pool at K > 1, and the stop's tick (ahead_stop): J - K one-byte
-# tokens in a FIFO the lane holds open both ways, so a token given back never
-# blocks and a take never reads an end of file; a cargo that inherits a pool
-# ignores its own job bound. J - K is under 1,000 bytes, which any system's
-# pipe buffer holds.
+# The tick of every timed wait (groups_end, run_deadline): a FIFO nobody
+# writes, each reader opening it both ways, so a read never meets an end of
+# file and lasts its whole timeout.
+mkfifo "$work/tick" || { echo "sim-canaries: mkfifo failed"; exit 2; }
+# The job pool at K > 1: J - K one-byte tokens in a FIFO the lane holds open
+# both ways, so a token given back never blocks and a take never reads an end
+# of file; a cargo that inherits a pool ignores its own job bound. J - K is
+# under 1,000 bytes, which any system's pipe buffer holds.
 if [ "$builds" -gt 1 ]; then
-  mkfifo "$work/pool" "$work/tick" || { echo "sim-canaries: mkfifo failed"; exit 2; }
+  mkfifo "$work/pool" || { echo "sim-canaries: mkfifo failed"; exit 2; }
   exec 3<>"$work/pool"
   token=$builds
   while [ "$token" -lt "$build_jobs" ]; do
@@ -2013,8 +2148,158 @@ uring_unavailable() {
 plain_red() {
   echo "   red for another reason: the plain build does not pass $1 (a canary needs a green" \
     "control):"
-  tail -5 "$2"
+  red_excerpt "$2"
   fail=1
+}
+
+# red_excerpt <log>: what a red leg's log says of its failure: each line holding
+# `panicked at` and the lines of its message after it, up to a blank line, a
+# `note:` or `stack backtrace:` line or a test's `---- ` header (at most 4
+# panics of 8 lines), then the log's last 5 lines, libtest's summary; every line
+# read as bytes with the control bytes dropped and cut at 160 bytes, so a log's
+# line of any length or bytes prints bounded. The whole log is read, so no
+# writer of the pipe is cut short.
+red_excerpt() {
+  tr -d '\000-\010\013-\037\177' <"$1" | LC_ALL=C awk '
+    /panicked at / { taking = panics++ < 4 ? 8 : 0 }
+    taking && !/panicked at / && (/^$/ || /^note: / || /^stack backtrace:/ || /^---- /) {
+      taking = 0
+    }
+    taking { print substr($0, 1, 160); taking-- }
+    { last[NR % 5] = substr($0, 1, 160) }
+    END { for (line = NR > 5 ? NR - 4 : 1; line <= NR; line++) print last[line % 5] }'
+}
+
+# hung_red <plain|planted|preflight> <seconds> <whose> <log>: the row's verdict
+# when a run passed its deadline (run_deadline ended its whole process group):
+# red, on the plain leg a control that is not green, on the planted leg never a
+# catch, whatever its log holds; <whose> names the deadline, `the row's`, the
+# kind's (`the crate-test`) or `the build`.
+hung_red() {
+  case "$1" in
+    plain)
+      echo "   HUNG after $2 s ($3 deadline) on the plain build: its process group is ended," \
+        "and a canary needs a green control:"
+      ;;
+    planted)
+      echo "   HUNG after $2 s ($3 deadline) on the planted build: its process group is ended," \
+        "and a hang is never a catch:"
+      ;;
+    preflight)
+      echo "   HUNG after $2 s ($3 deadline) in the preflight: its process group is ended:"
+      ;;
+  esac
+  red_excerpt "$4"
+  fail=1
+}
+
+# group_alive <process group>: prints the process ids and names of the group's
+# processes that are not zombies, read from the process table (`ps`), comma
+# separated, and is non-zero when none is; when the table cannot be read, a
+# group `kill -0` reaches is alive, its processes unnamed.
+group_alive() {
+  local table
+  table=$(ps -A -o pgid= -o pid= -o stat= -o comm= 2>/dev/null) || {
+    kill -0 -- "-$1" 2>/dev/null || return 1
+    echo "processes the table does not list"
+    return 0
+  }
+  printf '%s\n' "$table" | LC_ALL=C awk -v g="$1" '$1 == g && $3 !~ /^Z/ {
+      printf "%s%s %s", (live++ ? ", " : ""), $2, substr($4, 1, 32)
+    }
+    END { if (live) printf "\n"; exit !live }'
+}
+
+# wait_bounded <job> <seconds>: the lane waits for its job at most <seconds>. A
+# watcher job reads the tick for <seconds>, then signals the lane (SIGUSR1,
+# again each second until it is stopped), which ends the wait; the watcher is
+# stopped once the wait ends. run_status is the job's exit status, and run_late
+# is 1 when the seconds passed first: the job then still runs, or ended on the
+# deadline's tick, and its status is not its own. The signal's trap is the
+# lane's for its whole life, and run_late is read only once the watcher is gone,
+# so a signal it sent before it was stopped is counted.
+run_late=0 run_status=0 run_late_s='' run_late_whose=''
+trap 'run_late=1' USR1
+wait_bounded() {
+  run_late=0 run_status=0
+  {
+    read -r -t "$2" -u 4 _ 4<>"$work/tick" || true
+    while kill -USR1 "$$" 2>/dev/null; do read -r -t 1 -u 4 _ 4<>"$work/tick" || true; done
+  } </dev/null >/dev/null 2>&1 3>&- &
+  run_watch=$!
+  wait "$1" || run_status=$?
+  kill -KILL "$run_watch" 2>/dev/null || true
+  wait "$run_watch" 2>/dev/null || true
+  run_watch=''
+}
+
+# run_deadline <seconds> <whose> <log|-> <command…>: one run, bounded. The
+# command, an executable the lane forks with no shell between (so its parent is
+# the lane), runs as a job in a process group of its own, stdin and the pool's
+# descriptor closed, its output the log, written whole, or the lane's own for
+# `-`, and the lane waits for it at most <seconds> (wait_bounded). Past them the
+# run's whole group ends (groups_end), and run_late is 1, with the seconds and
+# <whose> deadline they were in run_late_s and run_late_whose. A run that ends
+# in time and leaves a process of its group alive (a node it did not reap) has
+# that process named and its group ended, so nothing it started outlives it:
+# the run's verdict is still its own.
+run_deadline() {
+  local seconds=$1 whose=$2 out=$3 left
+  shift 3
+  set -m
+  if [ "$out" = - ]; then
+    "$@" </dev/null 3>&- &
+  else
+    "$@" </dev/null >"$out" 2>&1 3>&- &
+  fi
+  run_pid=$!
+  set +m
+  wait_bounded "$run_pid" "$seconds"
+  if [ "$run_late" -eq 1 ]; then
+    run_late_s=$seconds run_late_whose=$whose
+    groups_end "a run past its deadline" "$run_pid"
+  elif kill -0 -- "-$run_pid" 2>/dev/null && left=$(group_alive "$run_pid"); then
+    echo "   left behind: the run ended with processes of its group alive ($left); the group" \
+      "is ended"
+    groups_end "a run's leftovers" "$run_pid"
+  fi
+  run_pid=''
+}
+
+# leg_run <seconds> <whose> <log> <command…> -- <test arguments…>: a test leg.
+# Its build alone (`<command…> --no-run`, the command a build ahead runs), under
+# the build deadline (kind_deadline_s build), then, built, its run (`<command…>
+# -- <test arguments…>`) under <whose> deadline of <seconds>, each a bounded run
+# (run_deadline) writing the log whole. A build that fails leaves its status in
+# run_status and its output as the leg's log, judged as a compile error always
+# was: red for another reason; a build past its deadline reads late, as a run.
+leg_run() {
+  local seconds=$1 whose=$2 out=$3
+  local -a command
+  shift 3
+  command=()
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+    command+=("$1")
+    shift
+  done
+  run_deadline "$(kind_deadline_s build)" "the build" "$out" "${command[@]}" --no-run
+  if [ "$run_late" -eq 1 ] || [ "$run_status" -ne 0 ]; then return 0; fi
+  run_deadline "$seconds" "$whose" "$out" "${command[@]}" "$@"
+}
+
+# build_bounded <what> <command…>: a build the lane runs in its own output under
+# the build deadline (run_deadline); non-zero when it failed or passed the
+# deadline, which it names: the caller reads either as the build failed.
+build_bounded() {
+  local what=$1
+  shift
+  run_deadline "$(kind_deadline_s build)" "the build" - "$@"
+  if [ "$run_late" -eq 1 ]; then
+    echo "   HUNG after $run_late_s s (the build deadline) building $what: its process group" \
+      "is ended"
+    return 1
+  fi
+  [ "$run_status" -eq 0 ]
 }
 
 # now_ds: the clock in tenths of a second, for the times the log prints:
@@ -2051,43 +2336,43 @@ crate_target_args() {
 }
 
 # The planted builds, each command in one place: a row's planted leg runs it,
-# and its cfg's build ahead runs the same, a test's built alone (`--no-run`)
-# where the leg names the test to run (`-- <test>`).
-# planted_sim <cfg>: the planted simulator.
+# and its cfg's build ahead runs the same, a test's built alone (`--no-run`),
+# as the leg's own build is before its run names the test (`-- <test>`).
+# planted_sim <cfg>: sets `leg` to the planted simulator's build command.
 planted_sim() {
-  RUSTFLAGS="--cfg $1" 3>&- "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
-    --target-dir "$TARGET_ROOT/canary-$1"
+  leg=(env "RUSTFLAGS=--cfg $1" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim
+    --target-dir "$TARGET_ROOT/canary-$1")
 }
-# planted_crate_test <cfg> <package> [<test>]: the crate's test target in
-# target_args (crate_target_args), run on <test>, or with none built alone.
+# planted_crate_test <cfg> <package>: sets `leg` to the planted test command of
+# the crate's target in target_args (crate_target_args), an executable (`env`)
+# and its arguments, so a run of it is the lane's own child (run_deadline).
 planted_crate_test() {
-  local -a tail
-  tail=(--no-run)
-  if [ -n "${3:-}" ]; then tail=(-- "$3"); fi
-  RUSTFLAGS="--cfg $1" 3>&- "$CARGO" test -p "$2" "${target_args[@]}" \
-    --target-dir "$TARGET_ROOT/canary-$1" "${tail[@]}"
+  leg=(env "RUSTFLAGS=--cfg $1" "$CARGO" test -p "$2" "${target_args[@]}"
+    --target-dir "$TARGET_ROOT/canary-$1")
 }
-# planted_loom <cfg> <package> [<test>]: the Loom models, run on <test>, or
-# with none built alone.
+# planted_loom <cfg> <package>: sets `leg` to the planted Loom models' command,
+# as planted_crate_test does.
 planted_loom() {
-  local -a tail
-  tail=(--no-run)
-  if [ -n "${3:-}" ]; then tail=(-- "$3"); fi
-  RUSTFLAGS="--cfg loom --cfg $1" LOOM_MAX_PREEMPTIONS=3 3>&- "$CARGO" test -p "$2" --release \
-    --lib --target-dir "$TARGET_ROOT/canary-$1" "${tail[@]}"
+  leg=(env "RUSTFLAGS=--cfg loom --cfg $1" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$2" --release
+    --lib --target-dir "$TARGET_ROOT/canary-$1")
 }
 
 # crate_test <label> <cfg> <package[/features]> <lib|test:NAME> <test name>
-# <witness, or empty>
+# <witness, or empty>: each leg under the row's deadline (row_deadline_s).
 crate_test() {
   local label=$1 cfg=$2 spec=$3 target=$4 name=$5 witness=$6 package=${3%%/*} target_args
   local status reason printed
+  local -a leg
   crate_target_args "$spec" "$target"
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
   echo "== canary $label: $spec $target on the plain build must stay green"
-  status=0
-  "$CARGO" test -p "$package" "${target_args[@]}" --target-dir "$TARGET_ROOT" -- "$name" \
-    --show-output > "$control" 2>&1 3>&- || status=$?
+  leg_run "$row_deadline_s" "$row_deadline_from" "$control" "$CARGO" test -p "$package" \
+    "${target_args[@]}" --target-dir "$TARGET_ROOT" -- "$name" --show-output
+  status=$run_status
+  if [ "$run_late" -eq 1 ]; then
+    hung_red plain "$run_late_s" "$run_late_whose" "$control"
+    return
+  fi
   if reason=$(judged_nothing crate-test "$status" "$control" "$name"); then
     nothing_judged "$label" "$reason"
     return
@@ -2108,9 +2393,12 @@ crate_test() {
   controls_green=$((controls_green + 1))
   if [ "$controls_only" -eq 1 ]; then return; fi
   echo "== canary $label: $spec $target on the planted build must go red"
-  status=0
-  planted_crate_test "$cfg" "$package" "$name" > "$log" 2>&1 || status=$?
-  if reason=$(judged_nothing crate-test "$status" "$log" "$name"); then
+  planted_crate_test "$cfg" "$package"
+  leg_run "$row_deadline_s" "$row_deadline_from" "$log" "${leg[@]}" -- "$name"
+  status=$run_status
+  if [ "$run_late" -eq 1 ]; then
+    hung_red planted "$run_late_s" "$run_late_whose" "$log"
+  elif reason=$(judged_nothing crate-test "$status" "$log" "$name"); then
     nothing_judged "$label" "$reason"
   elif [ "$status" -eq 0 ]; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"
@@ -2120,7 +2408,7 @@ crate_test() {
     fail=1
   elif ! grep -Eq -- "${verdict}FAILED" "$log"; then
     echo "   red for another reason (expected 'test $name ... FAILED'):"
-    tail -5 "$log"
+    red_excerpt "$log"
     fail=1
   elif grep -Fq -- "VACUOUS" "$log"; then
     echo "   red for another reason (the test's engagement check, not its oracle):"
@@ -2128,7 +2416,7 @@ crate_test() {
     fail=1
   elif [ -n "$witness" ] && ! grep -Fq -- "$witness" "$log"; then
     echo "   red for another reason (expected the oracle's assertion '$witness'):"
-    tail -5 "$log"
+    red_excerpt "$log"
     fail=1
   elif [ -n "$witness" ]; then
     echo "   caught: $(grep -F -m1 -- "$witness" "$log" | cut -c1-160)"
@@ -2141,15 +2429,21 @@ crate_test() {
 
 # loom_test <label> <cfg> <package> <test name> <witness>: the model under
 # `--cfg loom`, planted and plain, each in its own target dir (RUSTFLAGS
-# differ).
+# differ), each leg under the row's deadline (row_deadline_s).
 loom_test() {
   local label=$1 cfg=$2 package=$3 name=$4 witness=$5 status reason printed
+  local -a leg
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
   echo "== canary $label: $package on the plain loom build must stay green"
-  status=0
-  RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 3>&- "$CARGO" test -p "$package" --release \
-    --lib --target-dir "$TARGET_ROOT/loom" -- "$name" --show-output > "$control" 2>&1 \
-    || status=$?
+  leg_run "$row_deadline_s" "$row_deadline_from" "$control" env "RUSTFLAGS=--cfg loom" \
+    LOOM_MAX_PREEMPTIONS=3 \
+    "$CARGO" test -p "$package" --release --lib --target-dir "$TARGET_ROOT/loom" -- "$name" \
+    --show-output
+  status=$run_status
+  if [ "$run_late" -eq 1 ]; then
+    hung_red plain "$run_late_s" "$run_late_whose" "$control"
+    return
+  fi
   if reason=$(judged_nothing loom "$status" "$control" "$name"); then
     nothing_judged "$label" "$reason"
     return
@@ -2165,20 +2459,23 @@ loom_test() {
   controls_green=$((controls_green + 1))
   if [ "$controls_only" -eq 1 ]; then return; fi
   echo "== canary $label: $package on the planted loom build must go red"
-  status=0
-  planted_loom "$cfg" "$package" "$name" > "$log" 2>&1 || status=$?
-  if reason=$(judged_nothing loom "$status" "$log" "$name"); then
+  planted_loom "$cfg" "$package"
+  leg_run "$row_deadline_s" "$row_deadline_from" "$log" "${leg[@]}" -- "$name"
+  status=$run_status
+  if [ "$run_late" -eq 1 ]; then
+    hung_red planted "$run_late_s" "$run_late_whose" "$log"
+  elif reason=$(judged_nothing loom "$status" "$log" "$name"); then
     nothing_judged "$label" "$reason"
   elif [ "$status" -eq 0 ]; then
     echo "   NOT CAUGHT: the planted build ran green (the model has no teeth)"
     fail=1
   elif ! grep -Eq -- "${verdict}FAILED" "$log"; then
     echo "   red for another reason (expected 'test $name ... FAILED'):"
-    tail -5 "$log"
+    red_excerpt "$log"
     fail=1
   elif ! grep -Fq -- "$witness" "$log"; then
     echo "   red for another reason (expected the model's assertion '$witness'):"
-    tail -5 "$log"
+    red_excerpt "$log"
     fail=1
   else
     echo "   caught: $(grep -F -m1 -- "$witness" "$log" | cut -c1-160)"
@@ -2218,22 +2515,26 @@ token_catches() {
 sim_built=0
 # A plain leg is the scenario, its flags and the seed, not the plant: rows
 # that share one share its run and its log (three rows run m4-recovery
-# --replay-above-window at the lane seed, about 34 s each). A leg's log is
-# `leg-<index>.log`, its index its place in `control_legs`, matched whole;
-# `control_state` holds the leg's verdict at the same index: `green`, `red`,
-# or `nothing` with the reason after a space.
+# --replay-above-window at the lane seed, about 34 s each), and the run's
+# deadline is its first row's. A leg's log is `leg-<index>.log`, its index its
+# place in `control_legs`, matched whole; `control_state` holds the leg's
+# verdict at the same index: `green`, `red`, `nothing` with the reason after a
+# space, or `hung` with the deadline's seconds and whose it was.
 control_legs=()
 control_state=()
 
-# scenario_row <label> <cfg> <scenario> <expected> [flags…]
+# scenario_row <label> <cfg> <scenario> <expected> [flags…]: each run under
+# the row's deadline (row_deadline_s).
 scenario_row() {
   local label=$1 cfg=$2 name=$3 expect=$4 leg index j status reason printed catches planted
+  local hung
   local -a flags
   flags=("${@:5}")
   if [ "$sim_built" -eq 0 ]; then
     sim_built=1
-    "$CARGO" build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT" \
-      3>&- || sim_built=2
+    build_bounded "the plain inf-sim" \
+      "$CARGO" build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT" \
+      || sim_built=2
   fi
   if [ "$sim_built" -eq 2 ]; then
     echo "== canary $label: the plain inf-sim build"
@@ -2251,10 +2552,12 @@ scenario_row() {
     echo "== canary $label: on the plain build must stay green"
     index=${#control_legs[@]}
     control_legs+=("$leg")
-    status=0
-    3>&- "$sim_target/release/inf-sim" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} \
-      > "$work/leg-$index.log" 2>&1 || status=$?
-    if reason=$(judged_nothing scenario "$status" "$work/leg-$index.log"); then
+    run_deadline "$row_deadline_s" "$row_deadline_from" "$work/leg-$index.log" \
+      "$sim_target/release/inf-sim" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"}
+    status=$run_status
+    if [ "$run_late" -eq 1 ]; then
+      control_state+=("hung $run_late_s $run_late_whose")
+    elif reason=$(judged_nothing scenario "$status" "$work/leg-$index.log"); then
       control_state+=("nothing $reason")
     elif [ "$status" -ne 0 ]; then
       control_state+=(red)
@@ -2267,8 +2570,19 @@ scenario_row() {
       nothing_judged "$label" "${control_state[$index]#nothing }"
       return
       ;;
+    hung\ *)
+      hung=${control_state[$index]#hung }
+      hung_red plain "${hung%% *}" "${hung#* }" "$work/leg-$index.log"
+      return
+      ;;
     red)
       plain_red "'${leg% }'" "$work/leg-$index.log"
+      return
+      ;;
+    green) ;;
+    *)
+      echo "   red: the plain leg's state '${control_state[$index]}' is none the lane writes"
+      fail=1
       return
       ;;
   esac
@@ -2279,24 +2593,27 @@ scenario_row() {
   controls_green=$((controls_green + 1))
   if [ "$controls_only" -eq 1 ]; then return; fi
   echo "== canary $label: building inf-sim with --cfg $cfg into $TARGET_ROOT/canary-$cfg"
-  if ! planted_sim "$cfg"; then
+  planted_sim "$cfg"
+  if ! build_bounded "the planted inf-sim" "${leg[@]}"; then
     echo "   red for another reason (the planted build failed; its output is above)"
     fail=1
     return
   fi
   planted="$sim_target/canary-$cfg/release/inf-sim"
   echo "== canary $label: lane seed $seed on the planted build must go red"
-  status=0
-  3>&- "$planted" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"} > "$log" 2>&1 \
-    || status=$?
-  if reason=$(judged_nothing scenario "$status" "$log"); then
+  run_deadline "$row_deadline_s" "$row_deadline_from" "$log" "$planted" --scenario "$name" \
+    --seed "$seed" ${flags[@]+"${flags[@]}"}
+  status=$run_status
+  if [ "$run_late" -eq 1 ]; then
+    hung_red planted "$run_late_s" "$run_late_whose" "$log"
+  elif reason=$(judged_nothing scenario "$status" "$log"); then
     nothing_judged "$label" "$reason"
   elif [ "$status" -eq 0 ]; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"
     fail=1
   elif ! grep -q -- "$expect" "$log"; then
     echo "   red for another reason (expected a violation mentioning '$expect'):"
-    tail -5 "$log"
+    red_excerpt "$log"
     fail=1
   elif ! catches=$(token_catches "$expect" "$log"); then
     # Each line naming the token is an engagement clause it does not name:
@@ -2317,9 +2634,11 @@ scenario_row() {
 bench_built=0 node_built=0
 bench=${INF_CANARY_BENCH:-$sim_target/canary-plain/release/inf-bench}
 plain_node=$sim_target/canary-plain/release/infinityd
-# Each instrument's preflight, once a lane: its name in `preflight_names`
-# and, at the same index, its verdict in `preflight_state`, `ok`, `red` or
-# `nothing` with the reason after a space; its log `preflight-<index>.log`.
+# Each instrument's preflight, once a lane, under the binary kind's deadline
+# (kind_deadline_s): its name in `preflight_names` and, at the same index, its
+# verdict in `preflight_state`, `ok`, `red` or `nothing` with the reason after
+# a space, or `hung` with the deadline's seconds; its log
+# `preflight-<index>.log`.
 preflight_names=()
 preflight_state=()
 
@@ -2327,7 +2646,7 @@ preflight_state=()
 # stub is named) and each binary row's instrument preflighted once, so a
 # host outside an instrument's scope builds no node at all.
 binary_preflights() {
-  local row name j index status reason
+  local row name j index status reason seconds
   local -a parts
   for row in "${rows[@]}"; do
     # shellcheck disable=SC2206
@@ -2342,19 +2661,22 @@ binary_preflights() {
       bench_built=1
       if [ -z "${INF_CANARY_BENCH:-}" ]; then
         echo "== binary rows: building inf-bench into $TARGET_ROOT/canary-plain"
-        RUSTFLAGS= "$CARGO" build --release -p inf-bench --target-dir "$TARGET_ROOT/canary-plain" \
-          3>&- || bench_built=2
+        build_bounded "inf-bench" env RUSTFLAGS= "$CARGO" build --release -p inf-bench \
+          --target-dir "$TARGET_ROOT/canary-plain" || bench_built=2
       fi
     fi
     index=${#preflight_names[@]}
     preflight_names+=("$name")
     if [ "$bench_built" -eq 2 ]; then preflight_state+=(unbuilt); continue; fi
     echo "== binary rows: $name --preflight"
-    status=0
-    3>&- "$bench" "$name" --preflight > "$work/preflight-$index.log" 2>&1 || status=$?
+    seconds=$(kind_deadline_s binary)
+    run_deadline "$seconds" "the binary" "$work/preflight-$index.log" "$bench" "$name" --preflight
+    status=$run_status
     tr -d '\000-\010\013-\037\177' <"$work/preflight-$index.log" \
       | LC_ALL=C awk 'NR <= 3 { print "   " substr($0, 1, 160) }'
-    if reason=$(judged_nothing binary "$status" "$work/preflight-$index.log"); then
+    if [ "$run_late" -eq 1 ]; then
+      preflight_state+=("hung $seconds")
+    elif reason=$(judged_nothing binary "$status" "$work/preflight-$index.log"); then
       preflight_state+=("nothing $reason")
     elif [ "$status" -eq 0 ]; then
       preflight_state+=(ok)
@@ -2373,7 +2695,8 @@ token_line() {
     END { exit !found }'
 }
 
-# binary_row <label> <cfg> <instrument> <token> [flags…]
+# binary_row <label> <cfg> <instrument> <token> [flags…]: the instrument's run
+# under the row's deadline (row_deadline_s), its node builds unbounded.
 binary_row() {
   local label=$1 cfg=$2 name=$3 token=$4 index=-1 j state status reason line built_at ran_at
   local -a flags
@@ -2401,7 +2724,19 @@ binary_row() {
     red\ *)
       echo "== canary $label: $name --preflight"
       echo "   red for another reason (the preflight exited ${state#red }):"
-      tail -5 "$work/preflight-$index.log"
+      red_excerpt "$work/preflight-$index.log"
+      fail=1
+      return
+      ;;
+    hung\ *)
+      echo "== canary $label: $name --preflight"
+      hung_red preflight "${state#hung }" "the binary" "$work/preflight-$index.log"
+      return
+      ;;
+    ok) ;;
+    *)
+      echo "== canary $label: $name --preflight"
+      echo "   red: the preflight's state '$state' is none the lane writes"
       fail=1
       return
       ;;
@@ -2409,8 +2744,8 @@ binary_row() {
   if [ "$node_built" -eq 0 ]; then
     node_built=1
     echo "== binary rows: building the plain infinityd into $TARGET_ROOT/canary-plain"
-    RUSTFLAGS= "$CARGO" build --release -p infinityd --target-dir "$TARGET_ROOT/canary-plain" \
-      3>&- || node_built=2
+    build_bounded "the plain infinityd" env RUSTFLAGS= "$CARGO" build --release -p infinityd \
+      --target-dir "$TARGET_ROOT/canary-plain" || node_built=2
   fi
   if [ "$node_built" -eq 2 ]; then
     echo "== canary $label: the plain infinityd build"
@@ -2420,18 +2755,20 @@ binary_row() {
   fi
   echo "== canary $label: building infinityd with --cfg $cfg into $TARGET_ROOT/canary-$cfg"
   built_at=$SECONDS
-  if ! RUSTFLAGS="--cfg $cfg" 3>&- "$CARGO" build --release -p infinityd \
-      --target-dir "$TARGET_ROOT/canary-$cfg"; then
+  if ! build_bounded "the planted infinityd" env "RUSTFLAGS=--cfg $cfg" "$CARGO" build --release \
+      -p infinityd --target-dir "$TARGET_ROOT/canary-$cfg"; then
     echo "   red for another reason (the planted build failed; its output is above)"
     fail=1
     return
   fi
   echo "== canary $label: the planted node against the plain one must read $token"
   ran_at=$SECONDS
-  status=0
-  "$bench" "$name" --base "$plain_node" --candidate "$sim_target/canary-$cfg/release/infinityd" \
-    "${flags[@]}" > "$log" 2>&1 3>&- || status=$?
-  if reason=$(judged_nothing binary "$status" "$log"); then
+  run_deadline "$row_deadline_s" "$row_deadline_from" "$log" "$bench" "$name" \
+    --base "$plain_node" --candidate "$sim_target/canary-$cfg/release/infinityd" "${flags[@]}"
+  status=$run_status
+  if [ "$run_late" -eq 1 ]; then
+    hung_red planted "$run_late_s" "$run_late_whose" "$log"
+  elif reason=$(judged_nothing binary "$status" "$log"); then
     nothing_judged "$label" "$reason"
   elif [ "$status" -eq 0 ]; then
     echo "   NOT CAUGHT: the instrument read the planted node within (the plant has no teeth):"
@@ -2448,7 +2785,7 @@ binary_row() {
     fail=1
   else
     echo "   red for another reason (exit $status, expected 1 and a line beginning '$token:'):"
-    tail -5 "$log"
+    red_excerpt "$log"
     fail=1
   fi
 }
@@ -2565,7 +2902,7 @@ done
 # build's status, after every build ran.
 ahead_build() {
   local cfg=$1 row key made=" " status=0 built began package target_args
-  local -a parts
+  local -a parts leg
   began=$(now_ds)
   for row in "${rows[@]}"; do
     [ "${row%% *}" = "$cfg" ] || continue
@@ -2588,9 +2925,16 @@ ahead_build() {
       test:*)
         crate_target_args "${parts[2]}" "${parts[3]}"
         planted_crate_test "$cfg" "$package"
+        3>&- "${leg[@]}" --no-run
         ;;
-      loom:*) planted_loom "$cfg" "$package" ;;
-      sim) planted_sim "$cfg" ;;
+      loom:*)
+        planted_loom "$cfg" "$package"
+        3>&- "${leg[@]}" --no-run
+        ;;
+      sim)
+        planted_sim "$cfg"
+        3>&- "${leg[@]}"
+        ;;
     esac </dev/null >>"$work/ahead-$cfg.log" 2>&1 || built=$?
     if [ "$status" -eq 0 ]; then status=$built; fi
   done
@@ -2599,7 +2943,7 @@ ahead_build() {
 }
 
 # ahead_start <index>: the build ahead of the cfg at that index of cfg_order,
-# a job in a process group of its own, so ahead_stop ends its compilers too.
+# a job in a process group of its own, so jobs_stop ends its compilers too.
 ahead_start() {
   ahead_began[$1]=$(now_ds)
   set -m
@@ -2624,13 +2968,22 @@ ahead_fill() {
   done
 }
 
-# ahead_reap <index>: the cfg's build ahead, if started, waited for once; its
-# status and the wait kept.
+# ahead_reap <index>: the cfg's build ahead, if started, waited for once, at
+# most until the build deadline (kind_deadline_s build) from its start passes:
+# then its whole group ends and its status is `hung`. Its status and the wait
+# kept.
 ahead_reap() {
-  local status=0 began
+  local status began left_s
   [ -n "${ahead_pid[$1]:-}" ] && [ -z "${ahead_status[$1]:-}" ] || return 0
   began=$(now_ds)
-  wait "${ahead_pid[$1]}" || status=$?
+  left_s=$(($(kind_deadline_s build) - (began - ahead_began[$1]) / 10))
+  if [ "$left_s" -lt 1 ]; then left_s=1; fi
+  wait_bounded "${ahead_pid[$1]}" "$left_s"
+  status=$run_status
+  if [ "$run_late" -eq 1 ]; then
+    groups_end "a build ahead past its deadline" "${ahead_pid[$1]}"
+    status=hung
+  fi
   ahead_status[$1]=$status
   ahead_waited[$1]=$(($(now_ds) - began))
 }
@@ -2648,14 +3001,22 @@ ahead_join() {
   [ -n "${ahead_pid[$1]:-}" ] || return 0
   ahead_reap "$1"
   built=$(cat "$work/ahead-$cfg.ds" 2>/dev/null || echo 0)
-  if [ "${ahead_status[$1]}" -eq 0 ]; then
-    echo "== canary $cfg: built ahead in $(tenths "$built") s, $(tenths "${ahead_waited[$1]}") s" \
-      "waited for"
-  else
-    echo "== canary $cfg: its build ahead failed (exit ${ahead_status[$1]} after" \
-      "$(tenths "$built") s); each row's leg builds again, in order:"
-    tail -5 "$work/ahead-$cfg.log"
-  fi
+  case "${ahead_status[$1]}" in
+    0)
+      echo "== canary $cfg: built ahead in $(tenths "$built") s, $(tenths "${ahead_waited[$1]}")" \
+        "s waited for"
+      ;;
+    hung)
+      echo "== canary $cfg: its build ahead passed the build deadline ($(kind_deadline_s build) s" \
+        "from its start) and is ended; each row's leg builds again, in order:"
+      red_excerpt "$work/ahead-$cfg.log"
+      ;;
+    *)
+      echo "== canary $cfg: its build ahead failed (exit ${ahead_status[$1]} after" \
+        "$(tenths "$built") s); each row's leg builds again, in order:"
+      tail -5 "$work/ahead-$cfg.log"
+      ;;
+  esac
 }
 
 # remove_planted <cfg>: the cfg's planted directory, through the root's own
@@ -2702,6 +3063,18 @@ for index in "${!rows[@]}"; do
       fi
       ahead_join "$cfg_index"
     fi
+  fi
+  # The row's words without its deadline (the pre-pass read each), and the
+  # deadline every run of the row is held to.
+  row_words "${rows[$index]}"
+  parts=("${words[@]}")
+  row_deadline_from="the row's"
+  if [ -z "$row_deadline_s" ]; then
+    case "${parts[1]}" in
+      crate-test | loom | binary) row_deadline_from="the ${parts[1]}" ;;
+      *) row_deadline_from="the scenario" ;;
+    esac
+    row_deadline_s=$(kind_deadline_s "${parts[1]}")
   fi
   label=$(row_label "${parts[@]}")
   began=$(now_ds)
