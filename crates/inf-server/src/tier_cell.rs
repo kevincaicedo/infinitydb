@@ -138,7 +138,9 @@ pub(crate) struct TierNs<F: SegmentFs> {
     /// and a dropped namespace's pinned catalog files, each with its handle,
     /// kept to a terminal answer; private to the walk, the commit's push
     /// and a result's consumption, and read by no MANIFEST, live set or cold
-    /// plan (they left `sealed` and `files` at the commit).
+    /// plan (they left `sealed` and `files` at the commit). The walk passes
+    /// an owner a cold read is pinned on
+    /// (§3.3 — a file with in-flight cold reads is never deleted).
     retiring: RetireList<F::File>,
     /// This owner's files out as retirement jobs, its residue's included:
     /// offered, in the worker's hand, or with their results unconsumed. A

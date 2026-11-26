@@ -2031,13 +2031,14 @@ impl SegmentFs for SimDisk {
     /// the same call failed: `set_len`, the `O_DIRECT` probe's `/proc`
     /// open or `sync_all`), its handle then closed and the file left.
     fn create_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
+        // Synced at create like the std tier (empty either way); `Direct`
+        // flags the inode so every tier write is alignment-asserted — the
+        // `O_DIRECT` contract the fault points broke unseen while the sim
+        // took the mode-blind default (F-L04-14, ADR-0119 A1).
         let (created, logged) = if inf_foundation::fault::fire(crate::fault::TIER_CREATE_FAIL) {
             let point = crate::fault::TIER_CREATE_FAIL;
             (Err(crate::fault::injected(point)), CallResult::Injected(point))
         } else {
-            // Synced at create like the std tier (empty either way);
-            // `Direct` flags the inode so every tier write is
-            // alignment-asserted (the `O_DIRECT` contract, ADR-0119 A1).
             match self.create_inode_full(
                 path,
                 Vec::new(),
