@@ -610,9 +610,38 @@ impl<F: SegmentFs> TierWriter<F> {
         mode: TierIoMode,
         capacity_hint: u64,
     ) -> io::Result<TierWriter<F>> {
+        TierWriter::prepare_dirs(fs, shard_dir)?;
+        TierWriter::create_named(fs, shard_dir, id, (cell, ns), base, mode, capacity_hint)
+    }
+
+    /// The cold directory made and its name synced in `shard_dir`: the
+    /// steps before a create's first file effect, so a failure here names
+    /// no file.
+    ///
+    /// # Errors
+    /// I/O failures from the fs seam.
+    pub fn prepare_dirs(fs: &F, shard_dir: &Path) -> io::Result<()> {
+        fs.create_dir_all(&shard_dir.join("cold"))?;
+        fs.sync_dir(shard_dir)
+    }
+
+    /// [`create_with_capacity`](Self::create_with_capacity) once the
+    /// directories are prepared: the file made (its first effect), its
+    /// header written and the cold directory synced.
+    ///
+    /// # Errors
+    /// I/O failures from the fs seam; a failure after `create_tier` may
+    /// leave the file made and named.
+    pub fn create_named(
+        fs: &F,
+        shard_dir: &Path,
+        id: u32,
+        (cell, ns): (u32, NsId),
+        base: LogicalAddr,
+        mode: TierIoMode,
+        capacity_hint: u64,
+    ) -> io::Result<TierWriter<F>> {
         let cold_dir = shard_dir.join("cold");
-        fs.create_dir_all(&cold_dir)?;
-        fs.sync_dir(shard_dir)?;
         let path = cold_dir.join(tier_file_name(id));
         let mut file = fs.create_tier(&path, mode)?;
         let mut staging = FrameStaging::new(1);

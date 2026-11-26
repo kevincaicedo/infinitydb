@@ -44,7 +44,7 @@ mod residue;
 
 pub use plan::{Planned, RoundPlan, Selection};
 use residue::ResidueSlot;
-pub use residue::ResidueState;
+pub use residue::{ResidueAnswer, ResidueState};
 
 /// How a pipeline's I/O reaches the device (M4.5-S31, ADR-0084 D1).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -849,31 +849,30 @@ impl<F: SegmentFs> TierFlush<F> {
         }
     }
 
-    /// The residue's job answered `Unlinked` or `AlreadyAbsent`: the name is
-    /// free, so the next create makes it again.
-    pub fn residue_terminal(&mut self) {
-        debug_assert!(
-            matches!(self.residue, ResidueSlot::Out { .. })
-                || cfg!(inf_canary_create_while_residue_out),
-            "a residue's terminal result answers its job out"
-        );
-        self.residue = ResidueSlot::Empty;
-    }
-
-    /// The residue's job answered `Retry`: the slot holds it again, due at
-    /// `due`, still charged.
-    pub fn residue_retry(&mut self, meta: TierFileMeta, due: inf_foundation::time::Nanos) {
+    /// The residue's job answered (ADR-0156 D1): only `Unlinked` or
+    /// `AlreadyAbsent` empties the slot, so the name is free and the next
+    /// create makes it again; `Retry` holds it again, due at `retry_due`,
+    /// still charged.
+    pub fn settle_residue(
+        &mut self,
+        meta: TierFileMeta,
+        answer: ResidueAnswer,
+        retry_due: inf_foundation::time::Nanos,
+    ) {
         let bytes = match self.residue {
             ResidueSlot::Out { bytes } => bytes,
             ResidueSlot::Empty | ResidueSlot::Filling { .. } | ResidueSlot::Held { .. } => {
                 debug_assert!(
                     cfg!(inf_canary_create_while_residue_out),
-                    "a residue's retry answers its job out"
+                    "a residue's answer settles its job out"
                 );
                 0
             }
         };
-        self.residue = ResidueSlot::Held { meta, due, bytes };
+        self.residue = match answer {
+            ResidueAnswer::Unlinked | ResidueAnswer::AlreadyAbsent => ResidueSlot::Empty,
+            ResidueAnswer::Retry => ResidueSlot::Held { meta, due: retry_due, bytes },
+        };
     }
 
     /// The create step's admission (ADR-0156 D1): a create runs only over an
@@ -1097,25 +1096,29 @@ impl<F: SegmentFs> TierFlush<F> {
                 source: crate::fault::injected(crate::fault::TIER_DIR_OPEN_FAIL),
             });
         }
+        // The directories first: a failure there names no file, so it
+        // leaves the slot empty (ADR-0156 D1's pre-effect admission).
+        let cold = self.config.shard_dir.join("cold");
+        TierWriter::prepare_dirs(&self.fs, &self.config.shard_dir)
+            .map_err(|source| TierFlushError::Io { path: cold.clone(), source })?;
         // The seam's create writes the header and syncs the directory after
         // `create_tier`, so a failure may leave the header's bytes: the
         // residue charges them until its unlink answers.
-        let path = self.config.shard_dir.join("cold").join(crate::tier::tier_file_name(id));
+        let path = cold.join(crate::tier::tier_file_name(id));
         self.begin_create(id, &path, crate::tier::TIER_HEADER_BYTES as u64);
         if cfg!(inf_canary_create_id_spent_on_failure) {
             self.next_id = next;
         }
-        let created = TierWriter::create_with_capacity(
+        let created = TierWriter::create_named(
             &self.fs,
             &self.config.shard_dir,
             id,
-            self.config.cell,
-            self.config.ns,
+            (self.config.cell, self.config.ns),
             base,
             self.config.mode,
             self.config.file_capacity,
         )
-        .map_err(|source| TierFlushError::Io { path: self.config.shard_dir.join("cold"), source });
+        .map_err(|source| TierFlushError::Io { path: cold, source });
         self.end_create(&created, next);
         let writer = created?;
         self.active_id = id;
@@ -2025,14 +2028,17 @@ mod tests {
         for _ in 0..RETRIES {
             if let Some(meta) = flush.take_residue(Nanos(0)) {
                 assert_eq!(meta.path, b, "the residue names the failed create's path");
-                match disk.unlink_tier(&meta.path) {
+                let answer = match disk.unlink_tier(&meta.path) {
                     Ok(()) => {
                         unlinked_before_create = true;
-                        flush.residue_terminal();
+                        ResidueAnswer::Unlinked
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => flush.residue_terminal(),
-                    Err(_) => flush.residue_retry(meta, Nanos(0)),
-                }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        ResidueAnswer::AlreadyAbsent
+                    }
+                    Err(_) => ResidueAnswer::Retry,
+                };
+                flush.settle_residue(meta, answer, Nanos(0));
             }
             match stage(&mut flush, span(600, 600, None), &[0xA1; 600]) {
                 Ok(()) => {
@@ -2069,6 +2075,54 @@ mod tests {
             Some(b),
             "the create after the failed one names the path that one named: no file id is spent"
         );
+    }
+
+    /// The seam drive's create (the boot demote step) owns a failed create's
+    /// name as the reactor drive's does. A failure before the file's first
+    /// effect (`tier_dir_open_fail`) names no file and leaves the slot empty.
+    /// With `tier_create_post_fail` once, the append's create fails after
+    /// its file exists: the slot holds the name, the header's bytes charged,
+    /// `next_id` unmoved, and the next append is deferred; once the
+    /// residue's unlink answers, the next append makes that same name.
+    #[test]
+    fn a_seam_create_that_fails_after_its_file_exists_holds_its_name() {
+        use crate::tier::{TIER_HEADER_BYTES, tier_file_name};
+        use inf_foundation::time::Nanos;
+        let disk = SimDisk::new();
+        let mut flush = sim_seam_pipeline(&disk, 1 << 20);
+        let zero = LogicalAddr::ZERO;
+        let before = flush.disk_bytes();
+        inf_foundation::fault::arm(crate::fault::TIER_DIR_OPEN_FAIL, FaultSpec::Nth(1));
+        let refused = flush.append_range(zero, &[0xB0; 600]);
+        inf_foundation::fault::disarm_all();
+        assert!(refused.is_err(), "engagement: the directory hold refused the create");
+        assert_eq!(flush.residue(), ResidueState::Empty, "no file named: no residue");
+        inf_foundation::fault::arm(crate::fault::TIER_CREATE_POST_FAIL, FaultSpec::Nth(1));
+        let err = flush.append_range(zero, &[0xB0; 600]).expect_err("the create fails");
+        inf_foundation::fault::disarm_all();
+        assert!(err.to_string().contains("tier_create_post_fail"), "engagement: {err}");
+        let made = Path::new("shard-0").join("cold").join(tier_file_name(0));
+        assert!(disk.open_read(&made).is_ok(), "engagement: the failed create left its file");
+        assert_eq!(flush.residue(), ResidueState::Held(Nanos(0)), "the name is owned, due now");
+        assert_eq!(flush.next_file_id(), 0, "no file id is spent");
+        let header = TIER_HEADER_BYTES as u64;
+        assert_eq!(flush.disk_bytes(), before + header, "the header's bytes are charged");
+        let deferred = flush.append_range(zero, &[0xB0; 600]);
+        assert!(
+            matches!(deferred, Err(TierFlushError::CreateDeferred { .. })),
+            "a create over a held residue is deferred: {deferred:?}"
+        );
+        let meta = flush.take_residue(Nanos(0)).expect("the held residue is due");
+        assert_eq!(meta.path, made, "the residue names the failed create's path");
+        assert_eq!(flush.disk_bytes(), before + header, "charged while its job is out");
+        disk.unlink_tier(&meta.path).expect("the residue's unlink");
+        flush.settle_residue(meta, ResidueAnswer::Unlinked, Nanos(0));
+        assert_eq!(flush.residue(), ResidueState::Empty, "the terminal answer frees the name");
+        assert_eq!(flush.disk_bytes(), before, "the charge leaves with the file");
+        flush.append_range(zero, &[0xB0; 600]).expect("the name is made again");
+        let active = flush.active().map(|(id, .., path)| (id, path.to_path_buf()));
+        assert_eq!(active, Some((0, made)), "the create names the failed one's path");
+        assert_eq!(flush.next_file_id(), 1);
     }
 
     /// A round stages at most two seals (ADR-0155 D3): a span far above a

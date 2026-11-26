@@ -43,6 +43,15 @@ pub(super) enum ResidueSlot {
     Out { bytes: u64 },
 }
 
+/// The control thread's answer for a residue's unlink, as the slot reads
+/// it: the file removed, no file had the name, or the attempt failed.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ResidueAnswer {
+    Unlinked,
+    AlreadyAbsent,
+    Retry,
+}
+
 /// The slot as the walk and the gauges read it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ResidueState {
