@@ -1289,6 +1289,10 @@ ordered_rows=(
   # A client row is inserted only through the plane's admission. Planted, SETNAME and the
   # state mirror insert, and a command run after Closed puts the closed client back.
   "inf_canary_command_registers_client m0-capacity ghost-client-row --close-leg registry-reset"
+  # ADR-0156 D1: a file a landed swap retired keeps its owner until its
+  # unlink answers. Planted, the commit drops the owner, and the life after
+  # the cut's R0 file is on the disk when its window closes.
+  "inf_canary_commit_retirement_forgets m4-ns-lifetimes RETIRE-R0"
   # A compaction read is taken only by spending a slot of its pass's room, so no namespace is
   # marked in flight with no task to run its chain (ADR-0177 D2). Planted, the read is taken
   # and marked first, the room asked after, and a one-slot pass marks its second namespace.
@@ -1552,6 +1556,11 @@ ordered_rows=(
   # ADR-0156 D4: a pass resumes at the lane after the last one it visited.
   # Planted, each pass starts at lane 0 and a later lane is never served.
   "inf_canary_retire_cursor_reset crate-test inf-server lib every_ready_lane_is_served_within_its_share_of_passes LANE_UNSERVED:"
+  # O3's stop clause: no file of a namespace dropped in the life is on the
+  # disk after its graceful stop. A premise plant, read in the simulator
+  # alone: a tier file no owner holds is made under a dropped namespace just
+  # before the stop.
+  "inf_canary_retire_drop_at_stop m4-ns-lifetimes RETIRE-STOP"
   # ADR-0156 D3: a retried file waits one injected millisecond after its
   # `Retry`'s consumption. Planted, the walk offers it before its due, and
   # the pace leg's retry lands within a 200 µs step of its failure.
@@ -1575,9 +1584,17 @@ ordered_rows=(
   # Planted, a pinned visit is not charged, and the turn reaches the file
   # behind 64 pinned ones.
   "inf_canary_retire_walk_unpaced crate-test inf-server lib a_turn_charges_its_retirement_visits_and_makes_at_most_sixty_four examined"
+  # O3's window opens with no harness hold. A premise plant, read in the
+  # simulator alone: the worker stays held at the opening.
+  "inf_canary_retire_window_held_open m4-ns-lifetimes RETIRE-OPEN"
   # ADR-0156 D3: an idle worker waits on its wake. Planted, it never waits,
   # a busy loop on an idle node.
   "inf_canary_retire_worker_never_waits crate-test inf-server lib an_idle_worker_waits_after_one_empty_circuit NO_WAIT:"
+  # ADR-0156 D4: a window's files end within ⌈F / 8⌉ + 5c + 1 steps.
+  # Planted, a worker pass runs one job, so the full pass's 16 files and the
+  # life after the cut's 9 outlast their bounds.
+  "inf_canary_retire_worker_one_job m4-ns-lifetimes RETIRE-BOUND"
+  "inf_canary_retire_worker_one_job m4-ns-lifetimes REBOOT-BOUND"
   # ADR-0156 D4: a worker pass runs at most 8 jobs. Planted, it ignores them,
   # and the full pass's step unlinks 16 tier files.
   "inf_canary_retire_worker_unpaced m4-ns-lifetimes RETIRE-STEP"

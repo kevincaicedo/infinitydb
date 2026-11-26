@@ -145,6 +145,28 @@ const RESIDUE_HELD_STEPS: u32 = 4;
 /// Steps the every-attempt namespace may take for its failures: two a
 /// failure, with room for the node's other work.
 const CREATE_EVERY_ATTEMPT_STEPS: u64 = 4 * CREATE_EVERY_ATTEMPTS;
+/// Injected time a window's opening may wait for the node's quiescence: the
+/// checkpoint the drops begin syncs its begin marker at an everysec tick and
+/// its MANIFEST swap waits for the durable watermark at the next, so a quiet
+/// node is at most about three everysec periods away (2,500 to 4,700 steps
+/// were read across seeds, 1.5 to 2.5 s); past four periods the opening is a
+/// breach, never a skip.
+const WINDOW_OPEN_NS_MAX: u64 = 4_000_000_000;
+/// Steps a window may run at most, its files' bound and the extension for
+/// files created inside it together: no leg creates more than a few files
+/// inside a window, so this ends a runaway extension, never a correct one.
+const WINDOW_STEPS_MAX: u64 = 1_024;
+/// Checkpoints the life after the cut may request before its dead file is
+/// retired by a landed swap (the first stamps the deaths).
+const R0_CKPTS_MAX: u32 = 8;
+/// The life after the cut's dropped namespaces: 8 files and R0's one on one
+/// shard is a bill of 9 files in 8 steps, which one job a pass misses.
+const REBOOT_VICTIMS: usize = 8;
+/// Steps the graceful stop may take: the stop's final sync and checkpoint
+/// are a few 20 ms barriers, then each cell's transport retires in four
+/// steps.
+const STOP_STEPS_MAX: u32 = 8_192;
+
 /// Write batches the disk leg may take to seal its first tier file: the
 /// 4 MiB ring wraps after about 22 batches of 64 × 3,000 B.
 const DISK_FILL_BATCHES_MAX: u32 = 64;
@@ -292,6 +314,15 @@ pub struct NsLifetimesReport {
     pub failed_creates: u64,
     /// The disk leg's `DISKFULL` refusals whose `used` was the sim disk's.
     pub disk_full_refusals: u64,
+    /// O3's windows: the files each opened with (life 1, the life after
+    /// the cut) and the life after the cut's R0.
+    pub window_files: u64,
+    pub reboot_window_files: u64,
+    pub reboot_r0_files: u64,
+    /// The graceful stop drained every cell, and the dropped namespaces
+    /// `RETIRE-STOP` read.
+    pub stop_drained: bool,
+    pub stop_dropped_read: u64,
 }
 
 impl NsLifetimesReport {
@@ -325,6 +356,12 @@ struct Run {
     pace: crate::harness::retry_pace::RetryPace,
     /// O7: failed creates (the create-fault leg).
     creates: crate::harness::create_clause::CreateClause,
+    /// O3's window: the life's MANIFEST names, R0 and the bill.
+    window: crate::harness::retire_window::RetireWindow,
+    /// The drops the harness read before this life's boot.
+    life_drops: usize,
+    /// The life after the cut's window's R0, which its stop reads again.
+    reboot_r0: std::collections::BTreeSet<PathBuf>,
 }
 
 /// A blob extent file, by its name.
@@ -371,6 +408,9 @@ impl Run {
             self.fail(breach);
         }
         for breach in self.creates.judge(&self.disk) {
+            self.fail(breach);
+        }
+        for breach in self.window.observe(&self.disk) {
             self.fail(breach);
         }
         let bound = self.report.leg.bound();
@@ -688,7 +728,20 @@ impl Run {
         self.step_until("recovery", |run| run.node.ready())?;
         self.drops.recovered(&self.disk);
         self.creates.recovered(&self.disk);
+        for breach in self.window.begin_life(&self.disk) {
+            self.fail(breach);
+        }
         Ok(())
+    }
+
+    /// Every tier file the disk names.
+    fn tier_files_on_disk(&self) -> std::collections::BTreeSet<PathBuf> {
+        self.disk.names_where(is_tier_file).into_iter().collect()
+    }
+
+    /// The ids of every namespace whose `DROP` the harness read.
+    fn dropped_ids(&self) -> std::collections::BTreeSet<u32> {
+        self.drops.dropped().collect()
     }
 
     /// The tier-file jobs out on `cell`.
@@ -962,13 +1015,143 @@ fn full_pass_cycle(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> 
     let held = run.step_until("two cells' job positions out", move |run| {
         run.jobs_out_on(0) == full && run.jobs_out_on(1) == full
     });
-    run.node.hold_retire = 0;
-    held?;
+    if let Err(err) = held {
+        run.node.hold_retire = 0;
+        return Err(err);
+    }
+    let window = open_window(run, "RETIRE")?;
+    run.report.window_files = window.bill.files;
+    close_window(run, &window)?;
     run.step_until("the full pass's files gone", move |run| {
         ids.iter().all(|&id| run.tier_files_of(id) == 0)
     })?;
     for index in 0..FULL_PASS_VICTIMS {
         run.create_until_ok(admin, &name("q", index))?;
+    }
+    Ok(())
+}
+
+/// One retirement window's bill and where it opened.
+struct Window {
+    label: &'static str,
+    bill: crate::harness::retire_window::WindowBill,
+    /// The disk log's length at the opening.
+    from: usize,
+}
+
+/// Whether every cell is quiet for a window's opening: no round out, no
+/// cold read, no extent hold or unsettled fence, every drop durable, the
+/// ledger settled and no checkpoint transition, and no harness hold but
+/// the worker's.
+fn node_quiet(run: &Run) -> bool {
+    let cells = (0..usize::from(run.report.cells)).all(|cell| {
+        let (tier, ledger, idle) = run.node.plane(cell).quiescence_for_sim();
+        tier.quiet() && ledger && idle
+    });
+    cells && run.node.frozen.is_none() && !run.node.hold_inbox
+}
+
+/// Whether every injected close or unlink failure the disk logged lies at
+/// least 1 ms plus a step before now, so every retry is due at the opening.
+fn retries_due(run: &Run) -> bool {
+    let points = [inf_log::fault::TIER_UNLINK_FAIL, inf_log::fault::TIER_CLOSE_FAIL];
+    let last = run
+        .disk
+        .logged_calls(0)
+        .iter()
+        .filter(
+            |entry| matches!(entry.result, CallResult::Injected(point) if points.contains(&point)),
+        )
+        .filter_map(|entry| entry.mark.map(|mark| mark.at))
+        .max();
+    let a = run.step_ns_max + 1_000;
+    last.is_none_or(|at| run.clock.now().0 >= at.0.saturating_add(1_000_000 + a))
+}
+
+/// Opens a retirement window (O3): the worker held, the node stepped until
+/// it is quiet with every retry due, then the worker released and, with no
+/// step between, the hold and the quiescence read again and the bill
+/// snapshot from the disk. Never quiet, or a hold at the instant of opening,
+/// is `RETIRE-OPEN`.
+fn open_window(run: &mut Run, label: &'static str) -> Result<Window, String> {
+    run.node.hold_retire = u64::MAX;
+    let begun = run.clock.now();
+    while !(node_quiet(run) && retries_due(run)) {
+        if run.clock.now().0.saturating_sub(begun.0) > WINDOW_OPEN_NS_MAX {
+            run.node.hold_retire = 0;
+            let cells: Vec<String> = (0..usize::from(run.report.cells))
+                .map(|cell| format!("{:?}", run.node.plane(cell).quiescence_for_sim()))
+                .collect();
+            return Err(format!(
+                "RETIRE-OPEN: the node was never quiet with every retry due in \
+                 {WINDOW_OPEN_NS_MAX} ns: cells {cells:?}, retries due {}",
+                retries_due(run)
+            ));
+        }
+        run.step()?;
+    }
+    // Canary `inf_canary_retire_window_held_open` (a premise plant, read in
+    // the simulator alone): the window opens with the worker still held.
+    if !cfg!(inf_canary_retire_window_held_open) {
+        run.node.hold_retire = 0;
+    }
+    if run.node.hold_retire != 0 || !node_quiet(run) {
+        let hold = run.node.hold_retire;
+        run.node.hold_retire = 0;
+        return Err(format!(
+            "RETIRE-OPEN: a hold at the window's opening: hold_retire {hold}, frozen {:?}, inbox \
+             held {}, quiet {}",
+            run.node.frozen,
+            run.node.hold_inbox,
+            node_quiet(run)
+        ));
+    }
+    // D is the files of the namespaces dropped in this life: a dropped
+    // namespace's file a cut resurrected after its tombstone retired has no
+    // owner in this life, so no sweep or window removes it.
+    let life: std::collections::BTreeSet<u32> = run.drops.dropped().skip(run.life_drops).collect();
+    let bill = run.window.bill(&run.tier_files_on_disk(), &life, &run.dropped_ids());
+    Ok(Window { label, bill, from: run.disk.logged_calls(0).len() })
+}
+
+/// Runs a window's steps and closes it: after `⌈F / 8⌉ + 5c + 1` steps (one
+/// more for each 8 files created inside it), no file of D is on the disk
+/// (`<label>-BOUND`) and none of R0 (`RETIRE-R0`). Its engagement is F > 0.
+fn close_window(run: &mut Run, window: &Window) -> Result<(), String> {
+    let bill = &window.bill;
+    let mut steps = 0u64;
+    loop {
+        let created = run
+            .disk
+            .logged_calls(window.from)
+            .iter()
+            .filter(|entry| {
+                matches!(entry.call, DiskCall::CreateTier { .. }) && entry.result == CallResult::Ok
+            })
+            .count() as u64;
+        if steps >= (bill.steps + created.div_ceil(8)).min(WINDOW_STEPS_MAX) {
+            break;
+        }
+        run.step()?;
+        steps += 1;
+    }
+    let on_disk = run.tier_files_on_disk();
+    let left = bill.d.iter().filter(|path| on_disk.contains(*path)).count();
+    let label = window.label;
+    if left > 0 {
+        run.fail(format!(
+            "{label}-BOUND: {left} of {} files left after {steps} steps (F {}, c {})",
+            bill.files, bill.files, bill.shards
+        ));
+    }
+    for path in bill.r0.iter().filter(|path| on_disk.contains(*path)) {
+        run.fail(format!(
+            "RETIRE-R0: {} a landed swap retired is on the disk after {label}'s {steps} steps",
+            path.display()
+        ));
+    }
+    if bill.files == 0 {
+        run.fail(format!("VACUOUS {label}-BOUND: the window opened with no file to retire"));
     }
     Ok(())
 }
@@ -1234,6 +1417,12 @@ fn new_run(
         drops: crate::harness::drop_clause::DropClause::per_step(),
         pace: crate::harness::retry_pace::RetryPace::default(),
         creates: crate::harness::create_clause::CreateClause::default(),
+        window: crate::harness::retire_window::RetireWindow::new(
+            PathBuf::from("node"),
+            scenario.cells,
+        ),
+        life_drops: 0,
+        reboot_r0: std::collections::BTreeSet::new(),
     })
 }
 
@@ -1282,7 +1471,11 @@ fn reboot(
         mut drops,
         mut pace,
         creates,
+        window,
+        life_drops: _,
+        reboot_r0,
     } = run;
+    let life_drops = drops.dropped().count();
     drop(node);
     drops.reboot();
     pace.reboot(&disk);
@@ -1309,6 +1502,9 @@ fn reboot(
         drops,
         pace,
         creates,
+        window,
+        life_drops,
+        reboot_r0,
     };
     if let Err(err) = after_cut(&mut run) {
         run.fail(err);
@@ -1352,6 +1548,11 @@ fn empty_report(cells: u16, leg: LifetimesLeg) -> NsLifetimesReport {
         retries_judged: 0,
         failed_creates: 0,
         disk_full_refusals: 0,
+        window_files: 0,
+        reboot_window_files: 0,
+        reboot_r0_files: 0,
+        stop_drained: false,
+        stop_dropped_read: 0,
     }
 }
 
@@ -1734,8 +1935,185 @@ fn after_cut(run: &mut Run) -> Result<(), String> {
         }
     }
     let mut admin = MiniClient::connect(&mut run.node, 0);
+    let held = reboot_r0(run);
+    if let Err(err) = held {
+        run.node.hold_retire = 0;
+        return Err(err);
+    }
+    reboot_window(run, &mut admin)?;
     run.drop_ns(&mut admin, b"p00")?;
-    run.create_until_ok(&mut admin, b"z00")
+    run.create_until_ok(&mut admin, b"z00")?;
+    // Canary `inf_canary_retire_drop_at_stop` (a premise plant, read in the
+    // simulator alone): just before the stop, a tier file no owner holds is
+    // made on the disk under a namespace dropped in this life. A flushed
+    // namespace dropped there instead is retired by the stop's own drain, so
+    // only a file outside every owner breaks the premise that each dropped
+    // file passed through the window.
+    if cfg!(inf_canary_retire_drop_at_stop) {
+        plant_stray_file(run)?;
+    }
+    admin.close(&mut run.node);
+    graceful_stop(run)?;
+    retire_stop(run);
+    Ok(())
+}
+
+/// Up to `count` live namespaces with keys written on cell 0 and a tier
+/// file the recovered MANIFESTs name, in name order.
+fn flushed_live(run: &Run, count: usize) -> Vec<Vec<u8>> {
+    let named = run.window.named_ns();
+    let mut names = Vec::new();
+    for (name, keys) in &run.live {
+        if names.len() == count {
+            break;
+        }
+        let id = run.node.plane(0).keyspace().ns_get(name).map(|spec| spec.id.0);
+        if !keys.is_empty() && id.is_some_and(|id| named.contains(&id)) {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+/// The life after the cut's R0 (O3): a live namespace whose file the
+/// recovered MANIFEST names has every key deleted, and with the worker held
+/// checkpoints are taken until a landed swap retired the dead file, which
+/// the disk still holds and the latest MANIFEST no longer names.
+fn reboot_r0(run: &mut Run) -> Result<(), String> {
+    let Some(name) = flushed_live(run, 1).pop() else {
+        return Err("VACUOUS RETIRE-R0: no live namespace with a manifested file".to_string());
+    };
+    let keys = run.live.get(&name).cloned().unwrap_or_default();
+    let mut client = run.use_ns(0, &name)?;
+    for key in &keys {
+        client.send(&mut run.node, &[b"DEL", key]);
+    }
+    for _ in &keys {
+        run.reply(&mut client)?;
+    }
+    client.close(&mut run.node);
+    if let Some(written) = run.live.get_mut(&name) {
+        written.clear();
+    }
+    run.node.hold_retire = u64::MAX;
+    let mut admin = MiniClient::connect(&mut run.node, 0);
+    for _ in 0..R0_CKPTS_MAX {
+        let r0 = run.window.r0(&run.tier_files_on_disk(), &run.dropped_ids());
+        if !r0.is_empty() {
+            break;
+        }
+        let reply = run.call(&mut admin, &[b"INF.CKPT", b"WAIT"])?;
+        if reply != OK {
+            return Err(format!("INF.CKPT WAIT answered {reply:?}"));
+        }
+        run.idle(SETTLE_GAP_STEPS)?;
+    }
+    admin.close(&mut run.node);
+    Ok(())
+}
+
+/// The life after the cut's window (O3, `REBOOT-BOUND`): `REBOOT_VICTIMS`
+/// flushed live namespaces dropped with the worker held beside R0's file,
+/// then the window opened and closed. Its R0 engagement: the window opened
+/// with R0 nonempty, else `VACUOUS RETIRE-R0`.
+fn reboot_window(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
+    run.node.hold_retire = u64::MAX;
+    for name in flushed_live(run, REBOOT_VICTIMS) {
+        if let Err(err) = run.drop_ns(admin, &name) {
+            run.node.hold_retire = 0;
+            return Err(err);
+        }
+    }
+    let window = open_window(run, "REBOOT")?;
+    run.report.reboot_window_files = window.bill.files;
+    run.report.reboot_r0_files = window.bill.r0.len() as u64;
+    let r0_empty = window.bill.r0.is_empty();
+    close_window(run, &window)?;
+    run.reboot_r0 = window.bill.r0;
+    if r0_empty {
+        run.fail("VACUOUS RETIRE-R0: the window after the cut opened with no R0 file".to_string());
+    }
+    Ok(())
+}
+
+/// The stop plant's file: a tier file no owner holds, under the last
+/// namespace dropped in this life, its handle closed at once.
+fn plant_stray_file(run: &mut Run) -> Result<(), String> {
+    use inf_log::fs::SegmentFs;
+    let id = run.drops.dropped().skip(run.life_drops).last();
+    let id =
+        id.ok_or_else(|| "the stop plant found no namespace dropped in the life".to_string())?;
+    let cold = PathBuf::from("node").join("shard-0").join(format!("ns-{id}")).join("cold");
+    run.disk.create_dir_all(&cold).map_err(|err| format!("the stop plant's dir: {err}"))?;
+    let path = cold.join(inf_log::tier_file_name(u32::MAX - 1));
+    let file = run.disk.create_tier(&path, inf_log::TierIoMode::Buffered);
+    drop(file.map_err(|err| format!("the stop plant's file: {err}"))?);
+    Ok(())
+}
+
+/// A graceful stop (ADR-0124 D2): every cell asked to stop, the assembly's
+/// `finish_stop` once every cell is Quiet, then steps until every cell is
+/// Drained (bounded).
+fn graceful_stop(run: &mut Run) -> Result<(), String> {
+    let cells = usize::from(run.report.cells);
+    for cell in 0..cells {
+        run.node.plane_mut(cell).request_stop();
+    }
+    let mut finished = false;
+    for _ in 0..STOP_STEPS_MAX {
+        let phases: Vec<inf_server::StopPhase> =
+            (0..cells).map(|cell| run.node.plane(cell).stop_phase()).collect();
+        if phases.iter().all(|phase| *phase == inf_server::StopPhase::Drained) {
+            run.report.stop_drained = true;
+            return Ok(());
+        }
+        let quiet = phases.iter().all(|phase| {
+            matches!(phase, inf_server::StopPhase::Quiet | inf_server::StopPhase::Drained)
+        });
+        if quiet && !finished {
+            for cell in 0..cells {
+                run.node.plane_mut(cell).finish_stop();
+            }
+            finished = true;
+        }
+        run.step()?;
+    }
+    run.report.stalled = true;
+    Err(format!("the graceful stop never drained in {STOP_STEPS_MAX} steps"))
+}
+
+/// `RETIRE-STOP` (O3): after the graceful stop, no tier file of a namespace
+/// dropped since the life's boot, and none of the window's R0, is on the
+/// disk. Engagement: the stop drained and a dropped namespace was read.
+fn retire_stop(run: &mut Run) {
+    let on_disk = run.tier_files_on_disk();
+    let dropped: Vec<u32> = run.drops.dropped().skip(run.life_drops).collect();
+    for &id in &dropped {
+        let dir = format!("ns-{id}");
+        let left = on_disk
+            .iter()
+            .filter(|path| path.components().any(|part| part.as_os_str() == dir.as_str()))
+            .count();
+        if left > 0 {
+            run.fail(format!(
+                "RETIRE-STOP: {left} tier files of namespace {id}, dropped in this life, on the \
+                 disk after the graceful stop"
+            ));
+        }
+    }
+    let r0_left: Vec<PathBuf> =
+        run.reboot_r0.iter().filter(|path| on_disk.contains(*path)).cloned().collect();
+    for path in r0_left {
+        run.fail(format!("RETIRE-STOP: R0's {} on the disk after the stop", path.display()));
+    }
+    run.report.stop_dropped_read = dropped.len() as u64;
+    if !run.report.stop_drained || dropped.is_empty() {
+        run.fail(format!(
+            "VACUOUS RETIRE-STOP: the stop drained {}, {} dropped namespaces read",
+            run.report.stop_drained,
+            dropped.len()
+        ));
+    }
 }
 
 /// The full leg's engagement: each clause unmet is `VACUOUS`.
@@ -1763,6 +2141,9 @@ fn engagement(run: &mut Run) {
     }
     if let Some(vacuous) = run.drops.step_engagement() {
         run.fail(vacuous);
+    }
+    if run.report.window_files == 0 {
+        run.fail("VACUOUS RETIRE-BOUND: the full pass's window had no file to retire".to_string());
     }
     if run.report.window_dropped == 0 {
         run.fail("VACUOUS RETIRE-WINDOW: no dropped namespace was read at the window".to_string());

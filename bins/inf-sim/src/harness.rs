@@ -81,6 +81,7 @@ pub(crate) mod drop_clause;
 mod idle;
 pub(crate) mod owners;
 mod pub_cross;
+pub(crate) mod retire_window;
 pub(crate) mod retry_pace;
 pub mod shadow;
 
