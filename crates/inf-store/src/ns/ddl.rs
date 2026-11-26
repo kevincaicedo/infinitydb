@@ -404,7 +404,11 @@ mod tests {
 
     /// A directory publish with nothing staged: the token every answer takes.
     fn published() -> DirectoryPublished {
-        inf_foundation::grants::GrantDirectory::new().1.publish()
+        inf_foundation::grants::GrantDirectory::new(
+            inf_foundation::grants::DirectoryPayload::try_new().expect("a directory"),
+        )
+        .1
+        .publish()
     }
 
     /// A token reads its own slot and nothing else: a later request's

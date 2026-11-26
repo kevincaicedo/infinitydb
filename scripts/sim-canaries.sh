@@ -969,6 +969,12 @@ rows=(
   # the Retiring grant's receipt is never written.
   "inf_canary_grants_generation_relaxed loom inf-foundation loom_a_pass_that_sees_the_generation_sees_the_retiring F9:"
   "inf_canary_grants_generation_first loom inf-foundation loom_a_pass_that_sees_the_generation_sees_the_retiring F9:"
+  # ADR-0156 D3: a cell's turn publishes its jobs and rings no bell, or a
+  # control post sends its message without the worker's wake; either way
+  # the worker waits on an empty circuit with a job or the message
+  # unconsumed and nothing left to wake it.
+  "inf_canary_retire_bell_silent loom inf-foundation loom_the_worker_never_waits_with_a_job_published_or_a_message_queued LOST_WAKE:"
+  "inf_canary_post_rings_no_wake loom inf-foundation loom_the_worker_never_waits_with_a_job_published_or_a_message_queued LOST_WAKE:"
   # ADR-0148 D2: the writer returns a tiered grant at its CREATE's notice,
   # while every cell holds the owner: the next tiered CREATE's apply finds
   # its position held and answers an internal error.

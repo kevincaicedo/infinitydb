@@ -24,7 +24,20 @@
 //! repeat, so a receipt left from an earlier grant of the position never
 //! matches a later one, and a duplicate receipt changes nothing.
 //!
-//! The Loom models at the end of this file check both orderings on these
+//! The node's retirement board (ADR-0156 D3, ADR-0157 D4) sits beside
+//! them: the one bell every cell rings after a turn's publish of
+//! retirement jobs, which wakes the control thread's worker, and each
+//! cell's `closing` word, which the cell stores at its stop before it
+//! releases its endpoints and the worker reads before it releases its
+//! lane. [`Bell::worker_turn`] is the worker's wait decision, written once
+//! here for the control thread, the simulator and the Loom model.
+//!
+//! Every payload is reserved fallibly, by checked arithmetic, before any
+//! cell exists (ADR-0148 D4): each `*Payload::try_new` returns the term it
+//! could not reserve, and the `Arc` headers that share the payloads are
+//! made afterwards, the reservation's only infallible allocations.
+//!
+//! The Loom models at the end of this file check the orderings on these
 //! same types (`RUSTFLAGS="--cfg loom"`).
 
 /// Atomics and `Arc`, swapped for Loom's model-checked versions under
@@ -42,6 +55,47 @@ mod sync {
 }
 
 use sync::{Arc, AtomicBool, AtomicU32, AtomicU64, Ordering};
+
+/// A payload of the node's grants or its retirement board that the boot
+/// could not reserve (ADR-0148 D4): which one, and the bytes it asked;
+/// `None` when the size does not fit a `usize`. Nothing of it was made.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PayloadRefused {
+    pub payload: GrantsPayload,
+    pub bytes: Option<usize>,
+}
+
+/// The payloads [`PayloadRefused`] names.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GrantsPayload {
+    /// The directory's slots, [`POSITIONS`] words a node.
+    Directory,
+    /// The receipts, [`POSITIONS`] a cell.
+    Receipts,
+    /// The receipt writers' one-shot flags, one a cell.
+    ReceiptsTaken,
+    /// The cells' `closing` words, one a cell.
+    Closing,
+}
+
+/// `len` values made by `make`, in one allocation reserved exactly and
+/// fallibly first: the vector is filled within its reservation and never
+/// grows, so a refusal makes nothing and a success allocates once.
+fn reserved<T>(
+    len: usize,
+    payload: GrantsPayload,
+    make: impl FnMut() -> T,
+) -> Result<Vec<T>, PayloadRefused> {
+    let refused = PayloadRefused { payload, bytes: len.checked_mul(size_of::<T>()) };
+    if refused.bytes.is_none() {
+        return Err(refused);
+    }
+    let mut values = Vec::new();
+    values.try_reserve_exact(len).map_err(|_| refused)?;
+    values.extend(core::iter::repeat_with(make).take(len));
+    debug_assert_eq!(values.len(), values.capacity(), "filled within the reservation");
+    Ok(values)
+}
 
 /// Grant positions: the node's lifetime limit. A Loom model runs on four,
 /// since the orderings do not depend on the count and every slot is a
@@ -127,8 +181,26 @@ impl GrantSlot {
 /// the one [`DirectoryWriter`].
 #[derive(Debug)]
 pub struct GrantDirectory {
-    slots: [AtomicU64; POSITIONS],
+    /// [`POSITIONS`] words, reserved at boot, never grown.
+    slots: Vec<AtomicU64>,
     generation: AtomicU64,
+}
+
+/// The directory's slots, reserved before any cell: every position Vacant.
+#[derive(Debug)]
+pub struct DirectoryPayload {
+    slots: Vec<AtomicU64>,
+}
+
+impl DirectoryPayload {
+    /// Reserves the [`POSITIONS`] slots, one allocation.
+    ///
+    /// # Errors
+    /// [`PayloadRefused`] naming [`GrantsPayload::Directory`].
+    pub fn try_new() -> Result<DirectoryPayload, PayloadRefused> {
+        let slots = reserved(POSITIONS, GrantsPayload::Directory, || AtomicU64::new(0))?;
+        Ok(DirectoryPayload { slots })
+    }
 }
 
 /// Proof that the directory's stores of one catalog answer are published:
@@ -146,14 +218,14 @@ pub struct DirectoryCursor {
 }
 
 impl GrantDirectory {
-    /// A directory with every position Vacant, generation 0, and its one
-    /// writer, made together so no second writer exists.
+    /// The directory over its reserved `payload`, every position Vacant,
+    /// generation 0, and its one writer, made together so no second writer
+    /// exists. The `Arc` header is its one allocation, made after the
+    /// payload's (class F at boot: a refusal is the allocator's abort).
     #[must_use]
-    pub fn new() -> (Arc<GrantDirectory>, DirectoryWriter) {
-        let directory = Arc::new(GrantDirectory {
-            slots: core::array::from_fn(|_| AtomicU64::new(0)),
-            generation: AtomicU64::new(0),
-        });
+    pub fn new(payload: DirectoryPayload) -> (Arc<GrantDirectory>, DirectoryWriter) {
+        let DirectoryPayload { slots } = payload;
+        let directory = Arc::new(GrantDirectory { slots, generation: AtomicU64::new(0) });
         let staged = [None; POSITIONS];
         let writer = DirectoryWriter { directory: Arc::clone(&directory), staged, staged_count: 0 };
         (directory, writer)
@@ -281,8 +353,35 @@ impl DirectoryWriter {
 /// Every cell's terminal receipts: [`POSITIONS`] a cell.
 #[derive(Debug)]
 pub struct ReceiptBoard {
-    receipts: Box<[AtomicU32]>,
-    taken: Box<[AtomicBool]>,
+    /// `cells × POSITIONS` receipts, reserved at boot, never grown.
+    receipts: Vec<AtomicU32>,
+    /// One flag a cell: its writer was taken.
+    taken: Vec<AtomicBool>,
+}
+
+/// The receipt board's two payloads, reserved before any cell: every
+/// receipt 0, no writer taken.
+#[derive(Debug)]
+pub struct ReceiptPayload {
+    receipts: Vec<AtomicU32>,
+    taken: Vec<AtomicBool>,
+}
+
+impl ReceiptPayload {
+    /// Reserves `cells × POSITIONS` receipts, then `cells` flags: two
+    /// allocations, the product checked.
+    ///
+    /// # Errors
+    /// [`PayloadRefused`] naming the payload refused; nothing is kept.
+    pub fn try_new(cells: u16) -> Result<ReceiptPayload, PayloadRefused> {
+        let cells = usize::from(cells);
+        let Some(len) = cells.checked_mul(POSITIONS) else {
+            return Err(PayloadRefused { payload: GrantsPayload::Receipts, bytes: None });
+        };
+        let receipts = reserved(len, GrantsPayload::Receipts, || AtomicU32::new(0))?;
+        let taken = reserved(cells, GrantsPayload::ReceiptsTaken, || AtomicBool::new(false))?;
+        Ok(ReceiptPayload { receipts, taken })
+    }
 }
 
 /// One cell's writer half of the board, taken once a cell (not `Clone`).
@@ -293,14 +392,12 @@ pub struct ReceiptWriter {
 }
 
 impl ReceiptBoard {
-    /// A board of `cells` cells, every receipt 0.
+    /// The board over its reserved `payload`. The `Arc` header is its one
+    /// allocation, made after the payloads' (class F at boot).
     #[must_use]
-    pub fn new(cells: u16) -> Arc<ReceiptBoard> {
-        let cells = usize::from(cells);
-        Arc::new(ReceiptBoard {
-            receipts: (0..cells.saturating_mul(POSITIONS)).map(|_| AtomicU32::new(0)).collect(),
-            taken: (0..cells).map(|_| AtomicBool::new(false)).collect(),
-        })
+    pub fn new(payload: ReceiptPayload) -> Arc<ReceiptBoard> {
+        let ReceiptPayload { receipts, taken } = payload;
+        Arc::new(ReceiptBoard { receipts, taken })
     }
 
     /// The cells the board holds.
@@ -359,6 +456,155 @@ impl ReceiptWriter {
     }
 }
 
+/// The node's retirement board (ADR-0156 D3): the one bell and each cell's
+/// `closing` word. Shared by every cell and the control thread.
+#[derive(Debug)]
+pub struct RetireBoard {
+    bell: Bell,
+    /// One word a cell, reserved at boot, never grown: set once, at the
+    /// cell's stop, before it releases its two endpoints.
+    closing: Vec<AtomicBool>,
+}
+
+/// The cells' `closing` words, reserved before any cell: none set.
+#[derive(Debug)]
+pub struct ClosingPayload {
+    closing: Vec<AtomicBool>,
+}
+
+impl ClosingPayload {
+    /// Reserves one word a cell, one allocation.
+    ///
+    /// # Errors
+    /// [`PayloadRefused`] naming [`GrantsPayload::Closing`].
+    pub fn try_new(cells: u16) -> Result<ClosingPayload, PayloadRefused> {
+        let closing =
+            reserved(usize::from(cells), GrantsPayload::Closing, || AtomicBool::new(false))?;
+        Ok(ClosingPayload { closing })
+    }
+}
+
+impl RetireBoard {
+    /// The board over its reserved `payload`, the bell clear. The `Arc`
+    /// header is its one allocation, made after the payload's (class F at
+    /// boot).
+    #[must_use]
+    pub fn new(payload: ClosingPayload) -> Arc<RetireBoard> {
+        let ClosingPayload { closing } = payload;
+        Arc::new(RetireBoard { bell: Bell { rung: AtomicBool::new(false) }, closing })
+    }
+
+    /// The node's one bell.
+    #[must_use]
+    pub fn bell(&self) -> &Bell {
+        &self.bell
+    }
+
+    /// The cells the board holds.
+    #[must_use]
+    pub fn cells(&self) -> usize {
+        self.closing.len()
+    }
+
+    /// Cell `cell` is closing (`Release`): stored after every one of its
+    /// job positions is Free and before it releases its two endpoints, so
+    /// a worker that reads it reads every consumption before it.
+    pub fn close(&self, cell: usize) {
+        self.closing[cell].store(true, Ordering::Release);
+    }
+
+    /// Whether cell `cell` is closing (`Acquire`): the worker then
+    /// releases that cell's lane.
+    #[must_use]
+    pub fn closing(&self, cell: usize) -> bool {
+        self.closing[cell].load(Ordering::Acquire)
+    }
+}
+
+/// The wake the bell's ring and a control post send: the control thread's
+/// one-slot wake channel in production, whose full slot means a wake is
+/// already pending. It never blocks and never fails the caller.
+pub trait BellWake {
+    /// Sends the one wake unit if the slot is empty; else nothing.
+    fn wake(&self);
+}
+
+/// The node's one bell (ADR-0156 D3): every cell rings it after a turn that
+/// published retirement jobs; the worker clears it once an iteration, so
+/// one swap there reads every cell's publish since its last clear, and at
+/// most one wake is pending whatever the cell count.
+#[derive(Debug)]
+pub struct Bell {
+    rung: AtomicBool,
+}
+
+/// What [`Bell::worker_turn`] took: the message, if any, and whether the
+/// bell was set at the clear (a publish since the last turn's).
+#[derive(Debug, PartialEq, Eq)]
+pub struct WorkerTurn<M> {
+    pub message: Option<M>,
+    pub rung: bool,
+    /// The turn waited on the wake.
+    pub waited: bool,
+}
+
+impl Bell {
+    /// After a cell's turn published at least one job (`Release`, the
+    /// ring's own publish): sets the bell, and on its clear-to-set edge
+    /// sends `wake`. A ring that finds the bell set sends nothing: the
+    /// worker has not cleared it since an earlier ring, which sent the
+    /// wake or found one pending.
+    pub fn ring(&self, wake: &impl BellWake) {
+        // Canary `inf_canary_retire_bell_silent`: a turn's publish rings no
+        // bell, so a worker that found nothing waits past it.
+        if cfg!(inf_canary_retire_bell_silent) {
+            return;
+        }
+        if !self.rung.swap(true, Ordering::AcqRel) {
+            wake.wake();
+        }
+    }
+
+    /// The worker's turn (ADR-0156 D3): at most one message by
+    /// `try_recv`; only when `circuit_empty` (a whole circuit of empty
+    /// visits since the last job and the last set bell) and that found
+    /// none, it waits on the wake, then tries once more; then it clears
+    /// the bell. A request published before that clear is visited by the
+    /// pass that follows: its publish precedes its ring, which the clear
+    /// reads. One published after it finds the bell clear and sends the
+    /// wake, or finds it set by a ring since the clear, which sent it or
+    /// found one pending; a message sent after the empty `try_recv` sends
+    /// the wake after its send ([`wake_posted`]); and only this wait
+    /// consumes the wake, so the wait returns.
+    pub fn worker_turn<M>(
+        &self,
+        circuit_empty: bool,
+        mut try_recv: impl FnMut() -> Option<M>,
+        wait: impl FnOnce(),
+    ) -> WorkerTurn<M> {
+        let mut message = try_recv();
+        let mut waited = false;
+        if message.is_none() && circuit_empty {
+            wait();
+            waited = true;
+            message = try_recv();
+        }
+        let rung = self.rung.swap(false, Ordering::AcqRel);
+        WorkerTurn { message, rung, waited }
+    }
+}
+
+/// After a control message's send: sends the worker's wake, so a worker
+/// that found the channel empty and waits returns to take it.
+pub fn wake_posted(wake: &impl BellWake) {
+    // Canary `inf_canary_post_rings_no_wake`: a post sends without the
+    // wake, so a waiting worker sleeps with the message queued.
+    if cfg!(inf_canary_post_rings_no_wake) {
+        return;
+    }
+    wake.wake();
+}
+
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
@@ -382,7 +628,8 @@ mod tests {
     /// and a pass runs only on a generation it has not seen.
     #[test]
     fn a_publish_bumps_the_generation_once_after_its_stores() {
-        let (directory, mut writer) = GrantDirectory::new();
+        let (directory, mut writer) =
+            GrantDirectory::new(DirectoryPayload::try_new().expect("the directory"));
         let pos = writer.positions().next().expect("position 0");
         writer.reserve(pos, 16);
         assert_eq!(directory.slot(pos), GrantSlot::Reserved(16));
@@ -413,12 +660,13 @@ mod tests {
     /// the position never returns a later one, and every cell must name it.
     #[test]
     fn a_reclaim_needs_every_cell_to_name_the_exact_id() {
-        let board = ReceiptBoard::new(2);
+        let board = ReceiptBoard::new(ReceiptPayload::try_new(2).expect("the receipts"));
         let first = ReceiptBoard::writer(&board, 0).expect("cell 0's writer");
         let second = ReceiptBoard::writer(&board, 1).expect("cell 1's writer");
         assert!(ReceiptBoard::writer(&board, 0).is_none(), "one writer a cell");
         assert!(ReceiptBoard::writer(&board, 2).is_none(), "no cell 2");
-        let (_directory, writer) = GrantDirectory::new();
+        let (_directory, writer) =
+            GrantDirectory::new(DirectoryPayload::try_new().expect("the directory"));
         let pos = writer.positions().nth(3).expect("position 3");
         assert!(!board.all_name(pos, 16), "no receipt yet");
         first.publish(pos, 16);
@@ -430,6 +678,79 @@ mod tests {
         assert!(!board.all_name(pos, 17), "an old receipt never returns a later grant");
         assert_eq!(first.receipt(pos), 16);
         assert_eq!(first.cell(), 0);
+    }
+
+    /// A payload is one exact allocation filled within it, and a size that
+    /// does not fit a `usize` is refused with no allocation.
+    #[test]
+    fn a_payload_is_reserved_exactly_or_refused_whole() {
+        let slots = reserved(POSITIONS, GrantsPayload::Directory, || AtomicU64::new(0));
+        let slots = slots.expect("64 words");
+        assert_eq!((slots.len(), slots.capacity()), (POSITIONS, POSITIONS));
+        let refused = reserved(usize::MAX, GrantsPayload::Receipts, || AtomicU32::new(0));
+        let refused = refused.expect_err("a size past usize");
+        assert_eq!(refused, PayloadRefused { payload: GrantsPayload::Receipts, bytes: None });
+        let receipts = ReceiptPayload::try_new(3).expect("three cells");
+        assert_eq!((receipts.receipts.len(), receipts.taken.len()), (3 * POSITIONS, 3));
+        let board = ReceiptBoard::new(receipts);
+        assert_eq!(board.cells(), 3);
+    }
+
+    /// A wake that counts its sends.
+    #[derive(Default)]
+    struct Wakes(core::cell::Cell<u32>);
+
+    impl BellWake for Wakes {
+        fn wake(&self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    /// The bell sends a wake on its clear-to-set edge only, and a post
+    /// sends one every time; each cell's `closing` is its own.
+    #[test]
+    fn the_bell_wakes_on_its_edge_and_a_post_always() {
+        let board = RetireBoard::new(ClosingPayload::try_new(2).expect("two cells"));
+        let wakes = Wakes::default();
+        board.bell().ring(&wakes);
+        board.bell().ring(&wakes);
+        assert_eq!(wakes.0.get(), 1, "a ring on a set bell sends nothing");
+        let turn = board.bell().worker_turn(false, || None::<u8>, || unreachable!("no wait"));
+        assert_eq!(turn, WorkerTurn { message: None, rung: true, waited: false });
+        board.bell().ring(&wakes);
+        assert_eq!(wakes.0.get(), 2, "cleared, the next ring sends again");
+        wake_posted(&wakes);
+        wake_posted(&wakes);
+        assert_eq!(wakes.0.get(), 4, "a post sends a wake every time");
+        assert!(!board.closing(1));
+        board.close(1);
+        assert!(board.closing(1) && !board.closing(0), "one cell's word");
+        assert_eq!(board.cells(), 2);
+    }
+
+    /// The turn waits only when its circuit was empty and no message was
+    /// queued, then tries once more; a message found first never waits.
+    #[test]
+    fn a_turn_waits_only_on_an_empty_circuit_with_nothing_queued() {
+        let board = RetireBoard::new(ClosingPayload::try_new(1).expect("one cell"));
+        let bell = board.bell();
+        let mut queue = vec![7u8];
+        let turn = bell.worker_turn(true, || queue.pop(), || unreachable!("a message queued"));
+        assert_eq!(turn, WorkerTurn { message: Some(7), rung: false, waited: false });
+        let turn = bell.worker_turn(false, || None::<u8>, || unreachable!("a job may wait"));
+        assert!(!turn.waited, "a circuit with a job never waits");
+        let queue = core::cell::RefCell::new(Vec::new());
+        let waits = core::cell::Cell::new(0);
+        let turn = bell.worker_turn(
+            true,
+            || queue.borrow_mut().pop(),
+            || {
+                waits.set(waits.get() + 1);
+                queue.borrow_mut().push(9);
+            },
+        );
+        assert_eq!(waits.get(), 1);
+        assert_eq!(turn, WorkerTurn { message: Some(9), rung: false, waited: true });
     }
 }
 
@@ -450,7 +771,8 @@ mod loom_tests {
     #[test]
     fn loom_a_pass_that_sees_the_generation_sees_the_retiring() {
         loom::model(|| {
-            let (directory, mut writer) = GrantDirectory::new();
+            let (directory, mut writer) =
+                GrantDirectory::new(DirectoryPayload::try_new().expect("the directory"));
             let pos = writer.positions().nth(1).expect("position 1");
             writer.reserve(pos, 16);
             writer.stage_declared(pos, 16);
@@ -490,8 +812,9 @@ mod loom_tests {
     #[test]
     fn loom_a_reclaim_that_reads_every_receipt_reads_every_end() {
         loom::model(|| {
-            let board = ReceiptBoard::new(2);
-            let (_directory, writer) = GrantDirectory::new();
+            let board = ReceiptBoard::new(ReceiptPayload::try_new(2).expect("the receipts"));
+            let (_directory, writer) =
+                GrantDirectory::new(DirectoryPayload::try_new().expect("the directory"));
             let pos = writer.positions().nth(2).expect("position 2");
             let ended = Arc::new([AtomicU32::new(0), AtomicU32::new(0)]);
             let cells: Vec<_> = (0..2u16)
@@ -533,9 +856,10 @@ mod loom_tests {
     #[test]
     fn loom_an_old_receipt_never_reclaims_a_reused_position() {
         loom::model(|| {
-            let board = ReceiptBoard::new(1);
+            let board = ReceiptBoard::new(ReceiptPayload::try_new(1).expect("the receipts"));
             let receipts = ReceiptBoard::writer(&board, 0).expect("cell 0");
-            let (directory, mut writer) = GrantDirectory::new();
+            let (directory, mut writer) =
+                GrantDirectory::new(DirectoryPayload::try_new().expect("the directory"));
             let pos = writer.positions().next().expect("position 0");
             receipts.publish(pos, 16);
             let reuse = thread::spawn(move || {
@@ -566,5 +890,128 @@ mod loom_tests {
         let kept = REUSE_OLD_KEPT.load(std::sync::atomic::Ordering::Relaxed);
         assert!(receipted > 0, "VACUOUS: no pass read the reused grant Retiring");
         assert!(kept > 0, "VACUOUS: no reclaim of the reused grant met the old receipt");
+    }
+
+    /// The control thread's one-slot wake channel as the model sees it: a
+    /// slot flag. A send to a full slot changes nothing (`try_send`'s
+    /// `Full`); only the wait empties it. Every access to a word several
+    /// threads write is an RMW: Loom 0.7 lets a later RMW miss a plain store
+    /// to the same word that happens before it.
+    struct ModelWake {
+        slot: AtomicBool,
+    }
+
+    impl BellWake for ModelWake {
+        fn wake(&self) {
+            self.slot.swap(true, Ordering::AcqRel);
+        }
+    }
+
+    /// The model's cells: two, each one lane of the worker's circuit.
+    const CELLS: usize = 2;
+
+    /// The threads beside the worker: the cells and the poster.
+    const SENDERS: usize = CELLS + 1;
+
+    /// Executions in which the worker waited on the wake.
+    static WORKER_WAITED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// The node's one bell (F18): two cells each publish a job (`Release`,
+    /// the ring's own publish) and ring; a poster sends one message on a
+    /// one-message channel and wakes; the worker runs its turns with
+    /// `idle`, its passes visiting the lanes from a cursor, until it has
+    /// taken both jobs and the message. Its wait returns when the wake's
+    /// slot is set; one that finds every sender finished and the slot
+    /// empty would sleep forever with a job or the message unconsumed (it
+    /// waits only while it has not taken all of them), which the model
+    /// asserts against: the planted silent ring and the planted post
+    /// without its wake each reach one.
+    #[test]
+    fn loom_the_worker_never_waits_with_a_job_published_or_a_message_queued() {
+        loom::model(|| {
+            let board = RetireBoard::new(ClosingPayload::try_new(2).expect("two cells"));
+            let wake = Arc::new(ModelWake { slot: AtomicBool::new(false) });
+            let published = Arc::new([AtomicBool::new(false), AtomicBool::new(false)]);
+            let channel = Arc::new(AtomicU32::new(0));
+            let finished: Arc<[AtomicBool; SENDERS]> =
+                Arc::new(core::array::from_fn(|_| AtomicBool::new(false)));
+            let cells: Vec<_> = (0..CELLS)
+                .map(|cell| {
+                    let (board, wake) = (Arc::clone(&board), Arc::clone(&wake));
+                    let (published, finished) = (Arc::clone(&published), Arc::clone(&finished));
+                    thread::spawn(move || {
+                        published[cell].store(true, Ordering::Release);
+                        board.bell().ring(&*wake);
+                        finished[cell].store(true, Ordering::Release);
+                    })
+                })
+                .collect();
+            let poster = {
+                let (channel, wake) = (Arc::clone(&channel), Arc::clone(&wake));
+                let finished = Arc::clone(&finished);
+                thread::spawn(move || {
+                    channel.swap(1, Ordering::AcqRel);
+                    wake_posted(&*wake);
+                    finished[CELLS].store(true, Ordering::Release);
+                })
+            };
+            // The wait: returns once the slot is full, emptying it. With every
+            // sender finished, no wake can come: one last look at the slot,
+            // and an empty one is a worker asleep with work unconsumed.
+            let wait = || {
+                loop {
+                    if wake.slot.swap(false, Ordering::AcqRel) {
+                        return;
+                    }
+                    if finished.iter().all(|done| done.load(Ordering::Acquire)) {
+                        assert!(
+                            wake.slot.swap(false, Ordering::AcqRel),
+                            "LOST_WAKE: the worker waits with every sender done and its slot \
+                             empty"
+                        );
+                        return;
+                    }
+                    thread::yield_now();
+                }
+            };
+            let (mut taken, mut handled, mut waited) = ([false; CELLS], false, false);
+            let (mut idle, mut cursor) = (0usize, 0usize);
+            for _ in 0..16 {
+                let turn = board.bell().worker_turn(
+                    idle >= CELLS,
+                    || (channel.swap(0, Ordering::AcqRel) != 0).then_some(()),
+                    wait,
+                );
+                waited |= turn.waited;
+                handled |= turn.message.is_some();
+                if turn.rung {
+                    idle = 0;
+                }
+                while idle < CELLS {
+                    let lane = cursor;
+                    cursor = (cursor + 1) % CELLS;
+                    if !taken[lane] && published[lane].load(Ordering::Acquire) {
+                        taken[lane] = true;
+                        idle = 0;
+                    } else {
+                        idle += 1;
+                    }
+                }
+                if taken == [true; CELLS] && handled {
+                    break;
+                }
+            }
+            assert!(handled, "the message was handled");
+            assert_eq!(taken, [true; CELLS], "every published job was taken");
+            if waited {
+                WORKER_WAITED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            for cell in cells {
+                cell.join().expect("cell");
+            }
+            poster.join().expect("poster");
+        });
+        let waits = WORKER_WAITED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(waits > 0, "VACUOUS: no execution's worker waited on the wake");
     }
 }

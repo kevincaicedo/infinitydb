@@ -20,8 +20,10 @@ use inf_store::{Keyspace, StoreConfig, TierSpec};
 impl<F: SegmentFs + Clone> TierCell<F> {
     /// A tier cell that is the only cell of a node whose directory it owns.
     pub(crate) fn standalone(fs: F, cell: u32, shard_dir: PathBuf, census: Rc<CapCensus>) -> Self {
-        let (directory, writer) = GrantDirectory::new();
-        let board = inf_foundation::grants::ReceiptBoard::new(1);
+        let payload = inf_foundation::grants::DirectoryPayload::try_new().expect("a directory");
+        let (directory, writer) = GrantDirectory::new(payload);
+        let receipts = inf_foundation::grants::ReceiptPayload::try_new(1).expect("one cell");
+        let board = inf_foundation::grants::ReceiptBoard::new(receipts);
         let receipts = inf_foundation::grants::ReceiptBoard::writer(&board, 0).expect("cell 0");
         let cursor = DirectoryCursor::default();
         let grants = CellGrants { directory, receipts, cursor, writer: Some(writer) };

@@ -49,8 +49,8 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use inf_foundation::grants::{
-    DirectoryPublished, DirectoryWriter, GrantDirectory, GrantPos, POSITIONS, ReceiptBoard,
-    ReceiptWriter,
+    DirectoryPayload, DirectoryPublished, DirectoryWriter, GrantDirectory, GrantPos, POSITIONS,
+    PayloadRefused, ReceiptBoard, ReceiptPayload, ReceiptWriter,
 };
 use inf_foundation::issue::{
     self, FinalCredit, IssueClock, IssueCredit, IssueExhausted, IssueQuota, IssueSpace, Issued,
@@ -1458,8 +1458,13 @@ impl TierNamespaceGrants {
     /// other position Vacant, published before any cell exists. Drop
     /// tombstones take no position. The boot's count refused `k > 64`
     /// first, so every definition has its position.
-    fn seed(catalog: Option<&NsCatalog>, cells: u16) -> TierNamespaceGrants {
-        let (_directory, mut directory) = GrantDirectory::new();
+    fn seed(
+        catalog: Option<&NsCatalog>,
+        cells: u16,
+    ) -> Result<TierNamespaceGrants, PayloadRefused> {
+        let directory = DirectoryPayload::try_new()?;
+        let receipts = ReceiptPayload::try_new(cells)?;
+        let (_directory, mut directory) = GrantDirectory::new(directory);
         let mut live: Vec<NsId> = catalog
             .map(|c| c.entries.iter().filter(|e| e.tier.is_some()).map(|e| e.id).collect())
             .unwrap_or_default();
@@ -1473,7 +1478,7 @@ impl TierNamespaceGrants {
         // No epoch is published at boot: each cell is built after this, on
         // a thread its assembly starts, and reads the directory as it is.
         let _boot = directory.publish();
-        TierNamespaceGrants { book, directory, receipts: ReceiptBoard::new(cells) }
+        Ok(TierNamespaceGrants { book, directory, receipts: ReceiptBoard::new(receipts) })
     }
 
     /// Step 1 for a tiered `CREATE` (ADR-0148 D1, D4; ADR-0172 D3): the
@@ -2503,6 +2508,9 @@ pub enum ControlBootRefused {
     /// (ADR-0148 D5, A1.2): a data directory with more is refused, with no
     /// migration. Drop tombstones and their residue take no lifetime.
     TieredLifetimes { live: usize },
+    /// A payload of the tiered grants could not be reserved (ADR-0148 D4):
+    /// nothing of it was made and no cell exists.
+    GrantsPayload(PayloadRefused),
 }
 
 impl std::fmt::Display for ControlBootRefused {
@@ -2513,6 +2521,12 @@ impl std::fmt::Display for ControlBootRefused {
                 "the catalog names {live} live tiered namespaces, more than the \
                  {TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX} tiered namespace lifetimes a node \
                  holds: a data directory with more is refused at boot, with no migration"
+            ),
+            ControlBootRefused::GrantsPayload(PayloadRefused { payload, bytes }) => write!(
+                f,
+                "the tiered grants' {payload:?} payload of {} bytes could not be reserved at \
+                 boot",
+                bytes.map_or_else(|| "more than usize::MAX".to_owned(), |b| b.to_string())
             ),
         }
     }
@@ -2598,7 +2612,8 @@ impl ControlHandle {
         });
         let (tx, rx) = mpsc::sync_channel::<ControlMsg>(256);
         let (epochs, word) = CatalogEpochs::new();
-        let grants = TierNamespaceGrants::seed(seed, cells);
+        let grants =
+            TierNamespaceGrants::seed(seed, cells).map_err(ControlBootRefused::GrantsPayload)?;
         let handle = Arc::new(ControlHandle {
             tx,
             next_ns_id: AtomicU32::new(next_id),
