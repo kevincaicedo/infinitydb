@@ -156,6 +156,15 @@ impl RetireJobs {
     }
 }
 
+/// What a job's file is (ADR-0156 D1, D2): a retired file of the
+/// namespace's catalog or retirement list, or a failed create's residue,
+/// which its position's residue slot owns.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum JobKind {
+    Retired,
+    Residue,
+}
+
 /// A retired tier file's owner on its way to the worker: its meta, at most
 /// one handle, and the job position it holds. Not `Clone`; built and opened
 /// only in this module.
@@ -167,6 +176,7 @@ impl RetireJobs {
 pub struct RetireJob<J> {
     job: JobPos,
     key: JobKey,
+    kind: JobKind,
     meta: TierFileMeta,
     handle: Option<J>,
 }
@@ -188,6 +198,7 @@ pub struct RetireJob<J> {
 pub struct RetireResult {
     job: JobPos,
     key: JobKey,
+    kind: JobKind,
     meta: TierFileMeta,
     outcome: RetireOutcome,
 }
@@ -237,6 +248,7 @@ impl RetryCause {
 pub(crate) struct Consumed {
     pub(crate) pos: GrantPos,
     pub(crate) ns: NsId,
+    pub(crate) kind: JobKind,
     pub(crate) meta: TierFileMeta,
     pub(crate) outcome: RetireOutcome,
 }
@@ -302,6 +314,7 @@ impl<J> OfferBatch<'_, J> {
         &mut self,
         pos: GrantPos,
         ns: NsId,
+        kind: JobKind,
         meta: TierFileMeta,
         handle: Option<J>,
     ) -> Result<(), (TierFileMeta, Option<J>)> {
@@ -325,7 +338,7 @@ impl<J> OfferBatch<'_, J> {
             self.jobs.take(job, key);
             job
         };
-        permit.write(RetireJob { job, key, meta, handle });
+        permit.write(RetireJob { job, key, kind, meta, handle });
         self.offered += 1;
         Ok(())
     }
@@ -381,7 +394,7 @@ impl<J> CellPart<J> {
         let jobs = &mut self.jobs;
         let mut stale = 0;
         let taken = results.consume_batch(TIER_RETIRE_JOBS_PER_CELL, |result| {
-            let RetireResult { job, key, meta, outcome } = result;
+            let RetireResult { job, key, kind, meta, outcome } = result;
             if !jobs.release(job, key) {
                 // Only the planted credit puts two jobs on one position.
                 debug_assert!(
@@ -391,7 +404,7 @@ impl<J> CellPart<J> {
                 stale += 1;
                 return;
             }
-            consume(Consumed { pos: key.pos, ns: key.ns, meta, outcome });
+            consume(Consumed { pos: key.pos, ns: key.ns, kind, meta, outcome });
         });
         (taken, stale)
     }
@@ -641,9 +654,16 @@ impl<J: SegmentFile + FinalClose> RetireWorker<J> {
             self.cursor = 0;
         }
         let (mut visits, mut jobs) = (0, 0);
+        // Canary `inf_canary_retire_worker_unpaced`: the pass ignores its 8
+        // jobs, so one pass unlinks every ready job its 64 visits reach.
+        let jobs_max = if cfg!(inf_canary_retire_worker_unpaced) {
+            usize::MAX
+        } else {
+            RETIRE_WORKER_JOBS_PER_PASS
+        };
         while lanes > 0
             && visits < RETIRE_WORKER_VISITS_PER_PASS
-            && jobs < RETIRE_WORKER_JOBS_PER_PASS
+            && jobs < jobs_max
             && self.idle < lanes
         {
             let at = self.cursor;
@@ -729,7 +749,7 @@ fn wake_cell(wake: Option<&CellWake>, cell: u16) {
 /// its path unlinked: `Ok` is `Unlinked`, `NotFound` `AlreadyAbsent`, any
 /// other error `Retry(Unlink)`.
 fn run<J: FinalClose, F: SegmentFs<File = J>>(job: RetireJob<J>, fs: &F) -> RetireResult {
-    let RetireJob { job, key, meta, handle } = job;
+    let RetireJob { job, key, kind, meta, handle } = job;
     let outcome = match handle.map(FinalClose::final_close) {
         Some(Err(error)) => RetireOutcome::Retry(RetryCause::of(&error, true)),
         Some(Ok(())) | None => match fs.unlink_tier(&meta.path) {
@@ -738,7 +758,7 @@ fn run<J: FinalClose, F: SegmentFs<File = J>>(job: RetireJob<J>, fs: &F) -> Reti
             Err(error) => RetireOutcome::Retry(RetryCause::of(&error, false)),
         },
     };
-    RetireResult { job, key, meta, outcome }
+    RetireResult { job, key, kind, meta, outcome }
 }
 
 /// The canary's double close: a retry of a file whose close failed (it has

@@ -153,6 +153,24 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         TimerOutcome::Successor(next)
     }
 
+    /// The tier-file retirement role's delivery (ADR-0154 A1): one compare
+    /// of the latest retry's due with the turn, no I/O. A later due is the
+    /// successor's deadline; else every retry is due and this iteration's
+    /// walk offers them. A refused successor leaves the role Idle, the
+    /// retries offered at the first turn past their due.
+    fn tier_retire_tick<'n>(
+        &self,
+        cx: &mut LoopCx<'_>,
+        notice: &'n TimerNotice,
+    ) -> TimerOutcome<'n> {
+        let due = self.shared.tier.borrow().as_ref().and_then(|tier| tier.retire_role_due(cx.now));
+        let Some(due) = due else { return TimerOutcome::Complete };
+        match cx.timers().successor(notice, due) {
+            Ok(next) => TimerOutcome::Successor(next),
+            Err(_) => TimerOutcome::Complete,
+        }
+    }
+
     fn arm_initial_listener(&mut self, cx: &mut LoopCx<'_>) -> bool {
         use crate::cache_boot::CacheBootStatus;
 
@@ -881,6 +899,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             // The holds need no handler: the wake is the effect, and this
             // iteration's LOG step seals the held frame.
             Some(TimerRole::FillHold | TimerRole::GroupHold) => TimerOutcome::Complete,
+            Some(TimerRole::TierRetire) => self.tier_retire_tick(cx, notice),
             None => {
                 debug_assert!(false, "a notice routed {} names no timer role", notice.route());
                 TimerOutcome::Complete

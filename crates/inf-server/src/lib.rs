@@ -129,9 +129,9 @@ pub use recover::{
     UnitPhase, open_cell_log,
 };
 pub use tier_retire::{
-    BootReservation, BootTerm, CellPart, CellWake, DetachedTier, FinalClose, JobPos, RetireJob,
-    RetireLane, RetireOutcome, RetireResult, RetireStep, RetireWorker, RetryCause, TierBoot,
-    TierLifetimeBoot, TierShared, TransportPhase,
+    BootReservation, BootTerm, CellPart, CellWake, DetachedTier, FinalClose, JobKind, JobPos,
+    RetireJob, RetireLane, RetireOutcome, RetireResult, RetireStep, RetireWorker, RetryCause,
+    TierBoot, TierLifetimeBoot, TierShared, TransportPhase,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use tier_retire::{CutCustody, cut_for_sim, retire_with};

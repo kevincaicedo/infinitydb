@@ -804,6 +804,10 @@ pub struct ServerPlane<
     /// until `enable_durable` moves it into the tier cell's grants; held
     /// here, it is the stop's to retire (a cell still recovering).
     held_part: Option<crate::tier_retire::CellPart<F::File>>,
+    /// The tier-file retirement role's owner (ADR-0154 A1) until
+    /// `enable_durable` hands it to the tier cell; a cell with no durable
+    /// plane keeps it Idle here, as it keeps the everysec role's.
+    tier_retire_timer: Option<inf_runtime::TimerOwner>,
     /// The graceful stop (ADR-0124 D2); `None` while serving.
     stop: Option<StopDrive>,
     /// Take a checkpoint before the final sync of a stop (D2 step 3).
@@ -1174,6 +1178,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             memory_publish_in: 1,
             final_credit: None,
             held_part: None,
+            tier_retire_timer: Some(timers.tier_retire),
             stop: None,
             stop_checkpoint: true,
         };
@@ -1441,14 +1446,20 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let wake = control.retire_wake();
             Some(crate::tier_cell::CellGrants::new(directory, receipts, part, board, wake))
         });
-        *self.shared.tier.borrow_mut() = Some(crate::tier_cell::TierCell::new(
+        let mut tier = crate::tier_cell::TierCell::new(
             fs.clone(),
             u32::from(cell_id),
             shard_dir.clone(),
             Rc::clone(&self.shared.census),
             self.shared.wait_nodes.clone(),
             grants,
-        ));
+        );
+        // The durable cell's retirement role (ADR-0154 A1): its tier cell
+        // arms it at a retried file's due.
+        if let Some(owner) = self.tier_retire_timer.take() {
+            tier.set_retire_timer(owner);
+        }
+        *self.shared.tier.borrow_mut() = Some(tier);
         let manifest = crate::ckpt::ManifestCell::new(
             fs,
             shard_dir,
@@ -1573,12 +1584,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             // the catalog swap carrying the drop is durable.
             let control = self.shared.control.borrow().clone();
             let durable = self.shared.durable.borrow();
-            units += tier.maintain_draining(
+            units += tier.retire_walk(
                 cx.now,
                 |epoch| control.as_ref().is_none_or(|control| control.persisted(epoch)),
                 |fence| durable.as_ref().is_none_or(|cell| cell.commit.settled_through(fence)),
             );
             drop(durable);
+            tier.arm_retire_role(&mut cx.timers());
             if units > 0 {
                 cx.charge(GroupClass::Maintenance, units);
             }
@@ -1618,13 +1630,15 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             self.shared.node.tier_window_written_bytes.set(written);
             self.shared.node.tier_ns_positions.set(tier.positions_held());
             self.shared.node.tier_position_conflicts.set(tier.position_conflicts());
-            let (retire, jobs_out) = tier.retire_gauges();
-            let node = &self.shared.node;
-            node.tier_retire_jobs_out.set(jobs_out);
+            let gauges = tier.retire_gauges();
+            let (node, retire) = (&self.shared.node, gauges.stats);
+            node.tier_retire_jobs_out.set(gauges.jobs_out);
             node.tier_files_retired.set(retire.files_retired);
             node.tier_retire_errors_transient.set(retire.errors_transient);
             node.tier_retire_errors_operator.set(retire.errors_operator);
             node.tier_retire_results_stale.set(retire.stale);
+            node.tier_retire_pending.set(gauges.pending);
+            node.tier_create_residues.set(gauges.residues);
             tier.cold.clone()
         };
         // Reactor-drive flush ops (M4.5-S31): pushed outside the tier
@@ -1795,10 +1809,21 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         self.shared.node.tier_flush.get()
     }
 
+    /// The tier-file retirement role's phase on the cell's timer set and
+    /// the latest due a consumed `Retry` set (ADR-0154 A1), `None` on a cell
+    /// whose tier cell holds no role: read by the role's crate test between
+    /// scheduler steps.
+    pub fn tier_retire_role_for_sim(
+        &self,
+        timers: &inf_runtime::TimerSet,
+    ) -> Option<(inf_runtime::OwnerPhase, Nanos)> {
+        self.shared.tier.borrow().as_ref().and_then(|tier| tier.retire_role(timers))
+    }
+
     /// The cell's tier-file jobs out (0 without a tier), read from its part
     /// for the simulator's held-worker cycle between scheduler steps.
     pub fn tier_retire_jobs_out_for_sim(&self) -> u64 {
-        self.shared.tier.borrow().as_ref().map_or(0, |tier| tier.retire_gauges().1)
+        self.shared.tier.borrow().as_ref().map_or(0, |tier| tier.retire_gauges().jobs_out)
     }
 
     /// Checkpoint `(completed, aborted)` for the simulator's oracles

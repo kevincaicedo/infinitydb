@@ -628,6 +628,12 @@ impl<D: BackendDriver, C: Clock> CellLoop<D, C> {
         self.timers.armed()
     }
 
+    /// The cell's timer set, read only: an owner's phase and the earliest
+    /// armed deadline, which a harness reads between iterations.
+    pub fn timer_set(&self) -> &TimerSet {
+        &self.timers
+    }
+
     /// The iteration whose lend last built this loop's cold turn, counted
     /// as [`Self::counters`] counts iterations, from 1; 0 while no lend has
     /// built one. An iteration in which no step lends leaves it as it was.

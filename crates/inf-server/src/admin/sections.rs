@@ -527,8 +527,8 @@ fn tripwires_section(
 
 /// `INFO` — the keyspace lines.
 /// The cell's tier-file retirement (ADR-0156 D3): its jobs out, its files
-/// retired, its failed attempts by errno class and its results with no
-/// owner (cell scope); then the
+/// retired, its failed attempts by errno class, its results with no owner,
+/// its retiring owners and its failed creates' files (cell scope); then the
 /// control thread's worker's passes and jobs (node scope).
 fn retire_lines(text: &mut String, node: &NodeInfo) {
     push(text, &format!("tier_retire_jobs_out:{}", node.tier_retire_jobs_out.get()));
@@ -538,6 +538,8 @@ fn retire_lines(text: &mut String, node: &NodeInfo) {
     push(text, &format!("tier_retire_errors_transient:{transient}"));
     push(text, &format!("tier_retire_errors_operator:{operator}"));
     push(text, &format!("tier_retire_results_stale:{}", node.tier_retire_results_stale.get()));
+    push(text, &format!("tier_retire_pending:{}", node.tier_retire_pending.get()));
+    push(text, &format!("tier_create_residues:{}", node.tier_create_residues.get()));
     let (passes, jobs) = node
         .retire_board
         .borrow()

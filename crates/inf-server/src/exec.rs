@@ -182,6 +182,12 @@ pub struct NodeState {
     pub tier_retire_errors_transient: Cell<u64>,
     pub tier_retire_errors_operator: Cell<u64>,
     pub tier_retire_results_stale: Cell<u64>,
+    /// The cell's retiring owners plus its dropped namespaces' catalogs (a
+    /// gauge: the retirement walk's depth), and its failed creates' files
+    /// still owned, held or out for their unlink (a gauge). Render-only,
+    /// cell scope.
+    pub tier_retire_pending: Cell<u64>,
+    pub tier_create_residues: Cell<u64>,
     /// Namespaces a MAINTAIN pass left for a later one because their task
     /// class had no room (ADR-0177 D2's `compact` and `shadow` crossing,
     /// counted at the room): at the shipped caps reached only while a

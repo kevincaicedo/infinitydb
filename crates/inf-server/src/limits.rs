@@ -62,9 +62,10 @@ pub const ACK_WAKES_PER_TURN: NonZeroU32 = NonZeroU32::MIN.saturating_add(1_024 
 
 /// Timer owner positions one server cell holds (ADR-0154 D1, D4): its roles'
 /// count, `TimerRole::COUNT` (one listener's accept retry, everysec, fill
-/// hold, group hold), so the cap is derived from the producers and a role
-/// added is a position added. Owner: `ServerTimers::build`, the cell's one
-/// constructor of its set and its owners, inside `ServerPlane::new`.
+/// hold, group hold, the tier retirement's retry), so the cap is derived
+/// from the producers and a role added is a position added. Owner:
+/// `ServerTimers::build`, the cell's one constructor of its set and its
+/// owners, inside `ServerPlane::new`.
 /// `CapFill::Assembly`: the build reserves every position before the cell's
 /// loop exists, and no role closes its owner, so the `timer-owners` row is
 /// full at the serve mark and takes no publish after it (the census counts
@@ -637,9 +638,24 @@ pub const RETIRE_WORKER_JOBS_PER_PASS: usize = 8;
 /// Injected time a tier file whose close or unlink failed waits before its
 /// next offer, from the consumption of that failure (ADR-0156 D3: no sooner
 /// than one injected millisecond). Owner: the file's position on its cell.
-/// Crossing: the file is passed until then, after every other file of its
-/// position, and offered at the first MAINTAIN past it.
+/// Crossing: the walk passes the file until then, moving it behind its
+/// position's other owners; the retirement timer role wakes the cell at
+/// its due, and that iteration's walk offers it.
 pub const TIER_RETIRE_RETRY_NS: Nanos = Nanos(1_000_000);
+
+/// Owner visits one cell's retirement walk makes a turn (ADR-0156 D4), its
+/// consumed results included: a pinned or not-yet-due owner's visit counts
+/// as an offered one's, each one Maintenance unit. Owner: the cell's walk.
+/// Crossing: the turn ends, and the next starts at the position after the
+/// turn's first, so every pending position is a turn's first within 64
+/// turns.
+pub const TIER_RETIRE_VISITS_PER_TURN: u32 = 64;
+
+/// Job offers one cell's retirement walk makes a turn, an offer deferred
+/// for want of a free job position included (ADR-0156 D2, D4). Owner: the
+/// cell's walk. Crossing: the turn ends; the owner stays where it is, at
+/// its catalog's end or its list's pass, for the next turn.
+pub const TIER_RETIRE_OFFERS_PER_TURN: u32 = 8;
 
 /// Waits a threaded test fixture's retirement of one cell's transport takes
 /// at most, each the caller's own (about a millisecond in every fixture).

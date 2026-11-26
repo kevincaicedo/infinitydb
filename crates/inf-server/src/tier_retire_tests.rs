@@ -79,7 +79,7 @@ impl<J: SegmentFile + FinalClose> Rig<J> {
             return false;
         }
         let file = meta.id;
-        let offered = batch.offer(pos, NsId(ns), meta, handle).is_ok();
+        let offered = batch.offer(pos, NsId(ns), JobKind::Retired, meta, handle).is_ok();
         if batch.publish() > 0 {
             self.board.bell().ring(&self.wake);
         }
@@ -558,7 +558,9 @@ fn a_parked_cell_is_woken_by_its_results() {
             let id = round * 8 + i;
             let path = dir.join(inf_log::tier_file_name(id));
             let file = StdSegmentFs.create_tier(&path, TierIoMode::Buffered).expect("a file");
-            assert!(batch.offer(pos, NsId(16), meta(id, path), Some(file)).is_ok());
+            assert!(
+                batch.offer(pos, NsId(16), JobKind::Retired, meta(id, path), Some(file)).is_ok()
+            );
         }
         assert_eq!(batch.publish(), 8);
         shared.board.bell().ring(&wake);
