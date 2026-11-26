@@ -1504,8 +1504,10 @@ ordered_rows=(
   "inf_canary_rearm_after_eof m0-capacity recv-armed-after-eof --close-leg half-close"
   # ADR-0156 D3: a dropped namespace's receipt waits for every job's result. Planted, the
   # terminal step ignores the jobs out: with the worker held, the cell test's MAINTAIN
-  # publishes the receipt with jobs out.
+  # publishes the receipt with jobs out, and the simulator's successor CREATE is accepted while
+  # the dropped namespace's tier files are still on the disk.
   "inf_canary_receipt_jobs_out_ignored crate-test inf-server lib a_drained_namespaces_receipt_waits_for_its_jobs_out RECEIPT_WITH_JOBS_OUT:"
+  "inf_canary_receipt_jobs_out_ignored m4-ns-lifetimes HELD-WORKER"
   # The registries drop a connection when its queue is empty, so a queued SUBSCRIBE's 0→1
   # precedes the close's 1→0 in one task. Planted, the removal runs at Closed, before the drain,
   # and the owner keeps counting the closed client.

@@ -713,7 +713,8 @@ fn main() {
                  commands, {} steps, {} CREATEs accepted, {} refused while a grant was Retiring, \
                  {} at the limit, at most {} ns directories holding open files under a shard ({} \
                  under cell 0's at the limit), drops across held extent I/O {}, cold reads {}, \
-                 peer rounds {}, failed unlinks {}, {} churn cycles, {} disconnects, refused leg \
+                 peer rounds {}, failed unlinks {} ({} while every attempt failed), drops with \
+                 jobs held {}, {} churn cycles, {} disconnects, refused leg \
                  {}, tombstones {} settled and {} after the rollback, trace {} bytes, hash \
                  {:#018x}",
                 report.leg,
@@ -729,6 +730,8 @@ fn main() {
                 report.cold_reads_across_drop,
                 report.rounds_held_across_drop,
                 report.unlink_failures,
+                report.unlink_every_attempt,
+                report.jobs_held_across_drop,
                 report.churn_cycles,
                 report.disconnects,
                 report.refused_leg,
