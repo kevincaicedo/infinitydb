@@ -2148,20 +2148,23 @@ fn same_numbered_retired_files(id: u32) -> (Standalone<SimDisk>, Keyspace, [Path
             the same number; red until a pin names the namespace's lifetime with its file"]
 fn a_cold_read_defers_only_its_own_namespaces_file() {
     const FILE: u32 = 3;
-    let (mut cell, mut ks, _) = same_numbered_retired_files(FILE);
-    cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
-        .expect("MAINTAIN");
-    assert!(cell.retiring_at(1) == 0, "the control: 17's file 3 retires unread");
-    let (mut cell, mut ks, paths) = same_numbered_retired_files(FILE);
+    const TURNS: u64 = 4;
+    let walk = |cell: &mut Standalone<SimDisk>| {
+        for turn in 0..TURNS {
+            cell.retire_walk(Nanos(turn), |_| true, |_| true);
+            cell.step_worker();
+        }
+    };
+    let (mut cell, _ks, _) = same_numbered_retired_files(FILE);
+    walk(&mut cell);
+    assert_eq!(cell.retiring_at(1), 0, "the control: 17's file 3 retires unread");
+    let (mut cell, _ks, paths) = same_numbered_retired_files(FILE);
     let cold = cell.cold.clone().expect("the cell's cold engine");
     let class = inf_runtime::ReadClass::Foreground;
     let file = TierFileId::new(FILE);
     let wait = cold.enqueue(-1, file, 0, TIER_FRAME_BYTES, class, 0).expect("the read queued");
-    cell.maintain_ns(&mut ks, 0, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
-        .expect("MAINTAIN");
+    walk(&mut cell);
     let own_kept = cell.retiring_at(0);
-    cell.maintain_ns(&mut ks, 1, NO_DURABLE, false, 0, &mut TaskRoom::new(ROOMY, &Cell::new(0)))
-        .expect("MAINTAIN");
     let other_kept = cell.retiring_at(1);
     drop(wait);
     assert_eq!(own_kept, 1, "engagement: the read keeps namespace 16's file 3 retiring");
@@ -2271,4 +2274,105 @@ fn an_aborted_swap_moves_nothing_and_a_later_swap_retires_the_mark() {
     assert!(turns < TURNS_MAX, "the walk settles within {TURNS_MAX} turns");
     assert!(!on_disk(&cell, &first.path), "the later swap's commit retires the file");
     assert_eq!(cell.retire_gauges().stats.files_retired, 1);
+}
+
+/// A standalone sim-disk cell with `namespaces` tiered namespaces, ids from
+/// 16, each at its own position (the lowest Vacant one, in creation order),
+/// and `files[i]` tier files on the disk retiring on namespace `i`'s list,
+/// ids from `first_id[i]`, each handle closed. Returns the cell and every
+/// namespace's paths.
+fn retiring_namespaces(
+    namespaces: usize,
+    files: impl Fn(usize) -> u32,
+    first_id: impl Fn(usize) -> u32,
+) -> (Standalone<SimDisk>, Vec<Vec<PathBuf>>) {
+    let mut cell = TierCell::standalone(SimDisk::new(), 0, PathBuf::from("/shard-0"), census());
+    let mut paths = Vec::new();
+    for index in 0..namespaces {
+        let ns = NsId(16 + u32::try_from(index).expect("at most 64"));
+        cell.create_ns(ns, &spec());
+        let at = cell.live().position(|t| t.ns == ns).expect("installed");
+        let cold = cell.nth(at).dir.join("cold");
+        cell.fs.create_dir_all(&cold).expect("the cold directory");
+        let mut own = Vec::new();
+        for id in first_id(index)..first_id(index) + files(index) {
+            let path = cold.join(inf_log::tier_file_name(id));
+            drop(cell.fs.create_tier(&path, TierIoMode::Buffered).expect("a tier file"));
+            let meta = TierFileMeta {
+                id,
+                base: LogicalAddr::from_raw(u64::from(id) << 20).expect("fits"),
+                data_len: 1 << 20,
+                reason: inf_log::SealReason::Capacity,
+                path: path.clone(),
+            };
+            cell.retire_for_test(at, meta);
+            own.push(path);
+        }
+        paths.push(own);
+    }
+    (cell, paths)
+}
+
+/// The walk moves its start past each turn's first position (ADR-0156 D4):
+/// position 0 holds 64 owners every one of which a queued cold read pins,
+/// position 1 one eligible owner. The first turn begins both lists' passes;
+/// the second starts at position 1 and offers its owner, though position
+/// 0's 64 visits alone would spend a turn that began at 0.
+#[test]
+fn a_pending_position_behind_sixty_four_pinned_owners_is_offered_by_the_second_turn() {
+    const PINNED: u32 = 64;
+    const ELIGIBLE_ID: u32 = 1_000;
+    let (mut cell, paths) = retiring_namespaces(
+        2,
+        |index| if index == 0 { PINNED } else { 1 },
+        |index| {
+            if index == 0 { 0 } else { ELIGIBLE_ID }
+        },
+    );
+    let cold = cell.cold.clone().expect("the cell's cold engine");
+    let class = inf_runtime::ReadClass::Foreground;
+    let waits: Vec<_> = (0..PINNED)
+        .map(|id| {
+            let file = TierFileId::new(id);
+            cold.enqueue(-1, file, 0, inf_log::TIER_FRAME_BYTES, class, 0).expect("queued")
+        })
+        .collect();
+    cell.retire_walk(Nanos(0), |_| true, |_| true);
+    assert_eq!(cell.retire_gauges().jobs_out, 0, "the first turn begins both passes");
+    cell.retire_walk(Nanos(1), |_| true, |_| true);
+    let offered = cell.retire_gauges().jobs_out;
+    cell.step_worker();
+    drop(waits);
+    assert_eq!(offered, 1, "HEAD_STUCK: position 1's owner was not offered by the second turn");
+    assert!(!on_disk(&cell, &paths[1][0]), "the worker unlinked position 1's file");
+    assert_eq!(cell.retiring_at(0), PINNED as usize, "position 0's pinned owners stay listed");
+}
+
+/// Sixty-four Draining positions at once (ADR-0156 D4): every position
+/// granted, each with one retiring owner, every namespace dropped. Each turn
+/// makes at most 8 offers and 64 visits and examines at most 64 owners; the
+/// start moves each turn, so every position drains and publishes its receipt
+/// within the bound ⌈64 / 8⌉ + 5 turns of the lone cell, with the worker
+/// stepped after each turn.
+#[test]
+fn sixty_four_draining_positions_drain_at_eight_offers_a_turn() {
+    const POSITIONS_HELD: usize = 64;
+    const TURNS_MAX: u64 = 64 / 8 + 5;
+    let (mut cell, paths) = retiring_namespaces(POSITIONS_HELD, |_| 1, |_| 0);
+    for index in 0..POSITIONS_HELD {
+        cell.drop_ns(NsId(16 + u32::try_from(index).expect("at most 64")));
+    }
+    assert_eq!(cell.draining().0, POSITIONS_HELD, "engagement: every position Draining");
+    let mut turns = 0;
+    while cell.draining().0 > 0 && turns < TURNS_MAX {
+        let units = cell.retire_walk(Nanos(turns), |_| true, |_| true);
+        let offered = cell.retire_gauges().jobs_out;
+        assert!(units <= 64, "turn {turns}: {units} visits, above 64");
+        assert!(cell.walk_examined() <= 64, "turn {turns}: above 64 owners examined");
+        assert!(offered <= 8, "turn {turns}: {offered} offers, above 8");
+        cell.step_worker();
+        turns += 1;
+    }
+    assert_eq!(cell.draining().0, 0, "every Draining position drained in {TURNS_MAX} turns");
+    assert!(paths.iter().flatten().all(|path| !on_disk(&cell, path)), "every file is gone");
 }
