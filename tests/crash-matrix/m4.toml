@@ -222,6 +222,16 @@ tier = "node"
 test = "crash-matrix::tier::tier_create_post_fail_leaves_an_unnamed_file_the_boot_sweep_removes"
 expect = "residue-swept-at-boot"
 
+# A retired tier file's final close that reports an error has still
+# released its handle (Linux's order): nothing closes the number again,
+# the file stays named until its unlink, and after a cut the boot's sweep
+# removes it as it removes any file no MANIFEST names.
+[[row]]
+point = "tier_close_fail"
+tier = "node"
+test = "crash-matrix::tier::tier_close_fail_releases_the_handle_and_the_boot_sweep_removes_the_file"
+expect = "handle-released-file-swept-at-boot"
+
 # ADR-0174 D3: the boot settle read's one fault point — a cold twin's
 # key window unreadable at a replayed DEL.
 [[row]]

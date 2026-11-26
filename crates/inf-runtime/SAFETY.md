@@ -35,7 +35,10 @@ Invariants:
   fd converted once via `from_raw_fd` (single ownership transfer),
   `eventfd` creation with the same single-`OwnedFd` pattern, and the
   doorbell `write` of one stack `u64` (pointer + length name the same
-  8-byte local). No borrowed memory outlives a call.
+  8-byte local). No borrowed memory outlives a call. `close_reporting`
+  takes an `OwnedFd`, ends its ownership with `into_raw_fd` and closes the
+  number once with `close(2)`; the number is consumed on every return, so
+  no second close of it exists (ADR-0156 D3's final close).
 
 ## 1b. Stable byte ranges (`driver.rs::StableBytes`)
 

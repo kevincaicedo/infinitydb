@@ -6,10 +6,11 @@
 //! entry: a rename onto `MANIFEST` that `manifest_rename_fail` refuses
 //! never reaches the disk.
 //!
-//! Two calls are logged: a checkpoint's staging create (`create_meta` or
+//! Three calls are logged: a checkpoint's staging create (`create_meta` or
 //! `create_meta_direct` on a `ckpt-NNNNNN.ick.new` name), with its result
-//! and whether the name exists after it, and a rename onto a shard's
-//! `MANIFEST`, the recovery unit's commit point. Each entry carries the
+//! and whether the name exists after it; a rename onto a shard's
+//! `MANIFEST`, the recovery unit's commit point; and a handle's final
+//! close (`SimFile::close_reporting`), where `tier_close_fail` fires. Each entry carries the
 //! harness's last [`DiskMark`]: the phase that ran and its injected time,
 //! so an oracle spaces two creates by the time the harness gave, never by
 //! a clock the cell under test keeps.
@@ -46,6 +47,9 @@ pub enum DiskCall {
     CheckpointCreate { left_file: bool },
     /// A rename onto a shard's `MANIFEST` (the path logged is the target).
     ManifestRename,
+    /// A handle's final close: the path logged is the first name that
+    /// reached its inode at the close, empty when none did.
+    FinalClose,
 }
 
 /// How a logged call ended.
@@ -227,6 +231,40 @@ mod tests {
             entry(made, &staging, CallResult::Ok, Some(mark)),
         ];
         assert_eq!(disk.logged_calls(0), expected, "each attempt is a logged create");
+    }
+
+    /// A handle's final close: its fd leaves the open table on every
+    /// outcome, `tier_close_fail` reports `EIO` after that release, and the
+    /// disk logs each close with the inode's first name and its result.
+    #[test]
+    fn a_final_close_releases_its_fd_then_reports_and_is_logged() {
+        use inf_foundation::fault::{self, FaultSpec};
+        let disk = SimDisk::new();
+        let cold = Path::new("shard-0/cold");
+        disk.create_dir_all(cold).expect("dirs");
+        let (first, second) = (cold.join("tier-000000.itier"), cold.join("tier-000001.itier"));
+        let tier = |path: &Path| path.extension().is_some_and(|ext| ext == "itier");
+        let made = disk.create_tier(&first, crate::fs::TierIoMode::Buffered).expect("first");
+        let failing = disk.create_tier(&second, crate::fs::TierIoMode::Buffered).expect("second");
+        assert_eq!(disk.open_files_named(tier), 2);
+        let mark = DiskMark { phase: DiskPhase::Cell(CellId(2)), at: Nanos(11) };
+        disk.mark(mark.phase, mark.at);
+        made.close_reporting().expect("a close no point refuses");
+        assert_eq!(disk.open_files_named(tier), 1, "its fd left the open table");
+        fault::arm(crate::fault::TIER_CLOSE_FAIL, FaultSpec::Nth(1));
+        let refused = failing.close_reporting();
+        let fired = fault::fired(crate::fault::TIER_CLOSE_FAIL);
+        fault::disarm_all();
+        assert_eq!(fired, 1, "engagement: the close met the point");
+        let err = refused.expect_err("the armed close reports");
+        assert_eq!(err.raw_os_error(), Some(libc::EIO), "EIO, as Linux reports a close");
+        assert_eq!(disk.open_files_named(tier), 0, "released before the error is reported");
+        let point = CallResult::Injected(crate::fault::TIER_CLOSE_FAIL);
+        let expected = vec![
+            entry(DiskCall::FinalClose, &first, CallResult::Ok, Some(mark)),
+            entry(DiskCall::FinalClose, &second, point, Some(mark)),
+        ];
+        assert_eq!(disk.logged_calls(0), expected, "each final close is logged once");
     }
 
     /// At the cap a call is counted, not kept: the log a reader sees is

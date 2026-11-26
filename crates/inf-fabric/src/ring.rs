@@ -22,9 +22,17 @@
 //! This is the **only** module in `inf-fabric` allowed to contain `unsafe`
 //! code; every block is inventoried in `SAFETY.md`.
 
+use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 
 use inf_foundation::CachePadded;
+
+mod retained;
+
+pub use retained::{
+    Permit, RETAINED_RING_SLOTS, Reservation, RetainedConsumer, RetainedProducer, RetainedRing,
+    RetireCause, RingBlock, RingLayoutRefused, RingPhase, RingSteps,
+};
 
 /// Atomics/cells, swapped wholesale for loom's model-checked versions under
 /// `--cfg loom` (type-alias module pattern).
@@ -65,6 +73,25 @@ mod sync {
 
 use sync::Ordering;
 
+/// One slot of a ring's block: vacant or holding one unconsumed value, as
+/// the indices say (the ownership protocol on [`Shared`]).
+type Slot<T> = sync::UnsafeCell<MaybeUninit<T>>;
+
+/// How an endpoint reaches its ring's indices and slots. Both ownership
+/// variants run the one algorithm below through it, the backing selected
+/// at compile time (ADR-0157 D1): HEAD's ring through its `Arc`, the
+/// retained ring through the header address its owner keeps in place.
+trait Backing<T> {
+    /// The consumer's index (the ownership protocol on [`Shared`]).
+    fn head(&self) -> &sync::AtomicUsize;
+    /// The producer's index.
+    fn tail(&self) -> &sync::AtomicUsize;
+    /// `capacity - 1`; capacity is a power of two.
+    fn mask(&self) -> usize;
+    /// The slot block, `capacity` slots.
+    fn slots(&self) -> &[Slot<T>];
+}
+
 /// State shared by the two ring handles.
 ///
 /// Ownership protocol (the basis of every `unsafe` block below):
@@ -81,7 +108,7 @@ struct Shared<T> {
     tail: CachePadded<sync::AtomicUsize>,
     /// `capacity - 1`; capacity is a power of two.
     mask: usize,
-    slots: Box<[sync::UnsafeCell<MaybeUninit<T>>]>,
+    slots: Box<[Slot<T>]>,
 }
 
 // SAFETY: `Shared<T>` is accessed by exactly two threads under the ownership
@@ -112,20 +139,123 @@ impl<T> Drop for Shared<T> {
     }
 }
 
-/// Write half of an SPSC ring. `Send` (move it to the producing thread),
-/// single-owner: all methods take `&mut self`.
-pub struct Producer<T> {
-    shared: sync::Arc<Shared<T>>,
-    /// Local copy of `shared.tail` (we are its only writer).
+impl<T> Backing<T> for sync::Arc<Shared<T>> {
+    #[inline]
+    fn head(&self) -> &sync::AtomicUsize {
+        &self.head
+    }
+
+    #[inline]
+    fn tail(&self) -> &sync::AtomicUsize {
+        &self.tail
+    }
+
+    #[inline]
+    fn mask(&self) -> usize {
+        self.mask
+    }
+
+    #[inline]
+    fn slots(&self) -> &[Slot<T>] {
+        &self.slots
+    }
+}
+
+/// The producing half of the one algorithm, over either backing.
+struct Sender<T, B: Backing<T>> {
+    backing: B,
+    /// Local copy of the published tail (this side is its only writer).
     tail: usize,
     /// Last observed consumer index; refreshed only when the ring looks full.
     head_cache: usize,
+    values: PhantomData<T>,
 }
 
-/// Read half of an SPSC ring. `Send`, single-owner.
-pub struct Consumer<T> {
-    shared: sync::Arc<Shared<T>>,
-    /// Local copy of `shared.head` (we are its only writer).
+impl<T, B: Backing<T>> Sender<T, B> {
+    fn new(backing: B) -> Sender<T, B> {
+        Sender { backing, tail: 0, head_cache: 0, values: PhantomData }
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.backing.mask() + 1
+    }
+
+    /// Free slots from the producer's view, refreshing the cached consumer
+    /// index at most once (only when the cached view cannot satisfy `want`).
+    #[inline]
+    fn free_slots(&mut self, want: usize) -> usize {
+        let cap = self.backing.mask() + 1;
+        let free = cap - self.tail.wrapping_sub(self.head_cache);
+        if free >= want {
+            return free;
+        }
+        self.head_cache = self.backing.head().load(Ordering::Acquire);
+        cap - self.tail.wrapping_sub(self.head_cache)
+    }
+
+    /// Moves `value` into the slot at `index` (masked).
+    ///
+    /// # Safety
+    ///
+    /// `index` must lie in the producer-owned vacant range
+    /// `published_tail..head + capacity` and must not have been written since
+    /// it was last consumed — i.e. the slot is vacant and this producer is
+    /// the only thread touching it.
+    #[inline]
+    unsafe fn write_slot(&self, index: usize, value: T) {
+        self.backing.slots()[index & self.backing.mask()].with_mut(|slot| {
+            // SAFETY: caller contract — the slot is vacant and exclusively
+            // ours; writing a fresh `MaybeUninit` does not drop the (absent)
+            // previous value.
+            unsafe { slot.write(MaybeUninit::new(value)) };
+        });
+    }
+
+    /// Publishes the `count` slots written past the published tail with one
+    /// `Release` store.
+    #[inline]
+    fn publish(&mut self, count: usize) {
+        self.tail = self.tail.wrapping_add(count);
+        self.backing.tail().store(self.tail, Ordering::Release);
+    }
+
+    #[inline]
+    fn try_push(&mut self, value: T) -> Result<(), T> {
+        if self.free_slots(1) == 0 {
+            return Err(value);
+        }
+        // SAFETY: `free_slots(1) > 0` means `self.tail` is in the vacant
+        // producer-owned range; it is not yet published, so the consumer
+        // cannot observe it.
+        unsafe { self.write_slot(self.tail, value) };
+        self.publish(1);
+        Ok(())
+    }
+
+    fn publish_batch(&mut self, mut it: impl Iterator<Item = T>) -> usize {
+        // A batch wants maximum room: refresh the consumer index once.
+        let free = self.free_slots(usize::MAX);
+        let mut n = 0;
+        while n < free {
+            let Some(value) = it.next() else { break };
+            // SAFETY: `n < free` keeps `tail + n` inside the vacant
+            // producer-owned range established by `free_slots`; none of these
+            // slots are published until the store below.
+            unsafe { self.write_slot(self.tail.wrapping_add(n), value) };
+            n += 1;
+        }
+        if n > 0 {
+            self.publish(n);
+        }
+        n
+    }
+}
+
+/// The consuming half of the one algorithm, over either backing.
+struct Receiver<T, B: Backing<T>> {
+    backing: B,
+    /// Local copy of the published head (this side is its only writer).
     head: usize,
     /// Last observed producer index; refreshed only when the ring looks empty.
     tail_cache: usize,
@@ -133,6 +263,101 @@ pub struct Consumer<T> {
     /// stale-cache branch of `consume_batch` runs under the model (F-L12-05).
     #[cfg(loom)]
     tail_refreshes: usize,
+    values: PhantomData<T>,
+}
+
+impl<T, B: Backing<T>> Receiver<T, B> {
+    fn new(backing: B) -> Receiver<T, B> {
+        Receiver {
+            backing,
+            head: 0,
+            tail_cache: 0,
+            #[cfg(loom)]
+            tail_refreshes: 0,
+            values: PhantomData,
+        }
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.backing.mask() + 1
+    }
+
+    /// Moves the value out of the slot at `index` (masked).
+    ///
+    /// # Safety
+    ///
+    /// `index` must lie in `head..tail_published` (an initialized,
+    /// unconsumed slot observed via an `Acquire` load of `tail`) and must not
+    /// be read again afterwards without an intervening producer write.
+    #[inline]
+    unsafe fn read_slot(&self, index: usize) -> T {
+        self.backing.slots()[index & self.backing.mask()].with(|slot| {
+            // SAFETY: caller contract — the slot is initialized (the
+            // `Acquire` load of `tail` ordered the producer's write before
+            // this read) and is consumed exactly once.
+            unsafe { (*slot).assume_init_read() }
+        })
+    }
+
+    fn consume_batch(&mut self, max: usize, mut f: impl FnMut(T)) -> usize {
+        let mut available = self.tail_cache.wrapping_sub(self.head);
+        if available < max {
+            // Cached view can't satisfy the request: refresh once (mirrors
+            // the producer's lazy `free_slots`). At most one Acquire load
+            // per call, amortized over the whole batch.
+            self.tail_cache = self.backing.tail().load(Ordering::Acquire);
+            available = self.tail_cache.wrapping_sub(self.head);
+            #[cfg(loom)]
+            {
+                self.tail_refreshes += 1;
+            }
+        }
+        // Otherwise the slots `head..tail_cache` are read on the strength
+        // of an *earlier* Acquire: the cache is a lower bound on the
+        // published tail, every slot below it was ordered by that load,
+        // and `head` only advances inside that range (SAFETY.md).
+        if available == 0 {
+            return 0;
+        }
+        let n = available.min(max);
+        let guard = AdvanceGuard { receiver: self };
+        for _ in 0..n {
+            let index = guard.receiver.head;
+            // SAFETY: `index < tail_cache`, which was Acquire-loaded from the
+            // producer's published tail, so the slot is initialized; `head`
+            // is advanced past it immediately below (before `f` can panic),
+            // so it is consumed exactly once.
+            let value = unsafe { guard.receiver.read_slot(index) };
+            guard.receiver.head = index.wrapping_add(1);
+            f(value);
+        }
+        drop(guard);
+        n
+    }
+}
+
+/// Publishes consumer progress on drop — exactly once per `consume_batch`,
+/// including the unwind path.
+struct AdvanceGuard<'a, T, B: Backing<T>> {
+    receiver: &'a mut Receiver<T, B>,
+}
+
+impl<T, B: Backing<T>> Drop for AdvanceGuard<'_, T, B> {
+    fn drop(&mut self) {
+        self.receiver.backing.head().store(self.receiver.head, Ordering::Release);
+    }
+}
+
+/// Write half of an SPSC ring. `Send` (move it to the producing thread),
+/// single-owner: all methods take `&mut self`.
+pub struct Producer<T> {
+    inner: Sender<T, sync::Arc<Shared<T>>>,
+}
+
+/// Read half of an SPSC ring. `Send`, single-owner.
+pub struct Consumer<T> {
+    inner: Receiver<T, sync::Arc<Shared<T>>>,
 }
 
 /// Creates a bounded SPSC ring of `capacity` slots.
@@ -149,7 +374,7 @@ pub fn ring<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
         capacity.is_power_of_two(),
         "ring capacity must be a non-zero power of two, got {capacity}"
     );
-    let slots: Box<[sync::UnsafeCell<MaybeUninit<T>>]> =
+    let slots: Box<[Slot<T>]> =
         (0..capacity).map(|_| sync::UnsafeCell::new(MaybeUninit::uninit())).collect();
     let shared = sync::Arc::new(Shared {
         head: CachePadded(sync::AtomicUsize::new(0)),
@@ -157,14 +382,8 @@ pub fn ring<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
         mask: capacity - 1,
         slots,
     });
-    let producer = Producer { shared: sync::Arc::clone(&shared), tail: 0, head_cache: 0 };
-    let consumer = Consumer {
-        shared,
-        head: 0,
-        tail_cache: 0,
-        #[cfg(loom)]
-        tail_refreshes: 0,
-    };
+    let producer = Producer { inner: Sender::new(sync::Arc::clone(&shared)) };
+    let consumer = Consumer { inner: Receiver::new(shared) };
     (producer, consumer)
 }
 
@@ -172,38 +391,7 @@ impl<T> Producer<T> {
     /// Ring capacity in slots.
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.shared.mask + 1
-    }
-
-    /// Free slots from the producer's view, refreshing the cached consumer
-    /// index at most once (only when the cached view cannot satisfy `want`).
-    #[inline]
-    fn free_slots(&mut self, want: usize) -> usize {
-        let cap = self.shared.mask + 1;
-        let free = cap - self.tail.wrapping_sub(self.head_cache);
-        if free >= want {
-            return free;
-        }
-        self.head_cache = self.shared.head.load(Ordering::Acquire);
-        cap - self.tail.wrapping_sub(self.head_cache)
-    }
-
-    /// Moves `value` into the slot at `index` (masked).
-    ///
-    /// # Safety
-    ///
-    /// `index` must lie in the producer-owned vacant range
-    /// `published_tail..head + capacity` and must not have been written since
-    /// it was last consumed — i.e. the slot is vacant and this producer is
-    /// the only thread touching it.
-    #[inline]
-    unsafe fn write_slot(&self, index: usize, value: T) {
-        self.shared.slots[index & self.shared.mask].with_mut(|slot| {
-            // SAFETY: caller contract — the slot is vacant and exclusively
-            // ours; writing a fresh `MaybeUninit` does not drop the (absent)
-            // previous value.
-            unsafe { slot.write(MaybeUninit::new(value)) };
-        });
+        self.inner.capacity()
     }
 
     /// Pushes one value, publishing it immediately (one `Release` store).
@@ -214,16 +402,7 @@ impl<T> Producer<T> {
     /// the ring is unchanged.
     #[inline]
     pub fn try_push(&mut self, value: T) -> Result<(), T> {
-        if self.free_slots(1) == 0 {
-            return Err(value);
-        }
-        // SAFETY: `free_slots(1) > 0` means `self.tail` is in the vacant
-        // producer-owned range; it is not yet published, so the consumer
-        // cannot observe it.
-        unsafe { self.write_slot(self.tail, value) };
-        self.tail = self.tail.wrapping_add(1);
-        self.shared.tail.store(self.tail, Ordering::Release);
-        Ok(())
+        self.inner.try_push(value)
     }
 
     /// Writes as many items as fit, then publishes them with a **single**
@@ -231,23 +410,9 @@ impl<T> Producer<T> {
     ///
     /// Items are pulled from `it` only when a slot is available, so passing
     /// `iter.by_ref()` retains unpublished items for a later retry.
-    pub fn publish_batch(&mut self, mut it: impl Iterator<Item = T>) -> usize {
-        // A batch wants maximum room: refresh the consumer index once.
-        let free = self.free_slots(usize::MAX);
-        let mut n = 0;
-        while n < free {
-            let Some(value) = it.next() else { break };
-            // SAFETY: `n < free` keeps `tail + n` inside the vacant
-            // producer-owned range established by `free_slots`; none of these
-            // slots are published until the store below.
-            unsafe { self.write_slot(self.tail.wrapping_add(n), value) };
-            n += 1;
-        }
-        if n > 0 {
-            self.tail = self.tail.wrapping_add(n);
-            self.shared.tail.store(self.tail, Ordering::Release);
-        }
-        n
+    #[inline]
+    pub fn publish_batch(&mut self, it: impl Iterator<Item = T>) -> usize {
+        self.inner.publish_batch(it)
     }
 }
 
@@ -255,24 +420,7 @@ impl<T> Consumer<T> {
     /// Ring capacity in slots.
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.shared.mask + 1
-    }
-
-    /// Moves the value out of the slot at `index` (masked).
-    ///
-    /// # Safety
-    ///
-    /// `index` must lie in `head..tail_published` (an initialized,
-    /// unconsumed slot observed via an `Acquire` load of `tail`) and must not
-    /// be read again afterwards without an intervening producer write.
-    #[inline]
-    unsafe fn read_slot(&self, index: usize) -> T {
-        self.shared.slots[index & self.shared.mask].with(|slot| {
-            // SAFETY: caller contract — the slot is initialized (the
-            // `Acquire` load of `tail` ordered the producer's write before
-            // this read) and is consumed exactly once.
-            unsafe { (*slot).assume_init_read() }
-        })
+        self.inner.capacity()
     }
 
     /// Consumes up to `max` items, handing each to `f`, then publishes the
@@ -281,52 +429,9 @@ impl<T> Consumer<T> {
     ///
     /// Progress is published even if `f` panics, so a panicking callback
     /// never causes an item to be consumed twice.
-    pub fn consume_batch(&mut self, max: usize, mut f: impl FnMut(T)) -> usize {
-        let mut available = self.tail_cache.wrapping_sub(self.head);
-        if available < max {
-            // Cached view can't satisfy the request: refresh once (mirrors
-            // the producer's lazy `free_slots`). At most one Acquire load
-            // per call, amortized over the whole batch.
-            self.tail_cache = self.shared.tail.load(Ordering::Acquire);
-            available = self.tail_cache.wrapping_sub(self.head);
-            #[cfg(loom)]
-            {
-                self.tail_refreshes += 1;
-            }
-        }
-        // Otherwise the slots `head..tail_cache` are read on the strength
-        // of an *earlier* Acquire: the cache is a lower bound on the
-        // published tail, every slot below it was ordered by that load,
-        // and `head` only advances inside that range (SAFETY.md).
-        if available == 0 {
-            return 0;
-        }
-        let n = available.min(max);
-        let guard = AdvanceGuard { consumer: self };
-        for _ in 0..n {
-            let index = guard.consumer.head;
-            // SAFETY: `index < tail_cache`, which was Acquire-loaded from the
-            // producer's published tail, so the slot is initialized; `head`
-            // is advanced past it immediately below (before `f` can panic),
-            // so it is consumed exactly once.
-            let value = unsafe { guard.consumer.read_slot(index) };
-            guard.consumer.head = index.wrapping_add(1);
-            f(value);
-        }
-        drop(guard);
-        n
-    }
-}
-
-/// Publishes consumer progress on drop — exactly once per `consume_batch`,
-/// including the unwind path.
-struct AdvanceGuard<'a, T> {
-    consumer: &'a mut Consumer<T>,
-}
-
-impl<T> Drop for AdvanceGuard<'_, T> {
-    fn drop(&mut self) {
-        self.consumer.shared.head.store(self.consumer.head, Ordering::Release);
+    #[inline]
+    pub fn consume_batch(&mut self, max: usize, f: impl FnMut(T)) -> usize {
+        self.inner.consume_batch(max, f)
     }
 }
 
@@ -451,7 +556,7 @@ mod loom_tests {
             assert_eq!(got, [1, 2, 3, 4, 5]);
             // Exactly one call read on a stale cache: the pair after the
             // batch became visible. Every other call refreshed.
-            assert_eq!(calls - consumer.tail_refreshes, 1, "calls {calls}");
+            assert_eq!(calls - consumer.inner.tail_refreshes, 1, "calls {calls}");
         });
     }
 

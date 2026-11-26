@@ -37,6 +37,7 @@ mod pubsub;
 mod readahead;
 mod recover;
 mod tier_cell;
+mod tier_retire;
 mod topology;
 
 /// Process exit code for a durable fail-stop: an fsync or log-write error
@@ -127,6 +128,7 @@ pub use recover::{
     Recovery, RecoveryProgress, RecoveryUnit, STEP_FACT_FIELDS, StepBudget, StepFacts, UnitEntry,
     UnitPhase, open_cell_log,
 };
+pub use tier_retire::FinalClose;
 pub use topology::{
     TOPOLOGY_FILE, TopologyError, TopologySource, create_topology, load_topology, parse_topology,
     render_topology, resolve_topology,

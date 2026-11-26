@@ -49,6 +49,10 @@
 //!   whose `create_new` succeeded and whose `set_len`, `O_DIRECT` probe (a `/proc` open, so
 //!   `EMFILE` reaches it) or `sync_all` failed. It fires in the simulated disk only, so every
 //!   create path running on that disk meets it, and no other filesystem carries it
+//! - `tier_close_fail` — `SimFile::close_reporting`, after the handle's fd left the disk's open
+//!   table — `EIO`, Linux's order: the number is released, then the error reported. The final
+//!   close of a retiring tier file's handle (ADR-0156 D3) reports it and never closes again; the
+//!   disk logs the close with the point's name. It fires in the simulated disk only
 //! - `tier_unlink_fail` — `flush::unlink_tier_file` — typed I/O error, **non-fatal and counted**
 //!   (M4-S15, ADR-0059 D3): the durable truth already excludes the file — space is deferred, never
 //!   durability; the retry and the boot GC both re-drive it
@@ -118,6 +122,7 @@ pub const TIER_FOOTER_TORN: &str = "tier_footer_torn";
 pub const TIER_UNLINK_FAIL: &str = "tier_unlink_fail";
 pub const TIER_DIR_OPEN_FAIL: &str = "tier_dir_open_fail";
 pub const TIER_CREATE_POST_FAIL: &str = "tier_create_post_fail";
+pub const TIER_CLOSE_FAIL: &str = "tier_close_fail";
 pub const BLOB_SHORT_WRITE: &str = "blob_short_write";
 pub const BLOB_FSYNC_ERR: &str = "blob_fsync_err";
 pub const BLOB_UNLINK_FAIL: &str = "blob_unlink_fail";
@@ -145,6 +150,7 @@ pub const ALL: &[&str] = &[
     TIER_UNLINK_FAIL,
     TIER_DIR_OPEN_FAIL,
     TIER_CREATE_POST_FAIL,
+    TIER_CLOSE_FAIL,
     BLOB_SHORT_WRITE,
     BLOB_FSYNC_ERR,
     BLOB_UNLINK_FAIL,

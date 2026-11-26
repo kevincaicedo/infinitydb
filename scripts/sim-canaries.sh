@@ -1489,6 +1489,24 @@ ordered_rows=(
   # A general send keeps one credit free for the publish fan (ADR-0192 D2), so an origin parks
   # at most 7 applies at a peer of 8 credits. Planted, the guard is gone and all 8 arrive.
   "inf_canary_reserve_unguarded m0-capacity applies-high-water --close-leg small-credit"
+  # ADR-0157 D3: a backing owner dropped before its retirement leaks
+  # silently instead of failing stop.
+  "inf_canary_ring_drop_live_silent crate-test inf-fabric lib a_backing_dropped_before_its_retirement_fails_stop FAIL_STOP_MISSING:"
+  # ADR-0157 D3: an endpoint touches nothing after its release. Planted, the producer's drop
+  # writes a slot, or reads the header's `mask`, after its decrement; the model whose owner
+  # retires before the fixture's thread join reports that access as a causality violation.
+  "inf_canary_ring_header_after_release loom inf-fabric loom_retained_retirement_before_the_thread_join Causality"
+  # ADR-0157 D3, D5: the retained ring's endpoint release made
+  # `Relaxed`, the owner's join load made `Relaxed`, a join after one
+  # release, or the producer's release before its last publication's tail
+  # store: a join before the fixture's thread join reads a stale tail, or
+  # joins while the fixture holds an endpoint.
+  "inf_canary_ring_join_after_one loom inf-fabric loom_retained_join_waits_while_the_consumer_is_held JOIN_WITH_HELD_ENDPOINT:"
+  "inf_canary_ring_join_relaxed loom inf-fabric loom_retained_join_sees_both_endpoints_final_writes JOIN_VISIBILITY_GAP:"
+  "inf_canary_ring_release_before_write loom inf-fabric loom_retained_join_sees_both_endpoints_final_writes JOIN_VISIBILITY_GAP:"
+  "inf_canary_ring_release_relaxed loom inf-fabric loom_retained_join_sees_both_endpoints_final_writes JOIN_VISIBILITY_GAP:"
+  # The slot write after the release, on the same model as the header read above.
+  "inf_canary_ring_slot_after_release loom inf-fabric loom_retained_retirement_before_the_thread_join Causality"
   # A Pending first poll takes its class's spare as its task's slot, so no id names the spare
   # (ADR-0177 D2). Planted, the task takes the spare's handle but the spare stays set, and the
   # next first poll writes over the suspended task, at its address.

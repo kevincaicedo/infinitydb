@@ -235,6 +235,24 @@ pub fn probe_addr_unowned(addr: std::net::SocketAddrV4) -> io::Result<()> {
     Ok(())
 }
 
+/// Closes `fd` with one `close(2)` and reports its error (ADR-0156 D3: a
+/// tier file's final close, made once by the control thread's cleanup
+/// worker). The number is consumed on every return: Linux releases it even
+/// when `close` reports `EINTR` or `EIO`, so a caller never closes it again
+/// and retries a failure by its own means, never by a second close.
+///
+/// # Errors
+/// The errno `close(2)` reported, as it reported it.
+pub fn close_reporting(fd: std::os::fd::OwnedFd) -> io::Result<()> {
+    use std::os::fd::IntoRawFd as _;
+    let raw = fd.into_raw_fd();
+    // SAFETY: `raw` was owned by `fd`, whose ownership `into_raw_fd` ended
+    // without closing it, so this is the number's one close and nothing
+    // else holds it.
+    let rc = unsafe { libc::close(raw) };
+    if rc == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
 /// The port a listener actually bound (port 0 = kernel-assigned; tests).
 ///
 /// # Errors
@@ -405,6 +423,27 @@ mod tests {
         assert_eq!(get(libc::SOL_SOCKET, libc::SO_KEEPALIVE), 0);
         assert!(set_keepalive(-1, 60).is_err(), "a bad fd reports its error");
         drop(client);
+    }
+
+    /// One close, its number released: on Linux the descriptor's entry is
+    /// gone, or names another file once a later open reused the number.
+    #[test]
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "test-only: the descriptor table in /proc witnesses the close"
+    )]
+    fn close_reporting_closes_its_descriptor_once() {
+        use std::os::fd::AsRawFd as _;
+        let fd = std::os::fd::OwnedFd::from(listen_reuseport(0).expect("listener"));
+        let number = fd.as_raw_fd();
+        let entry = format!("/proc/self/fd/{number}");
+        let before = std::fs::read_link(&entry).ok();
+        assert_eq!(close_reporting(fd).map_err(|e| e.kind()), Ok(()));
+        if cfg!(target_os = "linux") {
+            let before = before.expect("the open socket's entry");
+            let after = std::fs::read_link(&entry).ok();
+            assert_ne!(after, Some(before), "the socket's descriptor is closed");
+        }
     }
 
     #[test]

@@ -559,6 +559,16 @@ pub struct StdSegmentFs;
 #[allow(clippy::disallowed_types, reason = "fs-seam: injected SegmentFs real backend")]
 pub struct StdSegmentFile(std::fs::File);
 
+impl StdSegmentFile {
+    /// The file's descriptor, owned: the handle ends here and nothing has
+    /// closed it, so its one close is the new owner's (a retired tier
+    /// file's final close, ADR-0156 D3).
+    #[must_use]
+    pub fn into_owned_fd(self) -> std::os::fd::OwnedFd {
+        std::os::fd::OwnedFd::from(self.0)
+    }
+}
+
 impl SegmentFile for StdSegmentFile {
     fn write_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
         std::os::unix::fs::FileExt::write_all_at(&self.0, data, offset)
@@ -1324,6 +1334,30 @@ pub mod mem {
             state.credit(entry.debited);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::disallowed_methods, reason = "test-only: a real filesystem fixture")]
+mod owned_fd_tests {
+    use std::os::fd::AsRawFd as _;
+
+    use super::{SegmentFile as _, SegmentFs as _, StdSegmentFs, TierIoMode};
+
+    /// The handle's own descriptor moves out whole: the same number, still
+    /// open, now the new owner's to close.
+    #[test]
+    fn into_owned_fd_hands_over_the_files_descriptor() {
+        let dir = std::env::temp_dir().join(format!("inf-log-owned-fd-{}", std::process::id()));
+        let fs = StdSegmentFs;
+        fs.create_dir_all(&dir).expect("dir");
+        let path = dir.join("tier-000000.itier");
+        let file = fs.create_tier(&path, TierIoMode::Buffered).expect("create");
+        let number = file.raw_fd().expect("a real file has a descriptor");
+        let fd = file.into_owned_fd();
+        assert_eq!(fd.as_raw_fd(), number, "the same descriptor");
+        drop(fd);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
