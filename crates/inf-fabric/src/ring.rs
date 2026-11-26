@@ -300,6 +300,18 @@ impl<T, B: Backing<T>> Receiver<T, B> {
         })
     }
 
+    /// Whether a published value waits, reading nothing but the indices: the
+    /// cached tail first, else one `Acquire` load of the published tail,
+    /// which also refreshes the cache `consume_batch` reads.
+    #[inline]
+    fn ready(&mut self) -> bool {
+        if self.tail_cache != self.head {
+            return true;
+        }
+        self.tail_cache = self.backing.tail().load(Ordering::Acquire);
+        self.tail_cache != self.head
+    }
+
     fn consume_batch(&mut self, max: usize, mut f: impl FnMut(T)) -> usize {
         let mut available = self.tail_cache.wrapping_sub(self.head);
         if available < max {

@@ -73,6 +73,10 @@ rests on these rules:
   endpoint left, `head` advanced before the value leaves, so it moves out
   once). A nonzero count changes nothing: the owner waits for the host's
   terminal event.
+- **`RetainedConsumer::ready`** reads only the indices, through the live
+  endpoint's `HeaderRef`: its own `head` and the published `tail`
+  (`Acquire`, as `consume_batch`'s refresh); it touches no slot and moves
+  no value, so it adds nothing to the slot protocol.
 - **`Send for RetainedProducer` / `RetainedConsumer`** for `T: Send`: an
   endpoint reaches the header only through `HeaderRef`; the two touch
   disjoint state; only values of `T` cross threads, by move. Neither is
