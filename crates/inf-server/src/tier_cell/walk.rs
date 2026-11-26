@@ -108,15 +108,15 @@ impl<J> WalkCx<'_, '_, J> {
         self.cold.is_some_and(|c| c.inflight_on(TierFileId::new(id)) > 0)
     }
 
-    /// Offers one owner, `room` checked first: `Err` hands it back whole.
+    /// Offers one owner charging `bytes`, `room` checked first: `Err` hands
+    /// it back whole.
     fn offer(
         &mut self,
         t: &mut TierNs<impl SegmentFs<File = J>>,
         kind: JobKind,
-        meta: TierFileMeta,
+        (meta, bytes): (TierFileMeta, u64),
         handle: Option<J>,
     ) -> Result<(), (TierFileMeta, Option<J>)> {
-        let bytes = meta.disk_bytes();
         self.batch.offer(t.pos, t.ns, kind, meta, handle)?;
         self.turn.visits += 1;
         self.turn.offers += 1;
@@ -410,7 +410,10 @@ fn visit_owner<F: SegmentFs>(
             return Visited::End;
         }
         cx.turn.examined += 1;
-        if cx.pinned(owner.meta.id) || cx.now < owner.due {
+        // Canary `inf_canary_retire_due_ignored`: a retried owner is offered
+        // before its due.
+        let early = cx.now < owner.due && !cfg!(inf_canary_retire_due_ignored);
+        if cx.pinned(owner.meta.id) || early {
             t.retiring.move_behind();
             cx.turn.charge_pass_over();
             continue;
@@ -424,7 +427,7 @@ fn visit_owner<F: SegmentFs>(
             unlink_on_cell(fs, t, meta, handle, cx);
             continue;
         }
-        if let Err((meta, handle)) = cx.offer(t, JobKind::Retired, meta, handle) {
+        if let Err((meta, handle)) = cx.offer(t, JobKind::Retired, (meta, bytes), handle) {
             // Unreachable: the batch had room above. The owner keeps its
             // file and its handle, never closed on the cell.
             t.retiring.push(RetiringFile { meta, handle, due: Nanos(0), bytes });
@@ -444,15 +447,15 @@ fn visit_residue<F: SegmentFs>(
         return Some(Visited::End);
     }
     cx.turn.examined += 1;
-    if cx.now < due {
+    if cx.now < due && !cfg!(inf_canary_retire_due_ignored) {
         cx.turn.charge_pass_over();
         return None;
     }
     if let Some(end) = cx.offer_blocked() {
         return Some(end);
     }
-    let meta = t.flush.take_residue(cx.now)?;
-    if let Err((meta, _)) = cx.offer(t, JobKind::Residue, meta, None) {
+    let meta = t.flush.take_residue(due.max(cx.now))?;
+    if let Err((meta, _)) = cx.offer(t, JobKind::Residue, (meta, 0), None) {
         // Unreachable: the batch had room above. The slot holds it again.
         t.flush.residue_retry(meta, cx.now);
         return Some(Visited::End);
@@ -490,9 +493,9 @@ fn visit_catalog<F: SegmentFs>(
             unlink_on_cell(fs, t, meta, handle, cx);
             continue;
         }
-        if let Err((meta, handle)) = cx.offer(t, JobKind::Retired, meta, handle) {
+        let bytes = meta.disk_bytes();
+        if let Err((meta, handle)) = cx.offer(t, JobKind::Retired, (meta, bytes), handle) {
             // Unreachable: the batch had room above.
-            let bytes = meta.disk_bytes();
             t.retiring.push(RetiringFile { meta, handle, due: Nanos(0), bytes });
             return Visited::End;
         }
