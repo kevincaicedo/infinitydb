@@ -269,13 +269,17 @@ proptest! {
             turn += 1;
             budget(schedule[turn % schedule.len()])
         };
+        // `want.len()` bounds the run, as in `sliced_with`: every yield
+        // writes, so a walk that repeats itself fails at the step that
+        // passes the whole run's length, and never loops.
         let mut got = Vec::new();
-        let mut stalled = false;
+        let mut total = 0;
         let walked = serialize_sliced(value, &opts, 0, &mut got, &mut next, &mut |step| {
-            stalled |= step.end == EmitStep::Yield && step.bytes.is_empty();
+            assert!(step.end == EmitStep::Done || !step.bytes.is_empty(), "a yield wrote nothing");
+            total += step.bytes.len();
+            assert!(total <= want.len(), "the sliced bytes run past the whole run's length");
         });
         prop_assert!(walked);
-        prop_assert!(!stalled, "a yield wrote nothing");
         prop_assert_eq!(&got, &want);
         let mut unsliced = Vec::new();
         serialize_into(value, &opts, &mut unsliced);

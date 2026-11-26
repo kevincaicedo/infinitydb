@@ -1280,3 +1280,121 @@ pub fn measure_sliced(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ser_frozen as frozen;
+    use crate::{DocValue, JsonParser, TapeDoc};
+
+    const COMPACT: SerializeOpts<'static> = SerializeOpts { indent: b"", newline: b"", space: b"" };
+    /// Separators of several bytes, one multi-byte: a step edge falls inside each.
+    const FORMATTED: SerializeOpts<'static> =
+        SerializeOpts { indent: "→ ".as_bytes(), newline: b"\r\n", space: b"  " };
+
+    fn tape(json: &[u8]) -> Vec<u8> {
+        JsonParser::new().parse(json).expect("the fixture parses")
+    }
+
+    fn budget(bytes_max: u32, nodes_max: u32) -> StepBudget {
+        let nz = |n| NonZeroU32::new(n).expect("a budget is at least 1");
+        StepBudget { bytes_max: nz(bytes_max), nodes_max: nz(nodes_max) }
+    }
+
+    /// A document's root container, as a walk is rooted at it.
+    fn container(doc: &[u8]) -> (TapeSource<'_>, Opener) {
+        let root = TapeDoc::from_bytes(doc).expect("the fixture validates").root();
+        let Root::Tape { source, opener } = Root::of(DocValue::from(root)) else {
+            panic!("the fixture is a tape container");
+        };
+        (source, opener)
+    }
+
+    /// The serializer as it stood, which shares no code with the walk.
+    fn frozen_bytes(doc: &[u8], opts: &SerializeOpts<'_>) -> Vec<u8> {
+        let root = TapeDoc::from_bytes(doc).expect("the fixture validates").root();
+        let mut out = Vec::new();
+        frozen::serialize_into(DocValue::from(root), opts, &mut out);
+        out
+    }
+
+    fn step(
+        emitter: &mut Emitter,
+        source: TapeSource<'_>,
+        opts: &SerializeOpts<'_>,
+        out: &mut Vec<u8>,
+        budget: StepBudget,
+    ) -> EmitStep {
+        if opts.is_compact() {
+            emitter.step::<_, false>(source, opts, out, budget)
+        } else {
+            emitter.step::<_, true>(source, opts, out, budget)
+        }
+    }
+
+    /// The walk to its end, in small steps. `want_len` bounds the run:
+    /// every yield writes, so a walk that runs past its value fails here
+    /// and never loops.
+    fn finish(
+        emitter: &mut Emitter,
+        source: TapeSource<'_>,
+        opts: &SerializeOpts<'_>,
+        want_len: usize,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let before = out.len();
+            let end = step(emitter, source, opts, &mut out, budget(7, 3));
+            assert!(out.len() <= want_len, "the re-rooted walk runs past its value's length");
+            if end == EmitStep::Done {
+                return out;
+            }
+            assert!(out.len() > before, "a yield wrote nothing");
+        }
+    }
+
+    /// `begin` roots a walk again wherever the last one stopped. One step
+    /// leaves a walk unfinished at every byte and every value of a
+    /// document nested seven deep, under a wrapper two deep; the same
+    /// emitter, rooted at another container, must write it as the frozen
+    /// serializer does. A parent the old walk left on the stack would be
+    /// popped when the new root closes, and the walk would write past it
+    /// or read outside its region.
+    #[test]
+    fn a_walk_left_unfinished_is_rooted_again_at_another_value() {
+        let first = br#"{"a":[[1,2,{"b":[3,4,5]}],"x"],"c":{"d":[6,{"e":{"f":[[["deep"]]]}}]}}"#;
+        let first = tape(first);
+        let targets =
+            [tape(br#"[{"k":[7,8]},"y",[[9]]]"#), tape(br#"{"m":{"n":[true,null]},"o":"p"}"#)];
+        let (first_source, first_opener) = container(&first);
+        let (mut unfinished, mut deepest) = (0usize, 0usize);
+        for opts in [COMPACT, FORMATTED] {
+            let first_len = frozen_bytes(&first, &opts).len();
+            let first_len = u32::try_from(first_len).expect("a short fixture");
+            let by_bytes = (1..first_len).map(|bytes_max| (bytes_max, u32::MAX));
+            let by_nodes = (1..=32).map(|nodes_max| (u32::MAX, nodes_max));
+            for (bytes_max, nodes_max) in by_bytes.chain(by_nodes) {
+                for target in &targets {
+                    let mut emitter = Emitter::new();
+                    emitter.root(first_opener, first_source, 2).expect("a short region");
+                    let mut scratch = Vec::new();
+                    let first_budget = budget(bytes_max, nodes_max);
+                    if step(&mut emitter, first_source, &opts, &mut scratch, first_budget)
+                        == EmitStep::Done
+                    {
+                        continue;
+                    }
+                    unfinished += 1;
+                    deepest = deepest.max(emitter.parents.len());
+                    let want = frozen_bytes(target, &opts);
+                    let (source, opener) = container(target);
+                    emitter.root(opener, source, 0).expect("a short region");
+                    let got = finish(&mut emitter, source, &opts, want.len());
+                    assert!(got == want, "re-rooted after a step of ({bytes_max}, {nodes_max})");
+                }
+            }
+        }
+        assert!(unfinished >= 400, "VACUOUS: {unfinished} walks left unfinished");
+        assert!(deepest >= 7, "VACUOUS: parents at most {deepest} deep");
+    }
+}
