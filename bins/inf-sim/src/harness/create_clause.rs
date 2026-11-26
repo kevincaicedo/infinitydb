@@ -50,6 +50,9 @@ pub(crate) struct CreateClause {
     held: Vec<&'static str>,
     /// Failed creates the clause read.
     pub(crate) failed_creates: u64,
+    /// Injected unlink failures of a residue's file: a `Retry` the slot
+    /// must keep.
+    pub(crate) residue_unlink_retries: u64,
 }
 
 impl CreateClause {
@@ -81,11 +84,15 @@ impl CreateClause {
                         CallResult::Ok | CallResult::Failed(std::io::ErrorKind::NotFound)
                     );
                     let worker = entry.mark.is_some_and(|mark| mark.phase == DiskPhase::Worker);
-                    if terminal
-                        && worker
-                        && let Some(state) = self.paths.get_mut(&entry.path)
-                    {
-                        state.residue = false;
+                    let failed =
+                        entry.result == CallResult::Injected(inf_log::fault::TIER_UNLINK_FAIL);
+                    if let Some(state) = self.paths.get_mut(&entry.path) {
+                        if terminal && worker {
+                            state.residue = false;
+                        }
+                        if failed && state.residue {
+                            self.residue_unlink_retries += 1;
+                        }
                     }
                 }
                 DiskCall::CheckpointCreate { .. }

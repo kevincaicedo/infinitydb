@@ -1635,7 +1635,12 @@ fn pace_leg(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
 /// Writes to `ns` on cell 0, the worker held, until `point` has failed a
 /// create; then holds the residue's unlink `RESIDUE_HELD_STEPS` more steps,
 /// each a MAINTAIN with the residue's job out, and releases the worker.
-fn fail_held_create(run: &mut Run, ns: &[u8], point: &'static str) -> Result<(), String> {
+fn fail_held_create(
+    run: &mut Run,
+    ns: &[u8],
+    point: &'static str,
+    residue_unlink_fails: bool,
+) -> Result<(), String> {
     inf_foundation::fault::arm(point, FaultSpec::Nth(1));
     run.node.hold_retire = u64::MAX;
     let failed = run
@@ -1644,6 +1649,9 @@ fn fail_held_create(run: &mut Run, ns: &[u8], point: &'static str) -> Result<(),
         })
         .and_then(|()| run.idle(RESIDUE_HELD_STEPS));
     let out = run.jobs_out_on(0);
+    if residue_unlink_fails {
+        arm_residue_unlink_fail(run);
+    }
     run.node.hold_retire = 0;
     inf_foundation::fault::disarm(point);
     failed?;
@@ -1653,11 +1661,25 @@ fn fail_held_create(run: &mut Run, ns: &[u8], point: &'static str) -> Result<(),
     Ok(())
 }
 
+/// The next tier-file unlink fails once: with the worker held and a
+/// failed create's residue the only job out, it is that residue's unlink,
+/// whose `Retry` must keep the slot until a later unlink answers.
+fn arm_residue_unlink_fail(run: &mut Run) {
+    run.pace.armed(inf_log::fault::TIER_UNLINK_FAIL);
+    inf_foundation::fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Nth(1));
+}
+
 /// O7's create-fault leg: `f00`'s first create refused before its file
-/// exists, `f01`'s after, each residue's unlink held across a MAINTAIN;
-/// `f02`'s failing on every attempt `CREATE_EVERY_ATTEMPTS` times; `f03`
-/// dropped while its failed create's residue is out. Each namespace's file
-/// is then made under the name its failed create named.
+/// exists, `f01`'s after, each residue's unlink held across a MAINTAIN and
+/// `f01`'s residue's unlink failing once on its Live position; `f02`'s and
+/// `f03`'s creates failing on every attempt `CREATE_EVERY_ATTEMPTS` times,
+/// after and before the file exists; `f04` and `f05` dropped while their
+/// failed creates' residues are out, after and before the file exists,
+/// `f04`'s residue's unlink failing once on its Draining position. Each
+/// live namespace's file is then made under the name its failed create
+/// named, and each dropped one drains with no file left. A create runs on
+/// a Live position alone (a Draining owner plans nothing), so a Draining
+/// position's failed create is the residue a drop carries into it.
 fn create_fault_leg(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
     let points = [inf_log::fault::TIER_CREATE_FAIL, inf_log::fault::TIER_CREATE_POST_FAIL];
     for (index, point) in points.into_iter().enumerate() {
@@ -1666,25 +1688,39 @@ fn create_fault_leg(run: &mut Run, admin: &mut MiniClient) -> Result<(), String>
             return Err("a create-fault leg's CREATE was refused".to_string());
         }
         let before = run.dirs_on(0);
-        fail_held_create(run, &ns, point)?;
+        let residue_unlink_fails = point == inf_log::fault::TIER_CREATE_POST_FAIL;
+        fail_held_create(run, &ns, point, residue_unlink_fails)?;
         run.step_until("the failed create's name made", move |run| run.dirs_on(0) > before)?;
     }
-    every_attempt(run, admin)?;
-    dropped_with_residue_out(run, admin)?;
+    every_attempt(run, admin, inf_log::fault::TIER_CREATE_POST_FAIL, 2)?;
+    every_attempt(run, admin, inf_log::fault::TIER_CREATE_FAIL, 3)?;
+    dropped_with_residue_out(run, admin, inf_log::fault::TIER_CREATE_POST_FAIL, 4)?;
+    dropped_with_residue_out(run, admin, inf_log::fault::TIER_CREATE_FAIL, 5)?;
     run.idle(SETTLE_GAP_STEPS)?;
     for breach in run.creates.left_files(&run.disk) {
         run.fail(breach);
+    }
+    if run.creates.residue_unlink_retries < 2 {
+        run.fail(format!(
+            "VACUOUS FAILED-CREATE: {} residue unlinks failed, not one on a Live and one on a \
+             Draining position",
+            run.creates.residue_unlink_retries
+        ));
     }
     run.report.failed_creates = run.creates.failed_creates;
     Ok(())
 }
 
-/// `f02`'s create on every attempt: `tier_create_post_fail` armed always
-/// until it fired `CREATE_EVERY_ATTEMPTS` times, one residue at a time,
-/// then disarmed; the next create makes the name every failure named.
-fn every_attempt(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
-    let point = inf_log::fault::TIER_CREATE_POST_FAIL;
-    let ns = name("f", 2);
+/// A namespace's create on every attempt: `point` armed always until it
+/// fired `CREATE_EVERY_ATTEMPTS` times, one residue at a time, then
+/// disarmed; the next create makes the name every failure named.
+fn every_attempt(
+    run: &mut Run,
+    admin: &mut MiniClient,
+    point: &'static str,
+    index: u32,
+) -> Result<(), String> {
+    let ns = name("f", index);
     if run.create(admin, &ns)? != OK {
         return Err("the every-attempt CREATE was refused".to_string());
     }
@@ -1713,11 +1749,17 @@ fn every_attempt(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
     run.step_until("the every-attempt name made", move |run| run.dirs_on(0) > before)
 }
 
-/// `f03` dropped while its failed create's residue is out: its owner drains
-/// only once the residue's result is consumed, and no file of it is left.
-fn dropped_with_residue_out(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
-    let point = inf_log::fault::TIER_CREATE_POST_FAIL;
-    let ns = name("f", 3);
+/// A namespace dropped while its failed create's residue is out: its owner
+/// drains only once the residue's terminal result is consumed, and no file
+/// of it is left. Where the file was made, the residue's unlink fails once
+/// on the Draining position, so its `Retry` must keep the slot.
+fn dropped_with_residue_out(
+    run: &mut Run,
+    admin: &mut MiniClient,
+    point: &'static str,
+    index: u32,
+) -> Result<(), String> {
+    let ns = name("f", index);
     if run.create(admin, &ns)? != OK {
         return Err("the dropped residue's CREATE was refused".to_string());
     }
@@ -1729,9 +1771,12 @@ fn dropped_with_residue_out(run: &mut Run, admin: &mut MiniClient) -> Result<(),
     inf_foundation::fault::disarm(point);
     let id = run.node.plane(0).keyspace().ns_get(&ns).map(|spec| spec.id.0);
     let dropped = tried.and_then(|()| run.drop_ns(admin, &ns));
+    if point == inf_log::fault::TIER_CREATE_POST_FAIL {
+        arm_residue_unlink_fail(run);
+    }
     run.node.hold_retire = 0;
     dropped?;
-    run.wait_positions(3)?;
+    run.wait_positions(4)?;
     if let Some(id) = id
         && run.tier_files_of(id) > 0
     {
@@ -2262,5 +2307,280 @@ mod tests {
         assert!(at >= due, "TF1-ROLE: the retry's unlink at {at:?}, before its due {due:?}");
         let breaches = run.report.violations.len();
         assert_eq!(breaches, 0, "the run's own oracles: {:?}", run.report.violations);
+    }
+
+    /// The role's phase on cell 0, its latest due and the timer set's
+    /// earliest deadline.
+    fn role_of(run: &Run) -> (OwnerPhase, Nanos, Option<Nanos>) {
+        let timers = run.node.cell_loop(0).timer_set();
+        let (phase, due) = run
+            .node
+            .plane(0)
+            .tier_retire_role_for_sim(timers)
+            .expect("TF1-ROLE: the durable cell holds no retirement role");
+        (phase, due, timers.next_deadline())
+    }
+
+    /// How long before the first deadline TF1's successor leg releases the
+    /// second file's pin: its read, offer, failed unlink and consumption take
+    /// a few 200 µs steps, inside the deadline's last millisecond.
+    const SECOND_RETRY_LEAD_NS: u64 = 900_000;
+
+    /// TF1's successor leg (ADR-0154 A1): a second `Retry` consumed while
+    /// the role is Armed moves its latest due and arms nothing; the first
+    /// deadline's delivery finds that due later than its turn and hands back
+    /// a successor at it, so the role is Armed again at a deadline in
+    /// [due, due + 1 ms]. Two dropped namespaces' files on cell 0: the
+    /// second is pinned by a cold read held at the device while the first's
+    /// unlink fails, and its own unlink fails once the read is released,
+    /// before the first deadline.
+    #[test]
+    fn tf1_a_retry_consumed_while_armed_moves_the_role_to_its_successor() {
+        const SEED: u64 = 0x2;
+        let leg = LifetimesLeg::Pace;
+        let scenario = scenario(SEED, leg);
+        let clock = Rc::new(VirtualClock::new(Nanos(1)));
+        let observer = TraceObserver::default();
+        let Ok(mut run) = new_run(&scenario, SEED, leg, &observer, &clock) else {
+            panic!("TF1: the node's boot was refused");
+        };
+        run.recover().expect("recovered");
+        let mut admin = MiniClient::connect(&mut run.node, 0);
+        for ns in [b"r00", b"r01"] {
+            assert_eq!(run.create(&mut admin, ns).expect("a reply"), OK);
+            run.flush_on_cell_0(ns).expect("flushed");
+        }
+        // r01's first keys read cold once its ring has wrapped (its first
+        // file sealed): their ring space is reused, so a GET reads the file.
+        let id = run.node.plane(0).keyspace().ns_get(b"r01").map(|spec| spec.id.0);
+        let id = id.expect("r01 is live");
+        let mut writer = run.use_ns(0, b"r01").expect("USE r01");
+        for _ in 0..DISK_FILL_BATCHES_MAX {
+            if run.tier_files_of(id) >= 2 {
+                break;
+            }
+            let keys = run.owned_keys(0, "w", FLUSH_BATCH);
+            run.write_inline(&mut writer, &keys).expect("written");
+            run.idle(FLUSH_SETTLE_STEPS).expect("settled");
+        }
+        assert!(run.tier_files_of(id) >= 2, "TF1: r01's first file never sealed");
+        run.disk.hold_reads(Some(is_tier_file));
+        let keys: Vec<Vec<u8>> =
+            run.live[b"r01".as_slice()].iter().take(COLD_READERS).cloned().collect();
+        let mut readers = Vec::new();
+        for key in &keys {
+            let mut reader = run.use_ns(0, b"r01").expect("USE r01");
+            reader.send(&mut run.node, &[b"GET", key]);
+            readers.push(reader);
+        }
+        run.step_until("a cold read of r01 held", |run| run.held(0).1 > 0).expect("held");
+        run.drop_ns(&mut admin, b"r01").expect("r01 dropped, its file pinned");
+        let from = run.disk.logged_calls(0).len();
+        let point = CallResult::Injected(inf_log::fault::TIER_UNLINK_FAIL);
+        inf_foundation::fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Nth(1));
+        run.drop_ns(&mut admin, b"r00").expect("r00 dropped");
+        let first = await_entry(&mut run, from, "r00's injected unlink failure", |entry| {
+            entry.call == DiskCall::UnlinkTier && entry.result == point
+        });
+        run.step().expect("the step that consumes r00's Retry");
+        let (phase, due_first, armed) = role_of(&run);
+        assert_eq!(phase, OwnerPhase::Armed, "TF1-ROLE: the first Retry left the role {phase:?}");
+        let armed = armed.expect("TF1-ROLE: no deadline armed");
+        // r01's pin is released late in the first deadline's last
+        // millisecond, so its Retry's due lies past that deadline: the
+        // delivery must hand back a successor.
+        for _ in 0..TF1_STEPS_MAX {
+            if run.clock.now().0 >= armed.0.saturating_sub(SECOND_RETRY_LEAD_NS) {
+                break;
+            }
+            run.step().expect("a step");
+        }
+        inf_foundation::fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Nth(1));
+        run.disk.hold_reads(None);
+        let from = run.disk.logged_calls(0).len();
+        let second = await_entry(&mut run, from, "r01's injected unlink failure", |entry| {
+            entry.call == DiskCall::UnlinkTier && entry.result == point && entry.path != first.path
+        });
+        inf_foundation::fault::disarm_all();
+        run.step().expect("the step that consumes r01's Retry");
+        let (phase, due_second, deadline) = role_of(&run);
+        assert!(
+            run.clock.now() < armed,
+            "TF1: r01's Retry ({:?}) was consumed at {:?}, past the first deadline {armed:?}",
+            second.mark,
+            run.clock.now()
+        );
+        assert_eq!(phase, OwnerPhase::Armed, "TF1-ROLE: the second Retry left the role {phase:?}");
+        assert!(
+            due_second > due_first,
+            "TF1-ROLE: the later Retry's due {due_second:?} is not later"
+        );
+        assert!(
+            due_second > armed,
+            "TF1: r01's due {due_second:?} is within the first deadline {armed:?}: no successor \
+             owed"
+        );
+        assert_eq!(deadline, Some(armed), "TF1-ROLE: the second Retry moved the armed deadline");
+        // The first deadline's delivery: the step whose iteration takes it.
+        for _ in 0..TF1_STEPS_MAX {
+            if role_of(&run).2 != Some(armed) {
+                break;
+            }
+            run.step().expect("a step");
+        }
+        let (phase, due, deadline) = role_of(&run);
+        assert_eq!(
+            phase,
+            OwnerPhase::Armed,
+            "TF1-SUCCESSOR: the delivery at {armed:?} left the role {phase:?} with its latest due \
+             {due:?} not yet reached"
+        );
+        let deadline = deadline.expect("TF1-SUCCESSOR: no deadline armed");
+        assert!(
+            due_second <= deadline && deadline.0 <= due_second.0 + 1_000_000,
+            "TF1-SUCCESSOR: the successor's deadline {deadline:?} is not within 1 ms after the \
+             later due {due_second:?}"
+        );
+        for path in [&first.path, &second.path] {
+            await_entry(&mut run, from, "a retry's removal", |entry| {
+                entry.call == DiskCall::UnlinkTier
+                    && entry.path == *path
+                    && entry.result == CallResult::Ok
+            });
+        }
+        for mut reader in readers {
+            run.reply(&mut reader).expect("the held read's reply");
+        }
+        assert_eq!(
+            run.report.violations.len(),
+            0,
+            "the run's own oracles: {:?}",
+            run.report.violations
+        );
+    }
+
+    /// The tier-file ids a shard's MANIFEST at `file` names for namespace
+    /// `ns`; `None` when the file is absent.
+    fn manifested(run: &Run, file: &Path, ns: u32) -> Option<Vec<u32>> {
+        let payload = inf_log::meta::read_envelope(&run.disk, file).expect("an envelope")?;
+        let manifest = inf_log::manifest::Manifest::decode(&payload).expect("a MANIFEST");
+        let section = manifest.tiers.iter().find(|section| section.ns == ns);
+        Some(
+            section.map(|section| section.files.iter().map(|f| f.id).collect()).unwrap_or_default(),
+        )
+    }
+
+    /// An aborted MANIFEST swap moves nothing (ADR-0059 D3, ADR-0156 D1): a
+    /// live namespace's first tier file made dead (every key deleted after
+    /// its ring wrapped and the file sealed), the next checkpoint marks it
+    /// retiring and stages a MANIFEST that leaves it out, and
+    /// `manifest_rename_fail` refuses the swap's rename. From the refusal to
+    /// the retry's rename the committed MANIFEST still names the file, the
+    /// disk still holds it, no unlink of it is logged and no job is out; the
+    /// `Backoff` retry renames a MANIFEST without it, and only after that
+    /// rename does the worker unlink it. The swap's staging create carries no
+    /// fault point of its own on the reactor tier, so the staging failure's
+    /// half is not driven here.
+    #[test]
+    fn an_aborted_swap_moves_nothing_and_its_retry_retires_the_mark() {
+        use inf_log::fs::SegmentFs;
+        const SEED: u64 = 0x2;
+        /// Steps the refusal, its backoff (64 MAINTAIN slices) and the
+        /// retry's barriers may take: far above them.
+        const SWAP_STEPS_MAX: u32 = 20_000;
+        let leg = LifetimesLeg::Disk;
+        let scenario = scenario(SEED, leg);
+        let clock = Rc::new(VirtualClock::new(Nanos(1)));
+        let observer = TraceObserver::default();
+        let Ok(mut run) = new_run(&scenario, SEED, leg, &observer, &clock) else {
+            panic!("the node's boot was refused");
+        };
+        run.recover().expect("recovered");
+        let mut admin = MiniClient::connect(&mut run.node, 0);
+        assert_eq!(run.create(&mut admin, b"a00").expect("a reply"), OK);
+        let id = run.node.plane(0).keyspace().ns_get(b"a00").map(|spec| spec.id.0).expect("live");
+        let mut client = run.use_ns(0, b"a00").expect("USE a00");
+        let mut written = Vec::new();
+        for _ in 0..DISK_FILL_BATCHES_MAX {
+            if run.tier_files_of(id) >= 2 {
+                break;
+            }
+            let keys = run.owned_keys(0, "a", FLUSH_BATCH);
+            run.write_inline(&mut client, &keys).expect("written");
+            written.extend(keys);
+            run.idle(FLUSH_SETTLE_STEPS).expect("settled");
+        }
+        assert!(run.tier_files_of(id) >= 2, "VACUOUS: the first tier file never sealed");
+        for key in &written {
+            client.send(&mut run.node, &[b"DEL", key]);
+        }
+        for _ in &written {
+            run.reply(&mut client).expect("a DEL's reply");
+        }
+        let shard = PathBuf::from("node").join("shard-0");
+        let file = shard.join(format!("ns-{id}")).join("cold").join(inf_log::tier_file_name(0));
+        let committed = shard.join(inf_log::manifest::MANIFEST_FILE);
+        let staged = shard.join(inf_log::manifest::MANIFEST_STAGING_FILE);
+        let point = inf_log::fault::MANIFEST_RENAME_FAIL;
+        inf_foundation::fault::arm(point, FaultSpec::Nth(1));
+        admin.send(&mut run.node, &[b"INF.CKPT"]);
+        let mut steps = 0;
+        // Each checkpoint marks the dead file; the armed one's rename fails.
+        while inf_foundation::fault::fired(point) == 0 {
+            assert!(steps < SWAP_STEPS_MAX, "VACUOUS: no swap met manifest_rename_fail");
+            let _ = admin.recv(&mut run.node);
+            run.step().expect("a step");
+            steps += 1;
+        }
+        inf_foundation::fault::disarm(point);
+        let staged_ids = manifested(&run, &staged, id).expect("VACUOUS: no staged MANIFEST");
+        assert!(
+            !staged_ids.contains(&0),
+            "VACUOUS: the refused swap's staged MANIFEST names file 0 ({staged_ids:?}): no mark"
+        );
+        let from = run.disk.logged_calls(0).len();
+        let renamed_at = loop {
+            assert!(steps < SWAP_STEPS_MAX, "the refused swap was never retried");
+            let ids = manifested(&run, &committed, id).expect("a committed MANIFEST");
+            let entries = run.disk.logged_calls(from);
+            let unlinked = entries.iter().any(|e| e.call == DiskCall::UnlinkTier && e.path == file);
+            if !ids.contains(&0) {
+                break run.disk.logged_calls(0).len();
+            }
+            assert!(
+                !unlinked,
+                "ABORTED-SWAP: {} unlinked while the MANIFEST names it",
+                file.display()
+            );
+            assert!(
+                run.disk.open_read(&file).is_ok(),
+                "ABORTED-SWAP: the marked file left the disk"
+            );
+            assert_eq!(run.jobs_out_on(0), 0, "ABORTED-SWAP: a job out under the aborted swap");
+            let _ = admin.recv(&mut run.node);
+            run.step().expect("a step");
+            steps += 1;
+        };
+        let rename = run
+            .disk
+            .logged_calls(from)
+            .into_iter()
+            .position(|e| e.call == DiskCall::ManifestRename && e.path == committed);
+        let unlink = run.disk.logged_calls(from).into_iter().position(|e| {
+            e.call == DiskCall::UnlinkTier && e.path == file && e.result == CallResult::Ok
+        });
+        assert!(rename.is_some(), "the retry's rename is logged after the refusal");
+        assert!(unlink.is_none_or(|u| rename.is_some_and(|r| r < u)), "unlinked before the rename");
+        await_entry(&mut run, renamed_at, "the marked file's unlink", |entry| {
+            entry.call == DiskCall::UnlinkTier
+                && entry.path == file
+                && entry.result == CallResult::Ok
+        });
+        assert_eq!(
+            run.report.violations.len(),
+            0,
+            "the run's own oracles: {:?}",
+            run.report.violations
+        );
     }
 }
