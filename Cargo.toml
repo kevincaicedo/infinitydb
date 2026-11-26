@@ -236,6 +236,7 @@ unexpected_cfgs = { level = "deny", check-cfg = [
     'cfg(inf_canary_ready_ignores_queued)',
     'cfg(inf_canary_rearm_after_eof)',
     'cfg(inf_canary_receipt_id_blind)',
+    'cfg(inf_canary_receipt_jobs_out_ignored)',
     'cfg(inf_canary_recover_ask_per_record)',
     'cfg(inf_canary_recover_begin_skip_entry_only)',
     'cfg(inf_canary_recover_del_unasked)',

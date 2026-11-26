@@ -1624,6 +1624,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             node.tier_files_retired.set(retire.files_retired);
             node.tier_retire_errors_transient.set(retire.errors_transient);
             node.tier_retire_errors_operator.set(retire.errors_operator);
+            node.tier_retire_results_stale.set(retire.stale);
             tier.cold.clone()
         };
         // Reactor-drive flush ops (M4.5-S31): pushed outside the tier
@@ -1792,6 +1793,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// all zero on a cell that never created a tiered namespace.
     pub fn tier_flush_gauges(&self) -> [u64; TIER_FLUSH_GAUGES] {
         self.shared.node.tier_flush.get()
+    }
+
+    /// The cell's tier-file jobs out (0 without a tier), read from its part
+    /// for the simulator's held-worker cycle between scheduler steps.
+    pub fn tier_retire_jobs_out_for_sim(&self) -> u64 {
+        self.shared.tier.borrow().as_ref().map_or(0, |tier| tier.retire_gauges().1)
     }
 
     /// Checkpoint `(completed, aborted)` for the simulator's oracles

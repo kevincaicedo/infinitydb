@@ -1532,6 +1532,11 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             if !drained(t, &settled) {
                 continue;
             }
+            debug_assert_eq!(
+                t.jobs_out, 0,
+                "RECEIPT_WITH_JOBS_OUT: namespace {} published its receipt with jobs out",
+                t.ns.0
+            );
             let (pos, id, round_seq) = (t.pos, t.ns, t.round_seq);
             *slot = Position::Vacant { round_seq };
             receipts.publish(pos, id.0);
@@ -1563,10 +1568,11 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         (self.retire_stats, out as u64)
     }
 
-    /// Whether a retirement result waits while a job is out: the parking
-    /// loop's final check (ADR-0156 D3's result wake).
-    pub(crate) fn retire_results_ready(&mut self) -> bool {
-        self.grants.as_mut().is_some_and(|grants| grants.part.results_ready())
+    /// Whether a retirement result waits while a job is out, or the
+    /// transport's stop can step without waiting: the parking loop's final
+    /// check (ADR-0156 D3's result wake and the lane release's wake).
+    pub(crate) fn retire_wake_pending(&mut self) -> bool {
+        self.grants.as_mut().is_some_and(|grants| grants.part.wake_pending())
     }
 
     /// The cell's grants, which hold its transport part.
@@ -1957,10 +1963,13 @@ fn close_at_drop<F: SegmentFs>(t: &mut TierNs<F>) {
 /// extent reader's hold outstanding, and every blob `SET`'s extent barrier
 /// it registered settled in the commit ledger (`settled(fence)`).
 fn drained<F: SegmentFs>(t: &TierNs<F>, settled: impl Fn(u64) -> bool) -> bool {
+    // Canary `inf_canary_receipt_jobs_out_ignored`: the terminal step
+    // ignores the jobs out, so the receipt goes out with the worker holding
+    // the owner's files.
     let files = t.flush.catalog_end_id().is_none()
         && t.retired.is_empty()
         && t.retrying.is_empty()
-        && t.jobs_out == 0;
+        && (t.jobs_out == 0 || cfg!(inf_canary_receipt_jobs_out_ignored));
     let fence = t.extent_fence.get();
     let held = Rc::strong_count(&t.holds) > 1 || (fence != 0 && !settled(fence));
     // The canary: the terminal step ignores the extent readers' holds and

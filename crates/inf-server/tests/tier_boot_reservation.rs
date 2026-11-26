@@ -1,4 +1,4 @@
-//! T3, the tier lifetimes' boot reservation (ADR-0148 D4), read by the
+//! The tier lifetimes' boot reservation (ADR-0148 D4), read by the
 //! counting allocator on the test's thread. The success leg requests
 //! exactly the bill this file computes from each type's size and the
 //! tables' lengths, allocates its three `Arc` headers last, and frees every

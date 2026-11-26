@@ -134,7 +134,7 @@ pub use tier_retire::{
     TierLifetimeBoot, TierShared, TransportPhase,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub use tier_retire::{cut_for_sim, retire_with};
+pub use tier_retire::{CutCustody, cut_for_sim, retire_with};
 
 /// The tier lifetimes' measured terms beside the boot reservation's bill
 /// (ADR-0148 D4): bytes a cell's position table and the node's writer book

@@ -1,14 +1,19 @@
-//! The tier-file transport's crate tests. T1, the transport: a ninth offer
+//! The tier-file transport's crate tests. The transport: a ninth offer
 //! deferred with eight jobs out and again with eight results unconsumed, a
 //! position freed only by its result's consumption, every owner consumed
-//! once by identity, each outcome, the stop's rows, and on Linux the native
-//! close and the cell's park ended by the worker's result wake. T2, the
-//! worker: its pass's fairness from its cursor, its wait only after a whole
-//! empty circuit, and a message's turn. The expected identities, the drop
-//! census and the waits are the tests' own, kept outside the candidate.
+//! once by identity, each outcome, the stop's rows, the cut's custody, the
+//! wakes landing between a cell's final check and its park, and on Linux
+//! the native close and the cell's park ended by the worker's result wake.
+//! The worker: its pass's fairness from its cursor under continuous,
+//! last-only, alternating and empty readiness and with one lane failing
+//! every attempt, its wait only after a whole empty circuit, and a
+//! message's turn, a full channel's included. The expected identities, the
+//! drop census and the waits are the tests' own, kept outside the
+//! candidate.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 
 use inf_foundation::fault::{self, FaultSpec};
@@ -140,7 +145,7 @@ fn mem_path(id: u32) -> PathBuf {
     Path::new("/shard-0/ns-16/cold").join(inf_log::tier_file_name(id))
 }
 
-/// T1, the transport's population: at 1, 2, 8 and 64 cells, eight jobs a
+/// The transport's population: at 1, 2, 8 and 64 cells, eight jobs a
 /// cell fill its positions and a ninth is deferred with nothing built;
 /// after the worker took every job and published every result, unconsumed,
 /// a ninth is deferred again (a dequeue frees nothing); one consumed result
@@ -184,7 +189,7 @@ fn a_position_frees_only_at_its_results_consumption() {
     }
 }
 
-/// T1, reuse: twenty full rounds on one cell, each with fresh file ids,
+/// The transport's reuse: twenty full rounds on one cell, each with fresh file ids,
 /// every identity consumed once and matched against the round's own set.
 #[test]
 fn twenty_rounds_of_reuse_keep_every_identity() {
@@ -204,7 +209,7 @@ fn twenty_rounds_of_reuse_keep_every_identity() {
     rig.assert_census("reuse");
 }
 
-/// T1, each outcome over the in-memory tier: a present file is `Unlinked`,
+/// Each outcome over the in-memory tier: a present file is `Unlinked`,
 /// an absent one `AlreadyAbsent`, an injected unlink failure `Retry` with no
 /// OS errno (the operator's class), and that owner, offered again with no
 /// handle, is unlinked: no owner is dropped unconsumed.
@@ -242,7 +247,7 @@ fn each_outcome_returns_its_owner() {
     assert!(fs.open_read(&mem_path(0)).is_err(), "the retry unlinked it");
 }
 
-/// T1, a close error on the simulated disk: the handle's final close
+/// A close error on the simulated disk: the handle's final close
 /// reports `tier_close_fail`'s `EIO` and no unlink is attempted; the retry,
 /// with no handle, unlinks and closes nothing.
 #[test]
@@ -277,7 +282,7 @@ fn a_failed_close_is_retried_by_its_unlink_alone() {
     assert_eq!(closes, 1, "the retry closed nothing");
 }
 
-/// T1, the stop: jobs queued, in the worker's hand and with results
+/// The stop: jobs queued, in the worker's hand and with results
 /// unconsumed when the stop begins. Offers end; results are consumed each
 /// turn; the cell releases its endpoints only once every position is Free,
 /// the worker releases its lane on reading `closing`, and the backings
@@ -327,7 +332,7 @@ fn the_stop_releases_only_with_every_position_free() {
 }
 
 /// A real file whose final close closes its descriptor, then reports
-/// `EIO` (Linux releases the number even on `EIO`): T1's close error over a
+/// `EIO` (Linux releases the number even on `EIO`): the close error over a
 /// native descriptor.
 struct FailingClose(StdSegmentFile);
 
@@ -418,7 +423,7 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// T1 on Linux, the native close: the job's descriptor is closed by its
+/// On Linux, the native close: the job's descriptor is closed by its
 /// final close (its `/proc/self/fd` entry gone or naming another file);
 /// after a close that failed, released as Linux releases it, a sentinel
 /// opened onto the reused number stays open through the retry, which
@@ -515,7 +520,7 @@ impl WorkerInbox for DeadlineInbox {
     }
 }
 
-/// T1's threaded leg (Linux): the worker on a thread of its own, the cell's
+/// The threaded leg (Linux): the worker on a thread of its own, the cell's
 /// thread parked on its loop waker with no timer until its results arrive:
 /// it announces its park, fences, checks its result ring, and only then
 /// waits on its eventfd, each wait under a 5 s failure deadline. Two rounds
@@ -598,9 +603,9 @@ fn a_parked_cell_is_woken_by_its_results() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ---- T2, the worker ----------------------------------------------------
+// ---- the worker --------------------------------------------------------
 
-/// T2's inbox: the real control channel and the one-slot wake, the
+/// The worker legs' inbox: the real control channel and the one-slot wake, the
 /// iteration count, and the wait's record. A wait with the wake's slot
 /// empty while the test's own bookkeeping holds a published job or a queued
 /// message is a wait nothing would end.
@@ -640,16 +645,72 @@ impl WorkerInbox for RecordingInbox {
     }
 }
 
-/// A worker rig of `lanes` lanes for T2, its offers published and rung the
+/// A worker rig of `lanes` lanes, its offers published and rung the
 /// way a cell's turn does.
 struct WorkerRig {
     rig: Rig<MemFile>,
     inbox: RecordingInbox,
     sender: ControlSender,
-    fs: MemFs,
+    fs: LaneFaultFs,
     /// Jobs taken by the worker so far, read from the consumed results.
     served: Vec<(u16, usize)>,
+    /// The messages handled, in the order the worker handled them.
+    handled: Vec<PathBuf>,
     next_id: u32,
+}
+
+/// The in-memory tier whose unlinks meet `tier_unlink_fail` only under
+/// `failing`: one lane's files fail as the armed point says, every other
+/// lane's are removed as if nothing were armed.
+#[derive(Clone)]
+struct LaneFaultFs {
+    inner: MemFs,
+    failing: Option<PathBuf>,
+}
+
+impl SegmentFs for LaneFaultFs {
+    type File = MemFile;
+    type DirStream = <MemFs as SegmentFs>::DirStream;
+
+    fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
+        self.inner.create_dir_all(dir)
+    }
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        self.inner.sync_dir(dir)
+    }
+    fn open_listing(&self, dir: &Path) -> io::Result<inf_log::fs::OpenedDir<Self::DirStream>> {
+        self.inner.open_listing(dir)
+    }
+    fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> io::Result<MemFile> {
+        self.inner.create_segment(path, prealloc_bytes)
+    }
+    fn create_meta(&self, path: &Path) -> io::Result<MemFile> {
+        self.inner.create_meta(path)
+    }
+    fn create_meta_direct(&self, path: &Path) -> io::Result<MemFile> {
+        self.inner.create_meta_direct(path)
+    }
+    fn open_dir(&self, dir: &Path) -> io::Result<MemFile> {
+        self.inner.open_dir(dir)
+    }
+    fn open_write(&self, path: &Path) -> io::Result<MemFile> {
+        self.inner.open_write(path)
+    }
+    fn open_read(&self, path: &Path) -> io::Result<MemFile> {
+        self.inner.open_read(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.inner.rename(from, to)
+    }
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        self.inner.remove_file(path)
+    }
+    fn unlink_tier(&self, path: &Path) -> io::Result<()> {
+        match &self.failing {
+            Some(dir) if !path.starts_with(dir) => self.inner.remove_file(path),
+            _ => self.inner.unlink_tier(path),
+        }
+    }
 }
 
 impl WorkerRig {
@@ -661,27 +722,41 @@ impl WorkerRig {
         let sender = ControlSender::over(control_tx, rig.wake.clone());
         let inbox =
             RecordingInbox { rx: control_rx, wake: wake_rx, pending_jobs: 0, queued: 0, waits: 0 };
-        WorkerRig { rig, inbox, sender, fs: MemFs::new(), served: Vec::new(), next_id: 0 }
+        let fs = LaneFaultFs { inner: MemFs::new(), failing: None };
+        WorkerRig { rig, inbox, sender, fs, served: Vec::new(), handled: Vec::new(), next_id: 0 }
     }
 
     fn publish(&mut self, lane: u16) {
         let id = self.next_id;
+        self.publish_at(lane, mem_path(id));
+    }
+
+    /// One job on `lane` for the file at `path`.
+    fn publish_at(&mut self, lane: u16, path: PathBuf) {
+        let id = self.next_id;
         self.next_id += 1;
-        assert!(self.rig.offer(lane, 16, meta(id, mem_path(id)), None), "lane {lane} has room");
+        assert!(self.rig.offer(lane, 16, meta(id, path), None), "lane {lane} has room");
         self.inbox.pending_jobs += 1;
     }
 
     fn post(&mut self) {
+        self.post_path(PathBuf::from("/nowhere"));
+    }
+
+    fn post_path(&mut self, path: PathBuf) {
         self.inbox.queued += 1;
-        self.sender.post(ControlMsg::Unlink(PathBuf::from("/nowhere")));
+        self.sender.post(ControlMsg::Unlink(path));
     }
 
     /// One iteration; returns the messages it handled.
     fn iterate(&mut self, iteration: usize) -> usize {
         let mut handled = 0;
-        let Self { rig, inbox, fs, served, .. } = self;
+        let Self { rig, inbox, fs, served, handled: order, .. } = self;
         let _ = rig.tier.worker().iterate(inbox, fs, |msg| {
-            handled += usize::from(matches!(msg, ControlMsg::Unlink(_)));
+            if let ControlMsg::Unlink(path) = msg {
+                handled += 1;
+                order.push(path);
+            }
         });
         for lane in 0..rig.parts.len() as u16 {
             let taken = rig.consume(lane);
@@ -694,15 +769,22 @@ impl WorkerRig {
     }
 }
 
-/// T2, last-only readiness at 65 lanes: one job in the last lane, published
-/// and rung before the worker's clear, is served before any wait; then the
-/// worker waits within ⌈65 / 64⌉ + 1 iterations of that job.
+/// Last-only readiness at 65 lanes. A job in the last lane, published and
+/// rung before the clear while the worker's circuit since its last job is
+/// still open, is served with no wait at all. After a whole empty circuit
+/// the worker waits; a job then published and rung ends that wait at once
+/// (the bell's wake) and is served. Then the worker waits within
+/// ⌈65 / 64⌉ + 1 iterations of its last job.
 #[test]
 fn a_last_lanes_job_is_served_before_any_wait() {
     let mut w = WorkerRig::new(65);
-    for iteration in 0..4 {
-        w.iterate(iteration);
-    }
+    w.publish(0);
+    let first = (0..4).find(|&i| {
+        w.iterate(i);
+        !w.served.is_empty()
+    });
+    assert!(first.is_some(), "lane 0's job was served");
+    w.served.clear();
     let waits_before = w.inbox.waits;
     w.publish(64);
     let served_at = (0..8).find(|&i| {
@@ -711,18 +793,31 @@ fn a_last_lanes_job_is_served_before_any_wait() {
     });
     assert!(served_at.is_some(), "the 65th lane's job was served");
     assert_eq!(w.served[0].0, 64);
-    let after = w.inbox.waits;
-    assert!(after >= waits_before, "waits recorded");
+    assert_eq!(
+        w.inbox.waits, waits_before,
+        "WAIT_BEFORE_SERVE: the worker waited with the last lane's job published and rung"
+    );
+    w.served.clear();
+    for iteration in 0..4 {
+        w.iterate(200 + iteration);
+    }
+    assert!(w.inbox.waits > waits_before, "VACUOUS: no wait after a whole empty circuit");
+    w.publish(64);
+    let served_at = (0..8).find(|&i| {
+        w.iterate(300 + i);
+        !w.served.is_empty()
+    });
+    assert!(served_at.is_some(), "the job published during a wait was served");
     let mut waited = false;
     for i in 0..(65usize.div_ceil(64) + 1) {
         let before = w.inbox.waits;
-        w.iterate(200 + i);
+        w.iterate(400 + i);
         waited |= w.inbox.waits > before;
     }
     assert!(waited, "NO_WAIT: the worker did not wait within 3 iterations of its last job");
 }
 
-/// T2, continuous readiness at 1, 2, 8, 64 and 65 lanes: every lane keeps a
+/// Continuous readiness at 1, 2, 8, 64 and 65 lanes: every lane keeps a
 /// job ready, and each lane is served within ⌈lanes / 8⌉ passes of the
 /// worker's cursor reaching it, so no lane waits behind the earlier ones.
 #[test]
@@ -751,7 +846,7 @@ fn every_ready_lane_is_served_within_its_share_of_passes() {
     }
 }
 
-/// T2, a steady sender under continuous readiness: the n-th message queued
+/// A steady sender under continuous readiness: the n-th message queued
 /// is handled within n iterations of its post, the bell's rings taking no
 /// message's turn.
 #[test]
@@ -777,7 +872,7 @@ fn a_message_waits_no_turn_behind_the_bell() {
     }
 }
 
-/// T2, empty readiness: with nothing published and nothing queued the
+/// Empty readiness: with nothing published and nothing queued the
 /// worker waits within ⌈lanes / 64⌉ + 1 iterations, at 1, 64 and 65 lanes.
 #[test]
 fn an_idle_worker_waits_after_one_empty_circuit() {
@@ -789,4 +884,212 @@ fn an_idle_worker_waits_after_one_empty_circuit() {
         }
         assert!(w.inbox.waits > 0, "NO_WAIT: {lanes} lanes: no wait within {within} iterations");
     }
+}
+
+/// Alternating readiness at 8, 64 and 65 lanes: even lanes publish on even
+/// iterations and odd lanes on odd ones, each only once its last job was
+/// served; every job is served within ⌈lanes / 8⌉ + 1 iterations of its
+/// publish, and no wait is left unwoken.
+#[test]
+fn alternating_lanes_are_each_served_within_their_share() {
+    for lanes in [8u16, 64, 65] {
+        let mut w = WorkerRig::new(lanes);
+        let bound = usize::from(lanes).div_ceil(8) + 1;
+        let mut published_at: Vec<Option<usize>> = vec![None; usize::from(lanes)];
+        let mut served = 0usize;
+        for iteration in 0..(8 * bound) {
+            for lane in 0..lanes {
+                let at = &mut published_at[usize::from(lane)];
+                if usize::from(lane) % 2 == iteration % 2 && at.is_none() {
+                    *at = Some(iteration);
+                    w.publish(lane);
+                }
+            }
+            w.iterate(iteration);
+            for (lane, at) in w.served.drain(..).collect::<Vec<_>>() {
+                let since = published_at[usize::from(lane)].take().expect("a published job");
+                assert!(
+                    at - since <= bound,
+                    "LANE_STARVED: {lanes} lanes: lane {lane} published at {since}, served at {at}"
+                );
+                served += 1;
+            }
+        }
+        assert!(served >= 4 * usize::from(lanes), "VACUOUS: {lanes} lanes: {served} jobs served");
+    }
+}
+
+/// A full 256-message channel under continuous readiness at 8 lanes: every
+/// message is handled in the order it was queued, the n-th within n
+/// iterations, whatever the lanes' publishes ring.
+#[test]
+fn a_full_channel_is_handled_in_order_within_its_turns() {
+    let mut w = WorkerRig::new(8);
+    for lane in 0..8 {
+        w.publish(lane);
+    }
+    let queued: Vec<PathBuf> = (0..256).map(|n| PathBuf::from(format!("/m/{n:03}"))).collect();
+    for path in &queued {
+        w.post_path(path.clone());
+    }
+    for iteration in 0..256 {
+        w.iterate(iteration);
+        assert!(
+            w.handled.len() > iteration,
+            "MESSAGE_BEHIND_WAKE: {} of 256 handled after iteration {iteration}",
+            w.handled.len()
+        );
+        for (lane, _) in w.served.drain(..).collect::<Vec<_>>() {
+            w.publish(lane);
+        }
+    }
+    assert_eq!(w.handled, queued, "MESSAGE_ORDER: the backlog was handled out of its order");
+}
+
+/// One lane failing every attempt at 8 lanes, every lane ready: lane 0's
+/// files lie where `tier_unlink_fail`, armed `Always`, meets each of its
+/// unlinks, so each of its jobs returns `Retry` and is offered again,
+/// holding at most its own 8 positions; every other lane's job is served
+/// within ⌈8 / 8⌉ + 1 iterations of its publish, each terminal.
+#[test]
+fn a_lane_failing_every_attempt_holds_only_its_own_positions() {
+    let mut w = WorkerRig::new(8);
+    let failing = PathBuf::from("/failing");
+    w.fs.failing = Some(failing.clone());
+    fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Always);
+    let bound = 2;
+    for n in 0..8 {
+        w.publish_at(0, failing.join(format!("f{n}")));
+    }
+    let mut published_at = [Some(0usize); 8];
+    for lane in 1..8 {
+        w.publish(lane);
+    }
+    let mut seen = 0usize;
+    let mut retried = 0usize;
+    for iteration in 0..64 {
+        w.iterate(iteration);
+        assert!(w.rig.parts[0].jobs_out() <= 8, "the failing lane holds only its own positions");
+        for &((cell, _, _), outcome) in &w.rig.consumed[seen..] {
+            if cell == 0 {
+                assert!(
+                    matches!(outcome, RetireOutcome::Retry(RetryCause::Unlink { .. })),
+                    "the failing lane's attempt answered {outcome:?}"
+                );
+                retried += 1;
+            } else {
+                assert!(
+                    matches!(outcome, RetireOutcome::Unlinked | RetireOutcome::AlreadyAbsent),
+                    "LANE_FAILED: lane {cell}'s job answered {outcome:?}"
+                );
+            }
+        }
+        seen = w.rig.consumed.len();
+        for (lane, at) in w.served.drain(..).collect::<Vec<_>>() {
+            if lane == 0 {
+                let id = w.next_id;
+                w.publish_at(0, failing.join(format!("f{id}")));
+                continue;
+            }
+            let since = published_at[usize::from(lane)].take().expect("a published job");
+            assert!(
+                at - since <= bound,
+                "LANE_STARVED: lane {lane} published at {since}, served at {at}"
+            );
+            published_at[usize::from(lane)] = Some(iteration + 1);
+            w.publish(lane);
+        }
+    }
+    let fired = fault::fired(inf_log::fault::TIER_UNLINK_FAIL);
+    fault::disarm_all();
+    assert!(retried >= 64, "VACUOUS: the failing lane's attempts: {retried}");
+    assert_eq!(fired as usize, retried, "every failing attempt met the armed point, no other");
+}
+
+/// The result wake landing between the cell's final check and its park, on
+/// one thread: the cell announces its park, fences, and its check finds no
+/// result; the worker then runs the job, publishes its result, fences and
+/// reads the announcement, so it wakes the cell, whose park ends at once.
+#[test]
+fn a_result_published_between_the_check_and_the_park_wakes_the_cell() {
+    let mut rig = Rig::<MemFile>::new(1);
+    let flags = Arc::new(vec![AtomicBool::new(false)]);
+    let woken = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&woken);
+    rig.tier.worker().set_cell_wake(CellWake::new(Arc::clone(&flags), move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }));
+    assert!(rig.offer(0, 16, meta(0, mem_path(0)), None));
+    flags[0].store(true, Ordering::Relaxed);
+    fence(Ordering::SeqCst);
+    assert!(!rig.parts[0].wake_pending(), "VACUOUS: a result before the worker ran");
+    rig.tier.iterate(&MemFs::new());
+    assert_eq!(
+        woken.load(Ordering::SeqCst),
+        1,
+        "WAKE_IN_GAP_LOST: the worker published into the gap and woke no cell"
+    );
+    flags[0].store(false, Ordering::Relaxed);
+    assert!(rig.parts[0].wake_pending(), "the result waits for the cell");
+    assert_eq!(rig.consume(0), 1);
+    rig.assert_census("the gap");
+}
+
+/// The lane release landing between a stopping cell's final check and its
+/// park, on one thread: Released, the cell announces its park and its
+/// check finds the worker's lane still held; the worker then reads
+/// `closing`, releases the lane, fences and reads the announcement, so it
+/// wakes the cell, and the check now answers that the stop can step.
+#[test]
+fn a_lane_released_between_the_check_and_the_park_wakes_the_cell() {
+    let mut rig = Rig::<MemFile>::new(1);
+    let flags = Arc::new(vec![AtomicBool::new(false)]);
+    let woken = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&woken);
+    rig.tier.worker().set_cell_wake(CellWake::new(Arc::clone(&flags), move |_| {
+        counter.fetch_add(1, Ordering::SeqCst);
+    }));
+    let board = Arc::clone(&rig.board);
+    assert_eq!(rig.parts[0].stop_step(&board, &rig.wake), TransportPhase::Closing);
+    assert_eq!(rig.parts[0].stop_step(&board, &rig.wake), TransportPhase::Released);
+    flags[0].store(true, Ordering::Relaxed);
+    fence(Ordering::SeqCst);
+    assert!(!rig.parts[0].wake_pending(), "VACUOUS: the lane released before the worker ran");
+    rig.tier.iterate(&MemFs::new());
+    assert_eq!(
+        woken.load(Ordering::SeqCst),
+        1,
+        "RELEASE_WAKE_LOST: the worker released the lane into the gap and woke no cell"
+    );
+    flags[0].store(false, Ordering::Relaxed);
+    assert!(rig.parts[0].wake_pending(), "the stop can step: the lane is released");
+    for _ in 0..8 {
+        if rig.parts[0].stop_step(&board, &rig.wake) == TransportPhase::Retired {
+            return;
+        }
+    }
+    panic!("the stop never retired after the lane's release");
+}
+
+/// The cut's custody: a part cut with two jobs queued for the worker and
+/// three results unconsumed drops each, counted, and retires both rings.
+#[test]
+fn a_cut_drops_every_queued_value_counted() {
+    let fs = MemFs::new();
+    let mut rig = Rig::<MemFile>::new(1);
+    for id in 0..3 {
+        assert!(rig.offer(0, 16, meta(id, mem_path(id)), None));
+    }
+    rig.serve(&fs);
+    for id in 3..5 {
+        assert!(rig.offer(0, 16, meta(id, mem_path(id)), None));
+    }
+    let Rig { tier, parts, .. } = &mut rig;
+    let custody = tier.cut(&mut parts[0]);
+    assert_eq!(
+        custody,
+        CutCustody { jobs: 2, results: 3 },
+        "CUT_CUSTODY: the cut found other values queued"
+    );
+    assert_eq!(parts[0].phase(), TransportPhase::Retired);
 }

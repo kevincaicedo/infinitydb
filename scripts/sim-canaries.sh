@@ -1502,6 +1502,10 @@ ordered_rows=(
   # The end of stream ends the receive (ADR-0196 A1.3). Planted, the end-of-stream arm re-arms
   # the half-closed slot, and the net refuses an arm after its EOF.
   "inf_canary_rearm_after_eof m0-capacity recv-armed-after-eof --close-leg half-close"
+  # ADR-0156 D3: a dropped namespace's receipt waits for every job's result. Planted, the
+  # terminal step ignores the jobs out: with the worker held, the cell test's MAINTAIN
+  # publishes the receipt with jobs out.
+  "inf_canary_receipt_jobs_out_ignored crate-test inf-server lib a_drained_namespaces_receipt_waits_for_its_jobs_out RECEIPT_WITH_JOBS_OUT:"
   # The registries drop a connection when its queue is empty, so a queued SUBSCRIBE's 0→1
   # precedes the close's 1→0 in one task. Planted, the removal runs at Closed, before the drain,
   # and the owner keeps counting the closed client.
@@ -1548,6 +1552,9 @@ ordered_rows=(
   # ADR-0156 D3: a result's publish is followed by the parked cell's wake.
   # Planted, the result is published silently and the parked cell sleeps.
   "inf_canary_retire_result_wake_silent crate-test inf-server lib a_parked_cell_is_woken_by_its_results RESULT_WAKE_MISSING:"
+  # The same plant on one thread: a result published between the cell's final check and its
+  # park wakes no cell.
+  "inf_canary_retire_result_wake_silent crate-test inf-server lib a_result_published_between_the_check_and_the_park_wakes_the_cell WAKE_IN_GAP_LOST:"
   # ADR-0156 D3: an idle worker waits on its wake. Planted, it never waits,
   # a busy loop on an idle node.
   "inf_canary_retire_worker_never_waits crate-test inf-server lib an_idle_worker_waits_after_one_empty_circuit NO_WAIT:"

@@ -1650,7 +1650,7 @@ impl BellWake for RetireWake {
     }
 }
 
-/// The control channel's one sender (F18): every message enters through
+/// The control channel's one sender: every message enters through
 /// [`post`](Self::post) or [`try_post`](Self::try_post), which send the
 /// worker's wake after the send, so a worker that found the channel empty
 /// and waits returns to take it.

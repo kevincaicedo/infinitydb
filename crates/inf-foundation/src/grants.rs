@@ -1020,7 +1020,7 @@ mod loom_tests {
     /// Executions in which the worker waited on the wake.
     static WORKER_WAITED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    /// The node's one bell (F18): two cells each publish a job (`Release`,
+    /// The node's one bell: two cells each publish a job (`Release`,
     /// the ring's own publish) and ring; a poster sends one message on a
     /// one-message channel and wakes; the worker runs its turns with
     /// `idle`, its passes visiting the lanes from a cursor, until it has

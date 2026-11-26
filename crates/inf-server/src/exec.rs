@@ -174,12 +174,14 @@ pub struct NodeState {
     pub tier_position_conflicts: Cell<u64>,
     /// The cell's tier-file retirement (ADR-0156 D3): its jobs out (a gauge,
     /// 0–8: at 8 its offers wait), the files whose terminal result it
-    /// consumed, and the `Retry` results it consumed by errno class.
+    /// consumed, the `Retry` results it consumed by errno class, and the
+    /// results whose owner it could not find (zero on a correct build).
     /// Render-only, cell scope.
     pub tier_retire_jobs_out: Cell<u64>,
     pub tier_files_retired: Cell<u64>,
     pub tier_retire_errors_transient: Cell<u64>,
     pub tier_retire_errors_operator: Cell<u64>,
+    pub tier_retire_results_stale: Cell<u64>,
     /// Namespaces a MAINTAIN pass left for a later one because their task
     /// class had no room (ADR-0177 D2's `compact` and `shadow` crossing,
     /// counted at the room): at the shipped caps reached only while a

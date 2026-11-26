@@ -197,7 +197,8 @@ pub struct RetireResult {
 pub enum RetireOutcome {
     /// The file was unlinked: terminal.
     Unlinked,
-    /// No file had the name (`NotFound`): terminal under F11's non-reuse.
+    /// No file had the name (`NotFound`): terminal, since a tier file's
+    /// name is never reused while its namespace lives.
     AlreadyAbsent,
     /// The close or the unlink failed: the owner returns, its handle closed.
     Retry(RetryCause),
@@ -309,11 +310,21 @@ impl<J> OfferBatch<'_, J> {
         }
         let Some(reservation) = self.reservation.as_mut() else { return Err((meta, handle)) };
         let Some(permit) = reservation.permit() else { return Err((meta, handle)) };
-        let job = self.jobs.free().unwrap_or(JobPos(0));
         let key = JobKey { pos, ns, file: meta.id };
-        if self.jobs.slots[usize::from(job.0)].is_none() {
+        let job = if cfg!(inf_canary_retire_credit_at_dequeue) {
+            // The planted room admits an offer with every position Out: it
+            // rides position 0, which it takes only while that is Free.
+            let job = self.jobs.free().unwrap_or(JobPos(0));
+            if self.jobs.slots[usize::from(job.0)].is_none() {
+                self.jobs.take(job, key);
+            }
+            job
+        } else {
+            // `room` found a Free position above.
+            let Some(job) = self.jobs.free() else { return Err((meta, handle)) };
             self.jobs.take(job, key);
-        }
+            job
+        };
         permit.write(RetireJob { job, key, meta, handle });
         self.offered += 1;
         Ok(())
@@ -372,6 +383,11 @@ impl<J> CellPart<J> {
         let taken = results.consume_batch(TIER_RETIRE_JOBS_PER_CELL, |result| {
             let RetireResult { job, key, meta, outcome } = result;
             if !jobs.release(job, key) {
+                // Only the planted credit puts two jobs on one position.
+                debug_assert!(
+                    cfg!(inf_canary_retire_credit_at_dequeue),
+                    "a result names a position its job does not hold"
+                );
                 stale += 1;
                 return;
             }
@@ -385,6 +401,25 @@ impl<J> CellPart<J> {
     /// reads that announcement after its publish).
     pub(crate) fn results_ready(&mut self) -> bool {
         self.jobs.out() > 0 && self.results.as_mut().is_some_and(RetainedConsumer::ready)
+    }
+
+    /// The parking cell's final check: a result waits, or the stop can step
+    /// without waiting. Released, it joins once the worker's lane is
+    /// released: the worker releases it, fences and reads the park flag,
+    /// so either it wakes this cell or this load sees the release (the
+    /// join's transition is the one the stop's next step makes). Joined,
+    /// the retirement's steps remain.
+    pub(crate) fn wake_pending(&mut self) -> bool {
+        match self.phase {
+            TransportPhase::Released => {
+                let requests = self.request_ring.join();
+                let results = self.result_ring.join();
+                !matches!(requests, RingPhase::Live) && !matches!(results, RingPhase::Live)
+            }
+            TransportPhase::Joined => true,
+            TransportPhase::Open | TransportPhase::Closing => self.results_ready(),
+            TransportPhase::Retired => false,
+        }
     }
 
     /// The stop's rows, one step a call, never waiting: Open enters
@@ -1007,10 +1042,12 @@ pub fn retire_with(
 /// The custody of a cut: every value found queued, each dropped as the
 /// dead process's descriptors close.
 #[cfg(any(test, feature = "test-support"))]
-#[derive(Default)]
-struct CutCustody {
-    jobs: usize,
-    results: usize,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CutCustody {
+    /// Jobs found queued in the request ring.
+    pub jobs: usize,
+    /// Results found queued in the result ring.
+    pub results: usize,
 }
 
 /// Cuts one cell's transport as a process exit would, on one thread that
@@ -1018,10 +1055,11 @@ struct CutCustody {
 /// them, every queued value dropped (its handle closed). Nothing on a
 /// Retired part. The simulator's node runs it at its end, and the test
 /// hosts' `Drop` (ADR-0157 D3: a host that holds a part retires it).
+/// Returns what it found queued.
 #[cfg(any(test, feature = "test-support"))]
-pub fn cut_for_sim<J>(part: &mut CellPart<J>, lane: &mut RetireLane<J>) {
+pub fn cut_for_sim<J>(part: &mut CellPart<J>, lane: &mut RetireLane<J>) -> CutCustody {
     if part.phase == TransportPhase::Retired {
-        return;
+        return CutCustody::default();
     }
     debug_assert_eq!(part.cell, lane.cell, "a part is cut with its own lane");
     part.requests = None;
@@ -1047,10 +1085,11 @@ pub fn cut_for_sim<J>(part: &mut CellPart<J>, lane: &mut RetireLane<J>) {
         });
         if matches!(requests, RingPhase::Terminal(_)) && matches!(results, RingPhase::Terminal(_)) {
             part.phase = TransportPhase::Retired;
-            return;
+            return custody;
         }
     }
     debug_assert!(false, "a cut retires both rings in bounded steps");
+    custody
 }
 
 impl<J> RetireWorker<J> {
@@ -1096,11 +1135,12 @@ impl<J: SegmentFile + FinalClose> DetachedTier<J> {
 
 #[cfg(any(test, feature = "test-support"))]
 impl<J: SegmentFile + FinalClose> DetachedTier<J> {
-    /// Cuts `part` with its lane: its host's end.
-    pub fn cut(&mut self, part: &mut CellPart<J>) {
-        if let Some(lane) = self.worker.lane_mut(part.cell) {
-            cut_for_sim(part, lane);
-        }
+    /// Cuts `part` with its lane: its host's end. Returns what it found
+    /// queued (nothing without its lane).
+    pub fn cut(&mut self, part: &mut CellPart<J>) -> CutCustody {
+        self.worker
+            .lane_mut(part.cell)
+            .map_or_else(CutCustody::default, |lane| cut_for_sim(part, lane))
     }
 }
 
@@ -1136,6 +1176,6 @@ impl WorkerInbox for NeverWait {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_types, reason = "test-only: real files and descriptors for T1")]
+#[allow(clippy::disallowed_types, reason = "test-only: real files and descriptors")]
 #[path = "tier_retire_tests.rs"]
 mod tier_retire_tests;

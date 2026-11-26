@@ -2145,8 +2145,10 @@ fn a_cold_read_defers_only_its_own_namespaces_file() {
 /// `armed`. Returns the disk's unlink entries in call order, each with its
 /// path, result and mark time, the injected time of the step whose MAINTAIN
 /// consumed the `Retry` (if any), and the paths in id order.
-/// The disk's unlink entries a drain-pace run reads: path, result, mark time.
-type UnlinkEntries = Vec<(PathBuf, inf_log::fs::sim::CallResult, Nanos)>;
+/// The disk's unlink entries a drain-pace run reads: path, result, mark time
+/// and the mark's phase (`None` unmarked).
+type UnlinkEntries =
+    Vec<(PathBuf, inf_log::fs::sim::CallResult, Nanos, Option<inf_log::fs::sim::DiskPhase>)>;
 
 fn drain_pace_run(armed: bool) -> (UnlinkEntries, Option<Nanos>, Vec<PathBuf>) {
     use inf_log::fs::sim::{DiskCall, DiskPhase};
@@ -2177,9 +2179,47 @@ fn drain_pace_run(armed: bool) -> (UnlinkEntries, Option<Nanos>, Vec<PathBuf>) {
         .logged_calls(0)
         .into_iter()
         .filter(|call| call.call == DiskCall::UnlinkTier)
-        .map(|call| (call.path, call.result, call.mark.map_or(Nanos(0), |mark| mark.at)))
+        .map(|call| {
+            let at = call.mark.map_or(Nanos(0), |mark| mark.at);
+            (call.path, call.result, at, call.mark.map(|mark| mark.phase))
+        })
         .collect();
     (entries, consumed_at, paths)
+}
+
+/// Every unlink of a drain-pace run is the worker's: its mark's phase.
+fn assert_worker_unlinks(entries: &UnlinkEntries, leg: &str) {
+    use inf_log::fs::sim::DiskPhase;
+    for (path, _, at, phase) in entries {
+        assert_eq!(
+            *phase,
+            Some(DiskPhase::Worker),
+            "UNLINK_ON_CELL: {leg}: {} unlinked at {at:?} under {phase:?}, not the worker's mark",
+            path.display()
+        );
+    }
+}
+
+/// The receipt waits for every job's result (ADR-0156 D3): with the worker
+/// held, a dropped namespace's three files go out as jobs and its catalog
+/// and lists empty, yet the owner stays Draining and no receipt names it;
+/// the worker's step returns the results, and the next MAINTAIN publishes
+/// the receipt.
+#[test]
+fn a_drained_namespaces_receipt_waits_for_its_jobs_out() {
+    let (mut cell, _ks, _paths) = retired_files(3);
+    cell.drop_ns(NsId(16));
+    for turn in 0..8u64 {
+        cell.maintain_draining(Nanos(turn), |_| true, |_| true);
+    }
+    assert_eq!(cell.retire_gauges().1, 3, "VACUOUS: the three files went out as jobs");
+    assert_eq!(cell.draining(), (1, 0), "RECEIPT_WITH_JOBS_OUT: the owner left with jobs out");
+    assert_ne!(cell.receipt_for(0), 16, "RECEIPT_WITH_JOBS_OUT: a receipt with jobs out");
+    cell.step_worker();
+    cell.maintain_draining(Nanos(8), |_| true, |_| true);
+    assert_eq!(cell.retire_gauges().1, 0, "every result consumed");
+    assert_eq!(cell.draining(), (0, 0), "the owner left once its results were consumed");
+    assert_eq!(cell.receipt_for(0), 16, "the receipt names the dropped namespace");
 }
 
 /// The drain's pace (ADR-0156 D3): a dropped namespace's retried file waits
@@ -2196,12 +2236,14 @@ fn a_retried_drain_file_waits_its_due_behind_the_rest() {
     use inf_log::fs::sim::CallResult;
     let (control, retry, _) = drain_pace_run(false);
     assert_eq!(control.len(), 9, "the control: nine unlinks");
-    assert!(control.iter().all(|(_, result, _)| *result == CallResult::Ok), "{control:?}");
+    assert!(control.iter().all(|(_, result, ..)| *result == CallResult::Ok), "{control:?}");
     assert!(retry.is_none(), "the control consumed no Retry");
+    assert_worker_unlinks(&control, "the control");
 
     let (entries, consumed_at, paths) = drain_pace_run(true);
+    assert_worker_unlinks(&entries, "the armed run");
     let point = CallResult::Injected(inf_log::fault::TIER_UNLINK_FAIL);
-    let failed = entries.iter().position(|(_, result, _)| *result == point);
+    let failed = entries.iter().position(|(_, result, ..)| *result == point);
     let failed = failed.expect("VACUOUS: no unlink met the armed point");
     let failed_path = entries[failed].0.clone();
     let consumed_at = consumed_at.expect("VACUOUS: no MAINTAIN consumed the Retry");
@@ -2215,7 +2257,7 @@ fn a_retried_drain_file_waits_its_due_behind_the_rest() {
     );
     let second =
         entries.iter().enumerate().skip(failed + 1).find(|(_, (path, ..))| *path == failed_path);
-    let Some((second, (_, result, at))) = second else {
+    let Some((second, (_, result, at, _))) = second else {
         panic!("RETRY_LOST: the failed file {} was never unlinked again", failed_path.display())
     };
     assert!(
