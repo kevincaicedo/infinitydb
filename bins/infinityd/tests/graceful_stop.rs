@@ -571,6 +571,7 @@ impl Drop for Watchdog {
 /// everysec sync (up to a second), then its swap's barriers; at 2 s the
 /// deadline sometimes fired inside that checkpoint, before the transport.
 /// 5 s leaves the checkpoint's bound and the box's load their margin.
+#[cfg(target_os = "linux")]
 const HELD_STOP_DEADLINE_MS: u64 = 5_000;
 
 /// A durable node whose `inf-control` thread is stopped alone: its stop

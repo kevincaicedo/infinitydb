@@ -20,7 +20,9 @@ use inf_foundation::fault::{self, FaultSpec};
 use inf_foundation::grants::{DirectoryWriter, GrantPos};
 use inf_log::fs::mem::{MemFile, MemFs};
 use inf_log::fs::sim::{SimDisk, SimFile};
-use inf_log::fs::{SegmentFile, SegmentFs, StdSegmentFile, StdSegmentFs, TierIoMode};
+use inf_log::fs::{SegmentFile, SegmentFs, TierIoMode};
+#[cfg(target_os = "linux")]
+use inf_log::fs::{StdSegmentFile, StdSegmentFs};
 use inf_log::{NsId, SealReason, TierFileMeta};
 use inf_store::LogicalAddr;
 
@@ -334,8 +336,10 @@ fn the_stop_releases_only_with_every_position_free() {
 /// A real file whose final close closes its descriptor, then reports
 /// `EIO` (Linux releases the number even on `EIO`): the close error over a
 /// native descriptor.
+#[cfg(target_os = "linux")]
 struct FailingClose(StdSegmentFile);
 
+#[cfg(target_os = "linux")]
 impl FinalClose for FailingClose {
     fn final_close(self) -> io::Result<()> {
         self.0.final_close()?;
@@ -343,6 +347,7 @@ impl FinalClose for FailingClose {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl SegmentFile for FailingClose {
     fn write_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
         self.0.write_at(offset, data)
@@ -368,9 +373,11 @@ impl SegmentFile for FailingClose {
 }
 
 /// The real filesystem, its files [`FailingClose`].
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy)]
 struct FailingCloseFs;
 
+#[cfg(target_os = "linux")]
 impl SegmentFs for FailingCloseFs {
     type File = FailingClose;
     type DirStream = <StdSegmentFs as SegmentFs>::DirStream;
@@ -411,6 +418,7 @@ impl SegmentFs for FailingCloseFs {
 }
 
 /// A fresh scratch directory of the test's own.
+#[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods, reason = "test-only: a real filesystem fixture")]
 fn scratch(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -494,12 +502,14 @@ fn sentinel_leg() {
 
 /// The control thread's receive side in the threaded leg: a real channel
 /// and the one-slot wake, each wait bounded by a failure deadline.
+#[cfg(target_os = "linux")]
 struct DeadlineInbox {
     rx: mpsc::Receiver<ControlMsg>,
     wake: mpsc::Receiver<()>,
     stop: Arc<AtomicBool>,
 }
 
+#[cfg(target_os = "linux")]
 impl WorkerInbox for DeadlineInbox {
     type Msg = ControlMsg;
 
