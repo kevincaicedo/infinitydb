@@ -5490,6 +5490,38 @@ for insn in 'callq\t*%rax' 'callq\t*8(%rax)' 'blr\tx8' 'notrack\tcallq\t*%rax'; 
     expect_red_because "waker: an indirect call '$insn' on the waker path is red" \
         "INDIRECT CALL on the waker path: waker_wake" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 done
+# The TLS resolver's call is a `blr` on aarch64 (the thread mark's read, ADR-0003 A1.6): in the
+# exact sequence each format emits it is the listed resolver; one instruction out of place and
+# the `blr` is an indirect call again.
+tsym=_ZN5probe4MARK17hE
+asm=$( { waker_body waker_wake "adrp\tx0, :tlsdesc:$tsym" "ldr\tx1, [x0, :tlsdesc_lo12:$tsym]" \
+             "add\tx0, x0, :tlsdesc_lo12:$tsym" ".tlsdesccall\t$tsym" 'blr\tx1' 'mrs\tx9, TPIDR_EL0' 'ret'
+         for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'ret'; done
+         waker_vtable; } | waker_asm waker-tlsdesc )
+expect green "waker: aarch64 ELF's TLS descriptor call scans green" \
+    env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+expect_output "waker: aarch64 ELF's TLS descriptor call is the listed TLS resolver" \
+    "listed callees (no body in this asm): tlsdesc" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+asm=$( { waker_body waker_wake ".tlsdesccall\t$tsym" 'mov\tx2, x1' 'blr\tx1' 'ret'
+         for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'ret'; done
+         waker_vtable; } | waker_asm waker-tlsdesc-apart )
+expect_red_because "waker: a \`blr\` not right after \`.tlsdesccall\` is an indirect call" \
+    "INDIRECT CALL on the waker path: waker_wake" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+macho_tlv() { # <the thunk call's register>: a Mach-O vtable whose waker_wake reads a thread-local
+    printf '\t.section\t__TEXT,__text,regular,pure_instructions\n\t.build_version macos, 15, 0\n'
+    macho_body waker_wake "adrp\tx0, _${tsym}@TLVPPAGE" "ldr\tx0, [x0, _${tsym}@TLVPPAGEOFF]" \
+        'ldr\tx9, [x0]' "blr\t$1" 'ldr\tx9, [x0]' 'ret'
+    for f in waker_clone waker_wake_by_ref waker_drop; do macho_body "$f" 'ret'; done
+    macho_vtable
+}
+asm=$(macho_tlv x9 | waker_asm waker-tlv)
+expect green "waker: Mach-O's thread-local thunk call scans green" \
+    env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+expect_output "waker: Mach-O's thread-local thunk call is the listed TLS resolver" \
+    "listed callees (no body in this asm): _tlv_get_addr" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
+asm=$(macho_tlv x8 | waker_asm waker-tlv-other)
+expect_red_because "waker: a Mach-O \`blr\` through a register the thunk load did not write is an indirect call" \
+    "INDIRECT CALL on the waker path: _waker_wake" env INF_WAKER_ASM="$asm" INF_WAKER_PROBE=off $WAKER
 asm=$( { waker_body waker_wake 'jmpq\t*%rax' 'callq\t*memcpy@GOTPCREL(%rip)' 'retq'
          for f in waker_clone waker_wake_by_ref waker_drop; do waker_body "$f" 'retq'; done
          waker_vtable; } | waker_asm waker-ijump )

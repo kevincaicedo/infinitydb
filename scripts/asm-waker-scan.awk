@@ -8,7 +8,7 @@
 #   ATOMIC <sym> <line> <mnemonic>   an atomic instruction inside a body,
 #                                    or the outline-atomics helper it calls
 #   CALL <sym> <line> <target>       a direct call or branch, conditional or not, leaving the
-#                                    body
+#                                    body, or the TLS resolver's `blr` (`tls_resolver`)
 #   INDIRECT <sym> <line> <call|jump>  an indirect branch inside a body
 #   UNREAD <sym> <line> <mnemonic>   a control transfer the scan has no edge rule for, or one
 #                                    behind a word the prefix table does not hold (`<word>+<m>`)
@@ -131,6 +131,27 @@ function cond_target(m, mi,   t) {
     return t
 }
 
+# The TLS resolver's call (the closed callee list's, ADR-0003 A1.6), which aarch64 spells as a
+# `blr`: read only in the exact sequence each format emits, so any other `blr` stays an indirect
+# call. ELF: `.tlsdesccall <sym>` (`tls` armed by the directive), then `blr`, the descriptor's
+# resolver, named `tlsdesc`. Mach-O: `ldr x0, [x0, <sym>@TLVPPAGEOFF]`, `ldr <xN>, [x0]`,
+# `blr <xN>`, the descriptor's thunk, dyld's `_tlv_get_addr`. Every other instruction disarms the
+# sequence. Returns the resolver for the `blr` that completes one, else "".
+function tls_resolver(m, mi,   st) {
+    st = tls
+    tls = ""
+    if (st == "desc" && m == "blr" && $(mi + 1) ~ /^x[0-9]+$/) return "tlsdesc"
+    if (st == "tlvp" && m == "ldr" && $(mi + 1) ~ /^x[0-9]+,$/ && $(mi + 2) == "[x0]") {
+        tls = "thunk"
+        tlvreg = $(mi + 1)
+        sub(/,$/, "", tlvreg)
+        return ""
+    }
+    if (st == "thunk" && m == "blr" && $(mi + 1) == tlvreg) return "_tlv_get_addr"
+    if (m == "ldr" && $(mi + 1) == "x0," && $(mi + 2) == "[x0," && $(mi + 3) ~ /@TLVPPAGEOFF\]$/) tls = "tlvp"
+    return ""
+}
+
 # A call returns to the body; a jump (a jump table, or a tail branch) does not.
 function is_call(m) {
     return m ~ /^(call|callq|calll|bl|blr)$/
@@ -171,6 +192,7 @@ inbody == 1 {
         inbody = 0
         next
     }
+    if ($1 == ".tlsdesccall") { tls = "desc"; next }
     # Directives and labels are not instructions.
     if ($0 ~ /^[[:space:]]*\./ || $0 ~ /^[^[:space:]]/ || $0 ~ /^[[:space:]]*#/ || $0 ~ /^[[:space:]]*$/) { next }
     instrs++
@@ -180,7 +202,9 @@ inbody == 1 {
     for (k = 1; k <= mi + 1; k++) {
         if (is_atomic($k)) { print "ATOMIC " cur " " NR " " $k; break }
     }
-    if (is_branch(m)) {
+    tgt = tls_resolver(m, mi)
+    if (tgt != "") { print "CALL " cur " " NR " " tgt }
+    else if (is_branch(m)) {
         tgt = $(mi + 1)
         # AT&T `*` marks an indirect operand (`callq *8(%rax)`, `jmpq
         # *.LJTI0_0(,%rax,8)`); `*sym@GOTPCREL(%rip)` is a direct call
@@ -227,6 +251,7 @@ $1 == ".cfi_startproc" && pending != "" {
     start = pline
     instrs = 0
     inbody = 1
+    tls = ""
     pending = ""
     next
 }

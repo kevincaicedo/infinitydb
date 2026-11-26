@@ -22,7 +22,8 @@
 #     below): the TLS resolver, `memcpy`/`memmove`/`memset`, a panic, abort or unwind entry, and
 #     the ready queue's growth (ADR-0003 A1.5's allocator exception, which leaves the list with
 #     the executor's intrusive ready list); the listed ones are printed on every run;
-#   * an indirect call on the owner lane is red (its target cannot be followed); indirect jumps
+#   * an indirect call on the owner lane is red (its target cannot be followed), except the TLS
+#     resolver's `blr` in the exact sequence aarch64 emits for it, a listed callee; indirect jumps
 #     are counted; a control transfer the scanner has no edge rule for is red (UNREAD);
 #   * it compiles a planted-bypass probe (`scripts/waker-atomics-probe`), whose three vtables
 #     and boundary module carry known verdicts, and asserts each one: a gate that cannot go red
@@ -63,10 +64,11 @@ trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
 # symbol's path ends `executor::foreign::<name>` (legacy or v0 mangling).
 BOUNDARY="clone wake wake_by_ref drop settle_held"
 # The closed callee list: a callee with no body in the asm that the owner lane may call. The TLS
-# resolver (ELF's `__tls_get_addr`; Mach-O's thread-local thunk), `memcpy`/`memmove`/`memset`, a
+# resolver (ELF's `__tls_get_addr`; aarch64 ELF's descriptor call, which the scanner names
+# `tlsdesc`; Mach-O's thread-local thunk), `memcpy`/`memmove`/`memset`, a
 # panic, abort or unwind entry, and the ready queue's growth (`VecDeque::grow`,
 # `RawVec::grow_one`): an ERE over the mangled symbol.
-CLOSED='^_*(_tls_get_addr|tls_get_addr|tlv_get_addr|tlv_bootstrap|memcpy|memmove|memset|Unwind_Resume|abort|rust_begin_unwind|rust_panic)$'
+CLOSED='^_*(_tls_get_addr|tls_get_addr|tlsdesc|tlv_get_addr|tlv_bootstrap|memcpy|memmove|memset|Unwind_Resume|abort|rust_begin_unwind|rust_panic)$'
 CLOSED="$CLOSED"'|4core9panicking|3std9panicking|4core4cell22panic_already_borrowed'
 CLOSED="$CLOSED"'|4core4cell30panic_already_mutably_borrowed|3std7process5abort'
 CLOSED="$CLOSED"'|4core6option13unwrap_failed|4core6option13expect_failed|4core6result13unwrap_failed'
