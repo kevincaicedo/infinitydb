@@ -197,7 +197,7 @@ pub enum LifetimesLeg {
     /// O7's leg: failed creates, before and after their file exists, once,
     /// on every attempt and under a drop.
     CreateFault,
-    /// §6's disk row: a live namespace's retired file failing its unlink
+    /// The disk row: a live namespace's retired file failing its unlink
     /// on every attempt keeps its bytes counted against the disk budget.
     Disk,
 }
@@ -1558,7 +1558,7 @@ fn disk_tier_bytes(run: &Run, cell: usize, id: u32) -> u64 {
         .sum()
 }
 
-/// §6's disk row (KF12's oracle), O6's points armed: a live namespace on
+/// The disk row (`RETIRE-CHARGE`), O6's points armed: a live namespace on
 /// cell 0 fills until its first tier file seals, every key is deleted, and
 /// checkpoints retire the dead file while `tier_unlink_fail` fails each of
 /// its unlinks. With the budget clamped to the sim disk's bytes of the
