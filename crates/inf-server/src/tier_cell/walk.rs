@@ -30,7 +30,7 @@
 
 use inf_foundation::grants::{GrantPos, POSITIONS, ReceiptWriter};
 use inf_foundation::time::Nanos;
-use inf_log::flush::ResidueState;
+use inf_log::flush::{ResidueAnswer, ResidueState};
 use inf_log::fs::SegmentFs;
 use inf_log::{NsId, TierFileMeta};
 use inf_runtime::{ColdReads, OwnerPhase, TierFileId, Timers};
@@ -82,7 +82,8 @@ impl TierQuiescence {
 struct Turn {
     visits: u32,
     offers: u32,
-    /// Owners and residues whose pin or due the turn read (F8's count).
+    /// Owners and residues whose pin or due the turn read, apart from the
+    /// charge.
     examined: u32,
 }
 
@@ -333,7 +334,8 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         q
     }
 
-    /// The owners and residues the last turn examined (F8's count).
+    /// The owners and residues the last turn examined, where a pin or a
+    /// due is read.
     #[cfg(test)]
     pub(crate) fn walk_examined(&self) -> u32 {
         self.examined
@@ -507,7 +509,7 @@ fn visit_residue<F: SegmentFs>(
     let meta = t.flush.take_residue(due.max(cx.now))?;
     if let Err((meta, _)) = cx.offer(t, JobKind::Residue, (meta, 0), None) {
         // Unreachable: the batch had room above. The slot holds it again.
-        t.flush.residue_retry(meta, cx.now);
+        t.flush.settle_residue(meta, ResidueAnswer::Retry, cx.now);
         return Some(Visited::End);
     }
     None
@@ -599,32 +601,25 @@ fn consume_result<F: SegmentFs>(
     if kind == JobKind::Retired {
         owner.out_bytes = owner.out_bytes.saturating_sub(meta.disk_bytes());
     }
-    let cause = match outcome {
-        RetireOutcome::Unlinked | RetireOutcome::AlreadyAbsent => {
-            stats.files_retired += 1;
-            if kind == JobKind::Residue {
-                owner.flush.residue_terminal();
-            }
-            return None;
-        }
-        RetireOutcome::Retry(cause) => cause,
-    };
-    if cause.transient() {
-        stats.errors_transient += 1;
-    } else {
-        stats.errors_operator += 1;
+    match outcome {
+        RetireOutcome::Unlinked | RetireOutcome::AlreadyAbsent => stats.files_retired += 1,
+        RetireOutcome::Retry(cause) if cause.transient() => stats.errors_transient += 1,
+        RetireOutcome::Retry(_) => stats.errors_operator += 1,
     }
     // Canary `inf_canary_unlink_result_ignored`: the cell drops the owner at
     // any result, so a file whose unlink failed is never retried.
-    if cfg!(inf_canary_unlink_result_ignored) {
-        if kind == JobKind::Residue {
-            owner.flush.residue_terminal();
-        }
-        return None;
-    }
+    let answer = if cfg!(inf_canary_unlink_result_ignored) {
+        ResidueAnswer::AlreadyAbsent
+    } else {
+        outcome.residue_answer()
+    };
     let due = Nanos(now.0.saturating_add(TIER_RETIRE_RETRY_NS.0));
-    match kind {
-        JobKind::Retired => {
+    match (kind, answer) {
+        // The slot settles through its one function of the answer: only a
+        // terminal one empties it (F17).
+        (JobKind::Residue, answer) => owner.flush.settle_residue(meta, answer, due),
+        (JobKind::Retired, ResidueAnswer::Unlinked | ResidueAnswer::AlreadyAbsent) => {}
+        (JobKind::Retired, ResidueAnswer::Retry) => {
             // Canary `inf_canary_retire_charge_released_on_retry`: the
             // retried owner's bytes leave the disk sum while its file stays.
             let bytes = if cfg!(inf_canary_retire_charge_released_on_retry) {
@@ -634,7 +629,9 @@ fn consume_result<F: SegmentFs>(
             };
             owner.retiring.push(RetiringFile { meta, handle: None, due, bytes });
         }
-        JobKind::Residue => owner.flush.residue_retry(meta, due),
+    }
+    if answer != ResidueAnswer::Retry {
+        return None;
     }
     *pending |= 1 << pos.index();
     Some(due)

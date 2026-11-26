@@ -467,7 +467,7 @@ pub(crate) struct TierCell<F: SegmentFs> {
     /// A consumed `Retry` asks the role to arm at `retry_due_last`.
     arm_wanted: bool,
     /// Owners and residues the last turn of the walk examined, where a pin
-    /// or a due is read (F8's count, apart from the charge).
+    /// or a due is read, apart from the charge.
     #[cfg(test)]
     examined: u32,
     /// The canary's dropped owners, parked aside with their positions and
@@ -1198,11 +1198,12 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         // its flush work from here rides the driver (ADR-0084 D1).
         owner.flush.set_drive(TierDrive::Reactor);
         owner.files = files;
-        // A failed create at boot left its file in the recovered pipeline's
-        // residue slot: the walk retires it.
-        if !matches!(owner.flush.residue(), inf_log::flush::ResidueState::Empty) {
-            self.pending |= 1 << permit.pos.index();
-        }
+        // A boot whose create fails refuses before any install (the demote
+        // step's typed refusal), so a recovered pipeline owns no residue.
+        debug_assert!(
+            matches!(owner.flush.residue(), inf_log::flush::ResidueState::Empty),
+            "a recovered pipeline holds no failed create's file"
+        );
         self.place(owner);
     }
 

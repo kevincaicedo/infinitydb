@@ -215,6 +215,18 @@ pub enum RetireOutcome {
     Retry(RetryCause),
 }
 
+impl RetireOutcome {
+    /// The answer as a residue slot reads it: each outcome its one answer.
+    #[must_use]
+    pub fn residue_answer(self) -> inf_log::flush::ResidueAnswer {
+        match self {
+            RetireOutcome::Unlinked => inf_log::flush::ResidueAnswer::Unlinked,
+            RetireOutcome::AlreadyAbsent => inf_log::flush::ResidueAnswer::AlreadyAbsent,
+            RetireOutcome::Retry(_) => inf_log::flush::ResidueAnswer::Retry,
+        }
+    }
+}
+
 /// The failed step of a `Retry`, with its error's kind and OS errno (none
 /// for an injected point).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
