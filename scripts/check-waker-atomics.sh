@@ -233,7 +233,7 @@ while read -r _ name _ n _ rest; do
     count=0
     for _a in $rest; do count=$((count + 1)); done
     boundary_seen="$boundary_seen $name ($n instructions, $count atomics),"
-done < <(grep '^BOUNDARY ' "$work/verdict" | sort -u -k2,2)
+done < <(grep '^BOUNDARY ' "$work/verdict" | LC_ALL=C sort -u -k2,2)
 boundary_seen=${boundary_seen%,}
 live="checked"
 if [ -n "${INF_WAKER_ASM:-}" ] && [ "${INF_WAKER_LIVE:-on}" = off ]; then
@@ -273,9 +273,9 @@ while read -r _ path sym; do
     echo "  $sym has no body in this asm and is no entry of the closed callee list"
     fail=1
 done < <(grep '^UNLISTED ' "$work/verdict")
-{ grep -E '^(LISTED|UNLISTED) ' "$work/verdict" || true; } | awk '{print $3}' | sort -u >"$work/unres"
+{ grep -E '^(LISTED|UNLISTED) ' "$work/verdict" || true; } | awk '{print $3}' | LC_ALL=C sort -u >"$work/unres"
 unresolved=$(wc -l <"$work/unres" | tr -d ' ')
-{ grep '^LISTED ' "$work/verdict" || true; } | awk '{print $3}' | sort -u >"$work/listed"
+{ grep '^LISTED ' "$work/verdict" || true; } | awk '{print $3}' | LC_ALL=C sort -u >"$work/listed"
 if [ -s "$work/listed" ]; then
     echo "  listed callees (no body in this asm): $(tr '\n' ' ' <"$work/listed")"
 fi
