@@ -207,6 +207,11 @@ impl<F: SegmentFs + Clone> TierCell<F> {
     pub(super) fn consume_results(&mut self, now: Nanos) -> u32 {
         let TierCell { positions, grants, retire_stats, pending, .. } = self;
         let Some(grants) = grants.as_mut() else { return 0 };
+        // With no job out no result can wait: the turn reads only cell-local
+        // words, never the result ring's shared index.
+        if grants.part.jobs_out() == 0 {
+            return 0;
+        }
         let mut due_last = None;
         let (taken, stale) = grants.part.consume(|consumed| {
             if let Some(due) = consume_result(positions, retire_stats, pending, consumed, now) {
