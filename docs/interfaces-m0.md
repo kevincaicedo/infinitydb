@@ -646,6 +646,18 @@ pub struct GroupScheduler;  // deficit-weighted, burst-capped; refill/budget/cha
 > implemented shape: these additions are not built, and they bound no
 > retained reply's bytes.
 
+> **ADR-0212 (2026-11-26), implementation open:** ADR-0212 supersedes
+> ADR-0150 whole and restates the note above, with these additions.
+> `StreamReady` also carries `measured:u8` and `length:u64`: the stream's
+> whole encoded length, when its producer measured it before the first
+> byte. `StreamResult` gains result `3`, `Released`: the producer's own
+> end of a read stream. A progress token comes from one `u64` counter a
+> directed pair and is never reused. `MeshConfig` gains
+> `progress_credits`, at least 1, and a ring needs `ring_capacity ≥ 2 ×
+> (data_credits + progress_credits)`: 16 in the shipped mesh, 1 at the
+> default. A reply of at most one chunk travels inline and a larger one
+> streams (ADR-0212 D3, D4). Not built.
+
 > **ADR-0190 (2026-10-29):** `Outcome` has
 > `ErrorReply(&'a [u8])`, outcome tag 7, encoded as `Bytes` is: a leg's
 > reply whose outcome is `Error`. `Bytes` keeps tag 1 and carries only a
@@ -1047,6 +1059,14 @@ impl SlotRouter {
 > cancellation acknowledgement (ADR-0150 D1, D2, D4, D5). These
 > replacements are not built; the sketches below are the implemented
 > execution and observer interfaces.
+
+> **ADR-0212 (2026-11-26), implementation open:** ADR-0212 supersedes
+> ADR-0150 whole and restates the note above. A command reserves its
+> reply's room in its connection's reply account before its first effect,
+> one receiver of one chunk for each reply that is not a fixed shape, and
+> stays unexecuted while that does not fit. A cap may release the stream
+> of a read-only command; it never releases the reply of a command that
+> is not read-only (ADR-0212 D1, D2, D8, D9). Not built.
 
 > **ADR-0190 (2026-10-29):** `execute` and
 > `execute_slices` take `out: &mut ReplyBuf` in place of
