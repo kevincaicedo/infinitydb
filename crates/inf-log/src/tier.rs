@@ -566,6 +566,14 @@ impl<F: SegmentFs> VerifiedTier<F> {
 }
 
 impl<F: SegmentFs> TierWriter<F> {
+    /// The writer's file handle, the writer ending here: nothing is synced
+    /// or closed, so its one close is the new owner's (a dropped
+    /// namespace's active file, retired by its final close, ADR-0156 D3).
+    #[must_use]
+    pub fn into_file(self) -> F::File {
+        self.file
+    }
+
     /// Creates `shard_dir/cold/tier-NNNNNN.itier` in `mode` with its
     /// header block and dir-fsync barriers (a file must exist durably
     /// before anything refers to it — the segment-create rule).

@@ -925,6 +925,25 @@ impl DiskState {
     /// commit (ADR-0020 D6 resurrection), no open handle. A removed or
     /// clobbered file otherwise keeps its full image for the life of the
     /// sim.
+    /// Removes the name `path`: its directory's journal queues the op for
+    /// its barrier, and the inode goes once no name or handle holds it.
+    fn remove_name(&mut self, path: &Path) -> io::Result<()> {
+        self.tick_op()?;
+        let Some(ino) = self.os_names.remove(path) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no file {}", path.display()),
+            ));
+        };
+        let parent = parent_dir(path);
+        self.pending_meta
+            .entry(parent)
+            .or_default()
+            .push(MetaOp::Remove { name: path.to_path_buf() });
+        self.release_if_orphan(ino);
+        Ok(())
+    }
+
     fn release_if_orphan(&mut self, ino: u64) {
         let named = self.os_names.values().any(|&i| i == ino)
             || self.durable_names.values().any(|&i| i == ino);
@@ -2106,22 +2125,25 @@ impl SegmentFs for SimDisk {
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
+        self.state.borrow_mut().remove_name(path)
+    }
+
+    /// A retired tier file's unlink (ADR-0156 D3): `tier_unlink_fail` fires
+    /// here, under the disk's own borrow, before the name is touched, and
+    /// the call log records every attempt with its result, so an oracle
+    /// anchors on the disk's entry, never on the caller's report.
+    fn unlink_tier(&self, path: &Path) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
-        state.tick_op()?;
-        let Some(ino) = state.os_names.remove(path) else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no file {}", path.display()),
-            ));
+        let (result, logged) = if inf_foundation::fault::fire(crate::fault::TIER_UNLINK_FAIL) {
+            let point = crate::fault::TIER_UNLINK_FAIL;
+            (Err(crate::fault::injected(point)), CallResult::Injected(point))
+        } else {
+            let removed = state.remove_name(path);
+            let logged = CallResult::of(&removed);
+            (removed, logged)
         };
-        let parent = parent_dir(path);
-        state
-            .pending_meta
-            .entry(parent)
-            .or_default()
-            .push(MetaOp::Remove { name: path.to_path_buf() });
-        state.release_if_orphan(ino);
-        Ok(())
+        state.calls.record(DiskCall::UnlinkTier, path, logged);
+        result
     }
 }
 

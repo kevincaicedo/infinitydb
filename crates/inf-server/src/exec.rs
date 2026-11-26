@@ -172,6 +172,16 @@ pub struct NodeState {
     /// Render-only, cell scope.
     pub tier_ns_positions: Cell<u64>,
     pub tier_position_conflicts: Cell<u64>,
+    /// The cell's tier-file retirement (ADR-0156 D3): its jobs out (a gauge,
+    /// 0–8: at 8 its offers wait), the files whose terminal result it
+    /// consumed, the `Retry` results it consumed by errno class, and the
+    /// results whose owner it could not find (zero on a correct build).
+    /// Render-only, cell scope.
+    pub tier_retire_jobs_out: Cell<u64>,
+    pub tier_files_retired: Cell<u64>,
+    pub tier_retire_errors_transient: Cell<u64>,
+    pub tier_retire_errors_operator: Cell<u64>,
+    pub tier_retire_results_stale: Cell<u64>,
     /// Namespaces a MAINTAIN pass left for a later one because their task
     /// class had no room (ADR-0177 D2's `compact` and `shadow` crossing,
     /// counted at the room): at the shipped caps reached only while a
@@ -485,6 +495,9 @@ pub struct NodeState {
     /// `INFO persistence` reads as it renders (`None` with no control
     /// plane: every one renders 0).
     pub ddl_gauges: RefCell<Option<std::sync::Arc<crate::control::DdlGauges>>>,
+    /// The node's retirement board (ADR-0156 D3), whose worker counters
+    /// `INFO` reads as it renders (`None` with no control plane: 0).
+    pub retire_board: RefCell<Option<std::sync::Arc<inf_foundation::grants::RetireBoard>>>,
     /// M2-S21: windowed rates (previous everysec-tick window) + fsync
     /// latency percentiles (µs) + checkpoint age (s).
     pub fsyncs_per_sec: Cell<u64>,

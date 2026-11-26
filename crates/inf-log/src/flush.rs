@@ -647,11 +647,12 @@ impl<F: SegmentFs> TierFlush<F> {
 
     /// Takes the catalog's last file out of a dropped namespace's pipeline
     /// (ADR-0148 D3), one at a time from its end: the active file, then the
-    /// staged seals, then the sealed files, last first. The
-    /// active file's and a staged seal's handles close as they leave; a
-    /// sealed file's handle is its owner's. Only once no round is staged,
+    /// staged seals, then the sealed files, last first. The active file's
+    /// and a staged seal's handles leave with their metas, unclosed, for
+    /// their retirement's one final close (ADR-0156 D3); a sealed file's
+    /// handle is its owner's (`None` here). Only once no round is staged,
     /// whose ops may name these files. O(1) a file, no clone.
-    pub fn pop_catalog_end(&mut self) -> Option<TierFileMeta> {
+    pub fn pop_catalog_end(&mut self) -> Option<(TierFileMeta, Option<F::File>)> {
         debug_assert!(!self.round_active(), "a dropped pipeline's round is finished first");
         if let Some(writer) = self.writer.take() {
             let meta = TierFileMeta {
@@ -661,15 +662,14 @@ impl<F: SegmentFs> TierFlush<F> {
                 reason: SealReason::Shutdown,
                 path: writer.path().to_path_buf(),
             };
-            drop(writer);
-            return Some(meta);
+            return Some((meta, Some(writer.into_file())));
         }
         if let Some(seal) = self.pending_seals.pop_front() {
             let PendingSeal { id, base, data_len, path, file, .. } = seal;
-            drop(file);
-            return Some(TierFileMeta { id, base, data_len, reason: SealReason::Shutdown, path });
+            let meta = TierFileMeta { id, base, data_len, reason: SealReason::Shutdown, path };
+            return Some((meta, Some(file)));
         }
-        self.sealed.pop()
+        self.sealed.pop().map(|meta| (meta, None))
     }
 
     /// Seals staged in the in-flight round, not yet committed — the
@@ -1372,10 +1372,11 @@ fn locate_held<F: SegmentFs>(
 }
 
 /// Unlinks a retired tier file (M4-S15, ADR-0059 D3) — the last step of
-/// the retirement pipeline, executed by the plane only after the
-/// covering MANIFEST swap landed **and** the file's read pins drained
-/// (`ColdReads::inflight_on == 0`). Routed through [`SegmentFs`] so DST
-/// faults it like every other file operation.
+/// the retirement pipeline, executed only after the covering MANIFEST swap
+/// landed **and** the file's read pins drained (`ColdReads::inflight_on ==
+/// 0`). It is [`SegmentFs::unlink_tier`], where `tier_unlink_fail` fires,
+/// so DST faults it like every other file operation and the simulated disk
+/// logs each attempt.
 ///
 /// # Errors
 /// The fs error, **non-fatal by design** (the one deliberate exception
@@ -1384,10 +1385,7 @@ fn locate_held<F: SegmentFs>(
 /// durability — the caller counts it and retries, and the boot GC
 /// re-drives it after any crash (both idempotent).
 pub fn unlink_tier_file<F: SegmentFs>(fs: &F, meta: &TierFileMeta) -> std::io::Result<()> {
-    if inf_foundation::fault::fire(crate::fault::TIER_UNLINK_FAIL) {
-        return Err(crate::fault::injected(crate::fault::TIER_UNLINK_FAIL));
-    }
-    fs.remove_file(&meta.path)
+    fs.unlink_tier(&meta.path)
 }
 
 #[cfg(test)]

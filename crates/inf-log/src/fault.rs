@@ -53,9 +53,10 @@
 //!   table — `EIO`, Linux's order: the number is released, then the error reported. The final
 //!   close of a retiring tier file's handle (ADR-0156 D3) reports it and never closes again; the
 //!   disk logs the close with the point's name. It fires in the simulated disk only
-//! - `tier_unlink_fail` — `flush::unlink_tier_file` — typed I/O error, **non-fatal and counted**
-//!   (M4-S15, ADR-0059 D3): the durable truth already excludes the file — space is deferred, never
-//!   durability; the retry and the boot GC both re-drive it
+//! - `tier_unlink_fail` — `SegmentFs::unlink_tier`, the trait's default and inside the simulated
+//!   disk's own call, which logs the attempt — typed I/O error with no OS errno, **non-fatal and
+//!   counted** (M4-S15, ADR-0059 D3): the durable truth already excludes the file — space is
+//!   deferred, never durability; the owner's paced retry and the boot GC both re-drive it
 //! - `blob_short_write` — `blob::device_write` — extent write cut short, typed I/O error — the
 //!   append fails whole and the extent is abandoned (M4-S17, ADR-0061 D9)
 //! - `blob_fsync_err` — `ExtentWriter::finish` — typed

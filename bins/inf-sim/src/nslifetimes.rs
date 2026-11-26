@@ -20,19 +20,23 @@
 //! 3. the pinned cycle: a flushed namespace dropped while cold reads on its
 //!    tier file are held at the device and its flush round on a peer holds
 //!    its barrier there, its first unlink failing; the same successor;
-//! 4. the churn: `CHURN` cycles, each dropping the namespace the last one
+//! 4. the held-worker cycle: a flushed namespace dropped with the control
+//!    thread's retirement worker held, its tier files out as jobs; its
+//!    successor refused while they are out, and again while the worker
+//!    runs with every unlink failing; accepted once they succeed;
+//! 5. the churn: `CHURN` cycles, each dropping the namespace the last one
 //!    created (every `CHURN_BLOB_EVERY`th with blob writes in flight on
 //!    every cell) and creating its successor, retried while refused;
-//! 5. the disconnects at 63 grants: a tiered `CREATE` whose client closes
+//! 6. the disconnects at 63 grants: a tiered `CREATE` whose client closes
 //!    once its persist request is queued with the writer held, and one
 //!    whose client closes while a peer is frozen with its leg unapplied;
 //!    each alone (the namespace on every cell, also after the cut) and with
 //!    a peer's leg refused (on none, also after the cut);
-//! 6. the peer refusal at 63 grants: rolled back on every cell, the node's
+//! 7. the peer refusal at 63 grants: rolled back on every cell, the node's
 //!    `ns_drop_tombstones` one above its settled value from the rollback
 //!    until the tombstone retires; the next `CREATE` is accepted once every
 //!    receipt is in, its id the last `+OK`'s + 2;
-//! 7. a power cut and a reboot: every live name served on every cell, the
+//! 8. a power cut and a reboot: every live name served on every cell, the
 //!    refused ones on none, a drop and a `CREATE` taking the next id.
 //!
 //! The `control` leg: 63 tiered `CREATE`s flushed on cell 0 and no churn,
@@ -46,7 +50,9 @@
 //! closed descriptor; `IDS`: each `+OK` `CREATE`'s id (`INF.NS INFO`) is the
 //! last committed + 1, a rolled-back one committing one; `REPLY`: every
 //! `CREATE` answers `+OK`, the taken-name error, a tiered or a catalog
-//! capacity line, never an internal error. Each engagement clause the run
+//! capacity line, never an internal error; `HELD-WORKER`: the held-worker
+//! cycle's successor answers `+OK` only once no tier file of the dropped
+//! namespace is left on the disk. Each engagement clause the run
 //! must meet is `VACUOUS` when missed (`engagement`).
 
 use std::collections::BTreeMap;
@@ -79,6 +85,9 @@ const RETRY_GAP_STEPS: u32 = 4;
 /// A held cycle's tiered `CREATE` attempts while its holds last: each is
 /// refused on a node whose grant waits for every owner to end.
 const HELD_TRIES: u32 = 6;
+/// Steps the held-worker cycle runs its worker with every unlink failing:
+/// each a millisecond at most, so each file is tried again many times.
+const EVERY_ATTEMPT_STEPS: u32 = 32;
 /// Blob writes in flight on each cell at a churn drop.
 const BLOBS_PER_CELL: usize = 4;
 /// A blob value: above the 4 KiB `BLOB-THRESHOLD`.
@@ -200,6 +209,11 @@ pub struct NsLifetimesReport {
     pub rounds_held_across_drop: u64,
     /// Tier unlinks the injected failure refused.
     pub unlink_failures: u64,
+    /// `DROP`s answered with the retirement worker held and a tier file of
+    /// the namespace out as a job.
+    pub jobs_held_across_drop: u64,
+    /// Unlinks refused while every attempt failed (the held-worker cycle).
+    pub unlink_every_attempt: u64,
     pub churn_cycles: u64,
     /// Disconnects whose client closed with its program still running.
     pub disconnects: u64,
@@ -233,6 +247,9 @@ struct Run {
     refused: Vec<Vec<u8>>,
     /// The next key ordinal: every key of the run is a fresh name.
     next_key: u64,
+    /// The drop clause (ADR-0156 D3): every dropped namespace's tier-file
+    /// unlink after its `+OK` is the worker's.
+    drops: crate::harness::drop_clause::DropClause,
 }
 
 /// A blob extent file, by its name.
@@ -272,6 +289,9 @@ impl Run {
         self.node
             .step(&mut self.rng, &self.clock, &self.disk, self.step_ns_max)
             .map_err(|e| format!("step failed: {e}"))?;
+        for breach in self.drops.judge(&self.disk) {
+            self.fail(breach);
+        }
         let bound = self.report.leg.bound();
         for (shard, dirs) in self.disk.open_ns_dirs() {
             self.report.open_dirs_max = self.report.open_dirs_max.max(dirs);
@@ -330,6 +350,23 @@ impl Run {
     /// `ns-<id>` directories holding an open file under `cell`'s shard.
     fn dirs_on(&self, cell: usize) -> usize {
         self.disk.open_ns_dirs().get(&format!("shard-{cell}")).copied().unwrap_or(0)
+    }
+
+    /// The tier-file jobs out on every cell, read from the cells' parts.
+    fn retire_jobs_out(&self) -> u64 {
+        (0..usize::from(self.report.cells))
+            .map(|cell| self.node.plane(cell).tier_retire_jobs_out_for_sim())
+            .sum()
+    }
+
+    /// Tier files of namespace `id` the disk still names.
+    fn tier_files_of(&self, id: u32) -> usize {
+        let dir = format!("ns-{id}");
+        let named = self.disk.names_where(is_tier_file);
+        named
+            .iter()
+            .filter(|path| path.components().any(|part| part.as_os_str() == dir.as_str()))
+            .count()
     }
 
     /// The syncs and the reads `cell`'s device holds now.
@@ -515,9 +552,13 @@ impl Run {
 
     /// `INF.NS DROP name`, answered `+OK`.
     fn drop_ns(&mut self, client: &mut MiniClient, name: &[u8]) -> Result<(), String> {
+        let id = self.node.plane(0).keyspace().ns_get(name).map(|spec| spec.id.0);
         let reply = self.call(client, &[b"INF.NS", b"DROP", name])?;
         if reply != OK {
             return Err(format!("DROP {} answered {reply:?}", String::from_utf8_lossy(name)));
+        }
+        if let Some(id) = id {
+            self.drops.note_drop(id, self.clock.now());
         }
         self.live.remove(name);
         Ok(())
@@ -725,6 +766,73 @@ fn pinned_cycle(
     Ok(())
 }
 
+/// Phase 4, the held-worker cycle: `victim`, flushed on cell 0, is dropped
+/// with the control thread's retirement worker held, so its tier files go
+/// out as jobs and stay out; its successor's tiered `CREATE` is refused
+/// while they are out (the receipt waits for every job's result). The
+/// worker then runs with every unlink failing for `EVERY_ATTEMPT_STEPS`
+/// steps, each file retried and never removed, the successor still
+/// refused; then the unlinks succeed and the successor is accepted and
+/// flushed. An accepted successor while a file of the dropped namespace is
+/// on the disk is `HELD-WORKER`; flushed beside the files the held worker
+/// keeps open, it also crosses `LIFETIMES`.
+fn held_worker_cycle(
+    run: &mut Run,
+    admin: &mut MiniClient,
+    victim: &[u8],
+    successor: &[u8],
+) -> Result<(), String> {
+    let id = run.node.plane(0).keyspace().ns_get(victim).map(|spec| spec.id.0);
+    let id = id.ok_or_else(|| "the held-worker cycle's victim is not live".to_string())?;
+    run.node.hold_retire = u64::MAX;
+    run.drop_ns(admin, victim)?;
+    run.step_until("a dropped namespace's tier file out as a job", |run| {
+        run.retire_jobs_out() > 0
+    })?;
+    run.report.jobs_held_across_drop += 1;
+    for _ in 0..HELD_TRIES {
+        let reply = run.create(admin, successor)?;
+        if reply == OK {
+            held_worker_accepted(run, id, "with the worker held");
+            let flushed = run.flush_on_cell_0(successor);
+            run.node.hold_retire = 0;
+            return flushed;
+        }
+        if reply != BUSY {
+            return Err(format!("a held-worker cycle's CREATE answered {reply:?}"));
+        }
+        run.report.refused_busy += 1;
+        run.idle(RETRY_GAP_STEPS)?;
+    }
+    let before = inf_foundation::fault::fired(inf_log::fault::TIER_UNLINK_FAIL);
+    inf_foundation::fault::arm(inf_log::fault::TIER_UNLINK_FAIL, FaultSpec::Always);
+    run.node.hold_retire = 0;
+    let reply = run.idle(EVERY_ATTEMPT_STEPS).and_then(|()| run.create(admin, successor));
+    let failed = inf_foundation::fault::fired(inf_log::fault::TIER_UNLINK_FAIL) - before;
+    inf_foundation::fault::disarm(inf_log::fault::TIER_UNLINK_FAIL);
+    run.report.unlink_every_attempt += failed;
+    run.report.unlink_failures += failed;
+    match reply? {
+        reply if reply == OK => held_worker_accepted(run, id, "with every unlink failing"),
+        reply if reply == BUSY => run.report.refused_busy += 1,
+        reply => return Err(format!("a failing-unlink CREATE answered {reply:?}")),
+    }
+    run.create_until_ok(admin, successor)?;
+    run.flush_on_cell_0(successor)
+}
+
+/// The held-worker cycle's successor answered `+OK`: a breach while the
+/// disk still names a tier file of the dropped namespace `id`.
+fn held_worker_accepted(run: &mut Run, id: u32, while_: &str) {
+    let left = run.tier_files_of(id);
+    if left > 0 {
+        run.fail(format!(
+            "HELD-WORKER: the successor's CREATE answered +OK {while_}, {left} tier files of \
+             dropped namespace {id} still on the disk"
+        ));
+    }
+}
+
 /// Blob writes in flight on `ns` on every cell: their extent barriers hold
 /// its owners at a drop. The writers, their replies unread.
 fn blob_writes(run: &mut Run, ns: &[u8], cycle: u32) -> Result<Vec<MiniClient>, String> {
@@ -741,7 +849,7 @@ fn blob_writes(run: &mut Run, ns: &[u8], cycle: u32) -> Result<Vec<MiniClient>, 
     Ok(writers)
 }
 
-/// Phase 4: each cycle drops `victim` (every `CHURN_BLOB_EVERY`th with blob
+/// Phase 5: each cycle drops `victim` (every `CHURN_BLOB_EVERY`th with blob
 /// writes in flight on every cell), then creates its successor, retried
 /// while refused. Returns the last namespace created.
 fn churn(run: &mut Run, admin: &mut MiniClient, mut victim: Vec<u8>) -> Result<Vec<u8>, String> {
@@ -832,7 +940,7 @@ fn disconnect(
     Ok(())
 }
 
-/// Phase 5: the four disconnects at 63 grants. After each, the node is back
+/// Phase 6: the four disconnects at 63 grants. After each, the node is back
 /// at 63 with every receipt in: an accepted one drops the lowest `t`
 /// namespace; a refused one's grant returns through a probe's `CREATE`.
 fn disconnects(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
@@ -906,7 +1014,7 @@ fn tombstones_to(
     Err(format!("ns_drop_tombstones never read {want}"))
 }
 
-/// Phase 6: the peer refusal at 63 grants, with the tombstone count settled
+/// Phase 7: the peer refusal at 63 grants, with the tombstone count settled
 /// first.
 fn peer_refusal(run: &mut Run, admin: &mut MiniClient) -> Result<(), String> {
     let rounds = tombstones_to(run, admin, 0, u64::MAX, 0)?;
@@ -961,6 +1069,7 @@ fn run_observed(seed: u64, leg: LifetimesLeg, observer: TraceObserver) -> NsLife
         live: BTreeMap::new(),
         refused: Vec::new(),
         next_key: 0,
+        drops: crate::harness::drop_clause::DropClause::default(),
     };
     if let Err(err) = phases(&mut run) {
         run.fail(err);
@@ -974,7 +1083,7 @@ fn run_observed(seed: u64, leg: LifetimesLeg, observer: TraceObserver) -> NsLife
 }
 
 /// The cut and the reboot: the old node is gone before the disk is cut;
-/// then phase 7 and the engagement verdict.
+/// then phase 8 and the engagement verdict.
 fn reboot(
     run: Run,
     scenario: &DurableScenario,
@@ -993,6 +1102,7 @@ fn reboot(
         live,
         refused,
         next_key,
+        drops,
     } = run;
     drop(node);
     observer.power_cut(&disk, run_clock.now(), seed ^ 0x11FE_0C07);
@@ -1015,6 +1125,7 @@ fn reboot(
         live,
         refused,
         next_key,
+        drops,
     };
     if let Err(err) = after_cut(&mut run) {
         run.fail(err);
@@ -1046,6 +1157,8 @@ fn empty_report(cells: u16, leg: LifetimesLeg) -> NsLifetimesReport {
         cold_reads_across_drop: 0,
         rounds_held_across_drop: 0,
         unlink_failures: 0,
+        jobs_held_across_drop: 0,
+        unlink_every_attempt: 0,
         churn_cycles: 0,
         disconnects: 0,
         refused_leg: 0,
@@ -1054,7 +1167,7 @@ fn empty_report(cells: u16, leg: LifetimesLeg) -> NsLifetimesReport {
     }
 }
 
-/// Phases 1–6 on one life (the control leg: phase 1 alone).
+/// Phases 1–7 on one life (the control leg: phase 1 alone).
 fn phases(run: &mut Run) -> Result<(), String> {
     run.recover()?;
     let mut admin = MiniClient::connect(&mut run.node, 0);
@@ -1064,7 +1177,8 @@ fn phases(run: &mut Run) -> Result<(), String> {
     }
     extent_cycle(run, &mut admin, b"t00", b"n00")?;
     pinned_cycle(run, &mut admin, b"t01", b"n01")?;
-    let last = churn(run, &mut admin, b"n01".to_vec())?;
+    held_worker_cycle(run, &mut admin, b"t02", b"n02")?;
+    let last = churn(run, &mut admin, b"n02".to_vec())?;
     run.drop_ns(&mut admin, &last)?;
     run.wait_positions(LIFETIMES as u64 - 1)?;
     disconnects(run, &mut admin)?;
@@ -1086,7 +1200,7 @@ fn control_checks(run: &mut Run) {
     }
 }
 
-/// Phase 7, after the cut: every live name on every cell, the refused ones
+/// Phase 8, after the cut: every live name on every cell, the refused ones
 /// on none, and a `CREATE` after a drop taking the next id.
 fn after_cut(run: &mut Run) -> Result<(), String> {
     run.recover()?;
@@ -1125,12 +1239,17 @@ fn engagement(run: &mut Run) {
         (r.cold_reads_across_drop > 0, "cold reads were held across a DROP"),
         (r.rounds_held_across_drop > 0, "a peer's flush round was held across a DROP"),
         (r.unlink_failures > 0, "a drained tier file's unlink failed"),
+        (r.jobs_held_across_drop > 0, "a DROP answered with its tier files held out as jobs"),
+        (r.unlink_every_attempt > 1, "a drained tier file's every attempt failed"),
         (r.churn_cycles == u64::from(CHURN), "the churn ran every cycle"),
         (r.disconnects == 4, "every disconnect closed with its program running"),
     ];
     let missed: Vec<&str> = clauses.iter().filter(|(met, _)| !met).map(|(_, what)| *what).collect();
     for what in missed {
         run.fail(format!("VACUOUS: not met: {what}"));
+    }
+    if let Some(vacuous) = run.drops.engagement() {
+        run.fail(vacuous);
     }
 }
 

@@ -39,6 +39,9 @@ Invariants:
   takes an `OwnedFd`, ends its ownership with `into_raw_fd` and closes the
   number once with `close(2)`; the number is consumed on every return, so
   no second close of it exists (ADR-0156 D3's final close).
+  `close_number_planted` is that second close, compiled only into the
+  `inf_canary_retire_close_twice` build: a planted violation for the
+  retirement worker's oracle, never in any other build.
 
 ## 1b. Stable byte ranges (`driver.rs::StableBytes`)
 

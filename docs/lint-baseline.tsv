@@ -60,7 +60,6 @@ fn_length	1	crates/inf-runtime/src/reactor.rs
 fn_length	2	crates/inf-runtime/src/uring.rs
 fn_length	2	crates/inf-server/src/admin.rs
 fn_length	1	crates/inf-server/src/ckpt.rs
-fn_length	1	crates/inf-server/src/control.rs
 fn_length	2	crates/inf-server/src/durable/ckpt.rs
 fn_length	3	crates/inf-server/src/durable.rs
 fn_length	2	crates/inf-server/src/exec.rs

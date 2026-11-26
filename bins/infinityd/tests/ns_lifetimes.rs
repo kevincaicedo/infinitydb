@@ -33,9 +33,9 @@
 //! readiness is a `DBSIZE` answer, a refusal is the exit.
 #![cfg(target_os = "linux")]
 
-// nextest-stall-default: each tiered namespace here is created, refused or
-// booted from a seeded catalog, and none is written: no write reaches a
-// window (ADR-0053 D4), so the stall bound is never read.
+// The one written tiered namespace states its `TAIL-STALL-TIMEOUT`; every
+// other one is created, refused or booted from a seeded catalog and never
+// written, so its window's stall bound is never read.
 
 #[path = "support/node.rs"]
 mod node;
@@ -419,4 +419,125 @@ fn a_boot_serves_at_most_sixty_four_live_tiered_definitions() {
         stderr.contains("namespace id 20 is at or above the catalog's next id 18"),
         "the refusal names the id and the counter: {stderr}"
     );
+}
+
+/// The written namespace's tail-stall bound: a hang bound, the test's own.
+const TAIL_STALL_TIMEOUT_MS: &[u8] = b"60000";
+
+/// The `.itier` files of namespace `id` on every shard of `dir`.
+fn tier_files(dir: &Path, id: u32) -> usize {
+    let Ok(shards) = std::fs::read_dir(dir) else { return 0 };
+    shards
+        .flatten()
+        .filter_map(|shard| std::fs::read_dir(shard.path().join(format!("ns-{id}/cold"))).ok())
+        .flat_map(|cold| cold.flatten())
+        .filter(|file| file.path().extension().is_some_and(|ext| ext == "itier"))
+        .count()
+}
+
+/// `field` of `INFO section`'s reply on `c`, as a number.
+fn info_field(c: &mut TcpStream, section: &[u8], field: &str) -> u64 {
+    c.write_all(&resp(&[b"INFO", section])).expect("write");
+    let header = line_raw(c);
+    let len: usize = header.trim_start_matches('$').trim().parse().expect("a bulk length");
+    let mut body = vec![0u8; len + 2];
+    c.read_exact(&mut body).expect("read");
+    let text = String::from_utf8_lossy(&body).into_owned();
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{field}:")))
+        .unwrap_or_else(|| panic!("no {field} in {text}"))
+        .trim()
+        .parse()
+        .expect("a number")
+}
+
+fn line_raw(c: &mut TcpStream) -> String {
+    let mut reply = Vec::new();
+    let mut byte = [0u8; 1];
+    while !reply.ends_with(b"\r\n") {
+        c.read_exact(&mut byte).expect("read");
+        reply.push(byte[0]);
+    }
+    String::from_utf8_lossy(&reply).into_owned()
+}
+
+/// The return leg (ADR-0148 D3, ADR-0156 D3): two cells and 64 tiered
+/// namespaces, the first written until its tier files are on disk, then
+/// dropped. The next tiered `CREATE` answers `+OK` (after `-TRYAGAIN` while
+/// the grant retires): the dropped namespace's files were closed and
+/// unlinked by the control thread's worker, every cell's receipt followed,
+/// and `INFO`'s `retire_worker_jobs` counts at least those files.
+#[test]
+fn a_dropped_namespaces_lifetime_returns_once_the_worker_retired_its_files() {
+    const KEYS: usize = 16_384;
+    const BATCH: usize = 512;
+    let dir = data_root("return");
+    let mut server = start(&dir);
+    let mut c = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
+    c.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
+    let written: [&[u8]; 9] = [
+        b"INF.NS",
+        b"CREATE",
+        b"tiered-00",
+        b"MODE",
+        b"durable",
+        b"MEM-BUDGET",
+        b"3mb",
+        b"TAIL-STALL-TIMEOUT",
+        TAIL_STALL_TIMEOUT_MS,
+    ];
+    assert_eq!(line(&mut c, &written), "+OK\r\n");
+    for at in 1..LIFETIMES_MAX {
+        let name = format!("tiered-{at:02}");
+        let parts: [&[u8]; 7] =
+            [b"INF.NS", b"CREATE", name.as_bytes(), b"MODE", b"durable", b"MEM-BUDGET", b"3mb"];
+        assert_eq!(line(&mut c, &parts), "+OK\r\n", "{name}");
+    }
+    let id = ns_id(&mut c, b"tiered-00");
+    let mut writer = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
+    writer.set_read_timeout(Some(Duration::from_secs(60))).expect("timeout");
+    assert_eq!(line(&mut writer, &[b"INF.NS", b"USE", b"tiered-00"]), "+OK\r\n");
+    let value = vec![b'v'; 1024];
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut next = 0usize;
+    while tier_files(&dir, id) == 0 {
+        assert!(Instant::now() < deadline, "the written namespace never flushed a tier file");
+        let mut wire = Vec::new();
+        for i in next..next + BATCH {
+            wire.extend_from_slice(&resp(&[
+                b"SET",
+                format!("k{:06}", i % KEYS).as_bytes(),
+                &value,
+            ]));
+        }
+        next += BATCH;
+        writer.write_all(&wire).expect("write");
+        for _ in 0..BATCH {
+            assert_eq!(line_raw(&mut writer), "+OK\r\n");
+        }
+    }
+    drop(writer);
+    let files = tier_files(&dir, id);
+    let jobs_before = info_field(&mut c, b"tripwires", "retire_worker_jobs");
+    assert_eq!(line(&mut c, &[b"INF.NS", b"DROP", b"tiered-00"]), "+OK\r\n");
+    let create: [&[u8]; 7] =
+        [b"INF.NS", b"CREATE", b"tiered-64", b"MODE", b"durable", b"MEM-BUDGET", b"3mb"];
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let reply = line(&mut c, &create);
+        if reply == "+OK\r\n" {
+            break;
+        }
+        assert_eq!(reply, "-TRYAGAIN tiered namespace capacity in use\r\n", "while it retires");
+        assert!(Instant::now() < deadline, "the dropped namespace's lifetime never returned");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let left = tier_files(&dir, id);
+    let jobs = info_field(&mut c, b"tripwires", "retire_worker_jobs") - jobs_before;
+    drop(c);
+    let status = server.stop();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(status.success(), "the node stopped gracefully: {status}");
+    assert_eq!(left, 0, "the dropped namespace's tier files are gone ({files} before the DROP)");
+    assert!(jobs >= files as u64, "the worker ran {jobs} jobs for {files} tier files");
 }

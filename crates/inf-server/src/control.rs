@@ -46,18 +46,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 // denylist-allow: the cell->control DDL channel (ADR-0015 D3), drained on this thread only.
 use std::sync::mpsc;
-use std::time::Duration;
 
 use inf_foundation::grants::{
-    DirectoryPublished, DirectoryWriter, GrantDirectory, GrantPos, POSITIONS, ReceiptBoard,
-    ReceiptWriter,
+    BellWake, DirectoryPublished, DirectoryWriter, GrantDirectory, GrantPos, POSITIONS,
+    ReceiptBoard, ReceiptWriter, RetireBoard,
 };
 use inf_foundation::issue::{
     self, FinalCredit, IssueClock, IssueCredit, IssueExhausted, IssueQuota, IssueSpace, Issued,
     Partition, PartitionRefused, RequestWord,
 };
 use inf_foundation::{CellCount, CellId};
-use inf_log::fs::StdSegmentFs;
+use inf_log::fs::{SegmentFile, SegmentFs, StdSegmentFs};
 use inf_log::meta::{read_meta, write_meta};
 use inf_store::ddl::{
     self, AnswerSlot, CatalogEpochs, CatalogWord, CreatePersisted, DdlRefusal, DdlVerdict,
@@ -70,6 +69,10 @@ use inf_wire::{Domain, Refusal};
 
 use crate::limits::{
     CKPT_BOARD_VISITS_PER_TURN, NS_IDS_EXHAUSTED, TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX,
+};
+use crate::tier_retire::{
+    BootReservation, CellPart, CellWake, DetachedTier, FinalClose, RetireWorker, TierBoot,
+    TierLifetimeBoot, TierShared, WorkerInbox,
 };
 
 /// Recycled-life residue recovery proved at boot (M4.5-S39b, ADR-0090
@@ -1157,7 +1160,7 @@ impl IndexBoard {
 /// it asks for, the export it was shaped from, and the writer half of its
 /// answer slot. Cell 0's readiness persist asks for no change and is
 /// answered through no slot.
-struct CatalogRequest {
+pub(crate) struct CatalogRequest {
     intent: Option<DdlIntent>,
     /// The requester's catalog export, before the writer's state applies.
     export: NsCatalog,
@@ -1417,6 +1420,15 @@ enum Grant {
     Retiring(NsId),
 }
 
+// The writer's book is a measured term of the boot (ADR-0148 D4): at most
+// 512 B a node, inline in the writer.
+const _: () = assert!(size_of::<[Grant; POSITIONS]>() <= 512, "the writer's book is 512 B at most");
+
+/// The writer's book's bytes (the boot test reports it beside the bill).
+pub(crate) const fn writer_book_bytes() -> usize {
+    size_of::<[Grant; POSITIONS]>()
+}
+
 /// The Retiring positions whose every cell's receipt names their id, read
 /// once at a tiered `CREATE`'s admission (ADR-0148 D4), one bit a position:
 /// returned to Vacant only if that `CREATE` is accepted.
@@ -1458,22 +1470,33 @@ impl TierNamespaceGrants {
     /// other position Vacant, published before any cell exists. Drop
     /// tombstones take no position. The boot's count refused `k > 64`
     /// first, so every definition has its position.
-    fn seed(catalog: Option<&NsCatalog>, cells: u16) -> TierNamespaceGrants {
-        let (_directory, mut directory) = GrantDirectory::new();
-        let mut live: Vec<NsId> = catalog
-            .map(|c| c.entries.iter().filter(|e| e.tier.is_some()).map(|e| e.id).collect())
-            .unwrap_or_default();
+    fn seed(
+        catalog: Option<&NsCatalog>,
+        mut directory: DirectoryWriter,
+        receipts: Arc<ReceiptBoard>,
+    ) -> TierNamespaceGrants {
+        // The live tiered ids, inline: the boot's count refused more than
+        // `POSITIONS` first, so they fit, and the boot allocates nothing here
+        // beyond its reservation (ADR-0148 D4).
+        let mut live = [NsId(0); POSITIONS];
+        let mut count = 0;
+        let tiered =
+            catalog.into_iter().flat_map(|c| c.entries.iter()).filter(|e| e.tier.is_some());
+        for entry in tiered.take(POSITIONS) {
+            live[count] = entry.id;
+            count += 1;
+        }
+        let live = &mut live[..count];
         live.sort_unstable();
-        debug_assert!(live.len() <= POSITIONS, "the boot's count refused the catalog first");
         let mut book = [Grant::Vacant; POSITIONS];
-        for (pos, id) in directory.positions().zip(live) {
+        for (pos, &id) in directory.positions().zip(live.iter()) {
             book[pos.index()] = Grant::Declared(id);
             directory.stage_declared(pos, id.0);
         }
         // No epoch is published at boot: each cell is built after this, on
         // a thread its assembly starts, and reads the directory as it is.
         let _boot = directory.publish();
-        TierNamespaceGrants { book, directory, receipts: ReceiptBoard::new(cells) }
+        TierNamespaceGrants { book, directory, receipts }
     }
 
     /// Step 1 for a tiered `CREATE` (ADR-0148 D1, D4; ADR-0172 D3): the
@@ -1556,7 +1579,7 @@ impl TierNamespaceGrants {
 }
 
 /// Control-thread work (single receiver, bounded — L3).
-enum ControlMsg {
+pub(crate) enum ControlMsg {
     /// A catalog request, answered in queue order.
     Request(CatalogRequest),
     /// A DDL's notice: it retires the writer's pending DDL.
@@ -1568,6 +1591,97 @@ enum ControlMsg {
     /// unit (below the durable manifest's floor / not the named `.ick`),
     /// so any thread may delete it; failure is re-collected by boot GC.
     Unlink(PathBuf),
+    /// The canary's wake as a message: the bell rings into this channel
+    /// instead of the worker's own wake.
+    #[cfg(inf_canary_retire_bell_in_channel)]
+    Wake,
+}
+
+/// The control thread's one-slot wake (ADR-0156 D3): the bell's ring and
+/// every control post send it, and only the worker's wait consumes it, so
+/// at most one wake is pending at any cell count and it holds no slot of
+/// the control channel. A full slot means a wake is already pending; a
+/// disconnected one, that the control thread is gone.
+#[derive(Clone)]
+pub(crate) struct RetireWake {
+    tx: mpsc::SyncSender<()>,
+    /// The canary's control channel, the planted wake's way in.
+    #[cfg(inf_canary_retire_bell_in_channel)]
+    planted: mpsc::SyncSender<ControlMsg>,
+}
+
+impl RetireWake {
+    /// The wake over `tx`, its planted channel `control` (the worker tests).
+    #[cfg(test)]
+    pub(crate) fn over(tx: mpsc::SyncSender<()>, control: &mpsc::SyncSender<ControlMsg>) -> Self {
+        let _ = control;
+        RetireWake {
+            tx,
+            #[cfg(inf_canary_retire_bell_in_channel)]
+            planted: control.clone(),
+        }
+    }
+
+    /// A wake whose receiver is gone: a ring sends into nothing (a
+    /// standalone test cell, whose worker the test steps).
+    #[cfg(test)]
+    pub(crate) fn unwired() -> RetireWake {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        RetireWake {
+            tx,
+            #[cfg(inf_canary_retire_bell_in_channel)]
+            planted: mpsc::sync_channel(1).0,
+        }
+    }
+}
+
+impl BellWake for RetireWake {
+    fn wake(&self) {
+        // Canary `inf_canary_retire_bell_in_channel`: the wake is a control
+        // message, which takes a message's slot and an iteration's turn.
+        #[cfg(inf_canary_retire_bell_in_channel)]
+        {
+            let _ = self.planted.try_send(ControlMsg::Wake);
+        }
+        #[cfg(not(inf_canary_retire_bell_in_channel))]
+        {
+            let _ = self.tx.try_send(());
+        }
+    }
+}
+
+/// The control channel's one sender: every message enters through
+/// [`post`](Self::post) or [`try_post`](Self::try_post), which send the
+/// worker's wake after the send, so a worker that found the channel empty
+/// and waits returns to take it.
+pub(crate) struct ControlSender {
+    tx: mpsc::SyncSender<ControlMsg>,
+    wake: RetireWake,
+}
+
+impl ControlSender {
+    /// The sender over `tx` and `wake` (the worker tests' poster).
+    #[cfg(test)]
+    pub(crate) fn over(tx: mpsc::SyncSender<ControlMsg>, wake: RetireWake) -> ControlSender {
+        ControlSender { tx, wake }
+    }
+
+    /// A blocking send, then the wake. A full channel waits for the next
+    /// receive (DDL-rate senders only).
+    pub(crate) fn post(&self, msg: ControlMsg) {
+        self.tx.send(msg).expect("control thread alive (fail-stop)");
+        inf_foundation::grants::wake_posted(&self.wake);
+    }
+
+    /// A send that never blocks, then the wake when it was sent; `false`
+    /// when the channel is full.
+    pub(crate) fn try_post(&self, msg: ControlMsg) -> bool {
+        let sent = self.tx.try_send(msg).is_ok();
+        if sent {
+            inf_foundation::grants::wake_posted(&self.wake);
+        }
+        sent
+    }
 }
 
 /// The catalog writer's node gauges and counters (ADR-0189 D11), node
@@ -1667,7 +1781,7 @@ impl DdlGauges {
 
 /// Shared handle the assembly wires into every cell's plane.
 pub struct ControlHandle {
-    tx: mpsc::SyncSender<ControlMsg>,
+    sender: ControlSender,
     /// The next namespace id (ADR-0148 D4): stored only by the catalog
     /// writer, when it accepts the `CREATE` that reserved it;
     /// [`NS_IDS_EXHAUSTED`] once the last id is issued.
@@ -1699,11 +1813,11 @@ pub struct ControlHandle {
     /// shared with every cell's `INFO`.
     gauges: Arc<DdlGauges>,
     /// The tiered grant directory the writer's book publishes (ADR-0148
-    /// D2): every cell reads it.
-    tier_directory: Arc<GrantDirectory>,
-    /// Every cell's terminal receipts (ADR-0148 D4): each cell writes its
-    /// own row, the writer's reclaim reads them all.
-    tier_receipts: Arc<ReceiptBoard>,
+    /// D2), which every cell reads; every cell's terminal receipts, each
+    /// cell writing its own row and the writer's reclaim reading them all
+    /// (D4); and the retirement board with the node's one bell (ADR-0156
+    /// D3). Reserved at boot, before any cell.
+    tier: TierShared,
     /// The node-wide DDL ticket (ADR-0108 D1): `0` = free, `cell + 1` =
     /// the cell whose DDL program holds it. One namespace DDL program
     /// runs at a time — its fan legs never cross another's. Taken by
@@ -1877,7 +1991,7 @@ impl ControlHandle {
     /// A DDL's notice to the writer (ADR-0189 D5), a blocking send like
     /// every request: it retires the pending DDL of its own kind and id.
     pub(crate) fn post_notice(&self, notice: DdlNotice) {
-        self.tx.send(ControlMsg::Notice(notice)).expect("control thread alive (fail-stop)");
+        self.sender.post(ControlMsg::Notice(notice));
     }
     /// The next namespace id (the catalog's `next_id`): the id a
     /// `CREATE` reserves, [`NS_IDS_EXHAUSTED`] once none is left.
@@ -1973,7 +2087,7 @@ impl ControlHandle {
         if inf_foundation::fault::fire(crate::fault::DDL_REQUEST_HELD) {
             inf_foundation::fault::hold(crate::fault::DDL_REQUEST_HELD);
         }
-        self.tx.send(ControlMsg::Request(req)).expect("control thread alive (fail-stop)");
+        self.sender.post(ControlMsg::Request(req));
         self.requests_sent.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1987,7 +2101,7 @@ impl ControlHandle {
     /// Non-blocking: `false` = queue full — the caller keeps the path and
     /// retries next MAINTAIN slice (bounded local queue, never a stall).
     pub fn request_unlink(&self, path: PathBuf) -> bool {
-        self.tx.try_send(ControlMsg::Unlink(path)).is_ok()
+        self.sender.try_post(ControlMsg::Unlink(path))
     }
 
     /// True once the writer has answered every request numbered at or
@@ -2042,7 +2156,19 @@ impl ControlHandle {
     /// namespace's owner only at the position it names Declared.
     #[must_use]
     pub fn tier_directory(&self) -> &Arc<GrantDirectory> {
-        &self.tier_directory
+        &self.tier.directory
+    }
+
+    /// The node's retirement board (ADR-0156 D3): the one bell, each cell's
+    /// `closing` and the worker's counters.
+    #[must_use]
+    pub fn retire_board(&self) -> &Arc<RetireBoard> {
+        &self.tier.board
+    }
+
+    /// The control thread's wake, which a cell's bell ring sends.
+    pub(crate) fn retire_wake(&self) -> RetireWake {
+        self.sender.wake.clone()
     }
 
     /// Cell `cell`'s writer of its terminal receipts (ADR-0148 D4), the
@@ -2050,7 +2176,7 @@ impl ControlHandle {
     /// does not have.
     #[must_use]
     pub fn take_tier_receipts(&self, cell: u16) -> Option<ReceiptWriter> {
-        ReceiptBoard::writer(&self.tier_receipts, cell)
+        ReceiptBoard::writer(&self.tier.receipts, cell)
     }
 }
 
@@ -2412,6 +2538,9 @@ impl CatalogWriter {
 /// run inside the deterministic loop.
 pub struct ControlInbox {
     rx: mpsc::Receiver<ControlMsg>,
+    /// The worker's one-slot wake, held so a ring finds it open; the
+    /// detached worker never waits on it (its receive is this drain).
+    _wake: mpsc::Receiver<()>,
     handle: Arc<ControlHandle>,
     /// The writer itself — inline, deterministic.
     writer: CatalogWriter,
@@ -2471,6 +2600,8 @@ impl ControlInbox {
             let is_request = match &msg {
                 ControlMsg::Request(_) => true,
                 ControlMsg::Notice(_) | ControlMsg::Unlink(_) => false,
+                #[cfg(inf_canary_retire_bell_in_channel)]
+                ControlMsg::Wake => false,
             };
             if is_request && requests_max == Some(answered) {
                 self.next = Some(msg);
@@ -2483,6 +2614,8 @@ impl ControlInbox {
                 ControlMsg::Unlink(path) => {
                     let _ = fs.remove_file(&path);
                 }
+                #[cfg(inf_canary_retire_bell_in_channel)]
+                ControlMsg::Wake => {}
             }
         }
         Ok(answered)
@@ -2490,8 +2623,15 @@ impl ControlInbox {
 }
 
 /// A detached control plane (M2-S19): the handle, the writer's inbox the
-/// host drains inline, and the boot's checkpoint issuers (ADR-0159 A1.2).
-pub type DetachedControl = (Arc<ControlHandle>, ControlInbox, CkptIssuers);
+/// host drains inline, the boot's checkpoint issuers (ADR-0159 A1.2), and
+/// the tier-file transport: the worker the host steps and the cells' parts
+/// it hands to their planes (ADR-0156 D3's planeless adapter).
+pub type DetachedControl<J> = (Arc<ControlHandle>, ControlInbox, CkptIssuers, DetachedTier<J>);
+
+/// A spawned control plane: the handle, the boot's checkpoint issuers, and
+/// each cell's tier-file transport part, in cell order, for the assembly to
+/// hand to that cell's thread once it exists.
+pub type SpawnedControl<J> = (Arc<ControlHandle>, CkptIssuers, Vec<CellPart<J>>);
 
 /// Why the control plane refuses a data directory at boot, before any cell
 /// exists: nothing of the catalog is truncated, deleted, rewritten or
@@ -2503,6 +2643,9 @@ pub enum ControlBootRefused {
     /// (ADR-0148 D5, A1.2): a data directory with more is refused, with no
     /// migration. Drop tombstones and their residue take no lifetime.
     TieredLifetimes { live: usize },
+    /// The tiered namespaces' boot storage could not be reserved
+    /// (ADR-0148 D4): what was built of it was retired, and no cell exists.
+    TierReservation(BootReservation),
 }
 
 impl std::fmt::Display for ControlBootRefused {
@@ -2514,6 +2657,7 @@ impl std::fmt::Display for ControlBootRefused {
                  {TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX} tiered namespace lifetimes a node \
                  holds: a data directory with more is refused at boot, with no migration"
             ),
+            ControlBootRefused::TierReservation(refused) => write!(f, "{refused}"),
         }
     }
 }
@@ -2533,17 +2677,22 @@ fn check_tiered_lifetimes(seed: Option<&NsCatalog>) -> Result<(), ControlBootRef
 
 impl ControlHandle {
     /// A control plane without the thread (M2-S19): the caller drains the
-    /// returned [`ControlInbox`] inline. Production nodes use
-    /// [`spawn`]; the sim's determinism forbids the thread.
+    /// returned [`ControlInbox`] inline and steps its [`DetachedTier`].
+    /// Production nodes use [`spawn`]; the sim's determinism forbids the
+    /// thread. `F` is the cells' file system: a tier-file job carries its
+    /// handle.
     ///
     /// # Errors
-    /// None in practice: an empty catalog names no tiered namespace. The
-    /// signature is the seeded constructors'.
-    pub fn detached(
+    /// [`ControlBootRefused`]: the boot reservation was refused; an empty
+    /// catalog names no tiered namespace.
+    pub fn detached<F: SegmentFs>(
         cells: CellCount,
         start_unix_ms: u64,
-    ) -> Result<DetachedControl, ControlBootRefused> {
-        ControlHandle::detached_in(None, CkptSpace::full(cells), start_unix_ms)
+    ) -> Result<DetachedControl<F::File>, ControlBootRefused>
+    where
+        F::File: FinalClose,
+    {
+        ControlHandle::detached_in::<F>(None, CkptSpace::full(cells), start_unix_ms)
     }
 
     /// A detached control plane seeded from a recovered catalog (the
@@ -2552,12 +2701,15 @@ impl ControlHandle {
     ///
     /// # Errors
     /// [`ControlBootRefused`]: the catalog is refused before any cell.
-    pub fn detached_with_catalog(
+    pub fn detached_with_catalog<F: SegmentFs>(
         seed: Option<&NsCatalog>,
         cells: CellCount,
         start_unix_ms: u64,
-    ) -> Result<DetachedControl, ControlBootRefused> {
-        ControlHandle::detached_in(seed, CkptSpace::full(cells), start_unix_ms)
+    ) -> Result<DetachedControl<F::File>, ControlBootRefused>
+    where
+        F::File: FinalClose,
+    {
+        ControlHandle::detached_in::<F>(seed, CkptSpace::full(cells), start_unix_ms)
     }
 
     /// [`detached_with_catalog`](Self::detached_with_catalog) over an
@@ -2565,30 +2717,38 @@ impl ControlHandle {
     ///
     /// # Errors
     /// [`ControlBootRefused`]: the catalog is refused before any cell.
-    pub fn detached_in(
+    pub fn detached_in<F: SegmentFs>(
         seed: Option<&NsCatalog>,
         space: CkptSpace,
         start_unix_ms: u64,
-    ) -> Result<DetachedControl, ControlBootRefused> {
-        let (handle, rx, writer, issuers) = ControlHandle::new_parts(seed, space, start_unix_ms)?;
-        let inbox = ControlInbox { rx, handle: Arc::clone(&handle), writer, next: None };
-        Ok((handle, inbox, issuers))
+    ) -> Result<DetachedControl<F::File>, ControlBootRefused>
+    where
+        F::File: FinalClose,
+    {
+        let parts = ControlHandle::new_parts::<F::File>(seed, space, start_unix_ms)?;
+        let ControlParts { handle, rx, wake, writer, issuers, worker, parts } = parts;
+        let inbox =
+            ControlInbox { rx, _wake: wake, handle: Arc::clone(&handle), writer, next: None };
+        Ok((handle, inbox, issuers, DetachedTier::new(worker, parts)))
     }
 
     /// The handle, the writer's inbox, the writer with its tombstone set
-    /// seeded from the boot catalog, and the boot's checkpoint issuers. Every
-    /// surviving tombstone is re-stamped with one fresh all-cell request
-    /// (ADR-0100 D3: cells edge-detect it after recovery, and the next
-    /// persist retires what they cover), paid by the control writer's
-    /// quota before any cell serves (ADR-0159 A1.2). A catalog over the
-    /// node's tiered lifetimes is refused first, with nothing built.
-    fn new_parts(
+    /// seeded from the boot catalog, the boot's checkpoint issuers, and the
+    /// tier-file transport. Every surviving tombstone is re-stamped with one
+    /// fresh all-cell request (ADR-0100 D3: cells edge-detect it after
+    /// recovery, and the next persist retires what they cover), paid by the
+    /// control writer's quota before any cell serves (ADR-0159 A1.2). A
+    /// catalog over the node's tiered lifetimes is refused first, with
+    /// nothing built; the boot reservation runs next, before every other
+    /// allocation here, and a refused one builds nothing more.
+    fn new_parts<J: SegmentFile + FinalClose>(
         seed: Option<&NsCatalog>,
         space: CkptSpace,
         start_unix_ms: u64,
-    ) -> Result<ControlParts, ControlBootRefused> {
+    ) -> Result<ControlParts<J>, ControlBootRefused> {
         check_tiered_lifetimes(seed)?;
         let cells = space.cells.get();
+        let TierBoot { shared, writer: directory, worker, parts } = reserve_tier::<J>(cells)?;
         let Partition { clock, owner, participants } =
             issue::partition(CkptBoard::new(space.cells), space.space);
         let next_id = seed.map_or(FIRST_NAMED_NS_ID, |c| c.next_id.max(FIRST_NAMED_NS_ID));
@@ -2597,10 +2757,18 @@ impl ControlHandle {
             c.index.next_generation.max(FIRST_INDEX_GENERATION)
         });
         let (tx, rx) = mpsc::sync_channel::<ControlMsg>(256);
+        // The worker's one-slot wake (ADR-0156 D3), beside the channel and
+        // made as it is (class F at boot): it holds no message's slot.
+        let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(1);
+        let wake = RetireWake {
+            tx: wake_tx,
+            #[cfg(inf_canary_retire_bell_in_channel)]
+            planted: tx.clone(),
+        };
         let (epochs, word) = CatalogEpochs::new();
-        let grants = TierNamespaceGrants::seed(seed, cells);
+        let grants = TierNamespaceGrants::seed(seed, directory, Arc::clone(&shared.receipts));
         let handle = Arc::new(ControlHandle {
-            tx,
+            sender: ControlSender { tx, wake },
             next_ns_id: AtomicU32::new(next_id),
             next_index_id: AtomicU32::new(next_index_id),
             next_index_generation: AtomicU64::new(next_index_generation),
@@ -2613,8 +2781,7 @@ impl ControlHandle {
             recovery: Arc::new(RecoveryBoard::new(cells, start_unix_ms)),
             memory_board: Arc::new(MemoryBoard::new(cells)),
             index_board: Arc::new(IndexBoard::new(cells)),
-            tier_directory: Arc::clone(grants.directory.directory()),
-            tier_receipts: Arc::clone(&grants.receipts),
+            tier: shared,
             ddl_holder: AtomicU16::new(0),
             ddl_generation: AtomicU64::new(0),
         });
@@ -2650,237 +2817,108 @@ impl ControlHandle {
             pending: None,
         };
         writer.publish_gauges();
-        Ok((handle, rx, writer, CkptIssuers { host, cells: cell_issuers }))
+        let issuers = CkptIssuers { host, cells: cell_issuers };
+        Ok(ControlParts { handle, rx, wake: wake_rx, writer, issuers, worker, parts })
+    }
+}
+
+/// The boot reservation of the tier-file transport and the grants' storage
+/// (ADR-0148 D4), its refusal the boot's typed error.
+fn reserve_tier<J: SegmentFile + FinalClose>(
+    cells: u16,
+) -> Result<TierBoot<J>, ControlBootRefused> {
+    match TierLifetimeBoot::reserve::<J>(cells) {
+        Ok(boot) => Ok(boot),
+        // Canary `inf_canary_boot_reservation_ignored`: the assembly goes on
+        // after a refused reservation, building the node regardless.
+        Err(_) if cfg!(inf_canary_boot_reservation_ignored) => {
+            TierLifetimeBoot::reserve::<J>(cells).map_err(ControlBootRefused::TierReservation)
+        }
+        Err(refused) => Err(ControlBootRefused::TierReservation(refused)),
     }
 }
 
 /// What [`ControlHandle::new_parts`] builds: the handle, the writer's
-/// inbox, the writer, and the boot's checkpoint issuers.
-type ControlParts = (Arc<ControlHandle>, mpsc::Receiver<ControlMsg>, CatalogWriter, CkptIssuers);
+/// inbox and the worker's wake, the writer, the boot's checkpoint issuers,
+/// and the tier-file transport's worker and parts.
+struct ControlParts<J> {
+    handle: Arc<ControlHandle>,
+    rx: mpsc::Receiver<ControlMsg>,
+    wake: mpsc::Receiver<()>,
+    writer: CatalogWriter,
+    issuers: CkptIssuers,
+    worker: RetireWorker<J>,
+    parts: Vec<CellPart<J>>,
+}
 
-/// Spawns the control thread. `seed` is the boot-loaded catalog (its
-/// `next_id` seeds the allocator; a fresh node starts at the named floor).
+#[cfg(test)]
+impl<J: SegmentFile + FinalClose> ControlParts<J> {
+    /// The handle and the writer a test drives, the transport as a detached
+    /// host whose drop cuts it.
+    fn into_test(self) -> (Arc<ControlHandle>, CatalogWriter, DetachedTier<J>) {
+        (self.handle, self.writer, DetachedTier::new(self.worker, self.parts))
+    }
+}
+
+mod runner;
+pub use runner::spawn_in;
+
+/// Spawns the control thread over the cells' file system `fs`, which its
+/// retirement worker unlinks through. `seed` is the boot-loaded catalog (its
+/// `next_id` seeds the allocator; a fresh node starts at the named floor);
+/// `cell_wake`, the park board the worker ends a parked cell's park through.
 ///
 /// The thread fail-stops the process on a failed swap: the catalog is
 /// durability metadata and a lost DDL after its `+OK` would be a §8.2
 /// violation — same rule class as fsync failure.
 ///
 /// # Errors
-/// [`ControlBootRefused`]: the catalog is refused before any cell, and no
-/// thread is spawned.
-pub fn spawn(
+/// [`ControlBootRefused`]: the catalog or the boot reservation is refused
+/// before any cell, and no thread is spawned.
+pub fn spawn<F: SegmentFs + Send + 'static>(
+    fs: F,
     data_dir: PathBuf,
     seed: Option<&NsCatalog>,
     cells: CellCount,
     start_unix_ms: u64,
-) -> Result<(Arc<ControlHandle>, CkptIssuers), ControlBootRefused> {
-    spawn_in(data_dir, seed, CkptSpace::full(cells), start_unix_ms)
+    cell_wake: Option<CellWake>,
+) -> Result<SpawnedControl<F::File>, ControlBootRefused>
+where
+    F::File: FinalClose + Send,
+{
+    spawn_in(fs, data_dir, seed, CkptSpace::full(cells), start_unix_ms, cell_wake)
 }
 
-/// [`spawn`] over an explicit issuance space — the A1.5 headroom seam for
-/// tests. Returns the handle and the boot's checkpoint issuers.
-///
-/// # Errors
-/// As [`spawn`].
-pub fn spawn_in(
-    data_dir: PathBuf,
-    seed: Option<&NsCatalog>,
-    space: CkptSpace,
-    start_unix_ms: u64,
-) -> Result<(Arc<ControlHandle>, CkptIssuers), ControlBootRefused> {
-    let cells = space.cells.get();
-    let (handle, rx, writer, issuers) = ControlHandle::new_parts(seed, space, start_unix_ms)?;
-    let booked = writer.tombstones.len();
-    if booked > DROPPED_NS_MAX {
-        eprintln!(
-            "control: {booked} drop tombstones at boot, over the cap of {DROPPED_NS_MAX}: a \
-             durable CREATE or DROP waits until the book drains below it (ceiling {booked})"
-        );
-    }
-    let board = Arc::clone(&handle.recovery);
-    // denylist-allow: the control thread itself (ADR-0015 D3) - the slow plane, never a cell.
-    std::thread::Builder::new()
-        .name("inf-control".into())
-        .spawn(move || {
-            // This thread is detached (the JoinHandle drops below): a
-            // swallowed unwind would leave cells serving with catalog
-            // persistence, checkpoint epochs, and delegated unlinks
-            // silently dead — the ADR-0026 D2 class. Same boundary as
-            // the cell threads (M2.5-S01/S16): panic ⇒ loud process exit.
-            let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                control_main(&data_dir, &board, &rx, cells, writer);
-            }));
-            if body.is_err() {
-                // The default hook already printed the panic.
-                eprintln!("infinityd: control thread panicked — fail-stop");
-                std::process::exit(101);
-            }
-        })
-        .expect("spawn control thread");
-    Ok((handle, issuers))
-}
-
-/// The control thread's message loop + boot narration (M2-S15/M2.5-S01),
-/// extracted so [`spawn`] can wrap it in the panic fail-stop boundary.
-fn control_main(
-    data_dir: &Path,
-    board: &Arc<RecoveryBoard>,
-    rx: &mpsc::Receiver<ControlMsg>,
-    cells: u16,
-    mut writer: CatalogWriter,
-) {
-    {
-        let mut handle_msg = |msg: ControlMsg| match msg {
-            ControlMsg::Request(req) => {
-                if let Err(err) = writer.answer(req, &StdSegmentFs, data_dir) {
-                    // §8.4 fail-stop: a DDL was acked against this
-                    // swap. `process::exit`, never `panic!` — this
-                    // thread is detached (the JoinHandle is dropped),
-                    // so an unwind would kill only the control plane
-                    // and leave cells serving with catalog
-                    // persistence, checkpoint epochs, and delegated
-                    // unlinks silently dead (the ADR-0026 D2
-                    // swallowed-death class; M2.5-S16 audit fix).
-                    eprintln!("FATAL: catalog META swap failed (fail-stop): {err}");
-                    std::process::exit(crate::EXIT_DURABLE_FAILSTOP);
-                }
-            }
-            ControlMsg::Notice(notice) => writer.notice(notice),
-            ControlMsg::Unlink(path) => {
-                // Never fatal: the file is outside every recovery
-                // unit; a survivor is re-collected at boot.
-                #[allow(clippy::disallowed_methods, reason = "control-thread: retired file unlink")]
-                if let Err(err) = std::fs::remove_file(&path)
-                    && err.kind() != std::io::ErrorKind::NotFound
-                {
-                    eprintln!("control: unlink {} failed: {err}", path.display());
-                }
-            }
-        };
-        // Boot narration (M2-S15): until every cell reports ready,
-        // poll the channel with a timeout and print per-cell ready
-        // lines + a periodic aggregate progress line (segments/bytes/
-        // ETA). Log-line clocks are ambient wall time — control-plane
-        // narration only, never oracle input (those ride the
-        // injected clocks).
-        let mut announced = vec![false; usize::from(cells)];
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "clock: control-thread boot narration, never oracle input (ADR-0015 D3)"
-        )]
-        // denylist-allow: boot-narration wall clock on the control thread, never oracle input.
-        let boot_started = std::time::Instant::now();
-        let mut next_progress = boot_started + Duration::from_secs(1);
-        while !board.all_ready() {
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(msg) => handle_msg(msg),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            }
-            for (cell, seen) in announced.iter_mut().enumerate() {
-                let slot = board.slot(cell as u16);
-                if !*seen && slot.ready() {
-                    *seen = true;
-                    let (_, total) = slot.bytes();
-                    let (segs, _) = slot.segments();
-                    let torn = slot.torn_truncated_at().map_or(String::new(), |lsn| {
-                        format!(", torn tail truncated at {lsn} (M2-S14)")
-                    });
-                    let residue = slot.residue();
-                    let recycled = if residue == RecoveredResidue::default() {
-                        String::new()
-                    } else {
-                        format!(
-                            ", recycled residue: {} segment stops, {} slacks (ADR-0090)",
-                            residue.segment_residue_stops, residue.recycled_residue_slacks
-                        )
-                    };
-                    let (ns, bytes) = slot.phases();
-                    let ms = |i: usize| ns[i] as f64 / 1e6;
-                    let unknown = match slot.records_skipped_unknown_ns() {
-                        0 => String::new(),
-                        n => format!(
-                            ", {n} records of untombstoned unknown namespaces skipped \
-                             (foreign log or corruption — ADR-0103 D4)"
-                        ),
-                    };
-                    eprintln!(
-                        "control: cell {cell} recovered ({segs} segments, {total} bytes, {} \
-                         records{torn}{recycled}{unknown}; phases ms: start {:.1}, ckpt {:.1} \
-                         [{} B], replay {:.1} [{} B], audit {:.1} [{} B], finish {:.1}, \
-                         total {:.1})",
-                        slot.records(),
-                        ms(0),
-                        ms(1),
-                        bytes[0],
-                        ms(2),
-                        bytes[1],
-                        ms(3),
-                        bytes[2],
-                        ms(4),
-                        ns.iter().sum::<u64>() as f64 / 1e6,
-                    );
-                }
-            }
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "clock: control-thread boot narration, never oracle input (ADR-0015 D3)"
-            )]
-            // denylist-allow: boot-narration wall clock on the control thread, never oracle input.
-            let now = std::time::Instant::now();
-            if now >= next_progress && !board.all_ready() {
-                next_progress = now + Duration::from_secs(1);
-                let (done, total) = board.bytes();
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "clock: boot narration, never oracle input (ADR-0015 D3)"
-                )]
-                let elapsed = boot_started.elapsed().as_secs_f64();
-                let eta = if done > 0 {
-                    (elapsed * (total.saturating_sub(done)) as f64 / done as f64).ceil()
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "control: recovery {}/{} cells ready, {done}/{total} bytes ({:.1}%), eta \
-                         {eta:.0}s",
-                    board.ready_cells(),
-                    board.cell_count(),
-                    if total > 0 { done as f64 * 100.0 / total as f64 } else { 100.0 },
-                );
-                // Stuck-cell narration (M2.5-S01): after 5 s, name each
-                // not-ready cell and the phase it published before its
-                // current step — the ADR-0022 D7 wedge signature was a
-                // silent cell; a stalled boot must say where it stalled.
-                if elapsed >= 5.0 {
-                    for cell in 0..cells {
-                        let slot = board.slot(cell);
-                        if !slot.ready() {
-                            let (done, total) = slot.bytes();
-                            eprintln!(
-                                "control: cell {cell} not ready — in {} ({done}/{total} bytes) for \
-                                     {elapsed:.0}s",
-                                CellRecoverySlot::phase_name(slot.phase()),
-                            );
-                        }
-                    }
-                }
+/// One message's handling on the control thread.
+fn handle_msg(writer: &mut CatalogWriter, data_dir: &Path, msg: ControlMsg) {
+    match msg {
+        ControlMsg::Request(req) => {
+            if let Err(err) = writer.answer(req, &StdSegmentFs, data_dir) {
+                // §8.4 fail-stop: a DDL was acked against this
+                // swap. `process::exit`, never `panic!` — this
+                // thread is detached (the JoinHandle is dropped),
+                // so an unwind would kill only the control plane
+                // and leave cells serving with catalog
+                // persistence, checkpoint epochs, and delegated
+                // unlinks silently dead (the ADR-0026 D2
+                // swallowed-death class; M2.5-S16 audit fix).
+                eprintln!("FATAL: catalog META swap failed (fail-stop): {err}");
+                std::process::exit(crate::EXIT_DURABLE_FAILSTOP);
             }
         }
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "clock: control-thread boot narration, never oracle input (ADR-0015 D3)"
-        )]
-        let boot_ms = boot_started.elapsed().as_millis();
-        eprintln!(
-            "control: recovery complete — {} cells serving ({boot_ms} ms)",
-            board.cell_count()
-        );
-        while let Ok(msg) = rx.recv() {
-            handle_msg(msg);
+        ControlMsg::Notice(notice) => writer.notice(notice),
+        ControlMsg::Unlink(path) => {
+            // Never fatal: the file is outside every recovery
+            // unit; a survivor is re-collected at boot.
+            #[allow(clippy::disallowed_methods, reason = "control-thread: retired file unlink")]
+            if let Err(err) = std::fs::remove_file(&path)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("control: unlink {} failed: {err}", path.display());
+            }
         }
-        // Channel closed = node shutdown; nothing to flush (every
-        // acked DDL already persisted before its reply).
+        #[cfg(inf_canary_retire_bell_in_channel)]
+        ControlMsg::Wake => {}
     }
 }
 
@@ -2890,6 +2928,8 @@ mod drop_tombstone_tests {
     use inf_store::{IndexCatalog, NsCatalog, NsMode, NsSpec};
 
     use inf_store::ddl::TombstoneHeld;
+
+    use inf_log::fs::mem::MemFile;
 
     use super::{
         BookFold, CatalogRequest, CatalogWriter, CkptSpace, ControlHandle, DROPPED_NS_MAX,
@@ -2930,8 +2970,8 @@ mod drop_tombstone_tests {
 
     fn writer() -> CatalogWriter {
         let cells = inf_foundation::CellCount::new(2).expect("two cells");
-        let (_handle, _rx, writer, _issuers) =
-            ControlHandle::new_parts(None, CkptSpace::full(cells), 0).expect("the catalog boots");
+        let parts = ControlHandle::new_parts::<MemFile>(None, CkptSpace::full(cells), 0);
+        let (_handle, writer, _tier) = parts.expect("the catalog boots").into_test();
         writer
     }
 
@@ -2951,7 +2991,8 @@ mod drop_tombstone_tests {
             seed.entries.extend((200..203).map(entry));
             seed.next_id = 300;
             seed.dropped = vec![250, 251];
-            ControlHandle::new_parts(Some(&seed), CkptSpace::full(cells), 0).map(|_| ())
+            ControlHandle::new_parts::<MemFile>(Some(&seed), CkptSpace::full(cells), 0)
+                .map(|parts| drop(parts.into_test()))
         };
         assert_eq!(boot(64), Ok(()), "64 live tiered definitions and two tombstones boot");
         assert_eq!(boot(65), Err(super::ControlBootRefused::TieredLifetimes { live: 65 }));
@@ -3060,9 +3101,10 @@ mod drop_tombstone_tests {
         let cells = inf_foundation::CellCount::new(2).expect("two cells");
         let mut seed = catalog(vec![tiered(30), entry(18), tiered(16), tiered(20)]);
         seed.dropped = vec![25];
-        let (handle, _rx, _writer, _issuers) =
-            ControlHandle::new_parts(Some(&seed), CkptSpace::full(cells), 0)
-                .expect("the catalog boots");
+        let (handle, _writer, _tier) =
+            ControlHandle::new_parts::<MemFile>(Some(&seed), CkptSpace::full(cells), 0)
+                .expect("the catalog boots")
+                .into_test();
         let directory = handle.tier_directory();
         let found: Vec<_> =
             [16, 20, 30].iter().map(|&id| directory.find_declared(id).map(|p| p.index())).collect();
@@ -3231,9 +3273,10 @@ mod drop_tombstone_tests {
         let mut seed = catalog(Vec::new());
         seed.next_id = 16 + 300;
         seed.dropped = (16..16 + 300).collect();
-        let (handle, _rx, mut w, _issuers) =
-            ControlHandle::new_parts(Some(&seed), CkptSpace::full(cells), 0)
-                .expect("the catalog boots");
+        let (handle, mut w, _tier) =
+            ControlHandle::new_parts::<MemFile>(Some(&seed), CkptSpace::full(cells), 0)
+                .expect("the catalog boots")
+                .into_test();
         let stamp = handle.ckpt_last_issued();
         (0..2).for_each(|cell| handle.ckpt_board().slot(cell).publish(stamp, 1, 1));
         w.tombstones.retire(handle.ckpt_board().min_published());
@@ -3256,9 +3299,10 @@ mod drop_tombstone_tests {
             let mut seed = catalog(Vec::new());
             seed.next_id = 16 + count;
             seed.dropped = (16..16 + count).collect();
-            let (handle, _rx, w, _issuers) =
-                ControlHandle::new_parts(Some(&seed), CkptSpace::full(cells), 0)
-                    .expect("the catalog boots");
+            let (handle, w, _tier) =
+                ControlHandle::new_parts::<MemFile>(Some(&seed), CkptSpace::full(cells), 0)
+                    .expect("the catalog boots")
+                    .into_test();
             let count = usize::try_from(count).expect("fits");
             assert_eq!(w.tombstones.len(), count);
             assert_eq!(w.tombstones.ceiling, count.max(DROPPED_NS_MAX));
@@ -3449,6 +3493,7 @@ mod tests {
 
     use inf_foundation::time::Nanos;
     use inf_foundation::{CellCount, CellId, SLOT_COUNT};
+    use inf_log::fs::mem::MemFs;
     use inf_store::{Keyspace, StoreConfig};
     use inf_wire::{Protocol, ReplyStream, RespWriter};
 
@@ -3503,8 +3548,8 @@ mod tests {
     #[test]
     fn ckpt_issue_at_u64_max_never_repeats() {
         let space = CkptSpace::with_headroom(cells(2), headroom(2)).expect("fits");
-        let (handle, _inbox, issuers) =
-            ControlHandle::detached_in(None, space, 0).expect("the catalog boots");
+        let (handle, _inbox, issuers, _tier) =
+            ControlHandle::detached_in::<MemFs>(None, space, 0).expect("the catalog boots");
         assert_eq!(handle.ckpt_last_issued(), u64::MAX - (3 * 2 + 2), "(N + 1)·h + N below");
         let mut ledger = BTreeSet::new();
         let mut previous = handle.ckpt_last_issued();
@@ -3542,8 +3587,8 @@ mod tests {
     /// observation, so the wake fires.
     #[test]
     fn published_sum_at_2_pow_63_is_not_the_initial_state() {
-        let (handle, _inbox, _issuers) =
-            ControlHandle::detached(cells(2), 0).expect("the catalog boots");
+        let (handle, _inbox, _issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(2), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         board.slot(0).publish(1 << 63, 1, 1);
         board.slot(1).publish(1 << 63, 1, 1);
@@ -3561,8 +3606,8 @@ mod tests {
     /// 2^63 + 2^63, and the alias oracle sees it.
     #[test]
     fn canary_the_u64_fold_aliases_the_initial_state() {
-        let (handle, _inbox, _issuers) =
-            ControlHandle::detached(cells(2), 0).expect("the catalog boots");
+        let (handle, _inbox, _issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(2), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         board.slot(0).publish(1 << 63, 1, 1);
         board.slot(1).publish(1 << 63, 1, 1);
@@ -3574,8 +3619,8 @@ mod tests {
     #[test]
     fn one_exhausted_quota_leaves_the_others_reserving() {
         let space = CkptSpace::with_headroom(cells(2), headroom(1)).expect("fits");
-        let (_handle, _inbox, issuers) =
-            ControlHandle::detached_in(None, space, 0).expect("the catalog boots");
+        let (_handle, _inbox, issuers, _tier) =
+            ControlHandle::detached_in::<MemFs>(None, space, 0).expect("the catalog boots");
         let mut quotas = issuers.cells.into_iter().map(|issuer| issuer.quota);
         let (mut first, mut second) = (quotas.next().expect("cell 0"), quotas.next().expect("1"));
         assert!(first.request(CkptTarget::All).is_ok());
@@ -3588,8 +3633,8 @@ mod tests {
     /// any point is observed within two completed sweeps.
     #[test]
     fn a_full_board_sweeps_in_256_bounded_turns_and_sees_an_advance_within_two() {
-        let (handle, _inbox, _issuers) =
-            ControlHandle::detached(cells(SLOT_COUNT), 0).expect("the catalog boots");
+        let (handle, _inbox, _issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(SLOT_COUNT), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         let mut sweep = BoardSweep::new(CellId(0));
         let mut turns = 0u32;
@@ -3620,8 +3665,8 @@ mod tests {
     /// the two-sweep oracle goes red.
     #[test]
     fn canary_a_stalled_sweep_is_caught() {
-        let (handle, _inbox, _issuers) =
-            ControlHandle::detached(cells(SLOT_COUNT), 0).expect("the catalog boots");
+        let (handle, _inbox, _issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(SLOT_COUNT), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         let mut sweep = BoardSweep::new(CellId(0));
         board.slot(3).publish(7, 1, 1_000);
@@ -3650,8 +3695,8 @@ mod tests {
     #[test]
     fn at_64_cells_or_fewer_one_step_equals_the_old_fold() {
         for count in [1u16, 2, 7, 64] {
-            let (handle, _inbox, _issuers) =
-                ControlHandle::detached(cells(count), 0).expect("the catalog boots");
+            let (handle, _inbox, _issuers, _tier) =
+                ControlHandle::detached::<MemFs>(cells(count), 0).expect("the catalog boots");
             let board = handle.ckpt_board();
             for cell in 0..count {
                 let epoch = u64::from(cell) * 7 + 3;
@@ -3722,8 +3767,8 @@ mod tests {
     /// progress already read (any other slot when the sweep is at its
     /// start): the observation that ends the term must carry both.
     fn turns_until_an_own_publication_is_observed(count: u16, me: u16, steps_in: u32) -> u32 {
-        let (handle, _inbox, _issuers) =
-            ControlHandle::detached(cells(count), 0).expect("the catalog boots");
+        let (handle, _inbox, _issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(count), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         let lastsave = LastSave::default();
         let mut sweep = BoardSweep::new(CellId(me));
@@ -3765,8 +3810,8 @@ mod tests {
     /// wire such a pair).
     #[test]
     fn a_sweep_of_a_cell_off_the_board_has_no_own_slot_term() {
-        let (handle, _inbox, _issuers) =
-            ControlHandle::detached(cells(2), 0).expect("the catalog boots");
+        let (handle, _inbox, _issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(2), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         let mut sweep = BoardSweep::new(CellId(2));
         board.slot(0).publish(3, 1, 1_000);
@@ -3786,8 +3831,8 @@ mod tests {
     /// raise) must fail this test.
     #[test]
     fn lastsave_after_wait_cell_covers_the_fenced_checkpoint() {
-        let (handle, _inbox, issuers) =
-            ControlHandle::detached(cells(2), 0).expect("the catalog boots");
+        let (handle, _inbox, issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(2), 0).expect("the catalog boots");
         let mut quota = issuers.cells.into_iter().next().expect("cell 0").quota;
         let epoch = quota.request(CkptTarget::Cell(CellId(1))).expect("a unit");
         let board = handle.ckpt_board();
@@ -3835,8 +3880,8 @@ mod tests {
     /// the sweep's term alone (`inf_canary_info_lastsave_from_observation`).
     #[test]
     fn lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell() {
-        let (handle, _inbox, issuers) =
-            ControlHandle::detached(cells(2), 0).expect("the catalog boots");
+        let (handle, _inbox, issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(2), 0).expect("the catalog boots");
         let mut quota = issuers.cells.into_iter().next().expect("cell 0").quota;
         let board = handle.ckpt_board();
         let (node, _) = NodeInfo::try_default().expect("fixture cache allocation");
@@ -3872,8 +3917,8 @@ mod tests {
     #[test]
     fn control_constructors_take_a_cell_count_up_to_the_slot_count() {
         assert!(CellCount::new(SLOT_COUNT + 1).is_err());
-        let (handle, _inbox, issuers) =
-            ControlHandle::detached(cells(SLOT_COUNT), 0).expect("the catalog boots");
+        let (handle, _inbox, issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(SLOT_COUNT), 0).expect("the catalog boots");
         assert_eq!(handle.ckpt_board().cell_count(), usize::from(SLOT_COUNT));
         assert_eq!(issuers.cells.len(), usize::from(SLOT_COUNT));
         assert!(issuers.host.remaining() >= 1 << 49, "Q >= 2^49 at 16,384 cells (A1.2)");

@@ -52,8 +52,10 @@ use inf_alloc::AlignedPool;
 use inf_foundation::LogHistogram;
 use inf_foundation::bounded::CapCensus;
 use inf_foundation::grants::{
-    DirectoryCursor, GrantDirectory, GrantPos, GrantSlot, POSITIONS, ReceiptWriter,
+    DirectoryCursor, GrantDirectory, GrantOrder, GrantPos, GrantSlot, POSITIONS, ReceiptWriter,
+    RetireBoard,
 };
+use inf_foundation::time::Nanos;
 use inf_log::blob::ExtentId;
 use inf_log::flush::{PendingSealView, unlink_tier_file};
 use inf_log::fs::{SegmentFile, SegmentFs};
@@ -65,8 +67,10 @@ use inf_runtime::{
 };
 use inf_store::{Keyspace, LogicalAddr, TierSpec, TieredTable};
 
+use crate::control::RetireWake;
 use crate::durable::ack_class::AckClasses;
-use crate::limits::{TIER_ISSUE_OPS_PER_TURN, TIER_PLANS_PER_TURN};
+use crate::limits::{TIER_ISSUE_OPS_PER_TURN, TIER_PLANS_PER_TURN, TIER_RETIRE_RETRY_NS};
+use crate::tier_retire::{CellPart, Consumed, RetireOutcome, TransportPhase};
 
 mod marks;
 mod round;
@@ -118,7 +122,9 @@ pub(crate) trait FlushAdmission {
 /// — reclaim is a background sweep, never a burst).
 const EXTENT_RECLAIM_PER_SLICE: usize = 8;
 
-/// Retired tier files unlinked per MAINTAIN slice (bounded teardown).
+/// Retired tier files a live namespace unlinks per MAINTAIN slice, and a
+/// dropped namespace's files the cell offers to the control thread's worker
+/// per turn, across the cell (bounded teardown, ADR-0156 D4's 8 offers).
 const UNLINKS_PER_SLICE: usize = 8;
 
 /// One tiered namespace's plane-side state.
@@ -132,6 +138,18 @@ pub(crate) struct TierNs<F: SegmentFs> {
     /// Retired metas awaiting `inflight_on == 0` before close + unlink
     /// (§3.3 — a file with in-flight cold reads is never deleted).
     retired: Vec<TierFileMeta>,
+    /// A dropped namespace's files whose close or unlink failed on the
+    /// worker (ADR-0156 D3): offered again only once nothing else of the
+    /// position is left and `retry_due` has passed, so a ready file uses
+    /// the service while a failing one waits for its retry time.
+    retrying: Vec<TierFileMeta>,
+    /// The injected time the position's last `Retry` allows its retries
+    /// from: its consumption plus `TIER_RETIRE_RETRY_NS`.
+    retry_due: Nanos,
+    /// This owner's files out as retirement jobs: offered, in the worker's
+    /// hand, or with their results unconsumed. A Draining owner's terminal
+    /// step waits for zero.
+    jobs_out: u32,
     /// `TAIL-STALL-TIMEOUT` (ADR-0053 D4), consumed at construction.
     pub tail_stall_timeout_ms: u32,
     /// `TIER-IO-MODE` (ADR-0054), consumed at construction — extent
@@ -425,12 +443,15 @@ pub(crate) struct TierCell<F: SegmentFs> {
     /// One tiered namespace owner a grant position (ADR-0148 D2, D3):
     /// Vacant, Live or Draining, at most 64 owners on the cell.
     positions: [Position<F>; POSITIONS],
-    /// The Live positions, ascending by namespace id: the turn's order.
-    /// Reserved to the positions' count at construction, never grown.
-    live: Vec<GrantPos>,
-    /// The node's grant directory and this cell's receipts; `None` on a
-    /// cell with no catalog writer, which installs no tiered owner.
-    grants: Option<CellGrants>,
+    /// The Live positions, ascending by namespace id: the turn's order,
+    /// inline (no allocation of its own).
+    live: GrantOrder,
+    /// The node's grant directory, this cell's receipts and its tier-file
+    /// transport; `None` on a cell with no catalog writer, which installs
+    /// no tiered owner and so needs no transport.
+    grants: Option<CellGrants<F::File>>,
+    /// The cell's retirement counters (`INFO`, cell scope).
+    retire_stats: TierRetireStats,
     /// The canary's dropped owners, parked aside with their positions and
     /// receipts already returned.
     #[cfg(inf_canary_grant_return_at_drop)]
@@ -482,6 +503,29 @@ enum Position<F: SegmentFs> {
     Draining { ns: Box<TierNs<F>>, release: u64, phase: DrainPhase },
 }
 
+// The position table is local owner state (ADR-0148 D4's measured term),
+// at most 2 KiB a cell for every shipped file system: each position holds
+// its owner by `Box`, so its size is independent of `F`.
+const POSITION_TABLE_BYTES_MAX: usize = 2_048;
+const _: () = assert!(
+    size_of::<[Position<inf_log::fs::StdSegmentFs>; POSITIONS]>() <= POSITION_TABLE_BYTES_MAX,
+    "the position table is 2 KiB at most"
+);
+const _: () = assert!(
+    size_of::<[Position<inf_log::fs::sim::SimDisk>; POSITIONS]>() <= POSITION_TABLE_BYTES_MAX,
+    "the position table is 2 KiB at most"
+);
+const _: () = assert!(
+    size_of::<[Position<inf_log::fs::mem::MemFs>; POSITIONS]>() <= POSITION_TABLE_BYTES_MAX,
+    "the position table is 2 KiB at most"
+);
+
+/// The position table's bytes on a cell over the real file system (the
+/// boot test reports it beside the reserved bill).
+pub(crate) const fn position_table_bytes() -> usize {
+    size_of::<[Position<inf_log::fs::StdSegmentFs>; POSITIONS]>()
+}
+
 /// How far a dropped namespace's owner has drained.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum DrainPhase {
@@ -493,27 +537,70 @@ enum DrainPhase {
 }
 
 /// This cell's half of the node's tiered grants (ADR-0148 D2–D4): the
-/// directory it installs from, its receipts, and its pass's place.
-pub(crate) struct CellGrants {
+/// directory it installs from, its receipts, its pass's place, and the
+/// tier-file transport that retires its owners' files (ADR-0156 D2–D3).
+/// A cell installs a tiered owner only through its grants, so a cell that
+/// can install one holds its transport, by type.
+pub(crate) struct CellGrants<J> {
     directory: Arc<GrantDirectory>,
     receipts: ReceiptWriter,
     cursor: DirectoryCursor,
+    /// The cell's job positions, request producer, result consumer and both
+    /// ring backings.
+    part: CellPart<J>,
+    /// The node's retirement board: its bell and the cell's `closing`.
+    board: Arc<RetireBoard>,
+    /// The control thread's wake, which the bell's ring sends.
+    wake: RetireWake,
     /// A standalone test cell grants through its directory's one writer.
     #[cfg(test)]
     writer: Option<inf_foundation::grants::DirectoryWriter>,
 }
 
-impl CellGrants {
-    /// The node's directory and this cell's receipt writer.
-    pub(crate) fn new(directory: Arc<GrantDirectory>, receipts: ReceiptWriter) -> CellGrants {
+impl<J> CellGrants<J> {
+    /// The node's directory, this cell's receipt writer and its part.
+    pub(crate) fn new(
+        directory: Arc<GrantDirectory>,
+        receipts: ReceiptWriter,
+        part: CellPart<J>,
+        board: Arc<RetireBoard>,
+        wake: RetireWake,
+    ) -> CellGrants<J> {
         CellGrants {
             directory,
             receipts,
             cursor: DirectoryCursor::default(),
+            part,
+            board,
+            wake,
             #[cfg(test)]
             writer: None,
         }
     }
+
+    /// The cell's transport part.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn part_mut(&mut self) -> &mut CellPart<J> {
+        &mut self.part
+    }
+
+    /// One step of the transport's stop (ADR-0156 D3): the ready results
+    /// first, then the stop's row the part stands at.
+    pub(crate) fn stop_step(&mut self) -> TransportPhase {
+        self.part.stop_step(&self.board, &self.wake)
+    }
+}
+
+/// The cell's tier-file retirement counters (ADR-0156 D3), cell scope.
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct TierRetireStats {
+    /// Files whose `Unlinked` or `AlreadyAbsent` the cell consumed.
+    pub(crate) files_retired: u64,
+    /// `Retry` results consumed, by errno class.
+    pub(crate) errors_transient: u64,
+    pub(crate) errors_operator: u64,
+    /// Results whose identity no owner held (zero by design).
+    pub(crate) stale: u64,
 }
 
 /// A child owner's hold on a tiered namespace's lifetime (ADR-0148 D3): a
@@ -688,7 +775,7 @@ impl<F: SegmentFs> TierCell<F> {
     /// Every Live owner, mutably, ascending by namespace id (a checkpoint's
     /// walk and its swap's commit).
     pub fn for_each_live_mut(&mut self, mut visit: impl FnMut(&mut TierNs<F>)) {
-        for &pos in &self.live {
+        for &pos in self.live.iter() {
             if let Some(t) = live_at_mut(&mut self.positions, pos) {
                 visit(t);
             }
@@ -808,7 +895,10 @@ impl<F: SegmentFs> TierCell<F> {
             self.position_conflicts += 1;
             return false;
         };
-        let pos = self.live.remove(at);
+        let Some(pos) = self.live.remove(at) else {
+            self.position_conflicts += 1;
+            return false;
+        };
         let slot = &mut self.positions[pos.index()];
         let mut owner = match std::mem::replace(slot, Position::Vacant { round_seq: 0 }) {
             Position::Live(t) => t,
@@ -874,15 +964,16 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         shard_dir: PathBuf,
         census: Rc<CapCensus>,
         nodes: WaitNodes,
-        grants: Option<CellGrants>,
+        grants: Option<CellGrants<F::File>>,
     ) -> TierCell<F> {
         TierCell {
             fs,
             cell,
             shard_dir,
             positions: core::array::from_fn(|_| Position::Vacant { round_seq: 0 }),
-            live: Vec::with_capacity(POSITIONS),
+            live: GrantOrder::default(),
             grants,
+            retire_stats: TierRetireStats::default(),
             #[cfg(inf_canary_grant_return_at_drop)]
             parked: Vec::new(),
             position_conflicts: 0,
@@ -940,7 +1031,8 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         *slot = Position::Live(owner);
         let positions = &self.positions;
         let at = self.live.partition_point(|&p| live_id(positions, p) < id);
-        self.live.insert(at, pos);
+        let placed = self.live.insert(at, pos);
+        debug_assert!(placed, "at most POSITIONS owners are Live, each at its own position");
     }
 
     /// Builds the pipeline of the owner `permit` admitted: the cold-read
@@ -987,6 +1079,9 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             flush,
             files: Vec::new(),
             retired: Vec::new(),
+            retrying: Vec::new(),
+            retry_due: Nanos(0),
+            jobs_out: 0,
             tail_stall_timeout_ms: spec.tail_stall_timeout_ms,
             io_mode: spec.tier_io_mode,
             stall_waiters: WaitList::unit(&self.nodes),
@@ -1362,7 +1457,7 @@ impl<F: SegmentFs + Clone> TierCell<F> {
     fn note_ready_groups(&mut self, now_us: u64) {
         let mut ready = 0u32;
         let mut wait_max = self.flush_stats.group_wait_us_max;
-        for &pos in &self.live {
+        for &pos in self.live.iter() {
             let Some(t) = live_at(&self.positions, pos) else { continue };
             if !t.has_ready_group() {
                 continue;
@@ -1378,32 +1473,46 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         }
     }
 
-    /// The dropped namespaces' drain, each MAINTAIN (ADR-0148 D3): a
+    /// The dropped namespaces' drain, each MAINTAIN (ADR-0148 D3, ADR-0156
+    /// D2–D4). First the transport's ready results, at most 8, in order:
+    /// `Unlinked` or `AlreadyAbsent` drops its owner; `Retry` puts it on its
+    /// position's `retrying`, its handle closed, due one injected
+    /// millisecond after this consumption. Then each Draining position: a
     /// Round position waits for every sent op's completion, then returns
     /// its windows (a parked round's unsent ops are never sent; its effects
     /// are discarded, the table being gone) and turns to its files. A Files
     /// position whose drop is durable (`persisted(release)`, ADR-0100 D5: a
-    /// cut before the swap must find every file) closes and unlinks one file
-    /// at a time, bounded by `UNLINKS_PER_SLICE` across the cell: first the
-    /// files its live life retired, then its catalog from the end, the
-    /// active file, its staged seals, its sealed files last first; each only
-    /// once no cold read is pinned on it, its handle closed before its
-    /// unlink, and a failed unlink kept for the next MAINTAIN. Its terminal
-    /// step, once no file is left, its compaction chain is back, no
+    /// cut before the swap must find every file) offers its owners to the
+    /// control thread's worker, one job each, at most `UNLINKS_PER_SLICE`
+    /// across the cell's turn: first the files its live life retired, then
+    /// its catalog from the end (the active file, its staged seals, its
+    /// sealed files last first), each with its handle and only once no cold
+    /// read is pinned on it, and last, once its `retry_due` has passed, the
+    /// files whose retry waits. A pinned file ends the position's visit; a
+    /// turn with no job position Free ends every visit. The turn's offers
+    /// publish once and ring the node's bell once. Its terminal step, once
+    /// no file is left and none is out, its compaction chain is back, no
     /// [`LifetimeHold`] is outstanding and the commit ledger has settled
     /// through its extent fence (`settled`), frees the position (the box's
     /// drop: T's pool and its holders) and then publishes this cell's
     /// receipt for the id. Returns the units.
     pub fn maintain_draining(
         &mut self,
+        now: Nanos,
         persisted: impl Fn(u64) -> bool,
         settled: impl Fn(u64) -> bool,
     ) -> u32 {
         #[cfg(inf_canary_grant_return_at_drop)]
         self.parked.retain(|t| t.round.as_ref().is_some_and(|r| r.pending > 0));
-        let mut units = 0u32;
-        for index in 0..POSITIONS {
-            let Position::Draining { ns: t, release, phase } = &mut self.positions[index] else {
+        let mut units = self.consume_results(now);
+        let TierCell { fs, cold, positions, grants, .. } = self;
+        let Some(CellGrants { part, receipts, board, wake, .. }) = grants.as_mut() else {
+            return units;
+        };
+        let mut batch = part.offers();
+        let mut offered = 0usize;
+        for slot in positions.iter_mut() {
+            let Position::Draining { ns: t, release, phase } = slot else {
                 continue;
             };
             if *phase == DrainPhase::Round {
@@ -1418,18 +1527,65 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             if !persisted(*release) {
                 continue;
             }
-            let left = (UNLINKS_PER_SLICE as u32).saturating_sub(units);
-            units += drain_files(&self.fs, self.cold.as_ref(), t, left);
+            let left = UNLINKS_PER_SLICE.saturating_sub(offered);
+            offered += offer_files(fs, cold.as_ref(), t, &mut batch, left, now);
             if !drained(t, &settled) {
                 continue;
             }
+            debug_assert_eq!(
+                t.jobs_out, 0,
+                "RECEIPT_WITH_JOBS_OUT: namespace {} published its receipt with jobs out",
+                t.ns.0
+            );
             let (pos, id, round_seq) = (t.pos, t.ns, t.round_seq);
-            self.positions[index] = Position::Vacant { round_seq };
-            if let Some(grants) = &self.grants {
-                grants.receipts.publish(pos, id.0);
-            }
+            *slot = Position::Vacant { round_seq };
+            receipts.publish(pos, id.0);
         }
+        if batch.publish() > 0 {
+            board.bell().ring(&*wake);
+        }
+        units += offered as u32;
         units
+    }
+
+    /// The transport's ready results, at most 8, each resolved by its
+    /// position and namespace id to its owner (ADR-0156 D2). Returns the
+    /// results consumed.
+    fn consume_results(&mut self, now: Nanos) -> u32 {
+        let TierCell { positions, grants, retire_stats, .. } = self;
+        let Some(grants) = grants.as_mut() else { return 0 };
+        let (taken, stale) = grants.part.consume(|consumed| {
+            consume_result(positions, retire_stats, consumed, now);
+        });
+        retire_stats.stale += stale as u64;
+        taken as u32
+    }
+
+    /// The cell's retirement counters and its jobs out
+    /// (`tier_retire_jobs_out`, a gauge 0–8).
+    pub(crate) fn retire_gauges(&self) -> (TierRetireStats, u64) {
+        let out = self.grants.as_ref().map_or(0, |grants| grants.part.jobs_out());
+        (self.retire_stats, out as u64)
+    }
+
+    /// Whether a retirement result waits while a job is out, or the
+    /// transport's stop can step without waiting: the parking loop's final
+    /// check (ADR-0156 D3's result wake and the lane release's wake).
+    pub(crate) fn retire_wake_pending(&mut self) -> bool {
+        self.grants.as_mut().is_some_and(|grants| grants.part.wake_pending())
+    }
+
+    /// The cell's grants, which hold its transport part.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn grants_mut(&mut self) -> Option<&mut CellGrants<F::File>> {
+        self.grants.as_mut()
+    }
+
+    /// One step of the transport's stop (ADR-0156 D3): the ready results
+    /// consumed, then the stop's row; `Retired` on a cell with no transport.
+    pub(crate) fn transport_stop_step(&mut self, now: Nanos) -> TransportPhase {
+        self.consume_results(now);
+        self.grants.as_mut().map_or(TransportPhase::Retired, CellGrants::stop_step)
     }
 
     /// REAP entry (M4.5-S31): records one tier-flush completion into its
@@ -1637,50 +1793,155 @@ fn unlink_retired<F: SegmentFs>(fs: &F, cold: Option<&ColdReads>, t: &mut TierNs
     unlinked as u32
 }
 
-/// One Files-phase visit of a dropped namespace's owner (ADR-0148 D3):
-/// closes and unlinks one file at a time while `left` lasts, the files its
-/// live life retired first, then its catalog's end. A file a cold read is
-/// pinned on ends the visit, its handle open; a failed unlink keeps its
-/// meta (the handle already closed) to retry first at the next MAINTAIN.
-/// Returns the files attempted.
-fn drain_files<F: SegmentFs>(
+/// One consumed result, resolved by its position and namespace id to its
+/// owner: a terminal one drops the owner (its handle was closed by the
+/// worker), a `Retry` returns it to its position's `retrying`, charged,
+/// counted by its errno class, due `TIER_RETIRE_RETRY_NS` after `now`.
+fn consume_result<F: SegmentFs>(
+    positions: &mut [Position<F>; POSITIONS],
+    stats: &mut TierRetireStats,
+    consumed: Consumed,
+    now: Nanos,
+) {
+    let Consumed { pos, ns, meta, outcome } = consumed;
+    let owner = match &mut positions[pos.index()] {
+        Position::Draining { ns: t, .. } | Position::Live(t) if t.ns == ns => t,
+        Position::Draining { .. } | Position::Live(_) | Position::Vacant { .. } => {
+            // Unreachable: a position's owner leaves only at its terminal
+            // step, which waits for every job of it consumed.
+            debug_assert!(false, "a result's owner left its position");
+            stats.stale += 1;
+            return;
+        }
+    };
+    debug_assert!(owner.jobs_out > 0, "a result answers one of the owner's jobs");
+    owner.jobs_out = owner.jobs_out.saturating_sub(1);
+    let cause = match outcome {
+        RetireOutcome::Unlinked | RetireOutcome::AlreadyAbsent => {
+            stats.files_retired += 1;
+            return;
+        }
+        RetireOutcome::Retry(cause) => cause,
+    };
+    if cause.transient() {
+        stats.errors_transient += 1;
+    } else {
+        stats.errors_operator += 1;
+    }
+    // Canary `inf_canary_unlink_result_ignored`: the cell drops the owner at
+    // any result, so a file whose unlink failed is never retried.
+    if cfg!(inf_canary_unlink_result_ignored) {
+        return;
+    }
+    owner.retry_due = Nanos(now.0.saturating_add(TIER_RETIRE_RETRY_NS.0));
+    // Canary `inf_canary_drain_retry_first`: the retried owner back on the
+    // end of `retired`, offered first once its due passes, as the cell's
+    // unlink kept it, so the position's other files wait out its failure.
+    if cfg!(inf_canary_drain_retry_first) {
+        owner.retired.push(meta);
+    } else {
+        owner.retrying.push(meta);
+    }
+}
+
+/// Where a Files-phase owner's next file comes from.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum NextFile {
+    Retired,
+    Catalog,
+    Retrying,
+}
+
+/// One Files-phase visit of a dropped namespace's owner (ADR-0148 D3,
+/// ADR-0156 D2): offers one file at a time while `left` lasts and the
+/// turn's batch has a job position and a ring slot, the files its live
+/// life retired first, then its catalog's end, then, once `now` has passed
+/// its `retry_due`, the files whose retry waits. Each moves with its
+/// handle into its job: a sealed file's from `files`, the active file's
+/// and a staged seal's from the pipeline, a retried one's none (closed by
+/// its failed attempt). A file a cold read is pinned on ends the visit,
+/// its handle kept. Returns the files offered.
+fn offer_files<F: SegmentFs>(
     fs: &F,
     cold: Option<&ColdReads>,
     t: &mut TierNs<F>,
-    left: u32,
-) -> u32 {
+    batch: &mut crate::tier_retire::OfferBatch<'_, F::File>,
+    left: usize,
+    now: Nanos,
+) -> usize {
     let pinned = |id: u32| cold.is_some_and(|c| c.inflight_on(TierFileId::new(id)) > 0);
-    let mut attempted = 0u32;
-    while attempted < left {
-        let meta = match t.retired.last() {
-            Some(meta) if pinned(meta.id) => break,
-            Some(_) => t.retired.pop(),
-            None => match t.flush.catalog_end_id() {
-                Some(id) if pinned(id) => break,
-                Some(_) => t.flush.pop_catalog_end(),
-                None => break,
-            },
+    let mut offered = 0usize;
+    while offered < left {
+        let (id, from) = if let Some(meta) = t.retired.last() {
+            (meta.id, NextFile::Retired)
+        } else if let Some(id) = t.flush.catalog_end_id() {
+            (id, NextFile::Catalog)
+        } else if let Some(meta) = t.retrying.last() {
+            (meta.id, NextFile::Retrying)
+        } else {
+            break;
         };
-        let Some(meta) = meta else { break };
-        // Its handle first: a sealed file's, which the pipeline does not
-        // hold (the active file's and a staged seal's closed as they
-        // left the pipeline).
-        if let Some(at) = t.files.iter().rposition(|(id, _)| *id == meta.id) {
-            drop(t.files.remove(at));
+        let held = match from {
+            // Canary `inf_canary_retire_due_ignored`: a retried file is
+            // offered before its due.
+            NextFile::Retrying => now < t.retry_due && !cfg!(inf_canary_retire_due_ignored),
+            // The planted order's retried file waits at the end of
+            // `retired` (canary `inf_canary_drain_retry_first`).
+            NextFile::Retired => cfg!(inf_canary_drain_retry_first) && now < t.retry_due,
+            NextFile::Catalog => false,
+        };
+        if held || pinned(id) || !batch.room() {
+            break;
         }
-        attempted += 1;
-        match unlink_tier_file(fs, &meta) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            // `tier_unlink_fail` reaches this arm: the file stays its
-            // owner's, so the position holds and no receipt is published.
-            Err(_) => {
+        let (meta, handle) = match from {
+            NextFile::Retired => {
+                let Some(meta) = t.retired.pop() else { break };
+                let handle = take_handle(&mut t.files, meta.id);
+                (meta, handle)
+            }
+            NextFile::Catalog => {
+                let Some((meta, handle)) = t.flush.pop_catalog_end() else { break };
+                let handle = handle.or_else(|| take_handle(&mut t.files, meta.id));
+                (meta, handle)
+            }
+            NextFile::Retrying => {
+                let Some(meta) = t.retrying.pop() else { break };
+                (meta, None)
+            }
+        };
+        offered += 1;
+        // Canary `inf_canary_drain_unlink_on_cell`: the cell closes and
+        // unlinks the file itself, on its loop, as before the transport.
+        if cfg!(inf_canary_drain_unlink_on_cell) {
+            drop(handle);
+            if unlink_tier_file(fs, &meta).is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound)
+            {
+                t.retired.push(meta);
+                break;
+            }
+            continue;
+        }
+        let _ = fs;
+        match batch.offer(t.pos, t.ns, meta, handle) {
+            Ok(()) => t.jobs_out += 1,
+            // Unreachable: the batch had room above. The owner keeps its
+            // file and its handle, never closed on the cell.
+            Err((meta, handle)) => {
+                if let Some(handle) = handle {
+                    t.files.push((meta.id, handle));
+                }
                 t.retired.push(meta);
                 break;
             }
         }
     }
-    attempted
+    offered
+}
+
+/// The handle `files` holds for file `id`, taken out of it.
+fn take_handle<File>(files: &mut Vec<(u32, File)>, id: u32) -> Option<File> {
+    let at = files.iter().rposition(|(held, _)| *held == id)?;
+    Some(files.remove(at).1)
 }
 
 /// The canary's drop: the owner's handles closed at its entry to Draining,
@@ -1690,18 +1951,25 @@ fn drain_files<F: SegmentFs>(
 fn close_at_drop<F: SegmentFs>(t: &mut TierNs<F>) {
     t.files.clear();
     if t.round.is_none() {
-        while let Some(meta) = t.flush.pop_catalog_end() {
+        while let Some((meta, _closed)) = t.flush.pop_catalog_end() {
             t.retired.push(meta);
         }
     }
 }
 
 /// Whether a Files-phase owner's every child owner has ended: no file in
-/// its catalog or its retirement list, its compaction chain back, no
+/// its catalog, its retirement list or its retries, none out as a job
+/// (every result consumed), its compaction chain back, no
 /// extent reader's hold outstanding, and every blob `SET`'s extent barrier
 /// it registered settled in the commit ledger (`settled(fence)`).
 fn drained<F: SegmentFs>(t: &TierNs<F>, settled: impl Fn(u64) -> bool) -> bool {
-    let files = t.flush.catalog_end_id().is_none() && t.retired.is_empty();
+    // Canary `inf_canary_receipt_jobs_out_ignored`: the terminal step
+    // ignores the jobs out, so the receipt goes out with the worker holding
+    // the owner's files.
+    let files = t.flush.catalog_end_id().is_none()
+        && t.retired.is_empty()
+        && t.retrying.is_empty()
+        && (t.jobs_out == 0 || cfg!(inf_canary_receipt_jobs_out_ignored));
     let fence = t.extent_fence.get();
     let held = Rc::strong_count(&t.holds) > 1 || (fence != 0 && !settled(fence));
     // The canary: the terminal step ignores the extent readers' holds and

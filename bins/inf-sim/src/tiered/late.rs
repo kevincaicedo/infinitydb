@@ -1393,6 +1393,10 @@ fn phase_9(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdic
             return Err(());
         }
     }
+    // The drop clause (ADR-0156 D3): from this reply on, the namespace's
+    // tier files are unlinked only by the control thread's worker.
+    let mut clause = crate::harness::drop_clause::DropClause::default();
+    clause.note_drop(super::DROPPED_NS_ID, cx.clock.now());
     drain_race(cx, node, &mut racer, in_flight)?;
     // The audit connection sits on the dropped namespace: its PING must
     // answer the typed dropped-namespace error (never a hang or a crash).
@@ -1412,7 +1416,38 @@ fn phase_9(cx: &mut Late<'_>, node: &mut Node, audit: &mut MiniClient) -> Verdic
         Ok(Some(reply)) if reply.starts_with(b"-ERR") => {}
         other => cx.fail(format!("USE of the dropped ns answered {other:?}")),
     }
+    drop_clause(cx, node, &mut clause)
+}
 
+/// The drop clause over the race's steps, then idle steps (at most
+/// `DROP_CLAUSE_STEPS`) until the worker's unlink of a dropped file is seen
+/// in this boot, its engagement.
+fn drop_clause(
+    cx: &mut Late<'_>,
+    node: &mut Node,
+    clause: &mut crate::harness::drop_clause::DropClause,
+) -> Verdict {
+    /// The idle steps the clause's engagement may take after the race.
+    const DROP_CLAUSE_STEPS: u32 = 64;
+    for breach in clause.judge(cx.disk) {
+        cx.fail(breach);
+    }
+    for _ in 0..DROP_CLAUSE_STEPS {
+        if clause.engagement().is_none() {
+            break;
+        }
+        if let Err(err) = node.step(cx.rng, cx.clock, cx.disk, cx.scenario.step_ns_max) {
+            cx.fail(format!("drop-clause step: {err}"));
+            return Err(());
+        }
+        cx.report.scheduler_steps += 1;
+        for breach in clause.judge(cx.disk) {
+            cx.fail(breach);
+        }
+    }
+    if let Some(vacuous) = clause.engagement() {
+        cx.fail(vacuous);
+    }
     Ok(())
 }
 

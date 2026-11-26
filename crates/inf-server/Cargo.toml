@@ -34,6 +34,12 @@ bench-diagnostics = []
 # shipping build (scripts/check-shipping-features.sh); `inf-sim`'s `dst`
 # requests it.
 fault-points = ["inf-runtime/fault-points"]
+# Test hosts' custody of the tier-file transport (ADR-0156 D3, ADR-0157 D3):
+# `DetachedTier`'s cutting `Drop`, `cut_for_sim`, `retire_with` and
+# `ServerPlane::retire_step`. Off in every shipping build
+# (scripts/check-shipping-features.sh); `inf-sim`'s `dst` requests it, and
+# this crate's own tests and benches reach it through the self dev-edge.
+test-support = []
 
 [lints]
 workspace = true
@@ -51,6 +57,9 @@ inf-simd.workspace = true
 libc.workspace = true
 # M3-S10/S11: the command-level JSON.SET/GET vs SET/GET denominator rows.
 criterion.workspace = true
+# The test hosts' transport custody for this crate's integration tests and
+# benches, through the self dev-edge (as `inf-store`'s suites reach theirs).
+inf-server = { path = ".", features = ["test-support"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 inf-runtime = { workspace = true, features = ["uring"] }

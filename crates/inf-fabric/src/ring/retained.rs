@@ -254,6 +254,15 @@ impl<T> RetainedConsumer<T> {
     pub fn consume_batch(&mut self, max: usize, f: impl FnMut(T)) -> usize {
         self.inner.consume_batch(max, f)
     }
+
+    /// Whether a published value waits to be consumed, moving none: the
+    /// check a parking consumer makes after it announces its park, so a
+    /// value published before the producer read that announcement is seen
+    /// here (one `Acquire` load of the published tail at most).
+    #[inline]
+    pub fn ready(&mut self) -> bool {
+        self.inner.ready()
+    }
 }
 
 /// Slots reserved on a retained ring, a synchronous borrow of its producer.
@@ -856,6 +865,28 @@ mod tests {
         assert!(full.permit().is_none());
         drop(full);
         assert_eq!(consumer.consume_batch(usize::MAX, drop), 8);
+        drop((producer, consumer));
+        assert_eq!(ring.join(), RingPhase::Retiring(RetireCause::Released));
+        retire_all(&mut ring, &mut Vec::new());
+    }
+
+    /// `ready` reads a published value and moves none: empty, then one
+    /// published value seen and still consumed whole, then empty again.
+    #[test]
+    fn ready_sees_a_published_value_and_moves_none() {
+        let mut ring = ready::<u32>();
+        let (mut producer, mut consumer) = ring.split().expect("ready");
+        assert!(!consumer.ready(), "an empty ring holds nothing");
+        let mut reservation = producer.reserve(1);
+        assert!(!consumer.ready(), "a reserved slot is not published");
+        reservation.permit().expect("room").write(5);
+        assert_eq!(reservation.publish(), 1);
+        assert!(consumer.ready(), "the published value waits");
+        assert!(consumer.ready(), "a check consumes nothing");
+        let mut got = Vec::new();
+        assert_eq!(consumer.consume_batch(8, |value| got.push(value)), 1);
+        assert_eq!(got, [5]);
+        assert!(!consumer.ready(), "consumed: empty again");
         drop((producer, consumer));
         assert_eq!(ring.join(), RingPhase::Retiring(RetireCause::Released));
         retire_all(&mut ring, &mut Vec::new());

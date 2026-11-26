@@ -943,6 +943,16 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> CellPlane for S
             flags[me].store(false, Ordering::Relaxed);
             return true;
         }
+        // The retirement worker's wakes pair the same way (ADR-0156 D3): it
+        // publishes a result, or releases a stopping cell's lane, then
+        // fences and reads the flag, so either it wakes this cell or this
+        // check sees the result or the release, on the tier's part or on
+        // the part this cell still holds.
+        let tier = self.shared.tier.borrow_mut().as_mut().is_some_and(|t| t.retire_wake_pending());
+        if tier || self.held_part.as_mut().is_some_and(|part| part.wake_pending()) {
+            flags[me].store(false, Ordering::Relaxed);
+            return true;
+        }
         false
     }
 

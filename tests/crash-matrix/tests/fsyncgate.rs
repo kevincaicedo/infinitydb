@@ -65,10 +65,17 @@ fn start_node(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let one_cell = inf_foundation::CellCount::new(1).expect("one cell");
-    let (control, issuers) =
-        inf_server::spawn_control(data_dir.to_path_buf(), catalog.as_ref(), one_cell, boot_unix_ms)
-            .expect("the catalog boots");
+    let (control, issuers, parts) = inf_server::spawn_control(
+        inf_server::StdSegmentFs,
+        data_dir.to_path_buf(),
+        catalog.as_ref(),
+        one_cell,
+        boot_unix_ms,
+        None,
+    )
+    .expect("the catalog boots");
     let issuer = issuers.cells.into_iter().next().expect("one cell's issuer");
+    let part = parts.into_iter().next().expect("one cell's transport part");
     let dir = data_dir.to_path_buf();
     let fabric = Mesh::new(1, MeshConfig { ring_capacity: 1024, data_credits: 256 })
         .into_iter()
@@ -112,6 +119,7 @@ fn start_node(
             false,
         )
         .expect("the server's timer owners fit their cap");
+        plane.hold_tier_part(part);
         plane.set_control(Arc::clone(&board), issuer).expect("cell 0's issuer");
         plane.begin_recovery(inf_server::StdSegmentFs, &cfg, 0, StdClock::new().now());
         let config = LoopConfig {
@@ -127,6 +135,17 @@ fn start_node(
                 panic!("recovery failed (fail-stop): {err}");
             }
         }
+        // The row's hard end retires the cell's transport on its thread
+        // while the control thread's worker runs.
+        inf_server::retire_with(
+            0,
+            || plane.retire_step(),
+            |_| {
+                #[allow(clippy::disallowed_methods)] // test harness thread, not cell code
+                std::thread::sleep(Duration::from_millis(1));
+                true
+            },
+        );
     });
     // Serve only once recovery finished (fresh dirs finish immediately).
     let deadline = Instant::now() + Duration::from_secs(30);

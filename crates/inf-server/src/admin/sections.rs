@@ -518,6 +518,7 @@ fn tripwires_section(
     // conflicts the grant rules make unreachable.
     push(text, &format!("tier_ns_positions:{}", node.tier_ns_positions.get()));
     push(text, &format!("tier_position_conflicts:{}", node.tier_position_conflicts.get()));
+    retire_lines(text, node);
     // MAINTAIN reads its full task class left for a later pass (ADR-0177 D2).
     push(text, &format!("tier_maint_task_waits:{}", node.tier_maint_task_waits.get()));
     push(text, &format!("loop_snapshot_bytes:{}", node.loop_snapshot.reserved_bytes()));
@@ -525,6 +526,27 @@ fn tripwires_section(
 }
 
 /// `INFO` — the keyspace lines.
+/// The cell's tier-file retirement (ADR-0156 D3): its jobs out, its files
+/// retired, its failed attempts by errno class and its results with no
+/// owner (cell scope); then the
+/// control thread's worker's passes and jobs (node scope).
+fn retire_lines(text: &mut String, node: &NodeInfo) {
+    push(text, &format!("tier_retire_jobs_out:{}", node.tier_retire_jobs_out.get()));
+    push(text, &format!("tier_files_retired:{}", node.tier_files_retired.get()));
+    let (transient, operator) =
+        (node.tier_retire_errors_transient.get(), node.tier_retire_errors_operator.get());
+    push(text, &format!("tier_retire_errors_transient:{transient}"));
+    push(text, &format!("tier_retire_errors_operator:{operator}"));
+    push(text, &format!("tier_retire_results_stale:{}", node.tier_retire_results_stale.get()));
+    let (passes, jobs) = node
+        .retire_board
+        .borrow()
+        .as_deref()
+        .map_or((0, 0), |board| (board.worker_passes(), board.worker_jobs()));
+    push(text, &format!("retire_worker_passes:{passes}"));
+    push(text, &format!("retire_worker_jobs:{jobs}"));
+}
+
 fn keyspace_section(text: &mut String, scope: &str, g: &crate::control::MemoryGauges) {
     push(text, "# Keyspace");
     // The node fold, like `DBSIZE` (ADR-0122 A2, F-L15-03): one line

@@ -446,3 +446,201 @@ fn quit_past_the_pool_delivers_every_earlier_reply() {
         "the tail is neither EOF nor a reset: {tail:?}"
     );
 }
+
+/// The node's control thread, found by its name in
+/// `/proc/<pid>/task/*/comm`.
+#[cfg(target_os = "linux")]
+fn control_thread(pid: u32) -> Option<i32> {
+    let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    tasks.flatten().find_map(|task| {
+        let comm = std::fs::read_to_string(task.path().join("comm")).ok()?;
+        (comm.trim() == "inf-control").then(|| task.file_name().to_str()?.parse().ok()).flatten()
+    })
+}
+
+/// One thread of the node stopped alone by `PTRACE_SEIZE` and
+/// `PTRACE_INTERRUPT`; its exit, once the process ends, reaped with
+/// `__WALL`, without which the process's own exit would stay unreported.
+/// It borrows the node's `Server`, so it drops first, by type: its drop
+/// lets the thread go before the node's kill and reap, and a failed leg's
+/// unwind never waits on an exit only its tracer can reap.
+#[cfg(target_os = "linux")]
+struct HeldThread<'server> {
+    server: &'server mut Server,
+    tid: i32,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for HeldThread<'_> {
+    fn drop(&mut self) {
+        // SAFETY: ptrace(2) on the thread this test seized, no address or
+        // data argument; it is in a ptrace-stop (never resumed), or gone.
+        let detached = unsafe { libc::ptrace(libc::PTRACE_DETACH, self.tid, 0, 0) };
+        if detached == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return;
+        }
+        // Not detachable: the node is killed and its thread's exit reaped
+        // here, polled under a bound, the one reap its parent's wait needs.
+        let pid = i32::try_from(self.server.child.id()).expect("a pid fits an i32");
+        // SAFETY: kill(2) of this test's own child.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let mut status = 0;
+            // SAFETY: waitpid(2) on the seized thread into a stack int.
+            let reaped =
+                unsafe { libc::waitpid(self.tid, &raw mut status, libc::__WALL | libc::WNOHANG) };
+            if reaped != 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<'server> HeldThread<'server> {
+    fn seize(server: &'server mut Server, tid: i32) -> HeldThread<'server> {
+        // SAFETY: ptrace(2) requests on a thread of this test's own child,
+        // with no address or data argument.
+        let seized = unsafe { libc::ptrace(libc::PTRACE_SEIZE, tid, 0, 0) };
+        assert_eq!(
+            seized,
+            0,
+            "PTRACE_SEIZE of thread {tid} refused: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: as above.
+        let interrupted = unsafe { libc::ptrace(libc::PTRACE_INTERRUPT, tid, 0, 0) };
+        assert_eq!(interrupted, 0, "PTRACE_INTERRUPT refused: {}", std::io::Error::last_os_error());
+        let mut status = 0;
+        // SAFETY: waitpid(2) on the seized thread into a stack int.
+        let waited = unsafe { libc::waitpid(tid, &raw mut status, libc::__WALL) };
+        assert_eq!(waited, tid, "the seized thread's stop: {}", std::io::Error::last_os_error());
+        HeldThread { server, tid }
+    }
+
+    /// Reaps the thread's report, if any, without waiting.
+    fn reap(&self) {
+        let mut status = 0;
+        // SAFETY: waitpid(2) on the seized thread into a stack int.
+        let _ = unsafe { libc::waitpid(self.tid, &raw mut status, libc::__WALL | libc::WNOHANG) };
+    }
+}
+
+/// The held leg's backstop: should the leg outlive `bound` (its own
+/// deadline is 12 s), the node is killed and this process exits naming the
+/// leg's witness, so no plant reads as a hang. Disarmed by its drop.
+#[cfg(target_os = "linux")]
+struct Watchdog {
+    disarm: Option<std::sync::mpsc::Sender<()>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Watchdog {
+    /// Armed before the node starts, so it outlives the node's drop; `pid`
+    /// holds the node's pid once spawned (0 before).
+    fn arm(pid: std::sync::Arc<AtomicU32>, bound: Duration) -> Watchdog {
+        let (disarm, armed) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if armed.recv_timeout(bound) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                eprintln!(
+                    "HELD_NODE_NO_EXIT: watchdog: the held leg outlived {} s",
+                    bound.as_secs()
+                );
+                if let Ok(pid @ 1..) = i32::try_from(pid.load(Ordering::Relaxed)) {
+                    // SAFETY: kill(2) of this test's own child.
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+                std::process::exit(101);
+            }
+        });
+        Watchdog { disarm: Some(disarm) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        drop(self.disarm.take());
+    }
+}
+
+/// A durable node whose `inf-control` thread is stopped alone: its stop
+/// reaches the transport's rows, each cell's lane is never released by the
+/// held worker, so no cell reaches `Drained` and each cell's stop deadline
+/// fires: the node exits 1 with the timeout's text within the deadline and
+/// 10 s, never 101 (a backing dropped before its retirement) or 134.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_held_control_thread_ends_the_stop_at_its_deadline() {
+    let _one_at_a_time = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = data_root("held-control");
+    let node_pid = std::sync::Arc::new(AtomicU32::new(0));
+    let _watchdog = Watchdog::arm(std::sync::Arc::clone(&node_pid), Duration::from_secs(40));
+    let mut server = Server::spawn(&dir, "2", &["--shutdown-timeout-ms", "2000"]);
+    node_pid.store(server.child.id(), Ordering::Relaxed);
+    let mut c = Client::connect(server.port);
+    c.ok(&[b"INF.NS", b"CREATE", b"held", b"MODE", b"durable", b"FSYNC", b"everysec"]);
+    drop(c);
+    let pid = server.child.id();
+    let tid = control_thread(pid).expect("the node's inf-control thread");
+    let held = HeldThread::seize(&mut server, tid);
+    let status = Command::new("kill").args(["-TERM", &pid.to_string()]).status().expect("kill(1)");
+    assert!(status.success(), "kill -TERM failed");
+    let deadline = Instant::now() + Duration::from_millis(2_000) + Duration::from_secs(10);
+    let status = loop {
+        held.reap();
+        if let Some(status) = held.server.child.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "HELD_NODE_NO_EXIT: still running 12 s after SIGTERM with its control thread held: {}",
+            held.server.text()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(held);
+    let text = server.text();
+    assert_eq!(status.code(), Some(1), "HELD_NODE_EXIT: {status}, not 1 — {text}");
+    assert!(text.contains("stop drain timed out"), "HELD_NODE_EXIT: no timeout line: {text}");
+    assert!(text.contains("Transport"), "the stop waited on its transport: {text}");
+}
+
+/// A durable node whose every cell fails its first step after its
+/// tier-file transport part arrived: a `--pin-start` past `CPU_SETSIZE`
+/// refuses each cell's pinning. The node exits 1 with `cell N failed:` and
+/// the pinning's text, never 101: the part is never dropped. (A port held
+/// by another listener is refused by the node's port probe before any
+/// cell, so a refused bind is no cell failure the node can reach.)
+#[test]
+#[cfg(target_os = "linux")]
+fn a_cell_failure_after_its_part_arrived_exits_one() {
+    let _one_at_a_time = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = data_root("cell-fails");
+    std::fs::create_dir_all(&dir).expect("data dir");
+    let stderr = dir.join("stderr");
+    let mut child = NodeBinary::built()
+        .command()
+        .args(["--port", "0", "--cells", "2", "--pin-start", "4096"])
+        .arg("--data-dir")
+        .arg(&dir)
+        .args(["--device-probe", "off"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&stderr).expect("stderr file")))
+        .spawn()
+        .expect("spawn infinityd");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "the node never exited with its cells unpinnable");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let text = std::fs::read_to_string(&stderr).unwrap_or_default();
+    assert_eq!(status.code(), Some(1), "CELL_FAILURE_EXIT: {status}, not 1 — {text}");
+    assert!(text.contains("failed:"), "CELL_FAILURE_EXIT: no cell failure line: {text}");
+    assert!(text.contains("CPU_SETSIZE"), "CELL_FAILURE_EXIT: no pinning text: {text}");
+}

@@ -2105,6 +2105,14 @@ pub(crate) struct Node {
     /// O1's judge (ADR-0177 D2), on every step of the life: each cell's
     /// first breach, joined to the life's verdict at its end.
     owners: crate::harness::owners::OwnersJudge,
+    /// The tier-file transport's worker and the parts not yet handed to a
+    /// plane (ADR-0156 D3's planeless adapter): its one iteration runs
+    /// once a step, after the control inbox's drain, never waiting.
+    tier: inf_server::DetachedTier<inf_log::fs::sim::SimFile>,
+    /// While nonzero, a step runs the control inbox's drain but not the
+    /// worker, one fewer each step: the deterministic form of an unlink
+    /// that does not return, beside `hold_inbox`.
+    pub(crate) hold_retire: u64,
 }
 
 /// One cell's durable configuration for `scenario` (every cell of a node
@@ -2196,19 +2204,41 @@ pub(crate) fn boot_meshed(
     let catalog = load_catalog_from(disk, &data_dir)?;
     // A catalog the control plane refuses (ADR-0148 D5) is the boot's typed
     // error, before any cell exists.
-    let (control, inbox, issuers) = inf_server::ControlHandle::detached_with_catalog(
-        catalog.as_ref(),
-        cell_count,
-        // Virtual boot instant (ms): control-plane display only.
-        clock.now().as_millis(),
-    )
-    .map_err(|refused| std::io::Error::new(std::io::ErrorKind::InvalidData, refused.to_string()))?;
+    let (control, inbox, issuers, tier) =
+        inf_server::ControlHandle::detached_with_catalog::<SimDisk>(
+            catalog.as_ref(),
+            cell_count,
+            // Virtual boot instant (ms): control-plane display only.
+            clock.now().as_millis(),
+        )
+        .map_err(|refused| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, refused.to_string())
+        })?;
     let inf_server::CkptIssuers { host: ckpt_host, cells: cell_issuers } = issuers;
     let mut cell_issuers = cell_issuers.into_iter();
+    // The node first, before any cell, holding the transport: every error
+    // return below drops it, and its `Drop` cuts every part, handed to a
+    // plane or not, before any field drops.
+    let mut node = Node {
+        nodes: Vec::new(),
+        iter_stats: Vec::new(),
+        owners: crate::harness::owners::OwnersJudge::new(usize::from(scenario.cells)),
+        cells: Vec::new(),
+        nets: Vec::new(),
+        control,
+        inbox,
+        ckpt_host,
+        data_dir: data_dir.clone(),
+        hold_inbox: false,
+        frozen: None,
+        observer: observer.clone(),
+        clock: Rc::clone(clock),
+        disk: disk.clone(),
+        observed_ready: false,
+        tier,
+        hold_retire: 0,
+    };
     let fabrics = Mesh::new(scenario.cells, mesh);
-    let mut nets = Vec::new();
-    let mut cells = Vec::new();
-    let mut nodes = Vec::new();
     for (i, fabric) in fabrics.into_iter().enumerate() {
         let net = CellNet::new(i as u16, scenario.seed, scenario.plant);
         // The clock rides into the driver for the stall device (M2.5-S14);
@@ -2223,7 +2253,7 @@ pub(crate) fn boot_meshed(
         let (node_info, admission) = NodeInfo::try_default().expect("fixture cache allocation");
         let node_info = Rc::new(node_info);
         node_info.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
-        nodes.push(Rc::clone(&node_info));
+        node.nodes.push(Rc::clone(&node_info));
         // The node's keyspace is cataloged (ADR-0189 D4), as `infinityd`'s,
         // and the plane builds it from this seed on its cell's census.
         let seed = KeyspaceSeed::Cataloged {
@@ -2245,38 +2275,29 @@ pub(crate) fn boot_meshed(
             false,
         )
         .map_err(std::io::Error::other)?;
+        let part = node.tier.take_part(i as u16).ok_or_else(|| {
+            std::io::Error::other("the boot reservation made one transport part per cell")
+        })?;
+        plane.hold_tier_part(part);
+        let spin_iters = scenario.wake.spin(scenario.spin_iters);
+        let config = LoopConfig { spin_iters, ..Default::default() };
+        let cell_loop =
+            CellLoop::new(driver, Rc::clone(clock), pool, config, serve_mark, timer_set, executor);
+        // In the node from the moment it holds its part.
+        node.nets.push(net);
+        node.cells.push((cell_loop, plane));
+        node.iter_stats.push(None);
+        let (_, plane) = node.cells.last_mut().expect("the cell just pushed");
         let cfg = durable_config(scenario, &data_dir);
         let issuer = cell_issuers.next().ok_or_else(|| {
             std::io::Error::other("the partition minted one checkpoint issuer per cell")
         })?;
         plane
-            .set_control(std::sync::Arc::clone(&control), issuer)
+            .set_control(std::sync::Arc::clone(&node.control), issuer)
             .map_err(|refused| std::io::Error::other(refused.to_string()))?;
         plane.begin_recovery(disk.clone(), &cfg, i as u16, clock.now());
-        let spin_iters = scenario.wake.spin(scenario.spin_iters);
-        let config = LoopConfig { spin_iters, ..Default::default() };
-        let cell_loop =
-            CellLoop::new(driver, Rc::clone(clock), pool, config, serve_mark, timer_set, executor);
-        nets.push(net);
-        cells.push((cell_loop, plane));
     }
-    Ok(Node {
-        nodes,
-        iter_stats: vec![None; cells.len()],
-        owners: crate::harness::owners::OwnersJudge::new(cells.len()),
-        cells,
-        nets,
-        control,
-        inbox,
-        ckpt_host,
-        data_dir,
-        hold_inbox: false,
-        frozen: None,
-        observer: observer.clone(),
-        clock: Rc::clone(clock),
-        disk: disk.clone(),
-        observed_ready: false,
-    })
+    Ok(node)
 }
 
 impl Drop for Node {
@@ -2285,6 +2306,16 @@ impl Drop for Node {
     /// rule, their liveness and the gates' derived counts), and its nets'
     /// invariants drained.
     fn drop(&mut self) {
+        // A life's end is a process exit for the transport: every part, on a
+        // plane or not yet handed out, is cut before any field drops
+        // (ADR-0157 D3). An unwind cuts nothing: the backings' panicking arm
+        // frees nothing.
+        if !std::thread::panicking() {
+            let worker = self.tier.worker();
+            for (_, plane) in &mut self.cells {
+                plane.cut_tier_part(worker);
+            }
+        }
         self.observe_state(b"node-end");
         let mut verdict = crate::census::CensusVerdict::default();
         for (index, (_, plane)) in self.cells.iter().enumerate() {
@@ -2393,6 +2424,15 @@ impl Node {
         }
         if !self.hold_inbox {
             self.inbox.drain(disk, &self.data_dir)?;
+        }
+        // The control thread's retirement worker, once a step after the
+        // drain (ADR-0156 D3): every call it makes the disk logs under the
+        // worker's mark.
+        if self.hold_retire > 0 {
+            self.hold_retire -= 1;
+        } else {
+            disk.mark(inf_log::fs::sim::DiskPhase::Worker, clock.now());
+            self.tier.iterate(disk);
         }
         clock.advance(Nanos(STEP_NS_FLOOR + rng.next_u64() % step_ns_max));
         if !self.observed_ready && self.ready() {

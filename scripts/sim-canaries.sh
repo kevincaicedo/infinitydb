@@ -1232,6 +1232,13 @@ ordered_rows=(
   # linked sync and a write-through write, each whole until the hold lifts. Planted,
   # hold_barriers keeps standalone syncs alone, and the frame barriers complete while held.
   "inf_canary_barrier_hold_standalone_only crate-test inf-sim test:disk a_barrier_hold_keeps_every_barrier_until_it_lifts barrier-completed-while-held"
+  # ADR-0148 D4: every payload of the reservation is reserved fallibly.
+  # Planted, the receipts are made by an infallible `collect`, and the child
+  # whose receipts' allocation is refused dies by SIGABRT.
+  "inf_canary_boot_payload_infallible crate-test inf-server test:tier_boot_reservation boot_reservation_refusals_are_typed CHILD_SIGNALED:"
+  # ADR-0148 D4: no cell is built after a refused boot reservation. Planted,
+  # the assembly reserves again and builds the node regardless.
+  "inf_canary_boot_reservation_ignored crate-test inf-server test:tier_boot_reservation boot_reservation_refusals_are_typed CELL_BUILT_AFTER_REFUSAL:"
   # The capped slab's admission compare on the `conn` class, whose cap is the cell's share
   # (ADR-0177 D2), at its control: the fan leg's share of clients on one cell. One task short,
   # the class holds 3 of its 4 and the last client's accept is refused there, so the leg reads
@@ -1243,6 +1250,11 @@ ordered_rows=(
   # the share then admits is refused at the class instead, which never crosses on the plain build.
   "inf_canary_cap_minus_one m0-capacity cap-row-unfilled --close-leg tasks"
   "inf_canary_cap_minus_one m0-capacity cap-row-crossed --close-leg tasks"
+  # ADR-0157 D3: a cell's every failure after its transport part arrived
+  # exits without a destructor. Planted, its error returns from the cell,
+  # dropping the part and the plane: exit 101, not 1.
+  "inf_canary_cell_exit_drops_plane crate-test infinityd test:graceful_stop a_held_control_thread_ends_the_stop_at_its_deadline HELD_NODE_EXIT:"
+  "inf_canary_cell_exit_drops_plane crate-test infinityd test:graceful_stop a_cell_failure_after_its_part_arrived_exits_one CELL_FAILURE_EXIT:"
   # A slot takes the largest power-of-two chunk one 64 KiB allocation holds, at most 64 slots,
   # and the builder takes no other count (ADR-0194 A1). Planted, chunk_slots_for answers 64 at
   # every width, the fixed chunk, and a slab of 1,032 B slots in chunks of 32 is refused.
@@ -1316,6 +1328,14 @@ ordered_rows=(
   # Planted, the queue alone diverts: a flat write runs inline while a tiered write of the same
   # origin holds its slot on a held cold read, and the flat write's open stops the cell.
   "inf_canary_divert_queue_only m0-capacity second-open-slot --close-leg gated-cold"
+  # ADR-0156 D3: a ready file uses the service while a failed one waits.
+  # Planted, the retried file goes back on the end of the retired list, so
+  # the visit ends at it until its due and offers it first.
+  "inf_canary_drain_retry_first crate-test inf-server lib a_retried_drain_file_waits_its_due_behind_the_rest RETRY_AHEAD:"
+  # ADR-0156 D3: a dropped namespace's tier files leave only through the
+  # control thread's worker. Planted, the drain visit unlinks them on the
+  # cell, and the disk logs a cell-marked unlink after the DROP's `+OK`.
+  "inf_canary_drain_unlink_on_cell m4-ns-lifetimes DROP-CLAUSE"
   # The slab's draining count, which the accept's active share reads, leaves with a draining
   # slot's removal (ADR-0123 A1). Planted, the removal keeps it, and MAINTAIN's sweep asserts
   # the count against its own walk once the first drained slot vacates: the lowered plane test
@@ -1472,12 +1492,22 @@ ordered_rows=(
   # whatever the route, ahead of the owed replies: the plane test and the DST leg.
   "inf_canary_parse_reply_around_queue crate-test inf-server lib protocol_error_answers_after_deferred reply-order"
   "inf_canary_parse_reply_around_queue m0-capacity reply-order --close-leg protocol-order"
+  # ADR-0156 D3: a control post sends the worker's wake after its message.
+  # Planted, it sends none, and a waiting worker sleeps with the message
+  # queued.
+  "inf_canary_post_rings_no_wake loom inf-foundation loom_the_worker_never_waits_with_a_job_published_or_a_message_queued LOST_WAKE:"
   # A QUIT the pump runs empties the queue behind it. Planted, the queue is kept, and the SETs
   # behind the QUIT run.
   "inf_canary_quit_keeps_queue m0-capacity post-quit-ran --close-leg deferred-quit"
   # The end of stream ends the receive (ADR-0196 A1.3). Planted, the end-of-stream arm re-arms
   # the half-closed slot, and the net refuses an arm after its EOF.
   "inf_canary_rearm_after_eof m0-capacity recv-armed-after-eof --close-leg half-close"
+  # ADR-0156 D3: a dropped namespace's receipt waits for every job's result. Planted, the
+  # terminal step ignores the jobs out: with the worker held, the cell test's MAINTAIN
+  # publishes the receipt with jobs out, and the simulator's successor CREATE is accepted while
+  # the dropped namespace's tier files are still on the disk.
+  "inf_canary_receipt_jobs_out_ignored crate-test inf-server lib a_drained_namespaces_receipt_waits_for_its_jobs_out RECEIPT_WITH_JOBS_OUT:"
+  "inf_canary_receipt_jobs_out_ignored m4-ns-lifetimes HELD-WORKER"
   # The registries drop a connection when its queue is empty, so a queued SUBSCRIBE's 0→1
   # precedes the close's 1→0 in one task. Planted, the removal runs at Closed, before the drain,
   # and the owner keeps counting the closed client.
@@ -1489,6 +1519,47 @@ ordered_rows=(
   # A general send keeps one credit free for the publish fan (ADR-0192 D2), so an origin parks
   # at most 7 applies at a peer of 8 credits. Planted, the guard is gone and all 8 arrive.
   "inf_canary_reserve_unguarded m0-capacity applies-high-water --close-leg small-credit"
+  # ADR-0156 D3: the worker's wake holds no message's slot or turn. Planted,
+  # the bell rings into the control channel, and each ring takes the turn
+  # of a message queued behind it.
+  "inf_canary_retire_bell_in_channel crate-test inf-server lib a_message_waits_no_turn_behind_the_bell MESSAGE_BEHIND_WAKE:"
+  # ADR-0156 D3: a cell's turn that published jobs rings the node's bell.
+  # Planted, it rings none, and the worker waits on an empty circuit with a
+  # job published and nothing left to wake it.
+  "inf_canary_retire_bell_silent loom inf-foundation loom_the_worker_never_waits_with_a_job_published_or_a_message_queued LOST_WAKE:"
+  # ADR-0156 D3: the worker waits only after a whole circuit of empty visits.
+  # Planted, it waits after any pass that took no job, with a later lane's
+  # job queued and nothing left to wake it.
+  "inf_canary_retire_block_after_empty_pass crate-test inf-server lib a_last_lanes_job_is_served_before_any_wait WAIT_UNWOKEN:"
+  # ADR-0156 D3: a final close consumes its number on every outcome.
+  # Planted, the retry after a close error closes that number again, which a
+  # sentinel opened since has reused.
+  "inf_canary_retire_close_twice crate-test inf-server lib a_retry_after_a_close_error_never_closes_the_number_again SENTINEL_CLOSED:"
+  # ADR-0156 D2: a job position is Free only at its result's consumption.
+  # Planted, a position counts as free once the worker took its request, so
+  # a ninth owner is admitted while eight results are unconsumed.
+  "inf_canary_retire_credit_at_dequeue crate-test inf-server lib a_position_frees_only_at_its_results_consumption NINTH_ADMITTED:"
+  # ADR-0156 D4: a pass resumes at the lane after the last one it visited.
+  # Planted, each pass starts at lane 0 and a later lane is never served.
+  "inf_canary_retire_cursor_reset crate-test inf-server lib every_ready_lane_is_served_within_its_share_of_passes LANE_UNSERVED:"
+  # ADR-0156 D3: a retried file waits one injected millisecond after its
+  # `Retry`'s consumption. Planted, the visit offers it before its due.
+  "inf_canary_retire_due_ignored crate-test inf-server lib a_retried_drain_file_waits_its_due_behind_the_rest RETRY_EARLY:"
+  # ADR-0156 D3, ADR-0157 D3: a cell releases its endpoints only with every
+  # position Free. Planted, it releases them with a result unconsumed.
+  "inf_canary_retire_join_early crate-test inf-server lib the_stop_releases_only_with_every_position_free OWNER_UNCONSUMED:"
+  # ADR-0156 D3: the worker returns every owner in a result. Planted, a
+  # `Retry` result is dropped, and its owner with it, never consumed.
+  "inf_canary_retire_result_dropped crate-test inf-server lib each_outcome_returns_its_owner OWNER_DROPPED:"
+  # ADR-0156 D3: a result's publish is followed by the parked cell's wake.
+  # Planted, the result is published silently and the parked cell sleeps.
+  "inf_canary_retire_result_wake_silent crate-test inf-server lib a_parked_cell_is_woken_by_its_results RESULT_WAKE_MISSING:"
+  # The same plant on one thread: a result published between the cell's final check and its
+  # park wakes no cell.
+  "inf_canary_retire_result_wake_silent crate-test inf-server lib a_result_published_between_the_check_and_the_park_wakes_the_cell WAKE_IN_GAP_LOST:"
+  # ADR-0156 D3: an idle worker waits on its wake. Planted, it never waits,
+  # a busy loop on an idle node.
+  "inf_canary_retire_worker_never_waits crate-test inf-server lib an_idle_worker_waits_after_one_empty_circuit NO_WAIT:"
   # ADR-0157 D3: a backing owner dropped before its retirement leaks
   # silently instead of failing stop.
   "inf_canary_ring_drop_live_silent crate-test inf-fabric lib a_backing_dropped_before_its_retirement_fails_stop FAIL_STOP_MISSING:"
@@ -1542,6 +1613,10 @@ ordered_rows=(
   # The stop's mark ends every parser (ADR-0196 A1.1). Planted, it reaches active slots alone,
   # and a SET held past the stop runs.
   "inf_canary_stop_skips_peer_reader crate-test inf-server lib stop_ends_every_reader set-after-stop"
+  # ADR-0124 D3, ADR-0157 D4: the stop reads its lane's release one load a
+  # turn. Planted, it waits for the release in a loop, so a held control
+  # thread holds the cell past its stop deadline.
+  "inf_canary_stop_waits_worker crate-test infinityd test:graceful_stop a_held_control_thread_ends_the_stop_at_its_deadline HELD_NODE_NO_EXIT:"
   # A class handle carries its slab's `SlabInstance`, which `reserve` compares first (ADR-0171
   # A2.1). Planted, the compare is skipped, and another executor's class, built alike, is
   # granted.
@@ -1572,6 +1647,10 @@ ordered_rows=(
   # Planted, the clock alone, and at the stall's end a client whose PING waits in the net for a
   # receive buffer is closed with it unread.
   "inf_canary_timeout_since_ignores_stall crate-test inf-sim lib timeout_spares_the_replies_of_a_stalled_cell reply-owed-close"
+  # ADR-0156 D3: only a consumed `Unlinked` or `AlreadyAbsent` drops a file's
+  # owner. Planted, the cell drops it at any result, so a failed unlink is
+  # never retried.
+  "inf_canary_unlink_result_ignored crate-test inf-server lib a_retried_drain_file_waits_its_due_behind_the_rest RETRY_LOST:"
   # The io_uring driver dispatches a reap's completions in the kernel's order, so the bytes a
   # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
   # the reap is dispatched last first, and the end of stream comes before the bytes.

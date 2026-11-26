@@ -800,6 +800,10 @@ pub struct ServerPlane<
     /// This cell's stop-checkpoint credit (ADR-0159 D3) until a stop takes
     /// it; wired with the control handle by `set_control`.
     final_credit: Option<CkptFinalCredit>,
+    /// This cell's tier-file transport part (ADR-0156 D2) from its arrival
+    /// until `enable_durable` moves it into the tier cell's grants; held
+    /// here, it is the stop's to retire (a cell still recovering).
+    held_part: Option<crate::tier_retire::CellPart<F::File>>,
     /// The graceful stop (ADR-0124 D2); `None` while serving.
     stop: Option<StopDrive>,
     /// Take a checkpoint before the final sync of a stop (D2 step 3).
@@ -888,6 +892,9 @@ pub enum StopHold {
     /// The durable cell is not quiescent: the first of its terms that
     /// holds it.
     Durable(DrainHold),
+    /// The tier-file transport is not retired: where it stands (a job out,
+    /// the worker's lane not yet released, a block not yet freed).
+    Transport(crate::tier_retire::TransportPhase),
 }
 
 /// The drain's own state (one `Option` check per MAINTAIN while serving).
@@ -1166,6 +1173,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             loading_board: None,
             memory_publish_in: 1,
             final_credit: None,
+            held_part: None,
             stop: None,
             stop_checkpoint: true,
         };
@@ -1420,13 +1428,18 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
                 return Err(err);
             }
         };
-        // The cell's tiered grants (ADR-0148 D2): the node's directory and
-        // this cell's receipts, from the catalog writer's control plane; a
-        // cell with none installs no tiered owner.
+        // The cell's tiered grants (ADR-0148 D2): the node's directory, this
+        // cell's receipts and its transport part, from the catalog writer's
+        // control plane; a cell with none installs no tiered owner. A part
+        // with no receipts stays held, the stop's to retire.
+        let held_part = &mut self.held_part;
         let grants = self.shared.control.borrow().as_ref().and_then(|control| {
             let receipts = control.take_tier_receipts(cell_id)?;
+            let part = held_part.take()?;
             let directory = Arc::clone(control.tier_directory());
-            Some(crate::tier_cell::CellGrants::new(directory, receipts))
+            let board = Arc::clone(control.retire_board());
+            let wake = control.retire_wake();
+            Some(crate::tier_cell::CellGrants::new(directory, receipts, part, board, wake))
         });
         *self.shared.tier.borrow_mut() = Some(crate::tier_cell::TierCell::new(
             fs.clone(),
@@ -1561,6 +1574,7 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             let control = self.shared.control.borrow().clone();
             let durable = self.shared.durable.borrow();
             units += tier.maintain_draining(
+                cx.now,
                 |epoch| control.as_ref().is_none_or(|control| control.persisted(epoch)),
                 |fence| durable.as_ref().is_none_or(|cell| cell.commit.settled_through(fence)),
             );
@@ -1604,6 +1618,13 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
             self.shared.node.tier_window_written_bytes.set(written);
             self.shared.node.tier_ns_positions.set(tier.positions_held());
             self.shared.node.tier_position_conflicts.set(tier.position_conflicts());
+            let (retire, jobs_out) = tier.retire_gauges();
+            let node = &self.shared.node;
+            node.tier_retire_jobs_out.set(jobs_out);
+            node.tier_files_retired.set(retire.files_retired);
+            node.tier_retire_errors_transient.set(retire.errors_transient);
+            node.tier_retire_errors_operator.set(retire.errors_operator);
+            node.tier_retire_results_stale.set(retire.stale);
             tier.cold.clone()
         };
         // Reactor-drive flush ops (M4.5-S31): pushed outside the tier
@@ -1746,10 +1767,20 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         }
         *self.shared.node.memory_board.borrow_mut() = Some(Arc::clone(control.memory_board()));
         *self.shared.node.ddl_gauges.borrow_mut() = Some(Arc::clone(control.ddl_gauges()));
+        *self.shared.node.retire_board.borrow_mut() = Some(Arc::clone(control.retire_board()));
         *self.shared.control.borrow_mut() = Some(control);
         *self.shared.ckpt_quota.borrow_mut() = Some(issuer.quota);
         self.final_credit = Some(issuer.final_credit);
         Ok(())
+    }
+
+    /// Holds this cell's tier-file transport part (ADR-0156 D2): an
+    /// infallible store right after the plane's construction, before any
+    /// fallible step, so the part lives in the plane from its arrival on;
+    /// `enable_durable` moves it into the tier cell's grants.
+    pub fn hold_tier_part(&mut self, part: crate::tier_retire::CellPart<F::File>) {
+        debug_assert!(self.held_part.is_none(), "a cell holds one part");
+        self.held_part = Some(part);
     }
 
     /// Durable counters for tests/stats (`None` = memory-only cell).
@@ -1762,6 +1793,12 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
     /// all zero on a cell that never created a tiered namespace.
     pub fn tier_flush_gauges(&self) -> [u64; TIER_FLUSH_GAUGES] {
         self.shared.node.tier_flush.get()
+    }
+
+    /// The cell's tier-file jobs out (0 without a tier), read from its part
+    /// for the simulator's held-worker cycle between scheduler steps.
+    pub fn tier_retire_jobs_out_for_sim(&self) -> u64 {
+        self.shared.tier.borrow().as_ref().map_or(0, |tier| tier.retire_gauges().1)
     }
 
     /// Checkpoint `(completed, aborted)` for the simulator's oracles
@@ -2058,12 +2095,73 @@ impl<O: PlaneObserver + 'static, F: SegmentFs + Clone + 'static> ServerPlane<O, 
         if stop.phase == StopPhase::Drained {
             return;
         }
-        match Self::drain_step(stop, &self.shared, self.stop_checkpoint) {
+        let now = self.shared.now.get();
+        let drained = Self::drain_step(stop, &self.shared, self.stop_checkpoint)
+            .and_then(|()| Self::transport_step(&self.shared, &mut self.held_part, now));
+        match drained {
             Ok(()) => {
                 stop.phase = StopPhase::Drained;
                 stop.hold = None;
             }
             Err(hold) => stop.hold = Some(hold),
+        }
+    }
+
+    /// The stop's transport rows (ADR-0156 D3, ADR-0157 D4), after the final
+    /// sync's quiescence: one step a turn of the tier cell's part and of a
+    /// part still held (a cell stopped while it recovers), never waiting;
+    /// `Ok` once both are Retired, so the cell is `Drained` only with no job
+    /// out and both backings retired.
+    fn transport_step(
+        shared: &Shared<O, F>,
+        held: &mut Option<crate::tier_retire::CellPart<F::File>>,
+        now: Nanos,
+    ) -> Result<(), StopHold> {
+        use crate::tier_retire::TransportPhase;
+        let tier = shared.tier.borrow_mut().as_mut().map(|tier| tier.transport_stop_step(now));
+        let held = match held.as_mut() {
+            Some(part) => match shared.control.borrow().as_ref() {
+                Some(control) => part.stop_step(control.retire_board(), &control.retire_wake()),
+                // Unreachable: a part arrives only with its control plane.
+                None => part.phase(),
+            },
+            None => TransportPhase::Retired,
+        };
+        for phase in [tier.unwrap_or(TransportPhase::Retired), held] {
+            if phase != TransportPhase::Retired {
+                return Err(StopHold::Transport(phase));
+            }
+        }
+        Ok(())
+    }
+
+    /// One step of the transport's stop on a test host's thread, never
+    /// waiting (ADR-0156 D3): the ready results consumed, Closing entered,
+    /// and once every position is Free the cell's endpoints released and the
+    /// bell rung; later steps join and retire a block a ring. `Retired` once
+    /// nothing is left; a threaded fixture's hard end loops it through
+    /// `retire_with`. It changes no durable state the cell owns.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn retire_step(&mut self) -> crate::tier_retire::RetireStep {
+        let now = self.shared.now.get();
+        match Self::transport_step(&self.shared, &mut self.held_part, now) {
+            Ok(()) => crate::tier_retire::RetireStep::Retired,
+            Err(_) => crate::tier_retire::RetireStep::Pending,
+        }
+    }
+
+    /// Cuts this cell's transport part with its lane from `worker`, as a
+    /// process exit would: the simulator's node at its end, a test host's
+    /// drop. Nothing on a part already Retired.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn cut_tier_part(&mut self, worker: &mut crate::tier_retire::RetireWorker<F::File>) {
+        let cell = self.shared.cell.0;
+        let Some(lane) = worker.lane_mut(cell) else { return };
+        if let Some(part) = self.held_part.as_mut() {
+            crate::tier_retire::cut_for_sim(part, lane);
+        }
+        if let Some(grants) = self.shared.tier.borrow_mut().as_mut().and_then(|t| t.grants_mut()) {
+            crate::tier_retire::cut_for_sim(grants.part_mut(), lane);
         }
     }
 

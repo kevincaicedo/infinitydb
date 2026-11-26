@@ -6,14 +6,15 @@
 //! entry: a rename onto `MANIFEST` that `manifest_rename_fail` refuses
 //! never reaches the disk.
 //!
-//! Three calls are logged: a checkpoint's staging create (`create_meta` or
+//! Four calls are logged: a checkpoint's staging create (`create_meta` or
 //! `create_meta_direct` on a `ckpt-NNNNNN.ick.new` name), with its result
 //! and whether the name exists after it; a rename onto a shard's
-//! `MANIFEST`, the recovery unit's commit point; and a handle's final
-//! close (`SimFile::close_reporting`), where `tier_close_fail` fires. Each entry carries the
-//! harness's last [`DiskMark`]: the phase that ran and its injected time,
-//! so an oracle spaces two creates by the time the harness gave, never by
-//! a clock the cell under test keeps.
+//! `MANIFEST`, the recovery unit's commit point; a handle's final close
+//! (`SimFile::close_reporting`), where `tier_close_fail` fires; and a
+//! retired tier file's unlink (`unlink_tier`), where `tier_unlink_fail`
+//! fires. Each entry carries the harness's last [`DiskMark`]: the phase
+//! that ran and its injected time, so an oracle spaces two creates by the
+//! time the harness gave, never by a clock the cell under test keeps.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,9 @@ use crate::limits::SIM_DISK_CALLS_LOGGED_MAX;
 pub enum DiskPhase {
     /// One iteration of this cell's loop.
     Cell(CellId),
+    /// The control thread's retirement worker, which the simulator runs
+    /// once a step after the cells' iterations.
+    Worker,
 }
 
 /// The harness's mark: the phase it runs and the injected time it gave
@@ -50,6 +54,10 @@ pub enum DiskCall {
     /// A handle's final close: the path logged is the first name that
     /// reached its inode at the close, empty when none did.
     FinalClose,
+    /// A retired tier file's unlink (`SegmentFs::unlink_tier`): the path
+    /// logged is the one asked for, its result `NotFound` when no file had
+    /// the name.
+    UnlinkTier,
 }
 
 /// How a logged call ended.
@@ -265,6 +273,45 @@ mod tests {
             entry(DiskCall::FinalClose, &second, point, Some(mark)),
         ];
         assert_eq!(disk.logged_calls(0), expected, "each final close is logged once");
+    }
+
+    /// A retired tier file's unlink is logged by the disk on every attempt:
+    /// `tier_unlink_fail` fires inside the call, before the name is touched,
+    /// so the file stays and the entry names the point; the next attempt
+    /// removes it, and one after that answers `NotFound`.
+    #[test]
+    fn each_tier_unlink_attempt_is_logged_with_its_result() {
+        use inf_foundation::fault::{self, FaultSpec};
+        let disk = SimDisk::new();
+        let cold = Path::new("shard-0/cold");
+        disk.create_dir_all(cold).expect("dirs");
+        let path = cold.join("tier-000000.itier");
+        drop(disk.create_tier(&path, crate::fs::TierIoMode::Buffered).expect("create"));
+        let mark = DiskMark { phase: DiskPhase::Worker, at: Nanos(21) };
+        disk.mark(mark.phase, mark.at);
+        fault::arm(crate::fault::TIER_UNLINK_FAIL, FaultSpec::Nth(1));
+        let refused = disk.unlink_tier(&path);
+        let fired = fault::fired(crate::fault::TIER_UNLINK_FAIL);
+        fault::disarm_all();
+        assert_eq!(fired, 1, "engagement: the unlink met the point");
+        let err = refused.expect_err("the armed unlink refuses");
+        assert!(err.to_string().contains("tier_unlink_fail"), "typed and named: {err}");
+        assert!(disk.open_read(&path).is_ok(), "a refused unlink leaves the file");
+        disk.unlink_tier(&path).expect("disarmed, the unlink removes it");
+        let absent = disk.unlink_tier(&path).expect_err("nothing left to unlink");
+        assert_eq!(absent.kind(), io::ErrorKind::NotFound);
+        let point = CallResult::Injected(crate::fault::TIER_UNLINK_FAIL);
+        let expected = vec![
+            entry(DiskCall::UnlinkTier, &path, point, Some(mark)),
+            entry(DiskCall::UnlinkTier, &path, CallResult::Ok, Some(mark)),
+            entry(
+                DiskCall::UnlinkTier,
+                &path,
+                CallResult::Failed(io::ErrorKind::NotFound),
+                Some(mark),
+            ),
+        ];
+        assert_eq!(disk.logged_calls(0), expected, "each attempt is logged once");
     }
 
     /// At the cap a call is counted, not kept: the log a reader sees is

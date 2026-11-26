@@ -39,7 +39,7 @@ use inf_foundation::CellId;
 use inf_foundation::KeyHasher;
 use inf_foundation::time::{Clock, StdClock};
 use inf_log::ckpt::{SyncIckWriter, ick_file_name};
-use inf_log::fs::StdSegmentFs;
+use inf_log::fs::{StdSegmentFile, StdSegmentFs};
 use inf_log::{
     CkptConfig, LogGeometry, Lsn, Manifest, MutationEffect, NsId, RecordView, SegmentConfig,
     SegmentId, SegmentRotor, StagingConfig, StagingRing, create_cell_dirs, scan_log_dir,
@@ -206,11 +206,11 @@ fn drive_cell(
     cells: u16,
     listener: std::net::TcpListener,
     fabric: inf_fabric::CellFabric,
-    control: Arc<inf_server::ControlHandle>,
-    issuer: inf_server::CellIssuer,
+    wiring: CellWiring,
     root: &Path,
     stop: &AtomicBool,
 ) {
+    let (control, issuer, part) = wiring;
     let mut pool = BufferPool::new(256, 4096);
     let mut driver = UringDriver::new(256, inf_runtime::UringConfig::from_lookup(std::env::var_os))
         .expect("uring");
@@ -244,6 +244,7 @@ fn drive_cell(
         false,
     )
     .expect("the server's timer owners fit their cap");
+    plane.hold_tier_part(part);
     plane.set_control(control, issuer).expect("the issuer of this cell");
     // M2.5-S08 A/B arm on the config (ADR-0109): the prefetch wrapper is
     // Recovery-private; the plane's filesystem is the bare tier.
@@ -263,7 +264,23 @@ fn drive_cell(
             panic!("cell {i} recovery failed: {err}");
         }
     }
+    // The bench's hard end retires the cell's transport on its own thread
+    // while the control thread's worker runs.
+    inf_server::retire_with(
+        i as u16,
+        || plane.retire_step(),
+        |_| {
+            #[allow(clippy::disallowed_methods)] // bench harness thread, not cell code
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            true
+        },
+    );
 }
+
+/// What a bench cell is wired with: the control handle, its checkpoint
+/// issuer and its tier-file transport part.
+type CellWiring =
+    (Arc<inf_server::ControlHandle>, inf_server::CellIssuer, inf_server::CellPart<StdSegmentFile>);
 
 /// Boot the node (the infinityd assembly shape) and time spawn→all_ready.
 fn boot_once(root: &Path, cells: u16) -> f64 {
@@ -281,10 +298,17 @@ fn boot_once(root: &Path, cells: u16) -> f64 {
         .unwrap_or(0);
     let catalog = inf_server::load_catalog(root).expect("catalog");
     let cell_count = inf_foundation::CellCount::new(cells).expect("a valid bench topology");
-    let (control, issuers) =
-        inf_server::spawn_control(root.to_path_buf(), catalog.as_ref(), cell_count, boot_unix_ms)
-            .expect("the catalog boots");
+    let (control, issuers, parts) = inf_server::spawn_control(
+        StdSegmentFs,
+        root.to_path_buf(),
+        catalog.as_ref(),
+        cell_count,
+        boot_unix_ms,
+        None,
+    )
+    .expect("the catalog boots");
     let mut cell_issuers = issuers.cells.into_iter();
+    let mut cell_parts = parts.into_iter();
     let board = Arc::clone(control.recovery_board());
 
     let started = Instant::now();
@@ -293,6 +317,7 @@ fn boot_once(root: &Path, cells: u16) -> f64 {
         let stop = Arc::clone(&stop);
         let control = Arc::clone(&control);
         let issuer = cell_issuers.next().expect("one issuer per cell");
+        let part = cell_parts.next().expect("one transport part per cell");
         let root = root.to_path_buf();
         handles.push(std::thread::spawn(move || {
             // M2.5-S08 A/B: INF_BOOT_READAHEAD=1 forces the prefetch arm
@@ -300,7 +325,8 @@ fn boot_once(root: &Path, cells: u16) -> f64 {
             // — the A/B that measured why); default matches the shipped
             // multi-cell posture (no prefetch).
             let boot_prefetch = env_u64("INF_BOOT_READAHEAD", 0) != 0;
-            drive_cell(boot_prefetch, i, cells, listener, fabric, control, issuer, &root, &stop);
+            let wiring = (control, issuer, part);
+            drive_cell(boot_prefetch, i, cells, listener, fabric, wiring, &root, &stop);
         }));
     }
     while !board.all_ready() {

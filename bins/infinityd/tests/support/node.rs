@@ -954,8 +954,7 @@ impl fmt::Debug for Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        kill_and_reap(&mut self.child);
     }
 }
 
@@ -978,8 +977,7 @@ impl fmt::Debug for LeasedNode<'_> {
 
 impl Drop for LeasedNode<'_> {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        kill_and_reap(&mut self.child);
     }
 }
 
@@ -1145,6 +1143,30 @@ fn probe_uid() -> Result<u32, ProbeFailure> {
 #[allow(clippy::disallowed_methods, reason = "test-only: a lock wait's wall-clock deadline")]
 fn now() -> Instant {
     Instant::now()
+}
+
+/// How long a node's drop waits for its killed child: a killed process
+/// reports its exit within milliseconds, unless a thread of it is traced
+/// and its tracer has not reaped it, which no wait of the parent can end.
+const REAP_BOUND: Duration = Duration::from_secs(20);
+
+/// Kills `child` and reaps it within [`REAP_BOUND`]; past it, says so and
+/// leaves the child unreaped, so no node's drop blocks without a bound.
+#[allow(clippy::disallowed_methods, reason = "test-only: a polled reap under a deadline")]
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let deadline = now() + REAP_BOUND;
+    while now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => std::thread::sleep(POLL),
+        }
+    }
+    eprintln!(
+        "node: pid {} not reaped {} s after its kill: left unreaped",
+        child.id(),
+        REAP_BOUND.as_secs()
+    );
 }
 
 /// One lock, polled every 10 ms until `wait` has passed since `began`: a
