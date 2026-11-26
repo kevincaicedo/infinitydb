@@ -2016,14 +2016,15 @@ fn a_turn_charges_its_retirement_visits_and_makes_at_most_sixty_four() {
     let units = cell.retire_walk(Nanos(0), |_| true, |_| true);
     let examined = cell.walk_examined();
     let offered = cell.retire_gauges().jobs_out;
+    let listed = cell.retiring_at(0);
     drop(waits);
-    assert_eq!(cell.retiring_at(0), (PINNED + 1) as usize, "engagement: no owner left the list");
     assert!(
         examined <= VISITS_PER_TURN_MAX,
         "one MAINTAIN over {PINNED} pinned retired files examined {examined} owners: a turn \
          visits at most {VISITS_PER_TURN_MAX}"
     );
     assert_eq!(offered, 0, "the unpinned file after the pinned ones is not reached this turn");
+    assert_eq!(listed, (PINNED + 1) as usize, "no owner left the list");
     assert_eq!(
         units, VISITS_PER_TURN_MAX,
         "one MAINTAIN over {PINNED} pinned retired files charged {units} unit(s): each of its \
@@ -2195,4 +2196,79 @@ fn a_drained_namespaces_receipt_waits_for_its_jobs_out() {
     assert_eq!(cell.retire_gauges().jobs_out, 0, "every result consumed");
     assert_eq!(cell.draining(), (0, 0), "the owner left once its results were consumed");
     assert_eq!(cell.receipt_for(0), 16, "the receipt names the dropped namespace");
+}
+
+/// The state an aborted swap must leave alone: namespace 16's sealed ids,
+/// its handles' ids, its retiring owners and the cell's jobs out.
+fn retirement_state(cell: &TierCell<SimDisk>) -> (Vec<u32>, Vec<u32>, usize, u64) {
+    let t = cell.nth(0);
+    let sealed = t.flush.sealed().iter().map(|meta| meta.id).collect();
+    let handles = t.files.iter().map(|(id, _)| *id).collect();
+    (sealed, handles, cell.retiring_at(0), cell.retire_gauges().jobs_out)
+}
+
+/// An aborted swap moves nothing (ADR-0156 D1, ADR-0059 D3 phase 4): only
+/// the covering swap's commit moves a retiring file out of the catalog. The
+/// compaction fixture's namespace 16 has its first sealed file emptied by
+/// deletes before checkpoint 1 begins, so checkpoint 1's scan marks it
+/// retiring; the swap aborts (the transition-idle reconciliation clears the
+/// mark, as a `Backoff` that ends without a commit does), and MAINTAIN and
+/// the walk with its worker run: the catalog, the handles, the list and the
+/// jobs equal their before-state, and the file stays on the disk. The next
+/// scan marks the same file, and that swap's commit moves it, with its
+/// handle, onto the list, from which the walk and the worker retire it.
+#[test]
+fn an_aborted_swap_moves_nothing_and_a_later_swap_retires_the_mark() {
+    const TURNS_MAX: u32 = 16;
+    let (mut cell, mut ks) = compaction_fixture();
+    let first = cell.nth(0).flush.sealed()[0].clone();
+    let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+    let hasher = KeyHasher::default();
+    let probe = b"round:999999";
+    let probe_addr = table.insert(probe, &[0x5A; 200], hasher.hash(probe)).expect("fits");
+    let len = table.record(probe_addr).encoded_len;
+    table.delete(hasher.hash(probe), probe_addr, len);
+    let mut emptied = 0;
+    for index in 0.. {
+        let key = format!("round:{index:06}").into_bytes();
+        let hash = hasher.hash(&key);
+        match table.lookup(&key, hash, &[]) {
+            inf_store::TieredLookup::Cold(addr) => {
+                let at = addr.to_raw();
+                if at >= first.base.to_raw() && at < first.base.to_raw() + first.data_len {
+                    table.delete(hash, addr, len);
+                    emptied += 1;
+                }
+            }
+            inf_store::TieredLookup::Ram(_) => {}
+            inf_store::TieredLookup::Miss => break,
+        }
+    }
+    assert!(emptied > 0, "engagement: the first sealed file held records");
+    table.begin_ckpt_walk(1);
+    table.end_ckpt_walk();
+    let flush = &cell.nth(0).flush;
+    assert_eq!(table.retire_scan(1, flush), 1, "engagement: checkpoint 1 marks the file");
+    let before = retirement_state(&cell);
+    assert!(before.1.contains(&first.id), "engagement: the file's handle is held");
+    let room = Cell::new(0);
+    cell.maintain_ns(&mut ks, 0, NO_DURABLE, true, 0, &mut TaskRoom::new(ROOMY, &room))
+        .expect("MAINTAIN");
+    for turn in 0..4 {
+        cell.retire_walk(Nanos(turn), |_| true, |_| true);
+        cell.step_worker();
+    }
+    assert_eq!(retirement_state(&cell), before, "an aborted swap moved an owner");
+    assert!(on_disk(&cell, &first.path), "an aborted swap's file stays on the disk");
+    let table = ks.tiered_store_mut(NsId(16)).expect("materialized");
+    assert_eq!(table.retire_scan(1, &cell.nth(0).flush), 1, "the abort cleared the mark");
+    cell.commit_retirement(&mut ks);
+    let (sealed, handles, retiring, _) = retirement_state(&cell);
+    assert!(!sealed.contains(&first.id), "the commit takes the file out of the catalog");
+    assert!(!handles.contains(&first.id), "the commit takes its handle with it");
+    assert_eq!(retiring, 1, "the file and its handle join the list");
+    let turns = cell.drain_until_quiet(Nanos(10), TURNS_MAX);
+    assert!(turns < TURNS_MAX, "the walk settles within {TURNS_MAX} turns");
+    assert!(!on_disk(&cell, &first.path), "the later swap's commit retires the file");
+    assert_eq!(cell.retire_gauges().stats.files_retired, 1);
 }
