@@ -4552,13 +4552,14 @@ if [ ! -e "$target/built-$1" ]; then
         *_deaf)
             # The child ignores SIGTERM from its start, as it inherits the
             # ignored signal: only a SIGKILL ends it before its 30 s.
+            # Its pid is the parent's `$!`: bash 3.2 has no `$BASHPID`.
             trap '' TERM
             (
                 exec 6<>"$here/linger"
-                echo "deaf $cfg $BASHPID" >>"$here/events"
                 read -r -t 30 -u 6 _ || true
                 echo "deaf-ended $cfg" >>"$here/events"
             ) &
+            echo "deaf $cfg $!" >>"$here/events"
             ;;
         esac
         trap 'echo "stopped $cfg" >>"$here/events"; exit 143' TERM
@@ -10258,7 +10259,10 @@ group_target_root() {
 # is fx_root_key. Paths hold a space, so a printed command that splits a path
 # is red. Each case runs the sourced helper in a process of its own: the root
 # it sets is read-only in the shell that set it.
-TRW="$work/tr"
+# Read physically, as target-root.sh reads every path (`pwd -P`): on macOS $TMPDIR is under
+# /var, a link to /private/var, and a logical $TRW would never match what the script prints.
+mkdir -p "$work/tr"
+TRW=$(cd -P "$work/tr" && pwd -P)
 TR_BIN="$TRW/bin"
 mkdir -p "$TR_BIN"
 IFS= read -r -d '' body <<'EOF' || true
