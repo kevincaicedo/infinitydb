@@ -120,10 +120,12 @@ rests on these rules:
   reduced count) run under Miri in CI with strict provenance, the retained
   ring's among them: both drop orders, the last release on another thread
   with the owner retiring before it joins the endpoint threads (a
-  post-release access is a data race or a use after free there; both
-  plants above are red under it), a failed startup transfer, full and
-  queued rings, zero-sized and over-aligned payloads, a cancel at every
-  construction boundary, the
+  post-release access is a data race or a use after free there, so both
+  plants above are red under it on most seeds, not every one: whether
+  Miri's schedule runs the stray access before the retirement depends on
+  the seed, and the Loom rows above are the deterministic canaries), a
+  failed startup transfer, full and queued rings, zero-sized and
+  over-aligned payloads, a cancel at every construction boundary, the
   budgeted retirement; `tests/retained_ring.rs` refuses each block through
   `inf-alloc`'s counting allocator and reconciles requested and freed
   bytes. The two tests that leak a dropped backing by design are skipped
