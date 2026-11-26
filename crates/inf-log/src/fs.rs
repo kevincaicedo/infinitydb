@@ -548,6 +548,24 @@ pub trait SegmentFs {
     /// Remove a file; `NotFound` when it does not exist — callers clearing
     /// staging debris (`META.new`) ignore that case explicitly.
     fn remove_file(&self, path: &Path) -> io::Result<()>;
+    /// Unlinks a retired tier file (ADR-0156 D3): the control thread's
+    /// retirement worker calls it once a file's handle is closed. The
+    /// default fires `tier_unlink_fail` (a typed, non-fatal error the
+    /// caller retries), then removes the file; `NotFound` when it is
+    /// already gone. Wrappers forward it explicitly, as `create_tier`: the
+    /// default would fire the point above the wrapped tier and bypass a
+    /// tier that fires and records it inside its own call (the simulated
+    /// disk).
+    ///
+    /// # Errors
+    /// The injected `tier_unlink_fail`, `NotFound`, and the removal's own
+    /// errors.
+    fn unlink_tier(&self, path: &Path) -> io::Result<()> {
+        if inf_foundation::fault::fire(crate::fault::TIER_UNLINK_FAIL) {
+            return Err(crate::fault::injected(crate::fault::TIER_UNLINK_FAIL));
+        }
+        self.remove_file(path)
+    }
 }
 
 /// `std::fs`-backed tier for boot scan, dev, and integration tests.

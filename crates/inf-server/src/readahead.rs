@@ -290,4 +290,10 @@ impl<F: SegmentFs> SegmentFs for ReadAheadFs<F> {
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         self.inner.remove_file(path)
     }
+
+    fn unlink_tier(&self, path: &Path) -> io::Result<()> {
+        // Explicit forward (ADR-0156 D3): the trait default would fire
+        // `tier_unlink_fail` here, above the wrapped tier's own call.
+        self.inner.unlink_tier(path)
+    }
 }

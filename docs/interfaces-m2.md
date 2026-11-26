@@ -418,6 +418,13 @@ those driver ops against the same `SimDisk`.
   a following `sync_data`; the sim tier models the un-synced window
   honestly (a power cut may resurrect the old tail).
 
+### Tier-file retirement additions (ADR-0156 D3, D5)
+
+- `SegmentFs::unlink_tier(path)` (default method) unlinks a retired tier
+  file; its default fires `tier_unlink_fail`, then removes; wrappers
+  (`ReadAheadFs`) forward it explicitly, as for `create_tier`; the
+  simulated disk fires it inside its own call and records the attempt.
+
 ### Namespace residue additions (ADR-0189 D8)
 
 > **ADR-0189 (2026-10-10):** the seam gains the two calls the run-time

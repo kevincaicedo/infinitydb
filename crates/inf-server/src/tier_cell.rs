@@ -1657,7 +1657,7 @@ fn drain_files<F: SegmentFs>(
             Some(_) => t.retired.pop(),
             None => match t.flush.catalog_end_id() {
                 Some(id) if pinned(id) => break,
-                Some(_) => t.flush.pop_catalog_end(),
+                Some(_) => t.flush.pop_catalog_end().map(|(meta, _closed)| meta),
                 None => break,
             },
         };
@@ -1690,7 +1690,7 @@ fn drain_files<F: SegmentFs>(
 fn close_at_drop<F: SegmentFs>(t: &mut TierNs<F>) {
     t.files.clear();
     if t.round.is_none() {
-        while let Some(meta) = t.flush.pop_catalog_end() {
+        while let Some((meta, _closed)) = t.flush.pop_catalog_end() {
             t.retired.push(meta);
         }
     }
