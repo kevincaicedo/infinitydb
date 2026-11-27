@@ -39,7 +39,9 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    # FCR-TESTS-N3 falsifier 5's split question, answered with a longer timeout: at 25 min the
+    # macOS leg's nextest had run 1815 of its 2950 tests.
+    timeout-minutes: 60
     steps:
       # ADR-0144 D3: the lint gates compare their tables with approved
       # copies in history (HEAD, the base branch tip, the introducing
