@@ -2,6 +2,7 @@
 //! aborted checks, and the whole-program serial run they compare against.
 
 use super::*;
+use crate::driver::Violations;
 
 impl Model {
     /// An aborted transaction published nothing; a committed one
@@ -96,7 +97,7 @@ impl Model {
             return;
         }
         let got = t.reply.clone().expect("a committed transaction replied");
-        let mut out = Vec::new();
+        let mut out = Violations::new();
         for (idx, (g, w)) in got.iter().zip(&serial.replies).enumerate() {
             if g != w {
                 out.push(format!(

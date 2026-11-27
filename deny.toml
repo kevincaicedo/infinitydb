@@ -11,6 +11,13 @@ allow = [
     "Zlib",
     "ISC",
 ]
+# libFuzzer's C++ runtime, which libfuzzer-sys compiles into a fuzz target,
+# is LLVM's code under NCSA. Only the fuzz manifests depend on libfuzzer-sys,
+# so no shipping build carries it, and the exception names that crate alone
+# (ADR-0198 D6).
+exceptions = [
+    { allow = ["NCSA"], crate = "libfuzzer-sys" },
+]
 
 [bans]
 multiple-versions = "warn"

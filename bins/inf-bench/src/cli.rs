@@ -3,6 +3,7 @@
 //! fail loudly instead of being silently ignored.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct Flags {
@@ -83,9 +84,50 @@ fn parse_num<T: std::str::FromStr>(raw: Option<&str>, name: &str, default: T) ->
     }
 }
 
+/// The `--infinityd-bin` default: the release `infinityd` in the target root
+/// that built this binary. A working directory's `target/release/infinityd` is
+/// the default root's only: under `CARGO_TARGET_DIR` it is a stale binary or
+/// none, and a gate would measure it (ADR-0198 A2). `infinityd` on `PATH` when
+/// the running binary's path is unknown.
+pub fn default_infinityd_bin() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| release_beside(&exe, "infinityd"))
+        .map_or_else(|| "infinityd".to_string(), |path| path.display().to_string())
+}
+
+/// Cargo puts a binary at `<root>/[<target triple>/]<profile>/<name>` and a
+/// test binary one level down, in `deps/`, so `<name>`'s release build sits in
+/// the `release` sibling of the directory holding `exe` (or holding its `deps/`).
+fn release_beside(exe: &Path, name: &str) -> Option<PathBuf> {
+    let mut profile = exe.parent()?;
+    if profile.file_name().is_some_and(|leaf| leaf == "deps") {
+        profile = profile.parent()?;
+    }
+    Some(profile.parent()?.join("release").join(name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_server_default_is_the_release_build_in_this_binarys_own_root() {
+        let at = |exe: &str| release_beside(Path::new(exe), "infinityd");
+        assert_eq!(at("/r/release/inf-bench"), Some(PathBuf::from("/r/release/infinityd")));
+        assert_eq!(at("/r/debug/inf-bench"), Some(PathBuf::from("/r/release/infinityd")));
+        assert_eq!(at("/r/debug/deps/inf_bench-0a1b"), Some(PathBuf::from("/r/release/infinityd")));
+        assert_eq!(
+            at("/shared/checkout-0123/release/inf-bench"),
+            Some(PathBuf::from("/shared/checkout-0123/release/infinityd"))
+        );
+        assert_eq!(at("/"), None);
+        assert_eq!(at("inf-bench"), None);
+        // The running test binary's own root, never the working directory's.
+        let exe = std::env::current_exe().unwrap();
+        let root = exe.parent().and_then(Path::parent).and_then(Path::parent).unwrap();
+        assert_eq!(default_infinityd_bin(), root.join("release/infinityd").display().to_string());
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

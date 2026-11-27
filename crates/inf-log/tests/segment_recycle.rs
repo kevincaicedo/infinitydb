@@ -25,6 +25,10 @@ use inf_log::{
     ZERO_FILL_SLICE_BYTES, build_recycle_sentinel, scan_region_evidence, segment_file_name,
 };
 
+#[path = "common/rotor_geometry.rs"]
+mod rotor_geometry;
+use rotor_geometry::geometry;
+
 const SEGMENT_BYTES: u32 = 16 << 10;
 
 fn stamp(seq: u64) -> FrameStamp {
@@ -57,9 +61,12 @@ impl Lab {
         let disk = SimDisk::new();
         let dir = PathBuf::from("log");
         disk.create_dir_all(&dir).expect("dir");
-        let rotor =
-            SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), cfg(recycle_slots))
-                .expect("fresh");
+        let rotor = SegmentRotor::create_fresh_deferred(
+            disk.clone(),
+            dir.clone(),
+            geometry(cfg(recycle_slots)),
+        )
+        .expect("fresh");
         Lab { disk, dir, rotor, seq: 0 }
     }
 
@@ -240,7 +247,8 @@ fn recycling_off_or_buffered_never_pools() {
         ..Default::default()
     };
     let mut rotor =
-        SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), buffered).expect("fresh");
+        SegmentRotor::create_fresh_deferred(disk.clone(), dir.clone(), geometry(buffered))
+            .expect("fresh");
     rotor.maintain_deferred(0).expect("maintain");
     let mut b = FrameBuilder::new();
     b.append(&record(1));

@@ -18,6 +18,9 @@ inf-server.workspace = true
 # through dev-dependency unification only — `cargo build --workspace
 # --release` never carries the machinery (the M2-S16 cost contract).
 inf-foundation = { workspace = true, features = ["fault-points"] }
+# The fsyncgate row's cell retires its tier-file transport at its hard end
+# (`retire_with`), a test host's custody.
+inf-server = { workspace = true, features = ["test-support"] }
 # M3-S18 document fixtures encode the production idoc/path/delta forms;
 # the dependency is test-only and does not alter the shipping crate DAG.
 inf-doc.workspace = true

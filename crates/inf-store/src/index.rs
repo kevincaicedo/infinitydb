@@ -284,6 +284,10 @@ impl HomeGroupCursor {
 }
 
 impl<M: SlotMode> Index<M> {
+    /// The bytes one probe group occupies: its control bytes, its 8-byte
+    /// slots and their sidecar — what a walk of the group reads.
+    pub const GROUP_BYTES: usize = GROUP * (1 + size_of::<Slot>() + M::EXT_BYTES_PER_SLOT);
+
     /// A table that can hold `at_least` entries without growing.
     pub fn with_capacity(at_least: usize) -> Index<M> {
         let slots = (at_least.max(1) * LOAD_DEN).div_ceil(LOAD_NUM);

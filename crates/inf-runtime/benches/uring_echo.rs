@@ -105,7 +105,9 @@ mod imp {
         }
 
         pin_to(SERVER_CORE);
-        let mut driver = UringDriver::new(1024).expect("uring");
+        let mut driver =
+            UringDriver::new(1024, inf_runtime::UringConfig::from_lookup(std::env::var_os))
+                .expect("uring");
         let mut pool = BufferPool::new(512, BUF_SIZE);
         driver.register_pool(&mut pool).expect("register");
         println!("capabilities: {:?}", driver.capabilities());

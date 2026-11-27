@@ -217,11 +217,14 @@ a clean box. `inf-compare` records governor and EPP for every Linux sysfs
 CPUs, refuse reference admission. CPU enumeration must also succeed and
 find at least one CPU. The report names each CPU and its reading.
 
-A built `target/release/inf-bench` (or `target/debug/inf-bench` when release
-is absent), resolved from the working directory, must also execute
-`env-check` successfully. An absent, unexecutable or failing checker refuses
-reference admission. This authoritative check also covers thermal state
-and the git tree. Run from the workspace root after building `inf-bench`.
+The `inf-bench` in the target root that built the running `inf-compare` (its
+release build when there is one, else its debug build) must also execute
+`env-check` successfully, whatever the working directory. An absent,
+unexecutable or failing checker refuses reference admission. So build
+`inf-bench` in the same root, for example `cargo build --release -p inf-bench`
+beside `cargo run --release -p inf-compare`. This authoritative check also
+covers thermal state and the git tree: run from the workspace root, whose
+tree both checks read.
 A `--reference-box` run on
 a non-clean box is **refused** unless `--unsafe-env` is passed, which stamps the
 result non-citable. macOS is dev-tier only and cannot run dragonfly (Linux-only).

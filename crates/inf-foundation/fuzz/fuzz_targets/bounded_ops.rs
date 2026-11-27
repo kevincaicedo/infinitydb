@@ -1,21 +1,50 @@
-//! Capped-container op sequences against std models (ADR-0151 D6): a
-//! `Reserve` deque beside a `VecDeque` the target caps by hand, a `Coalesce`
-//! deque beside one the target merges by hand, equal after every op; the
-//! census row's `high_water` and `crossings` equal the models' at the end;
-//! `len` never passes the cap; a layout past 64 KiB is refused. The models
-//! share no code with `inf_foundation::bounded`.
+//! Capped-container op sequences against std models (ADR-0151 D6, ADR-0171
+//! D5). The first byte picks the family. Deques: a `Reserve` deque beside a
+//! `VecDeque` the target caps by hand, popped at either end, a `Coalesce`
+//! deque beside one the target merges by hand, equal after every op and at
+//! every place (`get`,
+//! and `get_mut` edits at a place or the back); the census row's
+//! `high_water` and `crossings` equal the models' at the end; `len` never
+//! passes the cap; a layout past 64 KiB is refused. Slabs: a slab of either
+//! generation policy, its slot narrow or 2,992 B wide in chunks of 16
+//! (ADR-0194 A1), beside a `BTreeMap<(index, generation), value>`, with
+//! reserves, publishes, dropped reservations, reads, writes and takes of
+//! live and stale handles, words decoded by `get_mut_by_word` (a held
+//! handle's, or a peer's: any `u64` the input rolls up, whole or within the
+//! word's fields) against the model's own reading of the layout, and named
+//! reservations published or dropped on a wrapping slab (a dropped one
+//! advances its slot's generation); every handle read back against the model
+//! after every op, and the row's high water, crossings and capacity equal the
+//! model's at the end; the slab is built and retired one step per chunk or
+//! directory. No slot here nears its last generation (`SLAB_OPS_MAX` ops):
+//! reaching it takes the slab's test hook, which compiles only in the crate's
+//! own tests and under its test feature, never on this target's normal edge,
+//! so the crate's in-module model drives both policies' last value. Maps: a
+//! map of a cap from one entry past a chunk edge, over `u64` keys or `u64`
+//! pairs that share prefixes and part at the first bit, the last, or either
+//! word of a pair, beside a `BTreeMap<K, V>`, with admissions that publish,
+//! replace or are dropped, removals and writes; every key named so far read
+//! back after every op, the row's high water, crossings and capacity equal
+//! the model's at the end, and the map retired one step per item built. The
+//! models share no code with `inf_foundation::bounded`.
 #![no_main]
 #![allow(
     clippy::disallowed_types,
     reason = "fuzz target: the std models the capped types are checked against"
 )]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::fmt::Debug;
+use std::rc::Rc;
 
 use inf_foundation::CellId;
 use inf_foundation::bounded::{
-    Cap, CapCensus, CapError, CapFill, CappedDeque, Coalesce, Lossy, Merge, Reserve, Reserved,
+    Admission, Built, Cap, CapCensus, CapError, CapFill, CappedDeque, CappedMap, CappedSlab,
+    Coalesce, ExactKey, Generation, GenerationPolicy, Lookup, LookupMut, Lossy, MapBuilt,
+    MapRetired, Merge, Reserve, Reserved, Retire, Retiring, SlabReserved, SlotId, SlotWord, Taken,
+    WordLookup, WrapWithProof,
 };
+use inf_foundation::limits::{MAP_CHUNK_SLOTS_MAX, chunk_slots_for};
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -78,6 +107,21 @@ impl<T> Model<T> {
 
 fuzz_target!(|data: &[u8]| {
     let Some((&head, ops)) = data.split_first() else { return };
+    // The head's low three bits pick a cap, the next three the family, and
+    // its seventh a slab's wide slot.
+    let wide = head & 0x40 != 0;
+    match (head >> 3) & 7 {
+        0 | 1 => deques(head, ops),
+        2 if wide => slab::<Wide, u64, Retire, WIDE_CHUNK>(head, ops),
+        2 => slab::<u16, u32, Retire, MAP_CHUNK_SLOTS_MAX>(head, ops),
+        3 if wide => slab::<Wide, u64, WrapWithProof, WIDE_CHUNK>(head, ops),
+        3 => slab::<u16, u64, WrapWithProof, MAP_CHUNK_SLOTS_MAX>(head, ops),
+        4 | 5 => map::<u64>(head, ops),
+        _ => map::<(u64, u64)>(head, ops),
+    }
+});
+
+fn deques(head: u8, ops: &[u8]) {
     let which = usize::from(head & 7);
     let (census, _serve_mark) = CapCensus::new(CellId(u16::from(head)));
     let mut reserve = CappedDeque::<u16, Reserve>::new(CAPS[which], &census).expect("fits");
@@ -106,6 +150,9 @@ fuzz_target!(|data: &[u8]| {
                     reserve_model.crossings += 1;
                 }
             },
+            // Odd values take the back (a placeholder taken back), even
+            // ones the front.
+            2 if value & 1 == 1 => assert_eq!(reserve.pop_back(), reserve_model.entries.pop_back()),
             2 => assert_eq!(reserve.pop_front(), reserve_model.entries.pop_front()),
             3 => {
                 marks.push(Mark(value));
@@ -129,12 +176,38 @@ fuzz_target!(|data: &[u8]| {
                 }
                 marks_model.entries = merged;
             }
+            // An edit in place: odd values name a place from the front
+            // (one past the last included: no entry there), even ones the
+            // back.
+            6 if value & 1 == 1 => {
+                let index = usize::from(value >> 1) % (reserve_model.entries.len() + 1);
+                assert_eq!(
+                    reserve.get_mut(index).is_some(),
+                    index < reserve_model.entries.len(),
+                    "a place exists exactly below the length"
+                );
+                if let Some(entry) = reserve.get_mut(index) {
+                    *entry = value;
+                }
+                if let Some(entry) = reserve_model.entries.get_mut(index) {
+                    *entry = value;
+                }
+            }
             6 => {
                 if let Some(back) = reserve.back_mut() {
                     *back = value;
                 }
                 if let Some(back) = reserve_model.entries.back_mut() {
                     *back = value;
+                }
+            }
+            _ if value & 1 == 1 => {
+                let index = usize::from(value >> 1) % (marks_model.entries.len() + 1);
+                if let Some(entry) = marks.get_mut(index) {
+                    *entry = Mark(value);
+                }
+                if let Some(entry) = marks_model.entries.get_mut(index) {
+                    *entry = Mark(value);
                 }
             }
             _ => {
@@ -150,6 +223,10 @@ fuzz_target!(|data: &[u8]| {
         assert!(marks.len() <= cap);
         assert!(reserve.iter().eq(reserve_model.entries.iter()));
         assert!(marks.iter().eq(marks_model.entries.iter()));
+        for index in 0..=cap {
+            assert_eq!(reserve.get(index), reserve_model.entries.get(index));
+            assert_eq!(marks.get(index), marks_model.entries.get(index));
+        }
         assert_eq!(
             (reserve.front(), reserve.back()),
             (reserve_model.entries.front(), reserve_model.entries.back())
@@ -168,4 +245,514 @@ fuzz_target!(|data: &[u8]| {
     let row = census.row("fuzz-marks").expect("row");
     assert_eq!((row.high_water, row.crossings), (marks_model.high_water, marks_model.crossings));
     assert_eq!(marks.high_water(), marks_model.high_water);
-});
+}
+
+// A narrow slot's chunk holds 64 slots and a wide one's 16, and a directory
+// 256 chunks: one chunk, a chunk edge at 64 for either, and a directory over
+// three chunks or nine.
+// Ops a slab run reads: every op reads back every handle minted, so the run
+// is quadratic in this bound.
+const SLAB_OPS_MAX: usize = 512;
+const SLAB_CAPS: [Cap; 8] = [
+    Cap::entries::<1>("fuzz-slab", CapFill::Serving),
+    Cap::entries::<2>("fuzz-slab", CapFill::Serving),
+    Cap::entries::<3>("fuzz-slab", CapFill::Serving),
+    Cap::entries::<5>("fuzz-slab", CapFill::Serving),
+    Cap::entries::<63>("fuzz-slab", CapFill::Serving),
+    Cap::entries::<64>("fuzz-slab", CapFill::Serving),
+    Cap::entries::<65>("fuzz-slab", CapFill::Serving),
+    Cap::entries::<130>("fuzz-slab", CapFill::Serving),
+];
+
+/// A slab's value as the model holds it: a narrow slot's `u16`, or a wide
+/// slot's payload carrying it in its first and last words.
+trait SlabValue: PartialEq + Debug {
+    fn of(value: u16) -> Self;
+    fn value(&self) -> u16;
+}
+
+impl SlabValue for u16 {
+    fn of(value: u16) -> u16 {
+        value
+    }
+
+    fn value(&self) -> u16 {
+        *self
+    }
+}
+
+/// 372 words: a slot of 2,992 B at a `u64` generation.
+#[derive(PartialEq, Debug)]
+struct Wide([u64; 372]);
+
+impl SlabValue for Wide {
+    fn of(value: u16) -> Wide {
+        let mut words = [0; 372];
+        words[0] = u64::from(value);
+        words[371] = u64::from(value);
+        Wide(words)
+    }
+
+    fn value(&self) -> u16 {
+        assert_eq!(self.0[0], self.0[371], "a payload's two words disagree");
+        u16::try_from(self.0[0]).expect("a model value is a u16")
+    }
+}
+
+/// The wide slot's chunk, the count the rule answers for its slot's bytes,
+/// picked where the slab is declared, as a site that builds one picks it.
+const WIDE_CHUNK: usize = match chunk_slots_for(CappedSlab::<Wide, u64, Retire>::SLOT_BYTES) {
+    Some(slots) => slots,
+    None => panic!("no chunk holds the wide slot"),
+};
+const _: () = assert!(WIDE_CHUNK == 16, "a 2,992 B slot takes chunks of 16");
+
+/// Builds a slab by steps: the steps it took.
+fn built<T, G: Generation, P: GenerationPolicy, const C: usize>(
+    cap: Cap,
+    census: &Rc<CapCensus>,
+) -> (CappedSlab<T, G, P, C>, u32) {
+    let mut builder = CappedSlab::<T, G, P, C>::builder(cap, census).expect("fits");
+    let mut steps = 0;
+    loop {
+        steps += 1;
+        match builder.step() {
+            Built::More(next) => builder = next,
+            Built::Live(slab) => return (slab, steps),
+            Built::Refused(_, refused) => panic!("{refused}"),
+        }
+    }
+}
+
+/// The model's own generation step, sharing no code with `Generation`. A
+/// slot is taken at most `SLAB_OPS_MAX` times in a run, so its generation
+/// stays far below either width's last value and both policies advance it
+/// by one.
+trait ModelGeneration: Copy + Ord + Debug {
+    const ZERO: Self;
+    fn successor(self) -> Self;
+    /// The generation as a `u128`, whose low bits the model reads by
+    /// remainders, not the slab's masks.
+    fn wide(self) -> u128;
+}
+
+impl ModelGeneration for u32 {
+    const ZERO: u32 = 0;
+
+    fn successor(self) -> u32 {
+        self.checked_add(1).expect("a run's takes stay below the last generation")
+    }
+
+    fn wide(self) -> u128 {
+        u128::from(self)
+    }
+}
+
+impl ModelGeneration for u64 {
+    const ZERO: u64 = 0;
+
+    fn successor(self) -> u64 {
+        self.checked_add(1).expect("a run's takes stay below the last generation")
+    }
+
+    fn wide(self) -> u128 {
+        u128::from(self)
+    }
+}
+
+/// A slab run's model: the occupants by `(index, generation)`, the
+/// generation each index's next occupant takes (absent: never used, the
+/// first), every handle minted, live or stale (bounded by the ops read), and
+/// the row's high water and crossings. No slot retires in a run, so the
+/// capacity stays the cap.
+struct SlabModel<G> {
+    live: BTreeMap<(u32, G), u16>,
+    next: BTreeMap<u32, G>,
+    handles: Vec<SlotId<G>>,
+    capacity: u32,
+    high_water: u32,
+    crossings: u64,
+}
+
+/// A policy's word and reservation ops: a wrapping slab's word carries two
+/// generation bits, so a stale handle's word aliases a later occupant, and
+/// its reservations are named; a retiring slab's word carries its whole
+/// generation (at a `u64`, beside an index field of no bits: one slot, every
+/// larger cap refused `Layout`), and its reservations drop unnamed.
+trait FuzzPolicy<G: Generation + ModelGeneration>: GenerationPolicy + Sized {
+    fn word<T: SlabValue, const C: usize>(
+        slab: &mut CappedSlab<T, G, Self, C>,
+        model: &mut SlabModel<G>,
+        value: u16,
+        peer: u64,
+    );
+
+    fn reservation<T: SlabValue, const C: usize>(
+        slab: &mut CappedSlab<T, G, Self, C>,
+        model: &mut SlabModel<G>,
+        value: u16,
+    );
+}
+
+impl FuzzPolicy<u32> for Retire {
+    fn word<T: SlabValue, const C: usize>(
+        slab: &mut CappedSlab<T, u32, Self, C>,
+        model: &mut SlabModel<u32>,
+        value: u16,
+        peer: u64,
+    ) {
+        word::<T, u32, Self, 32, 32, C>(slab, model, value, peer);
+    }
+
+    fn reservation<T: SlabValue, const C: usize>(
+        slab: &mut CappedSlab<T, u32, Self, C>,
+        model: &mut SlabModel<u32>,
+        _: u16,
+    ) {
+        unnamed_drop(slab, model);
+    }
+}
+
+impl FuzzPolicy<u64> for Retire {
+    fn word<T: SlabValue, const C: usize>(
+        slab: &mut CappedSlab<T, u64, Self, C>,
+        model: &mut SlabModel<u64>,
+        value: u16,
+        peer: u64,
+    ) {
+        word::<T, u64, Self, 0, 64, C>(slab, model, value, peer);
+    }
+
+    fn reservation<T: SlabValue, const C: usize>(
+        slab: &mut CappedSlab<T, u64, Self, C>,
+        model: &mut SlabModel<u64>,
+        _: u16,
+    ) {
+        unnamed_drop(slab, model);
+    }
+}
+
+impl<G: Generation + ModelGeneration> FuzzPolicy<G> for WrapWithProof {
+    fn word<T: SlabValue, const C: usize>(
+        slab: &mut CappedSlab<T, G, Self, C>,
+        model: &mut SlabModel<G>,
+        value: u16,
+        peer: u64,
+    ) {
+        word::<T, G, Self, 16, 2, C>(slab, model, value, peer);
+    }
+
+    fn reservation<T: SlabValue, const C: usize>(
+        slab: &mut CappedSlab<T, G, Self, C>,
+        model: &mut SlabModel<G>,
+        value: u16,
+    ) {
+        let instance = slab.instance();
+        let named = match slab.reserve() {
+            SlabReserved::Slot(slot) => slot.named(),
+            SlabReserved::Full => {
+                assert_eq!(model.live.len() as u32, model.capacity, "Full below the capacity");
+                model.crossings += 1;
+                return;
+            }
+            SlabReserved::Exhausted => panic!("a wrapping slab answered Exhausted"),
+        };
+        let id = named.id();
+        let next = model.next.get(&id.index()).copied().unwrap_or(G::ZERO);
+        assert_eq!((id.generation(), id.instance()), (next, instance), "the named handle");
+        assert!(!model.live.contains_key(&(id.index(), id.generation())), "it names none");
+        if value & 1 == 1 {
+            assert_eq!(named.publish(T::of(value)), id, "the publish returns the named handle");
+            model.live.insert((id.index(), id.generation()), value);
+            model.high_water = model.high_water.max(model.live.len() as u32);
+        } else {
+            drop(named);
+            model.next.insert(id.index(), id.generation().successor());
+        }
+        model.handles.push(id);
+    }
+}
+
+/// A reservation dropped unnamed: nothing changes.
+fn unnamed_drop<T, G, P, const C: usize>(
+    slab: &mut CappedSlab<T, G, P, C>,
+    model: &mut SlabModel<G>,
+) where
+    G: Generation,
+    P: GenerationPolicy,
+{
+    match slab.reserve() {
+        SlabReserved::Slot(slot) => drop(slot),
+        SlabReserved::Full => model.crossings += 1,
+        SlabReserved::Exhausted => panic!("Exhausted with no slot retired"),
+    }
+}
+
+/// A word op: a held handle's word, or a peer's (`peer`, the input rolled up,
+/// whole or cut to the word's fields), decoded against the model's own
+/// reading of the layout by remainders of `u128`s: a bit above the fields or
+/// an index past the slots is `Vacant`, the live occupant whose generation's
+/// low bits are the field `Live` with its whole handle, any other `Stale`.
+fn word<T, G, P, const I: u32, const B: u32, const C: usize>(
+    slab: &mut CappedSlab<T, G, P, C>,
+    model: &mut SlabModel<G>,
+    value: u16,
+    peer: u64,
+) where
+    T: SlabValue,
+    G: Generation + ModelGeneration,
+    P: GenerationPolicy,
+{
+    let slots = u128::from(model.capacity);
+    let word = match SlotWord::<G, P, I, B>::for_slab(slab) {
+        Ok(word) => word,
+        Err(refused) => {
+            assert_eq!(refused, CapError::Layout);
+            assert!(slots > 1 << I, "the adapter refused slots its index field numbers");
+            return;
+        }
+    };
+    let bits = match value & 3 {
+        0 | 1 if !model.handles.is_empty() => {
+            let id = model.handles[usize::from(value >> 2) % model.handles.len()];
+            word.encode(id).expect("this slab's handle")
+        }
+        2 => peer,
+        // The two fields fit one word (the adapter's layout rule), so the cut
+        // is a `u64`.
+        _ => (u128::from(peer) % (1 << (I + B))) as u64,
+    };
+    let (index, carried) = (u128::from(bits) % (1 << I), u128::from(bits) >> I);
+    let expected = (carried >> B == 0 && index < slots).then(|| {
+        let index = index as u32;
+        let field = carried % (1 << B);
+        let live = model.live.range((index, G::ZERO)..).next();
+        live.filter(|((at, generation), _)| *at == index && generation.wide() % (1 << B) == field)
+            .map(|(key, value)| (*key, *value))
+    });
+    match (slab.get_mut_by_word(&word, bits), expected) {
+        (WordLookup::Live(id, found), Some(Some(((index, generation), held)))) => {
+            assert_eq!((id.index(), id.generation()), (index, generation), "the whole handle");
+            assert_eq!(found.value(), held, "the occupant the word names");
+            *found = T::of(value);
+            model.live.insert((index, generation), value);
+        }
+        (WordLookup::Stale, Some(None)) | (WordLookup::Vacant, None) => {}
+        (WordLookup::Live(..) | WordLookup::Stale | WordLookup::Vacant, _) => {
+            panic!("get_mut_by_word disagrees with the model")
+        }
+    }
+}
+
+fn slab<T, G, P, const C: usize>(head: u8, ops: &[u8])
+where
+    T: SlabValue,
+    G: Generation + ModelGeneration,
+    P: FuzzPolicy<G>,
+{
+    let cap = SLAB_CAPS[usize::from(head & 7)];
+    let (census, _serve_mark) = CapCensus::new(CellId(u16::from(head)));
+    let (mut slab, build_steps) = built::<T, G, P, C>(cap, &census);
+    let capacity = cap.entries_max();
+    let mut model = SlabModel {
+        live: BTreeMap::new(),
+        next: BTreeMap::new(),
+        handles: Vec::new(),
+        capacity,
+        high_water: 0,
+        crossings: 0,
+    };
+    // A peer's word: the input rolled up, so a run reaches any `u64`.
+    let mut peer = 0u64;
+    for &byte in ops.iter().take(SLAB_OPS_MAX) {
+        let value = u16::from(byte >> 3);
+        let pick = usize::from(value);
+        peer = peer.rotate_left(5) ^ u64::from(byte);
+        match byte & 7 {
+            0 | 1 => match slab.reserve() {
+                SlabReserved::Slot(slot) => {
+                    assert!((model.live.len() as u32) < capacity, "a slot past the capacity");
+                    let id = slot.publish(T::of(value));
+                    let (index, generation) = (id.index(), id.generation());
+                    assert!(index < cap.entries_max(), "an index past the cap");
+                    let expected = model.next.get(&index).copied().unwrap_or(G::ZERO);
+                    assert_eq!(generation, expected, "the slot's next generation");
+                    let fresh = model.live.insert((index, generation), value).is_none();
+                    assert!(fresh, "one occupant");
+                    model.handles.push(id);
+                    model.high_water = model.high_water.max(model.live.len() as u32);
+                }
+                SlabReserved::Full => {
+                    assert!(capacity > 0, "Full with no capacity left");
+                    assert_eq!(model.live.len() as u32, capacity, "Full below the capacity");
+                    model.crossings += 1;
+                }
+                SlabReserved::Exhausted => panic!("Exhausted with no slot retired"),
+            },
+            2 => unnamed_drop(&mut slab, &mut model),
+            3 | 4 if !model.handles.is_empty() => {
+                let id = model.handles[pick % model.handles.len()];
+                let (index, generation) = (id.index(), id.generation());
+                // Either entry to the take (ADR-0194 D1): op 3 by `take`, op 4 by
+                // `take_inlined`, each held to the one model.
+                let taken = if byte & 7 == 3 { slab.take(id) } else { slab.take_inlined(id) };
+                let Some(expected) = model.live.remove(&(index, generation)) else {
+                    assert_eq!(taken, Taken::Stale, "a stale handle");
+                    continue;
+                };
+                assert_eq!(taken, Taken::Value(T::of(expected)));
+                model.next.insert(index, generation.successor());
+            }
+            5 => P::word(&mut slab, &mut model, value, peer),
+            6 if !model.handles.is_empty() => {
+                let id = model.handles[pick % model.handles.len()];
+                match (slab.get_mut(id), model.live.get_mut(&(id.index(), id.generation()))) {
+                    (LookupMut::Live(found), Some(expected)) => {
+                        *found = T::of(value);
+                        *expected = value;
+                    }
+                    (LookupMut::Stale, None) => {}
+                    (LookupMut::Live(_) | LookupMut::Stale | LookupMut::Vacant, _) => {
+                        panic!("get_mut disagrees with the model")
+                    }
+                }
+            }
+            7 => P::reservation(&mut slab, &mut model, value),
+            _ => {}
+        }
+        assert_eq!(slab.len() as usize, model.live.len());
+        assert_eq!(slab.capacity_now(), capacity);
+        for id in &model.handles {
+            match (slab.get(*id), model.live.get(&(id.index(), id.generation()))) {
+                (Lookup::Live(found), Some(expected)) => assert_eq!(found.value(), *expected),
+                (Lookup::Stale, None) => {}
+                (Lookup::Live(_) | Lookup::Stale | Lookup::Vacant, _) => {
+                    panic!("get disagrees with the model")
+                }
+            }
+        }
+    }
+    let row = census.row("fuzz-slab").expect("row");
+    assert_eq!((row.high_water, row.crossings), (model.high_water, model.crossings));
+    assert_eq!(row.capacity_now, capacity);
+    let mut retiring = slab.retire();
+    let mut steps = 0;
+    loop {
+        steps += 1;
+        match retiring.step() {
+            Retiring::More(next) => retiring = next,
+            Retiring::Done => break,
+        }
+    }
+    assert_eq!(steps, build_steps, "one retire step per item built");
+}
+
+// Maps: a map of a cap from one entry to past a chunk edge, over keys with
+// shared prefixes and neighbours one bit apart, beside a `BTreeMap`. Each
+// op is a pair of bytes, its kind and its key's index in a pool of 256.
+const MAP_OPS_MAX: usize = 256;
+const MAP_CAPS: [Cap; 8] = [
+    Cap::entries::<1>("fuzz-map", CapFill::Serving),
+    Cap::entries::<2>("fuzz-map", CapFill::Serving),
+    Cap::entries::<3>("fuzz-map", CapFill::Serving),
+    Cap::entries::<5>("fuzz-map", CapFill::Serving),
+    Cap::entries::<63>("fuzz-map", CapFill::Serving),
+    Cap::entries::<64>("fuzz-map", CapFill::Serving),
+    Cap::entries::<65>("fuzz-map", CapFill::Serving),
+    Cap::entries::<130>("fuzz-map", CapFill::Serving),
+];
+
+/// A pool of 256 keys of one type: its index's low half in the key's
+/// first bits and its high half in its last, so keys share prefixes, part
+/// at the first bit and at the last, and differ in either word of a pair.
+trait PoolKey: ExactKey + Ord {
+    fn pooled(index: u8) -> Self;
+}
+
+impl PoolKey for u64 {
+    fn pooled(index: u8) -> u64 {
+        u64::from(index).rotate_right(4)
+    }
+}
+
+impl PoolKey for (u64, u64) {
+    fn pooled(index: u8) -> (u64, u64) {
+        (u64::from(index & 0xF).rotate_right(4), u64::from(index >> 4))
+    }
+}
+
+fn map<K: PoolKey>(head: u8, ops: &[u8]) {
+    let cap = MAP_CAPS[usize::from(head & 7)];
+    let (census, _serve_mark) = CapCensus::new(CellId(u16::from(head)));
+    let mut builder = CappedMap::<K, u16>::builder(cap, &census).expect("fits");
+    let mut build_steps = 0;
+    let mut map = loop {
+        build_steps += 1;
+        match builder.step() {
+            MapBuilt::More(next) => builder = next,
+            MapBuilt::Live(map) => break map,
+            MapBuilt::Refused(_, refused) => panic!("{refused}"),
+        }
+    };
+    let mut model: BTreeMap<K, u16> = BTreeMap::new();
+    let mut named: Vec<K> = Vec::new();
+    let (mut high_water, mut crossings) = (0u32, 0u64);
+    let full = |model: &BTreeMap<K, u16>| model.len() as u32 == cap.entries_max();
+    for (op, pair) in ops.chunks_exact(2).take(MAP_OPS_MAX).enumerate() {
+        let key = K::pooled(pair[1]);
+        if !named.contains(&key) {
+            named.push(key);
+        }
+        let value = op as u16;
+        match pair[0] & 7 {
+            0..=2 => match map.admit(key) {
+                Admission::Occupied(slot) => {
+                    let before = model.insert(key, value).expect("Occupied names a present key");
+                    assert_eq!(slot.replace(value), before, "the replaced value");
+                }
+                Admission::Vacant(slot) => {
+                    assert!(!model.contains_key(&key) && !full(&model), "a vacant slot");
+                    slot.publish(value);
+                    model.insert(key, value);
+                    high_water = high_water.max(model.len() as u32);
+                }
+                Admission::Full => {
+                    assert!(!model.contains_key(&key) && full(&model), "Full below the cap");
+                    crossings += 1;
+                }
+            },
+            3 => match map.admit(key) {
+                Admission::Vacant(slot) => drop(slot),
+                Admission::Full => crossings += 1,
+                Admission::Occupied(_) => {}
+            },
+            4 | 5 => assert_eq!(map.remove(key), model.remove(&key), "remove"),
+            6 => match (map.get_mut(key), model.get_mut(&key)) {
+                (Some(found), Some(expected)) => {
+                    *found = value;
+                    *expected = value;
+                }
+                (None, None) => {}
+                (Some(_), None) | (None, Some(_)) => panic!("get_mut disagrees with the model"),
+            },
+            _ => {}
+        }
+        assert_eq!(map.len() as usize, model.len());
+        for key in &named {
+            assert_eq!(map.get(*key), model.get(key), "get disagrees with the model");
+        }
+    }
+    let row = census.row("fuzz-map").expect("row");
+    assert_eq!((row.high_water, row.crossings), (high_water, crossings));
+    assert_eq!(row.capacity_now, cap.entries_max());
+    let mut retiring = map.retire();
+    let mut steps = 0;
+    loop {
+        steps += 1;
+        match retiring.step() {
+            MapRetired::More(next) => retiring = next,
+            MapRetired::Done => break,
+        }
+    }
+    assert_eq!(steps, build_steps, "one retire step per item built");
+}

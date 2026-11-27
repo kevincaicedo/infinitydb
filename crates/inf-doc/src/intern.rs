@@ -52,6 +52,15 @@ pub(crate) fn split_dict(tail: &[u8]) -> Result<(&[u8], &[u8]), DocError> {
 /// are small (a document's distinct repeated keys); the hot lookup path
 /// resolves the *needle* once, then compares ids (ADR-0038 D5).
 pub(crate) fn dict_region_get(dict: &[u8], id: usize) -> Option<&[u8]> {
+    let (start, end) = dict_region_span(dict, id)?;
+    Some(&dict[start..end])
+}
+
+/// Where id's key bytes lie in a raw table region, `start..end`: the
+/// position a serializer keeps across a suspension in place of the borrow.
+/// The same O(id) walk as [`dict_region_get`], which reads through it.
+#[inline]
+pub(crate) fn dict_region_span(dict: &[u8], id: usize) -> Option<(usize, usize)> {
     let count = u16::from_le_bytes([*dict.first()?, *dict.get(1)?]) as usize;
     if id >= count {
         return None;
@@ -62,7 +71,7 @@ pub(crate) fn dict_region_get(dict: &[u8], id: usize) -> Option<&[u8]> {
         off += 2 + len;
     }
     let len = u16::from_le_bytes([dict[off], dict[off + 1]]) as usize;
-    Some(&dict[off + 2..off + 2 + len])
+    Some((off + 2, off + 2 + len))
 }
 
 /// Find a key's id in a raw table region. O(table) — paid once per lookup

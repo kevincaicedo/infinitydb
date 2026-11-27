@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! ADR-0174 D1 at the server tier, on the injected `MemFs` seam: a cell
 //! log whose tiered tail re-appends more than the namespace's RAM window
 //! (`MEM-BUDGET + MAINTAIN-SLICE`) boots through `open_cell_log` — replay
@@ -30,16 +34,20 @@ const RECORDS_PER_FRAME: usize = 12;
 /// window (no MANIFEST — the first-crash shape: the catalog names it, no
 /// checkpoint does).
 fn tiered_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh_keyspace();
-    ks.ns_create(NsSpec {
-        id: TIER_NS,
-        name: b"hot".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: Some(TierSpec::for_budget(MEM_BUDGET)),
-    })
+    ks.ns_create(
+        NsSpec {
+            id: TIER_NS,
+            name: b"hot".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: Some(TierSpec::for_budget(MEM_BUDGET)),
+        },
+        &census,
+    )
     .expect("tiered ns");
     ks
 }

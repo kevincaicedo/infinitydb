@@ -1,13 +1,24 @@
 //! M4-S26 — the plane's tiered half: per-namespace flush pipelines, the
-//! cell's cold-read custody engine, the sealed-file fd table, the four
+//! cell's cold-read custody engine, the sealed-file fd table, the three
 //! MAINTAIN drivers (demote → flush → release, compaction, extent
-//! reclaim, retirement unlink), and the disk-admission cadence
-//! (ADR-0063 D2).
+//! reclaim), the retirement walk that hands every retired or dropped tier
+//! file to the control thread's worker (ADR-0156 D1–D4), and the
+//! disk-admission cadence (ADR-0063 D2).
 //!
 //! Ownership: one [`TierCell`] per cell, inside the plane's `Shared`
 //! (L1 — no cross-cell state). A node that never creates a tiered
 //! namespace constructs `None` of this — the ADR-0062 D8 / S03
 //! zero-cost posture is structural, not conditional.
+//!
+//! Lifetimes (ADR-0148 D2, D3): the cell holds one tiered namespace owner
+//! a grant position, at most 64, each named by its position and id. The
+//! owner is installed in the step that applies its `CREATE` (the origin
+//! after the catalog writer's answer, a peer's leg, the boot), only where
+//! the node's directory names the grant Declared; a `DROP` apply moves it
+//! to Draining, where it stays, holding its round, its pinned files and
+//! its compaction chain, until every child owner has ended; only then is
+//! the position Vacant and this cell's receipt for the id published, which
+//! the writer needs from every cell before it grants the position again.
 //!
 //! Drive shape (M4.5-S31, ADR-0084; the groups and the turn of ADR-0178
 //! D3 and ADR-0155 D4): the flush/seal legs ride the **reactor drive**.
@@ -32,30 +43,45 @@
 //! `IoOp::TierRead`, and complete through the custody table, each
 //! window planned below its file's [`ReadableLen`].
 
+use std::cell::Cell;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use inf_alloc::AlignedPool;
+use inf_foundation::LogHistogram;
 use inf_foundation::bounded::CapCensus;
-use inf_foundation::{FileOffset, LogHistogram};
+use inf_foundation::grants::{
+    DirectoryCursor, GrantDirectory, GrantOrder, GrantPos, GrantSlot, POSITIONS, ReceiptWriter,
+    RetireBoard,
+};
+use inf_foundation::time::Nanos;
 use inf_log::blob::ExtentId;
-use inf_log::flush::{PendingSealView, unlink_tier_file};
+use inf_log::flush::PendingSealView;
 use inf_log::fs::{SegmentFile, SegmentFs};
 use inf_log::limits::{TIER_GROUP_BYTES_MAX, TIER_GROUP_OPS_MAX};
-use inf_log::{NsId, TierDrive, TierFileMeta, TierFlush, TierFlushConfig, TierFlushError};
+use inf_log::{NsId, OpState, TierDrive, TierFileMeta, TierFlush, TierFlushConfig, TierFlushError};
 use inf_runtime::{
     ColdReadConfig, ColdReads, CompletionToken, IoOp, Issue, TierFileId, TokenClass, WaitList,
-    WriteBarrier,
+    WaitNodes, WriteBarrier,
 };
 use inf_store::{Keyspace, LogicalAddr, TierSpec, TieredTable};
 
+use crate::control::RetireWake;
 use crate::durable::ack_class::AckClasses;
 use crate::limits::{TIER_ISSUE_OPS_PER_TURN, TIER_PLANS_PER_TURN};
+use crate::tier_retire::{CellPart, TransportPhase};
 
 mod marks;
+mod retire_list;
+mod round;
+mod walk;
 
 pub(crate) use marks::EpochMarks;
+use retire_list::{RetireList, RetiringFile};
+use round::{FlushRound, RoundPhase, unsent};
+pub use walk::TierQuiescence;
 
 /// `errno` values the completion handler classifies (ADR-0084 D4).
 const ENOSPC: i32 = 28;
@@ -101,9 +127,6 @@ pub(crate) trait FlushAdmission {
 /// — reclaim is a background sweep, never a burst).
 const EXTENT_RECLAIM_PER_SLICE: usize = 8;
 
-/// Retired tier files unlinked per MAINTAIN slice (bounded teardown).
-const UNLINKS_PER_SLICE: usize = 8;
-
 /// One tiered namespace's plane-side state.
 pub(crate) struct TierNs<F: SegmentFs> {
     pub ns: NsId,
@@ -112,9 +135,21 @@ pub(crate) struct TierNs<F: SegmentFs> {
     /// the creation-mode fd (ADR-0054: one fd, one mode) instead of
     /// reopening; retirement closes them after the pin drain.
     files: Vec<(u32, F::File)>,
-    /// Retired metas awaiting `inflight_on == 0` before close + unlink
+    /// The retiring owners (ADR-0156 D1): the files a covering swap retired,
+    /// and a dropped namespace's pinned catalog files, each with its handle,
+    /// kept to a terminal answer; private to the walk, the commit's push
+    /// and a result's consumption, and read by no MANIFEST, live set or cold
+    /// plan (they left `sealed` and `files` at the commit). The walk passes
+    /// an owner a cold read is pinned on
     /// (§3.3 — a file with in-flight cold reads is never deleted).
-    retired: Vec<TierFileMeta>,
+    retiring: RetireList<F::File>,
+    /// This owner's files out as retirement jobs, its residue's included:
+    /// offered, in the worker's hand, or with their results unconsumed. A
+    /// Draining owner's terminal step waits for zero.
+    jobs_out: u32,
+    /// The bytes this owner's retired files out as jobs charge, until their
+    /// terminal results are consumed (ADR-0156 D1).
+    out_bytes: u64,
     /// `TAIL-STALL-TIMEOUT` (ADR-0053 D4), consumed at construction.
     pub tail_stall_timeout_ms: u32,
     /// `TIER-IO-MODE` (ADR-0054), consumed at construction — extent
@@ -132,12 +167,21 @@ pub(crate) struct TierNs<F: SegmentFs> {
     epoch_marks: EpochMarks,
     /// One compaction read chain in flight at a time (bounded).
     pub compact_inflight: bool,
+    /// The token every [`LifetimeHold`] clones: a blob `GET`'s extent
+    /// reader holds one across its awaits, and a Draining owner's terminal
+    /// step waits until no clone is left (ADR-0148 D3).
+    holds: Rc<()>,
+    /// The highest commit-ledger ticket of a blob `SET`'s extent barrier
+    /// this namespace registered, 0 for none: the ledger holds the extent's
+    /// handle until that barrier is synced, and a Draining owner's terminal
+    /// step waits until the ledger has settled through it (ADR-0148 D3).
+    extent_fence: Cell<u64>,
     /// Namespace directory (teardown unlink root).
     pub dir: PathBuf,
-    /// Completion-token lane (M4.5-S31, ADR-0084 D3): stable for this
-    /// namespace's plane life; recycled by [`TierCell`] once no op of it
-    /// is in flight, the round sequence carried forward (batch 12).
-    lane: u32,
+    /// The grant position the namespace holds (ADR-0148 D2), which is its
+    /// completion-token lane (ADR-0084 D3): the lane is reused only by the
+    /// position's next grant, whose round sequence continues this one's.
+    pos: GrantPos,
     /// Round-identity generation for the lane (wrapping; stale
     /// completions mismatch and are counted, never applied).
     round_seq: u32,
@@ -145,128 +189,6 @@ pub(crate) struct TierNs<F: SegmentFs> {
     /// explicit per-namespace bound; the staged intents live in
     /// [`TierFlush`]).
     round: Option<FlushRound>,
-    /// Set when the namespace is dropped with a round in flight (the
-    /// ADR-0084 D3 custody park): the catalog epoch its files release
-    /// at once the round is terminal (ADR-0100 D5).
-    release_epoch: u64,
-}
-
-/// Plane bookkeeping of one in-flight flush round (M4.5-S31): terminal
-/// op states parallel to `TierFlush::round_op`, the group cursor, the
-/// phase, and the identity its completion tokens carry.
-pub(crate) struct FlushRound {
-    states: Vec<OpState>,
-    /// Write positions checked when the round opened, indexed like
-    /// `round_op` (writes occupy `0..round_write_count()`, barriers
-    /// follow). Staged ops are immutable until `finish_round`, so a held
-    /// position stays the staged op's; every emit re-checks it in debug
-    /// builds (ADR-0167 D4).
-    write_positions: Vec<FileOffset>,
-    /// Ops submitted, not yet terminal.
-    pending: u32,
-    /// Writes until every write is done, then barriers (ADR-0178 T4: the
-    /// two are distinct states, so a barrier group is never built with a
-    /// write unsent or outstanding).
-    phase: RoundPhase,
-    /// The group builder's cursor: the first unsent op of the phase's
-    /// range, or the range's end once the phase is spent — the one rule
-    /// every writer of it keeps through [`FlushRound::place_cursor`] (the
-    /// open, a retry, the barrier phase, each emit), so the walk starts
-    /// at an unsent op and no run of done ops ever stands between the
-    /// cursor and the next group.
-    next_unsent: usize,
-    /// When the group at the cursor became ready, on the injected clock
-    /// in microseconds: the open, a grant that left unsent ops, a retry,
-    /// the barrier phase. `None` while nothing is unsent.
-    ready_since_us: Option<u64>,
-    /// The unsent ops are a retry of failed writes (the ungranted-retry
-    /// plant reads it).
-    retry: bool,
-    round_seq: u32,
-    staged_at_us: u64,
-    /// Worst write error of the current attempt (ENOSPC dominates).
-    write_error: Option<i32>,
-    /// A barrier failed — fatal at the next MAINTAIN (§8.4).
-    fatal: Option<i32>,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum OpState {
-    Unsent,
-    Sent,
-    Done,
-    Failed,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum RoundPhase {
-    Writes,
-    Barriers,
-}
-
-impl FlushRound {
-    fn new(
-        op_count: usize,
-        write_positions: Vec<FileOffset>,
-        round_seq: u32,
-        staged_at_us: u64,
-    ) -> FlushRound {
-        debug_assert!(write_positions.len() <= op_count, "writes lead the round's ops");
-        FlushRound {
-            states: vec![OpState::Unsent; op_count],
-            write_positions,
-            pending: 0,
-            phase: RoundPhase::Writes,
-            next_unsent: 0,
-            ready_since_us: Some(staged_at_us),
-            retry: false,
-            round_seq,
-            staged_at_us,
-            write_error: None,
-            fatal: None,
-        }
-    }
-
-    /// The op range the current phase may issue from, from the cursor.
-    fn phase_range(&self, writes: usize, op_count: usize) -> core::ops::Range<usize> {
-        match self.phase {
-            RoundPhase::Writes => self.next_unsent..writes,
-            RoundPhase::Barriers => self.next_unsent.max(writes)..op_count,
-        }
-    }
-
-    /// The first unsent op of the current phase's range — the cursor, by
-    /// the rule its writers keep — or `None` once the phase is spent.
-    /// One primitive for "is a group ready" and "where does it start".
-    fn first_unsent(&self, writes: usize, op_count: usize) -> Option<usize> {
-        let range = self.phase_range(writes, op_count);
-        let first = range.clone().find(|&index| self.states[index] == OpState::Unsent);
-        debug_assert_eq!(
-            first.unwrap_or(range.end),
-            range.start,
-            "the op at the cursor is unsent, or the phase is spent"
-        );
-        first
-    }
-
-    /// Whether an unsent op lies in the current phase's range: a group
-    /// is ready to be built and offered.
-    fn has_ready_group(&self, writes: usize, op_count: usize) -> bool {
-        self.first_unsent(writes, op_count).is_some()
-    }
-
-    /// Places the cursor at the first unsent op at or above `from` in the
-    /// current phase's range, or at the range's end when none is left:
-    /// the one writer of `next_unsent`. A retry calls it from 0 (a failed
-    /// write may lie below the old cursor), the barrier phase from the
-    /// first barrier, an emit from its group's end — so a run of done
-    /// ops is passed here, once, never charged to a turn's visits.
-    fn place_cursor(&mut self, from: usize, writes: usize, op_count: usize) {
-        self.next_unsent = from;
-        let range = self.phase_range(writes, op_count);
-        self.next_unsent =
-            range.clone().find(|&index| self.states[index] == OpState::Unsent).unwrap_or(range.end);
-    }
 }
 
 /// Cell-scope reactor-drive flush observables (ADR-0084 D6 — the
@@ -296,6 +218,10 @@ pub(crate) struct TierFlushStats {
     /// Plans the pass made — a span, a gap or a refusal — one per turn at
     /// most.
     pub rounds_planned: u64,
+    /// Plans refused because a namespace's file ids are spent: its flush
+    /// stops for the lifetime, and each turn that would plan it again
+    /// counts one.
+    pub file_ids_exhausted: u64,
 }
 
 /// A tier file's readable length: the data bytes below which a cold-read
@@ -444,9 +370,19 @@ impl<F: SegmentFs> TierNs<F> {
 
     /// Whether this namespace's round holds a group it may offer.
     fn has_ready_group(&self) -> bool {
-        self.round.as_ref().is_some_and(|r| {
-            r.has_ready_group(self.flush.round_write_count(), self.flush.round_op_count())
-        })
+        self.round.as_ref().is_some_and(|r| r.has_ready_group(&self.flush))
+    }
+
+    /// Records a blob `SET`'s extent barrier, registered in the commit
+    /// ledger under `ticket`: the namespace's terminal step waits for it.
+    pub fn note_extent_barrier(&self, ticket: u64) {
+        self.extent_fence.set(self.extent_fence.get().max(ticket));
+    }
+
+    /// The completion-token lane: the grant position's index, below 64.
+    fn lane(&self) -> u32 {
+        // A position's index is below `POSITIONS` (64), so it fits.
+        self.pos.index() as u32
     }
 }
 
@@ -504,8 +440,44 @@ pub(crate) struct TierCell<F: SegmentFs> {
     fs: F,
     cell: u32,
     shard_dir: PathBuf,
-    /// The cell's tiered namespaces, ascending by id: the turn's order.
-    pub namespaces: Vec<TierNs<F>>,
+    /// One tiered namespace owner a grant position (ADR-0148 D2, D3):
+    /// Vacant, Live or Draining, at most 64 owners on the cell.
+    positions: [Position<F>; POSITIONS],
+    /// The Live positions, ascending by namespace id: the turn's order,
+    /// inline (no allocation of its own).
+    live: GrantOrder,
+    /// The node's grant directory, this cell's receipts and its tier-file
+    /// transport; `None` on a cell with no catalog writer, which installs
+    /// no tiered owner and so needs no transport.
+    grants: Option<CellGrants<F::File>>,
+    /// The cell's retirement counters (`INFO`, cell scope).
+    retire_stats: TierRetireStats,
+    /// The retirement walk's pending positions (ADR-0156 D4), bit `p` for
+    /// position `p`: Draining, or Live with a retiring owner or a held
+    /// residue. Set by the commit, the drop, a failed create and a consumed
+    /// `Retry`; cleared only by the walk.
+    pending: u64,
+    /// The position the walk's next turn starts at or after, cyclic.
+    head: usize,
+    /// The retirement timer role's owner (ADR-0154 A1), `None` on a cell
+    /// with no durable plane, and the latest due a consumed `Retry` set
+    /// (`retry_due_last`): the role's callback compares it with the turn.
+    retire_timer: Option<inf_runtime::TimerOwner>,
+    retry_due_last: Nanos,
+    /// A consumed `Retry` asks the role to arm at `retry_due_last`.
+    arm_wanted: bool,
+    /// Owners and residues the last turn of the walk examined, where a pin
+    /// or a due is read, apart from the charge.
+    #[cfg(test)]
+    examined: u32,
+    /// The canary's dropped owners, parked aside with their positions and
+    /// receipts already returned.
+    #[cfg(inf_canary_grant_return_at_drop)]
+    parked: Vec<Box<TierNs<F>>>,
+    /// Installs and drops that met a position its grant says cannot be
+    /// there (F2, F3): zero while a position is granted again only after
+    /// every cell's receipt.
+    position_conflicts: u64,
     /// The custody engine (ADR-0055): one per cell, built at the first
     /// tiered materialization, sized from that namespace's
     /// `COLD-READ-QD` (CreateOnly). A later namespace with a different
@@ -517,42 +489,166 @@ pub(crate) struct TierCell<F: SegmentFs> {
     /// binds; percentiles never merge across cells.
     pub ram_hit_us: LogHistogram,
     pub cold_us: LogHistogram,
-    /// Dropped namespaces' teardown queues (pins drain before unlink).
-    teardown: Vec<TeardownNs>,
-    /// Next fresh completion-token lane (M4.5-S31). Lanes are 16 bits of
-    /// the token slot (`MAX_SLOT >> 8`), so they recycle (batch 12 of the
-    /// 2026-08-30 review): a lane returns to `free_lanes` only once its
-    /// namespace has no op in flight — dropped with no round, or drained
-    /// through `round_drain` — and the reuser continues the lane's round
-    /// sequence, so the generation half still makes stale routing
-    /// unrepresentable. Before this the counter was monotone and the
-    /// 65,537th tiered `CREATE` on a cell's lifetime was a release assert.
-    next_lane: u32,
-    /// Recycled lanes with the round sequence the next holder starts
-    /// above.
-    free_lanes: Vec<(u32, u32)>,
-    /// Dropped namespaces whose flush round is still in flight: the
-    /// windows the driver may touch live in their pipelines, so the
-    /// whole [`TierNs`] parks here until every op is terminal, then its
-    /// files join the teardown queue (ADR-0084 D3 custody). No further
-    /// group is offered for a parked round.
-    round_drain: Vec<TierNs<F>>,
     /// Reactor-drive flush observables (ADR-0084 D6).
     pub(crate) flush_stats: TierFlushStats,
     /// The cell's turn: one per cell, the two cell-wide orders.
     turn: TierTurn,
+    /// The namespace the last MAINTAIN pass of each task class paced first:
+    /// the next pass of that class starts at it, by id (ADR-0177 D2's
+    /// progress rule for a paced namespace). A pass that paces none leaves
+    /// it; a dropped one hands the start to the first id above it.
+    compact_paced: Option<NsId>,
+    shadow_paced: Option<NsId>,
     /// The cell's cap census: each namespace's reclaim marks register
     /// their row on it.
     census: Rc<CapCensus>,
+    /// The cell's wait nodes: each namespace's stall list takes them at its
+    /// install (ADR-0177 D5).
+    nodes: WaitNodes,
 }
 
-/// A dropped namespace's file half, unlinked in bounded slices
-/// (ADR-0062 D7 — DROP's plane-side obligation) once the catalog swap
-/// that carries the drop is durable (ADR-0100 D5: `release_epoch` is
-/// that persist's epoch; a crash before it must find every file).
-struct TeardownNs {
-    files: Vec<TierFileMeta>,
-    release_epoch: u64,
+/// One grant position on this cell (ADR-0148 D3).
+enum Position<F: SegmentFs> {
+    /// No owner: the round sequence its lane's next owner starts above, so
+    /// a stale completion of an earlier owner stays unroutable.
+    Vacant { round_seq: u32 },
+    /// The namespace's owner, serving.
+    Live(Box<TierNs<F>>),
+    /// A dropped namespace's owner, held until every child owner has
+    /// ended: no plan, group or cold plan from the drop on. `release` is
+    /// the drop's catalog epoch, before which no file of it is unlinked
+    /// (ADR-0100 D5).
+    Draining { ns: Box<TierNs<F>>, release: u64, phase: DrainPhase },
+}
+
+// The position table is local owner state (ADR-0148 D4's measured term),
+// at most 2 KiB a cell for every shipped file system: each position holds
+// its owner by `Box`, so its size is independent of `F`.
+const POSITION_TABLE_BYTES_MAX: usize = 2_048;
+const _: () = assert!(
+    size_of::<[Position<inf_log::fs::StdSegmentFs>; POSITIONS]>() <= POSITION_TABLE_BYTES_MAX,
+    "the position table is 2 KiB at most"
+);
+const _: () = assert!(
+    size_of::<[Position<inf_log::fs::sim::SimDisk>; POSITIONS]>() <= POSITION_TABLE_BYTES_MAX,
+    "the position table is 2 KiB at most"
+);
+const _: () = assert!(
+    size_of::<[Position<inf_log::fs::mem::MemFs>; POSITIONS]>() <= POSITION_TABLE_BYTES_MAX,
+    "the position table is 2 KiB at most"
+);
+
+/// The position table's bytes on a cell over the real file system (the
+/// boot test reports it beside the reserved bill).
+pub(crate) const fn position_table_bytes() -> usize {
+    size_of::<[Position<inf_log::fs::StdSegmentFs>; POSITIONS]>()
+}
+
+/// How far a dropped namespace's owner has drained.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DrainPhase {
+    /// Its flush round is out: every sent op's completion is awaited,
+    /// since the driver may still touch the round's windows (ADR-0084 D3).
+    Round,
+    /// No round is out: its files are closed and unlinked one at a time.
+    Files,
+}
+
+/// This cell's half of the node's tiered grants (ADR-0148 D2–D4): the
+/// directory it installs from, its receipts, its pass's place, and the
+/// tier-file transport that retires its owners' files (ADR-0156 D2–D3).
+/// A cell installs a tiered owner only through its grants, so a cell that
+/// can install one holds its transport, by type.
+pub(crate) struct CellGrants<J> {
+    directory: Arc<GrantDirectory>,
+    receipts: ReceiptWriter,
+    cursor: DirectoryCursor,
+    /// The cell's job positions, request producer, result consumer and both
+    /// ring backings.
+    part: CellPart<J>,
+    /// The node's retirement board: its bell and the cell's `closing`.
+    board: Arc<RetireBoard>,
+    /// The control thread's wake, which the bell's ring sends.
+    wake: RetireWake,
+    /// A standalone test cell grants through its directory's one writer.
+    #[cfg(test)]
+    writer: Option<inf_foundation::grants::DirectoryWriter>,
+}
+
+impl<J> CellGrants<J> {
+    /// The node's directory, this cell's receipt writer and its part.
+    pub(crate) fn new(
+        directory: Arc<GrantDirectory>,
+        receipts: ReceiptWriter,
+        part: CellPart<J>,
+        board: Arc<RetireBoard>,
+        wake: RetireWake,
+    ) -> CellGrants<J> {
+        CellGrants {
+            directory,
+            receipts,
+            cursor: DirectoryCursor::default(),
+            part,
+            board,
+            wake,
+            #[cfg(test)]
+            writer: None,
+        }
+    }
+
+    /// The cell's transport part.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn part_mut(&mut self) -> &mut CellPart<J> {
+        &mut self.part
+    }
+
+    /// One step of the transport's stop (ADR-0156 D3): the ready results
+    /// first, then the stop's row the part stands at.
+    pub(crate) fn stop_step(&mut self) -> TransportPhase {
+        self.part.stop_step(&self.board, &self.wake)
+    }
+}
+
+/// The cell's tier-file retirement counters (ADR-0156 D3), cell scope.
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct TierRetireStats {
+    /// Files whose `Unlinked` or `AlreadyAbsent` the cell consumed.
+    pub(crate) files_retired: u64,
+    /// `Retry` results consumed, by errno class.
+    pub(crate) errors_transient: u64,
+    pub(crate) errors_operator: u64,
+    /// Results whose identity no owner held (zero by design).
+    pub(crate) stale: u64,
+}
+
+/// A child owner's hold on a tiered namespace's lifetime (ADR-0148 D3): a
+/// clone of a token the owner holds, so its drop borrows nothing. A blob
+/// `GET`'s extent reader carries one across its awaits; a dropped
+/// namespace's owner is not freed, nor its receipt published, while any is
+/// outstanding.
+pub(crate) struct LifetimeHold(#[allow(dead_code, reason = "held for its drop")] Rc<()>);
+
+/// Why a cell refused to install a tiered namespace's owner (ADR-0148 D2).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum InstallRefused {
+    /// The directory names no Declared grant for the namespace, or the
+    /// cell has no catalog writer: unreachable on a well-formed leg, since
+    /// the writer publishes the grant before the epoch the origin awaits.
+    NotDeclared,
+    /// The grant's position holds an owner on this cell: unreachable while
+    /// a position is granted again only after every cell's receipt.
+    Occupied,
+}
+
+/// An admitted install: the position the directory names Declared for
+/// the namespace, Vacant on this cell, and the round sequence it carries.
+/// Consumed by the install in the same step (ADR-0148 D2: no admission is
+/// carried across a suspension).
+#[must_use = "an admitted install is consumed in its step"]
+pub(crate) struct InstallPermit {
+    pos: GrantPos,
+    ns: NsId,
+    round_seq: u32,
 }
 
 /// One compaction cold-read chain for the plane to issue
@@ -560,28 +656,209 @@ struct TeardownNs {
 /// `TieredTable::compaction_apply` back through the exact cursor).
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct CompactRead {
+    /// The owner's grant position: the chain's end resolves by it and the id.
+    pub pos: GrantPos,
     pub ns: NsId,
     pub file_id: u32,
     pub addr: LogicalAddr,
     pub len: u64,
 }
 
-impl<F: SegmentFs> TierNs<F> {
-    /// Queues one detached (retirement-committed) file for the
-    /// pin-gated unlink (ADR-0059 D3 phases 2-3; §3.3).
-    pub fn note_retired(&mut self, meta: TierFileMeta) {
-        self.retired.push(meta);
+/// One MAINTAIN pass's room in a task class (ADR-0177 D2): the class's free
+/// slots, read once a pass. A read is taken only by spending a slot of it,
+/// so the read's spawn meets a slot in the same step; a namespace with work
+/// the room cannot serve is paced: counted on `waits` (the cell's
+/// `tier_maint_task_waits`, a statistic) and left for a later pass.
+pub(crate) struct TaskRoom<'a> {
+    left: u32,
+    /// Namespaces this pass paced: the pass reads it to name its first.
+    paced: u32,
+    waits: &'a Cell<u64>,
+}
+
+impl<'a> TaskRoom<'a> {
+    /// A room of `left` slots, its paces counted on `waits`.
+    pub(crate) fn new(left: u32, waits: &'a Cell<u64>) -> TaskRoom<'a> {
+        TaskRoom { left, paced: 0, waits }
+    }
+
+    /// The slots still free this pass.
+    pub(crate) fn left(&self) -> u32 {
+        self.left
+    }
+
+    /// `n` reads taken, each a slot of the room: never more than are left.
+    pub(crate) fn spend(&mut self, n: u32) {
+        debug_assert!(n <= self.left, "a read taken past its room: {n} of {}", self.left);
+        self.left = self.left.saturating_sub(n);
+    }
+
+    /// A namespace with work this pass leaves for a later one: counted, the
+    /// count saturating.
+    pub(crate) fn pace(&mut self) {
+        self.paced += 1;
+        self.waits.set(self.waits.get().saturating_add(1));
     }
 }
 
-impl<F: SegmentFs> TierCell<F> {
-    pub fn ns(&self, ns: NsId) -> Option<&TierNs<F>> {
-        self.namespaces.iter().find(|t| t.ns == ns)
+/// What one MAINTAIN pass of the namespaces' drivers returns to the plane:
+/// the budget units to charge, every compaction read it took (those taken
+/// before a fatal error too: the plane spawns them, and the fail-stop is
+/// the durable plane's flag) and the fatal error that ended it.
+pub(crate) struct TierPass {
+    pub units: u32,
+    pub reads: Vec<CompactRead>,
+    pub fatal: Option<TierFlushError>,
+}
+
+/// The `compact` class's crossing at one namespace with work (ADR-0177 D2):
+/// the read is taken only by spending a slot of the pass's room, and marked
+/// in flight with it; with no slot left the namespace is paced and nothing
+/// is marked, so no namespace waits on a chain no task runs.
+fn take_compact(
+    room: &mut TaskRoom<'_>,
+    inflight: &mut bool,
+    read: CompactRead,
+) -> Option<CompactRead> {
+    // Canary: the read is taken and marked first, then the room asked, its
+    // answer ignored.
+    if cfg!(inf_canary_compact_take_before_permit) {
+        *inflight = true;
+        if room.left() > 0 {
+            room.spend(1);
+        }
+        return Some(read);
+    }
+    if room.left() == 0 {
+        room.pace();
+        return None;
+    }
+    room.spend(1);
+    *inflight = true;
+    Some(read)
+}
+
+impl<F: SegmentFs> TierNs<F> {
+    /// The namespace's tier-file disk bytes (ADR-0063 D2, ADR-0156 D1): the
+    /// pipeline's files and its failed create's residue, its retiring
+    /// owners and its files out as jobs, each counted until its terminal
+    /// result is consumed. Disk admission and compaction pressure both read
+    /// it, so a file that left the live set still holds its bytes until it
+    /// is gone.
+    pub fn tier_file_bytes(&self) -> u64 {
+        self.flush.disk_bytes() + self.retiring.bytes() + self.out_bytes
     }
 
-    /// Opens a blob extent for reading in the namespace's creation
-    /// I/O mode (M4-S26 blob reads; the §3.3 open is metadata-cheap and
-    /// the returned reader owns the fd across the chunked reads).
+    /// The swap's commit for this owner (ADR-0059 D3): every sealed file
+    /// `ids` names (ascending) leaves `sealed` and `files` in one pass each
+    /// and joins `behind` of the retirement list with its handle, eligible
+    /// at once. Returns the owners it pushed.
+    fn commit_retiring(&mut self, ids: &[u32]) -> usize {
+        let TierNs { flush, files, retiring, jobs_out, .. } = self;
+        retiring.reserve(ids.len(), *jobs_out as usize);
+        let mut handles = files.extract_if(.., |(id, _)| ids.binary_search(id).is_ok());
+        let mut next = handles.next();
+        let mut pushed = 0;
+        flush.detach_retiring(ids, |meta| {
+            while next.as_ref().is_some_and(|(id, _)| *id < meta.id) {
+                // Unreachable: a sealed file's handle names a catalog file.
+                debug_assert!(false, "a retired handle with no catalog file");
+                next = handles.next();
+            }
+            let handle = match next.take() {
+                Some((id, handle)) if id == meta.id => {
+                    next = handles.next();
+                    Some(handle)
+                }
+                other => {
+                    next = other;
+                    None
+                }
+            };
+            // Canary `inf_canary_commit_retirement_forgets`: the commit takes
+            // the file out of the catalog and drops its owner, so nothing
+            // ever unlinks it.
+            if cfg!(inf_canary_commit_retirement_forgets) {
+                return;
+            }
+            let bytes = meta.disk_bytes();
+            retiring.push(RetiringFile { meta, handle, due: Nanos(0), bytes });
+            pushed += 1;
+        });
+        debug_assert!(next.is_none(), "every retired handle met its file");
+        pushed
+    }
+}
+
+/// The Live owner at `pos`, if the position holds one.
+fn live_at<F: SegmentFs>(
+    positions: &[Position<F>; POSITIONS],
+    pos: GrantPos,
+) -> Option<&TierNs<F>> {
+    match &positions[pos.index()] {
+        Position::Live(t) => Some(t),
+        Position::Vacant { .. } | Position::Draining { .. } => None,
+    }
+}
+
+/// [`live_at`], mutably.
+fn live_at_mut<F: SegmentFs>(
+    positions: &mut [Position<F>; POSITIONS],
+    pos: GrantPos,
+) -> Option<&mut TierNs<F>> {
+    match &mut positions[pos.index()] {
+        Position::Live(t) => Some(t),
+        Position::Vacant { .. } | Position::Draining { .. } => None,
+    }
+}
+
+/// The id of the Live owner at `pos`; `u32::MAX`, above every id, when the
+/// position holds none (the Live order names only Live positions).
+fn live_id<F: SegmentFs>(positions: &[Position<F>; POSITIONS], pos: GrantPos) -> u32 {
+    live_at(positions, pos).map_or(u32::MAX, |t| t.ns.0)
+}
+
+impl<F: SegmentFs> TierCell<F> {
+    /// The Live owner of `ns`: at most 64 compares.
+    pub fn ns(&self, ns: NsId) -> Option<&TierNs<F>> {
+        self.live().find(|t| t.ns == ns)
+    }
+
+    /// The Live owners, ascending by namespace id.
+    pub fn live(&self) -> impl Iterator<Item = &TierNs<F>> {
+        self.live.iter().filter_map(|&pos| live_at(&self.positions, pos))
+    }
+
+    /// Live owners on the cell.
+    pub fn live_count(&self) -> usize {
+        self.live.len()
+    }
+
+    /// Every owner the cell holds, Live and Draining.
+    fn owners(&self) -> impl Iterator<Item = &TierNs<F>> {
+        self.positions.iter().filter_map(|position| match position {
+            Position::Live(t) | Position::Draining { ns: t, .. } => Some(&**t),
+            Position::Vacant { .. } => None,
+        })
+    }
+
+    /// Positions holding an owner, Live or Draining (`tier_ns_positions`).
+    pub(crate) fn positions_held(&self) -> u64 {
+        self.owners().count() as u64
+    }
+
+    /// Installs and drops that met their position in a state its grant
+    /// rules out (`tier_position_conflicts`).
+    pub(crate) fn position_conflicts(&self) -> u64 {
+        self.position_conflicts
+    }
+
+    /// Opens a blob extent of a Live namespace for reading in its
+    /// creation I/O mode (M4-S26 blob reads; the open is metadata-cheap
+    /// and the returned reader owns the fd across the chunked reads),
+    /// with the [`LifetimeHold`] the reader's holder keeps
+    /// beside it: a drop meanwhile holds the namespace's owner until the
+    /// hold is dropped (ADR-0148 D3).
     ///
     /// # Errors
     /// Open/probe failures — the command layer answers typed.
@@ -589,9 +866,10 @@ impl<F: SegmentFs> TierCell<F> {
         &self,
         ns: NsId,
         extent_id: u64,
-    ) -> std::io::Result<inf_log::blob::ExtentReader<F::File>> {
+    ) -> std::io::Result<(inf_log::blob::ExtentReader<F::File>, LifetimeHold)> {
         let t = self.ns(ns).ok_or_else(|| std::io::Error::other("namespace dropped"))?;
-        inf_log::blob::open_extent(&self.fs, &t.dir, ExtentId(extent_id), t.io_mode)
+        let reader = inf_log::blob::open_extent(&self.fs, &t.dir, ExtentId(extent_id), t.io_mode)?;
+        Ok((reader, LifetimeHold(Rc::clone(&t.holds))))
     }
 
     /// The owning cell index (extent headers carry it).
@@ -604,110 +882,258 @@ impl<F: SegmentFs> TierCell<F> {
         &self.fs
     }
 
+    /// The Live owner of `ns`, mutably.
     pub fn ns_mut(&mut self, ns: NsId) -> Option<&mut TierNs<F>> {
-        self.namespaces.iter_mut().find(|t| t.ns == ns)
+        let positions = &self.positions;
+        let pos = self.live.iter().copied().find(|&pos| live_id(positions, pos) == ns.0)?;
+        live_at_mut(&mut self.positions, pos)
     }
 
-    /// The index at which the rotation of `namespaces` (ascending by id)
+    /// The index at which the rotation of the Live order (ascending by id)
     /// begins for the first id above `after`, wrapping; 0 with no
     /// namespace, no `after`, or none above it.
     fn rotation_start(&self, after: Option<NsId>) -> usize {
-        let n = self.namespaces.len();
+        let n = self.live.len();
         if n == 0 {
             return 0;
         }
-        after.map_or(0, |after| self.namespaces.partition_point(|t| t.ns.0 <= after.0) % n)
+        let positions = &self.positions;
+        after.map_or(0, |after| {
+            self.live.partition_point(|&pos| live_id(positions, pos) <= after.0) % n
+        })
+    }
+
+    /// The Live order's index of the first id at or above `id`, wrapping.
+    fn rotation_at(&self, id: NsId) -> usize {
+        let n = self.live.len();
+        if n == 0 {
+            return 0;
+        }
+        let positions = &self.positions;
+        self.live.partition_point(|&pos| live_id(positions, pos) < id.0) % n
+    }
+
+    /// The directory pass (ADR-0148 D3), each MAINTAIN: only when the
+    /// directory's generation moved since the cell's last pass, every
+    /// Vacant position the directory names `Retiring(id)` gets this cell's
+    /// receipt for `id`, unless it holds one: a namespace whose `CREATE`
+    /// never reached this cell left nothing on it. One shared load with no
+    /// change, at most 64 slot loads on one.
+    pub fn directory_pass(&mut self) {
+        let Some(CellGrants { directory, receipts, cursor, .. }) = self.grants.as_mut() else {
+            return;
+        };
+        let positions = &self.positions;
+        directory.scan(cursor, |pos, slot| {
+            if let GrantSlot::Retiring(id) = slot
+                && matches!(positions[pos.index()], Position::Vacant { .. })
+                && receipts.receipt(pos) != id
+            {
+                receipts.publish(pos, id);
+            }
+        });
+    }
+
+    /// The drop of `ns` on this cell (ADR-0148 D3), in the step that
+    /// applies it to the store: its owner moves Live → Draining(Round) with
+    /// `release`, the drop's catalog epoch, and is held until every child
+    /// owner ends. Its stalled writers are woken, to find no Live
+    /// namespace; a dropped holder releases the turn, so the next pass
+    /// starts after the namespace served last. `false`, counted, when no
+    /// Live owner names `ns` (the store and the table disagree, F3).
+    pub fn drain(&mut self, ns: NsId, release: u64) -> bool {
+        let positions = &self.positions;
+        let Some(at) = self.live.iter().position(|&pos| live_id(positions, pos) == ns.0) else {
+            self.position_conflicts += 1;
+            return false;
+        };
+        let Some(pos) = self.live.remove(at) else {
+            self.position_conflicts += 1;
+            return false;
+        };
+        let slot = &mut self.positions[pos.index()];
+        let mut owner = match std::mem::replace(slot, Position::Vacant { round_seq: 0 }) {
+            Position::Live(t) => t,
+            other @ (Position::Vacant { .. } | Position::Draining { .. }) => {
+                *slot = other;
+                self.position_conflicts += 1;
+                return false;
+            }
+        };
+        if !owner.stall_waiters.is_idle() {
+            owner.stall_waiters.wake_all(());
+        }
+        // The list's one reservation for the catalog (ADR-0156 D2): a pinned
+        // catalog file moves onto it, a retried one comes back to it, and
+        // neither reallocates.
+        let catalog = owner.flush.catalog_len();
+        let out = owner.jobs_out as usize;
+        owner.retiring.reserve(catalog, out);
+        self.pending |= 1 << pos.index();
+        if cfg!(inf_canary_drop_closes_handles) {
+            close_at_drop(&mut owner);
+        }
+        if self.turn.holder == Some(ns) {
+            self.turn.holder = None;
+        }
+        #[cfg(inf_canary_grant_return_at_drop)]
+        {
+            let _ = (slot, release);
+            self.park_at_drop(pos, owner);
+        }
+        #[cfg(not(inf_canary_grant_return_at_drop))]
+        {
+            *slot = Position::Draining { ns: owner, release, phase: DrainPhase::Round };
+        }
+        true
+    }
+
+    /// The canary's drop: the position and this cell's receipt returned at
+    /// once, the owner parked aside until its round's sent ops end, its
+    /// handles open meanwhile.
+    #[cfg(inf_canary_grant_return_at_drop)]
+    fn park_at_drop(&mut self, pos: GrantPos, owner: Box<TierNs<F>>) {
+        self.positions[pos.index()] = Position::Vacant { round_seq: owner.round_seq };
+        if let Some(grants) = &self.grants {
+            grants.receipts.publish(pos, owner.ns.0);
+        }
+        self.parked.push(owner);
+    }
+
+    /// A compaction chain's end (ADR-0148 D3): resolved by position and id,
+    /// Live or Draining, so a dropped namespace's terminal step sees its
+    /// chain back.
+    pub fn chain_back(&mut self, pos: GrantPos, ns: NsId) {
+        match &mut self.positions[pos.index()] {
+            Position::Live(t) | Position::Draining { ns: t, .. } if t.ns == ns => {
+                t.compact_inflight = false;
+            }
+            Position::Live(_) | Position::Draining { .. } | Position::Vacant { .. } => {}
+        }
+    }
+}
+
+impl<F: SegmentFs> TierCell<F> {
+    /// The swap's commit (ADR-0059 D3 phases 2–3): every Live owner's files
+    /// the checkpoint retired leave its live set, its catalog and its
+    /// handles in one pass each and join its retirement list, eligible at
+    /// once; a position that gains an owner is pending for the walk.
+    pub fn commit_retirement(&mut self, ks: &mut Keyspace) {
+        for &pos in self.live.iter() {
+            let Some(t) = live_at_mut(&mut self.positions, pos) else { continue };
+            let Some(table) = ks.tiered_store_mut(t.ns) else { continue };
+            let mut ids = table.commit_retirement();
+            if ids.is_empty() {
+                continue;
+            }
+            ids.sort_unstable();
+            if t.commit_retiring(&ids) > 0 {
+                self.pending |= 1 << pos.index();
+            }
+        }
     }
 }
 
 impl<F: SegmentFs + Clone> TierCell<F> {
-    pub fn new(fs: F, cell: u32, shard_dir: PathBuf, census: Rc<CapCensus>) -> TierCell<F> {
+    /// The cell's tiered plane with every position Vacant; `grants` is the
+    /// node's directory and this cell's receipts, `None` on a cell with no
+    /// catalog writer; `nodes` the cell's wait nodes.
+    pub fn new(
+        fs: F,
+        cell: u32,
+        shard_dir: PathBuf,
+        census: Rc<CapCensus>,
+        nodes: WaitNodes,
+        grants: Option<CellGrants<F::File>>,
+    ) -> TierCell<F> {
         TierCell {
             fs,
             cell,
             shard_dir,
-            namespaces: Vec::new(),
+            positions: core::array::from_fn(|_| Position::Vacant { round_seq: 0 }),
+            live: GrantOrder::default(),
+            grants,
+            retire_stats: TierRetireStats::default(),
+            pending: 0,
+            head: 0,
+            retire_timer: None,
+            retry_due_last: Nanos(0),
+            arm_wanted: false,
+            #[cfg(test)]
+            examined: 0,
+            #[cfg(inf_canary_grant_return_at_drop)]
+            parked: Vec::new(),
+            position_conflicts: 0,
             cold: None,
             ram_hit_us: LogHistogram::new(),
             cold_us: LogHistogram::new(),
-            teardown: Vec::new(),
-            next_lane: 0,
-            free_lanes: Vec::new(),
-            round_drain: Vec::new(),
             flush_stats: TierFlushStats::default(),
             turn: TierTurn::default(),
+            compact_paced: None,
+            shadow_paced: None,
             census,
+            nodes,
         }
     }
 
-    /// Reconciles plane state with the keyspace's tiered set (runs each
-    /// MAINTAIN; DDL is rare, the fast path is two length loads).
-    /// Creation builds the flush pipeline + custody engine; a dropped
-    /// namespace moves its file half to the bounded teardown queue,
-    /// held until the catalog persist named in `releases` is durable
-    /// (ADR-0100 D5 — the DROP program records `(ns, epoch)` there
-    /// before this runs; the entry is consumed here).
-    pub fn sync_namespaces(&mut self, ks: &Keyspace, releases: &mut Vec<(NsId, u64)>) {
-        let live: Vec<(NsId, TierSpec)> =
-            ks.ns_iter().filter_map(|spec| spec.tier.map(|t| (spec.id, t))).collect();
-        if live.len() == self.namespaces.len()
-            && live.iter().all(|(id, _)| self.namespaces.iter().any(|t| t.ns == *id))
-        {
+    /// Admits the install of tiered namespace `ns`'s owner (ADR-0148 D2):
+    /// the directory names it Declared at a position this cell holds
+    /// Vacant. Moves nothing; the caller applies the store's `ns_create`
+    /// next and [`install`](Self::install) last, in one nonsuspending step.
+    ///
+    /// # Errors
+    /// [`InstallRefused`], counted when the position holds an owner.
+    pub fn admit_install(&mut self, ns: NsId) -> Result<InstallPermit, InstallRefused> {
+        let grants = self.grants.as_ref().ok_or(InstallRefused::NotDeclared)?;
+        let pos = grants.directory.find_declared(ns.0).ok_or(InstallRefused::NotDeclared)?;
+        match &self.positions[pos.index()] {
+            Position::Vacant { round_seq } => Ok(InstallPermit { pos, ns, round_seq: *round_seq }),
+            Position::Live(_) | Position::Draining { .. } => {
+                self.position_conflicts += 1;
+                Err(InstallRefused::Occupied)
+            }
+        }
+    }
+
+    /// Installs the owner `permit` admitted: its pipeline on the position's
+    /// lane, its round sequence carried.
+    pub fn install(&mut self, permit: InstallPermit, spec: &TierSpec) {
+        let owner = self.build(&permit, spec);
+        self.place(owner);
+    }
+
+    /// Places `owner` at its position, Vacant since its admission in this
+    /// step, and in the Live order.
+    fn place(&mut self, owner: Box<TierNs<F>>) {
+        let (pos, id) = (owner.pos, owner.ns.0);
+        let slot = &mut self.positions[pos.index()];
+        if !matches!(slot, Position::Vacant { .. }) {
+            // Unreachable: the admission found it Vacant and nothing ran
+            // between. Counted; the store holds a table with no owner,
+            // which MAINTAIN's check reports.
+            debug_assert!(false, "an admitted position held an owner at its install");
+            self.position_conflicts += 1;
             return;
         }
-        // Drops first (ids never recycle within a boot — registry rule).
-        let mut i = 0;
-        while i < self.namespaces.len() {
-            if live.iter().any(|(id, _)| *id == self.namespaces[i].ns) {
-                i += 1;
-                continue;
-            }
-            let mut gone = self.namespaces.remove(i);
-            // A dropped holder releases the turn: no grant of its can
-            // clear it, and the next pass starts after the one served last.
-            if self.turn.holder == Some(gone.ns) {
-                self.turn.holder = None;
-            }
-            let release_epoch = match releases.iter().position(|(ns, _)| *ns == gone.ns) {
-                Some(at) => releases.swap_remove(at).1,
-                None => {
-                    // Every drop path records its epoch before MAINTAIN
-                    // can run; a missing entry is a violated invariant,
-                    // answered by today's immediate teardown in release.
-                    debug_assert!(false, "dropped tiered ns {} without a release epoch", gone.ns.0);
-                    0
-                }
-            };
-            // A dropped namespace with a flush round in flight parks
-            // whole: the driver may still touch its windows, so nothing
-            // frees until every op is terminal (ADR-0084 D3 custody).
-            if gone.round.is_some() {
-                gone.release_epoch = release_epoch;
-                self.round_drain.push(gone);
-                continue;
-            }
-            // No op in flight on this lane: it recycles now, its round
-            // sequence carried forward.
-            self.free_lanes.push((gone.lane, gone.round_seq));
-            self.teardown.push(TeardownNs { files: teardown_files(&gone), release_epoch });
-        }
-        for (id, spec) in live {
-            if self.namespaces.iter().any(|t| t.ns == id) {
-                continue;
-            }
-            self.create_ns(id, &spec);
-        }
+        *slot = Position::Live(owner);
+        let positions = &self.positions;
+        let at = self.live.partition_point(|&p| live_id(positions, p) < id);
+        let placed = self.live.insert(at, pos);
+        debug_assert!(placed, "at most POSITIONS owners are Live, each at its own position");
     }
 
-    /// Builds `ns`'s pipeline and inserts it at its id's position, so the
-    /// turn's rotation is the vector's order. Returns that index.
-    fn create_ns(&mut self, ns: NsId, spec: &TierSpec) -> usize {
+    /// Builds the pipeline of the owner `permit` admitted: the cold-read
+    /// engine at the cell's first install, then the namespace's flush
+    /// pipeline on its position's lane (T's pool, its one allocation).
+    fn build(&mut self, permit: &InstallPermit, spec: &TierSpec) -> Box<TierNs<F>> {
+        let ns = permit.ns;
         if self.cold.is_none() {
             let qd = usize::from(spec.cold_read_qd);
             let pool = AlignedPool::new(qd, COLD_POOL_BUF);
             self.cold = Some(ColdReads::with_config(
                 pool,
                 ColdReadConfig { qd_cap: qd, overflow_cap: 4 * qd, ..ColdReadConfig::default() },
+                &self.census,
             ));
         }
         let dir = self.shard_dir.join(format!("ns-{}", ns.0));
@@ -720,22 +1146,14 @@ impl<F: SegmentFs + Clone> TierCell<F> {
                 mode: spec.tier_io_mode,
                 file_capacity: inf_log::flush::TIER_FILE_CAPACITY_DEFAULT,
                 slice_bytes: spec.maintain_slice_bytes,
+                record_len_max: spec.record_len_max(),
             },
             0,
+            &self.census,
         );
         // The plane's filesystems are fd-backed (StdSegmentFs, SimDisk):
         // flush I/O rides the driver (M4.5-S31, ADR-0084 D1).
         flush.set_drive(TierDrive::Reactor);
-        // A recycled lane first (its round sequence continues past the
-        // previous holder's), else a fresh one. The bound is on lanes
-        // held at once — live plus draining tiered namespaces — which
-        // memory exhausts long before 2^16 (a pipeline is MiBs).
-        let (lane, round_seq) = self.free_lanes.pop().unwrap_or_else(|| {
-            let lane = self.next_lane;
-            self.next_lane += 1;
-            (lane, 0)
-        });
-        assert!(lane <= inf_runtime::MAX_SLOT >> 8, "tier flush lanes exhausted");
         // The marks' one allocation, sized here and never grown. A refusal
         // is the allocation fail-stop each growth of this constructor takes;
         // their layout is a const assertion, and the census refuses only a
@@ -743,64 +1161,63 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         // shows.
         let epoch_marks = EpochMarks::new(&self.census)
             .unwrap_or_else(|refused| panic!("tiered namespace reclaim marks refused: {refused}"));
-        let at = self.namespaces.partition_point(|t| t.ns.0 < ns.0);
-        self.namespaces.insert(
-            at,
-            TierNs {
-                ns,
-                flush,
-                files: Vec::new(),
-                retired: Vec::new(),
-                tail_stall_timeout_ms: spec.tail_stall_timeout_ms,
-                io_mode: spec.tier_io_mode,
-                stall_waiters: WaitList::new(),
-                epoch_marks,
-                compact_inflight: false,
-                dir,
-                lane,
-                round_seq,
-                round: None,
-                release_epoch: 0,
-            },
-        );
-        at
+        Box::new(TierNs {
+            ns,
+            flush,
+            files: Vec::new(),
+            retiring: RetireList::default(),
+            jobs_out: 0,
+            out_bytes: 0,
+            tail_stall_timeout_ms: spec.tail_stall_timeout_ms,
+            io_mode: spec.tier_io_mode,
+            stall_waiters: WaitList::unit(&self.nodes),
+            epoch_marks,
+            compact_inflight: false,
+            holds: Rc::new(()),
+            extent_fence: Cell::new(0),
+            dir,
+            pos: permit.pos,
+            round_seq: permit.round_seq,
+            round: None,
+        })
     }
 
-    /// Installs a recovered namespace's pipeline + file handles (boot —
-    /// ADR-0057 D6; replaces the fresh pipeline `sync_namespaces` would
-    /// otherwise build). Consumed by the recovery composition
-    /// (`plane.rs` on `RecoveryProgress::Complete`).
+    /// Installs a recovered namespace's owner at the position `permit`
+    /// admitted (boot, ADR-0057 D6, ADR-0148 D5): the recovered pipeline and
+    /// the boot-opened handles, before the cell serves.
     pub fn install_recovered(
         &mut self,
-        ns: NsId,
+        permit: InstallPermit,
         spec: &TierSpec,
         flush: TierFlush<F>,
         files: Vec<(u32, F::File)>,
     ) {
-        if let Some(pos) = self.namespaces.iter().position(|t| t.ns == ns) {
-            let replaced = self.namespaces.remove(pos);
-            // Boot-time replacement: nothing is in flight before serving.
-            self.free_lanes.push((replaced.lane, replaced.round_seq));
-        }
-        let at = self.create_ns(ns, spec);
-        let t = &mut self.namespaces[at];
-        t.flush = flush;
+        let mut owner = self.build(&permit, spec);
+        owner.flush = flush;
         // Recovery built the pipeline on the seam (boot, pre-serving);
         // its flush work from here rides the driver (ADR-0084 D1).
-        t.flush.set_drive(TierDrive::Reactor);
-        t.files = files;
+        owner.flush.set_drive(TierDrive::Reactor);
+        owner.files = files;
+        // A boot whose create fails refuses before any install (the demote
+        // step's typed refusal), so a recovered pipeline owns no residue.
+        debug_assert!(
+            matches!(owner.flush.residue(), inf_log::flush::ResidueState::Empty),
+            "a recovered pipeline holds no failed create's file"
+        );
+        self.place(owner);
     }
 
     /// The MAINTAIN drivers for one namespace, bounded per slice: the
     /// demote seal, the round's advance on its completions (no offer:
     /// the turn makes those, [`TierCell::turn`]), the release, the stall
-    /// wake, the admission cadence, extent reclaim, the retirement
-    /// unlink and compaction. Returns `(budget units used, compaction
+    /// wake, the admission cadence, extent reclaim and compaction; its
+    /// retired files are the retirement walk's. Returns `(budget units used, compaction
     /// read to issue)` — the caller charges Maintenance and spawns the
     /// read chain (it owns the executor; this module owns no
-    /// `Rc<Shared>`). `durable` is the cell's durable plane, read in this
-    /// step for the extent-reclaim marks: its staged seq, its watermark and
-    /// the ack class of a seq (ADR-0061 D5).
+    /// `Rc<Shared>`), the read taken by spending a slot of `room`.
+    /// `durable` is the cell's durable plane, read in this step for the
+    /// extent-reclaim marks: its staged seq, its watermark and the ack
+    /// class of a seq (ADR-0061 D5).
     pub fn maintain_ns(
         &mut self,
         ks: &mut Keyspace,
@@ -808,12 +1225,14 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         durable: Option<&impl AckClasses>,
         transition_idle: bool,
         now_us: u64,
+        room: &mut TaskRoom<'_>,
     ) -> Result<(u32, Option<CompactRead>), TierFlushError> {
-        let cold = self.cold.clone();
         let stats = &mut self.flush_stats;
-        let t = &mut self.namespaces[at];
+        let Some(&pos) = self.live.get(at) else { return Ok((0, None)) };
+        let Some(t) = live_at_mut(&mut self.positions, pos) else { return Ok((0, None)) };
         let Some(table) = ks.tiered_store_mut(t.ns) else {
-            return Ok((0, None)); // dropped this tick; sync_namespaces reconciles next
+            // A Live owner always has its table (F3, checked in MAINTAIN).
+            return Ok((0, None));
         };
         let mut units = 0u32;
 
@@ -837,9 +1256,6 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         // turn's, after every namespace was visited.
         let sealed = if table.demote_due() { table.seal_slice() } else { 0 };
         let advanced = advance_round(table, t, stats, now_us);
-        for (id, handle) in t.flush.take_sealed_handles() {
-            t.files.push((id, handle));
-        }
         let released = table.release_slice();
         if (sealed | released) > 0 {
             units += 1 + ((sealed + released) / 4096) as u32;
@@ -849,14 +1265,14 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         // is always reachable (bounded: waiters re-check, then repark),
         // whatever the flush leg returned — a fatal barrier stops the
         // cell after this visit, never before the wake.
-        if released > 0 || t.stall_waiters.any_waiting() {
+        if released > 0 || !t.stall_waiters.is_idle() {
             t.stall_waiters.wake_all(());
         }
         advanced?;
 
         // ---- admission cadence (ADR-0063 D2): both usage halves are
         // fresh exactly here (post-flush).
-        table.refresh_disk_admission(t.flush.disk_bytes());
+        table.refresh_disk_admission(t.tier_file_bytes());
 
         // ---- extent reclaim epoch (ADR-0061 D5): a mark drains once
         // the fsync watermark covers its seq.
@@ -864,22 +1280,103 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             t.epoch_marks.tick(table.wal_epoch(), durable);
         }
         units += reclaim_extents(&self.fs, table, t);
-        units += unlink_retired(&self.fs, cold.as_ref(), t);
 
         // ---- compaction (ADR-0059): one read chain in flight; the
-        // caller spawns it with `ReadClass::Maintain`.
+        // caller spawns it with `ReadClass::Maintain`, under a permit of
+        // the `compact` class, whose slot `room` holds (ADR-0177 D2). The
+        // work is read with or without room: a paced namespace keeps the
+        // store's candidate, the state it holds between two chains.
         let mut compact = None;
         if !t.compact_inflight {
-            let pressure = table.compaction_pressure(t.flush.disk_bytes());
+            let pressure = table.compaction_pressure(t.tier_file_bytes());
             let slice = table.compaction_config().slice_bytes;
             if let inf_store::CompactionWork::Read { file_id, addr, len } =
                 table.compaction_work(&t.flush, pressure, slice)
             {
-                t.compact_inflight = true;
-                compact = Some(CompactRead { ns: t.ns, file_id, addr, len });
+                let read = CompactRead { pos: t.pos, ns: t.ns, file_id, addr, len };
+                compact = take_compact(room, &mut t.compact_inflight, read);
             }
         }
         Ok((units, compact))
+    }
+
+    /// One MAINTAIN pass of the namespaces' drivers ([`maintain_ns`] each),
+    /// from the Live namespace the last pass first paced, by id, wrapping:
+    /// a paced namespace is served before those after it. The fatal error
+    /// of a tier fsync (ADR-0056 D4) ends the pass; another error ends its
+    /// namespace's visit only.
+    ///
+    /// [`maintain_ns`]: Self::maintain_ns
+    pub fn maintain_pass(
+        &mut self,
+        ks: &mut Keyspace,
+        durable: Option<&impl AckClasses>,
+        transition_idle: bool,
+        now_us: u64,
+        room: &mut TaskRoom<'_>,
+    ) -> TierPass {
+        let n = self.live.len();
+        let start = self.compact_paced.map_or(0, |id| self.rotation_at(id));
+        let mut pass = TierPass { units: 0, reads: Vec::new(), fatal: None };
+        let mut first_paced = None;
+        for i in 0..n {
+            let at = (start + i) % n;
+            let paced = room.paced;
+            match self.maintain_ns(ks, at, durable, transition_idle, now_us, room) {
+                Ok((used, read)) => {
+                    pass.units += used;
+                    pass.reads.extend(read);
+                }
+                Err(err) if err.is_fatal() => {
+                    pass.fatal = Some(err);
+                    break;
+                }
+                Err(_) => {}
+            }
+            if first_paced.is_none() && room.paced > paced {
+                first_paced = Some(NsId(live_id(&self.positions, self.live[at])));
+            }
+        }
+        if first_paced.is_some() {
+            self.compact_paced = first_paced;
+        }
+        pass
+    }
+
+    /// One MAINTAIN pass of the shadow reconciler's reads (ADR-0093 D4):
+    /// each Live table hands at most [`inf_store::SHADOW_READS_IN_FLIGHT`]
+    /// and the room's slots, from the namespace the last pass first paced,
+    /// by id, wrapping. A table the room cut short with a read still owed
+    /// is paced.
+    pub fn shadow_pass(
+        &mut self,
+        ks: &mut Keyspace,
+        room: &mut TaskRoom<'_>,
+    ) -> Vec<(NsId, inf_store::ShadowRead)> {
+        let n = self.live.len();
+        let start = self.shadow_paced.map_or(0, |id| self.rotation_at(id));
+        let mut reads = Vec::new();
+        let mut first_paced = None;
+        for i in 0..n {
+            let ns = NsId(live_id(&self.positions, self.live[(start + i) % n]));
+            let Some(table) = ks.tiered_store_mut(ns) else { continue };
+            let max = inf_store::SHADOW_READS_IN_FLIGHT.min(room.left() as usize);
+            let taken = table.shadow_work(max);
+            // At most `max`, itself at most the room's `u32` slots.
+            room.spend(taken.len() as u32);
+            // Below the table's own bound the stop was the room's.
+            if (room.left() as usize) < inf_store::SHADOW_READS_IN_FLIGHT
+                && table.shadow_read_owed()
+            {
+                room.pace();
+                first_paced = first_paced.or(Some(ns));
+            }
+            reads.extend(taken.into_iter().map(|read| (ns, read)));
+        }
+        if first_paced.is_some() {
+            self.shadow_paced = first_paced;
+        }
+        reads
     }
 
     /// The cell's turn, once per MAINTAIN after every namespace's advance:
@@ -924,14 +1421,15 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         permit: PlanPermit,
     ) -> (u64, Result<(), TierFlushError>) {
         let PlanPermit(()) = permit;
-        let n = self.namespaces.len();
+        let n = self.live.len();
         let start = self.rotation_start(self.turn.planned_last);
         let stats = &mut self.flush_stats;
         let mut planned = false;
         let mut staged = 0u64;
         let mut result = Ok(());
         for i in 0..n {
-            let t = &mut self.namespaces[(start + i) % n];
+            let pos = self.live[(start + i) % n];
+            let Some(t) = live_at_mut(&mut self.positions, pos) else { continue };
             if t.round.is_some() {
                 continue;
             }
@@ -950,26 +1448,36 @@ impl<F: SegmentFs + Clone> TierCell<F> {
             planned = true;
             self.turn.planned_last = Some(t.ns);
             stats.rounds_planned += 1;
-            let stage = table.stage_flush_round(&mut t.flush);
-            staged = match &stage {
-                Ok(bytes) => *bytes,
-                Err(failed) => failed.staged_bytes,
-            };
-            if t.flush.round_active() {
-                if t.flush.round_op_count() == 0 {
-                    // Effects-only round (a gap at a file boundary): nothing
-                    // to wait on — the crossing applies now, as the seam
-                    // drive did.
-                    let _ = table.complete_flush_round(&mut t.flush);
-                    stats.rounds += 1;
-                } else if let Err(err) =
-                    open_round(t, now_us, |flush, index| flush.round_op(index).offset)
-                {
-                    return (staged, Err(err));
+            // The plan parses every position, reserves its windows and
+            // creates its file before it stages anything (ADR-0155 D2,
+            // ADR-0167 A1): a refusal leaves no round behind.
+            match table.stage_flush_round(&mut t.flush) {
+                Ok(bytes) => staged = bytes,
+                Err(err) => {
+                    debug_assert!(!t.flush.round_active(), "a refused plan staged nothing");
+                    if matches!(err, TierFlushError::FileIdsExhausted { .. }) {
+                        stats.file_ids_exhausted += 1;
+                    }
+                    // A create that failed at or after `create_tier` holds
+                    // its file in the residue slot: the walk offers it.
+                    if matches!(t.flush.residue(), inf_log::flush::ResidueState::Held(_)) {
+                        self.pending |= 1 << pos.index();
+                    }
+                    if err.is_fatal() {
+                        return (staged, Err(err));
+                    }
+                    result = Err(err);
+                    continue;
                 }
             }
-            if let Err(failed) = stage {
-                result = Err(failed.error);
+            if t.flush.round_op_count() == 0 {
+                // Effects-only round (a gap at a file boundary): nothing to
+                // wait on — the crossing applies now, as the seam drive did.
+                let (_, sealed) = table.complete_flush_round(&mut t.flush);
+                t.files.extend(sealed);
+                stats.rounds += 1;
+            } else {
+                open_round(t, now_us);
             }
         }
         (staged, result)
@@ -988,12 +1496,12 @@ impl<F: SegmentFs + Clone> TierCell<F> {
         ops: &mut Vec<IoOp>,
         admission: &mut impl FlushAdmission,
     ) {
-        let n = self.namespaces.len();
+        let n = self.live.len();
         if n == 0 {
             return;
         }
         let mut start = match self.turn.holder {
-            Some(holder) => self.namespaces.partition_point(|t| t.ns.0 < holder.0) % n,
+            Some(holder) => self.rotation_at(holder),
             None => self.rotation_start(self.turn.served_last),
         };
         // A planted canary: the visit starts at index 0 and continues
@@ -1010,7 +1518,8 @@ impl<F: SegmentFs + Clone> TierCell<F> {
                 let Some(left) = NonZeroUsize::new(visits_left) else {
                     return; // the turn's visits are spent: the pass ends
                 };
-                let t = &mut self.namespaces[(start + i) % n];
+                let pos = self.live[(start + i) % n];
+                let Some(t) = live_at_mut(&mut self.positions, pos) else { continue };
                 match visit_namespace(
                     &mut self.flush_stats,
                     &mut self.turn,
@@ -1042,76 +1551,41 @@ impl<F: SegmentFs + Clone> TierCell<F> {
     /// namespaces hold one.
     fn note_ready_groups(&mut self, now_us: u64) {
         let mut ready = 0u32;
-        for t in &self.namespaces {
+        let mut wait_max = self.flush_stats.group_wait_us_max;
+        for &pos in self.live.iter() {
+            let Some(t) = live_at(&self.positions, pos) else { continue };
             if !t.has_ready_group() {
                 continue;
             }
             ready += 1;
             if let Some(since) = t.round.as_ref().and_then(|r| r.ready_since_us) {
-                self.flush_stats.group_wait_us_max =
-                    self.flush_stats.group_wait_us_max.max(now_us.saturating_sub(since));
+                wait_max = wait_max.max(now_us.saturating_sub(since));
             }
         }
+        self.flush_stats.group_wait_us_max = wait_max;
         if ready >= 2 {
             self.flush_stats.turn_contended += 1;
         }
     }
 
-    /// Bounded teardown slices for dropped namespaces (ADR-0062 D7).
-    /// Unlinks route through the injected fs (L7) and failure only
-    /// defers disk space — the boot orphan sweep re-drives it.
-    /// Also advances parked rounds of dropped namespaces (ADR-0084 D3):
-    /// once every op is terminal, the windows recycle and the files
-    /// join the teardown queue; a parked round's unsent ops are never
-    /// sent. A queue whose catalog persist is not yet durable
-    /// (`persisted(release_epoch)` false — ADR-0100 D5) waits: a cut
-    /// before the swap must find every file.
-    pub fn maintain_teardown(&mut self, persisted: impl Fn(u64) -> bool) -> u32 {
-        let mut i = 0;
-        while i < self.round_drain.len() {
-            let done = self.round_drain[i].round.as_ref().is_none_or(|r| r.pending == 0);
-            if !done {
-                i += 1;
-                continue;
-            }
-            let mut gone = self.round_drain.remove(i);
-            gone.round = None;
-            // Every op of the lane is terminal: it recycles, its round
-            // sequence carried forward (a completion for it can no longer
-            // arrive, and the sequence keeps a stale one unroutable).
-            self.free_lanes.push((gone.lane, gone.round_seq));
-            // Effects are discarded — the table is gone; the pipeline's
-            // catalog facts die with it. Windows return to the pool the
-            // drop then frees.
-            let _ = gone.flush.finish_round();
-            self.teardown.push(TeardownNs {
-                files: teardown_files(&gone),
-                release_epoch: gone.release_epoch,
-            });
-        }
-        let mut units = 0;
-        let fs = self.fs.clone();
-        let cold = self.cold.as_ref();
-        for tn in &mut self.teardown {
-            if !persisted(tn.release_epoch) {
-                continue;
-            }
-            let mut i = 0;
-            while i < tn.files.len() && units < UNLINKS_PER_SLICE as u32 {
-                let id = tn.files[i].id;
-                let pinned =
-                    id != u32::MAX && cold.is_some_and(|c| c.inflight_on(TierFileId::new(id)) > 0);
-                if pinned {
-                    i += 1;
-                    continue;
-                }
-                let meta = tn.files.remove(i);
-                let _ = fs.remove_file(&meta.path);
-                units += 1;
-            }
-        }
-        self.teardown.retain(|tn| !tn.files.is_empty());
-        units
+    /// Whether a retirement result waits while a job is out, or the
+    /// transport's stop can step without waiting: the parking loop's final
+    /// check (ADR-0156 D3's result wake and the lane release's wake).
+    pub(crate) fn retire_wake_pending(&mut self) -> bool {
+        self.grants.as_mut().is_some_and(|grants| grants.part.wake_pending())
+    }
+
+    /// The cell's grants, which hold its transport part.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn grants_mut(&mut self) -> Option<&mut CellGrants<F::File>> {
+        self.grants.as_mut()
+    }
+
+    /// One step of the transport's stop (ADR-0156 D3): the ready results
+    /// consumed, then the stop's row; `Retired` on a cell with no transport.
+    pub(crate) fn transport_stop_step(&mut self, now: Nanos) -> TransportPhase {
+        self.consume_results(now);
+        self.grants.as_mut().map_or(TransportPhase::Retired, CellGrants::stop_step)
     }
 
     /// REAP entry (M4.5-S31): records one tier-flush completion into its
@@ -1122,17 +1596,20 @@ impl<F: SegmentFs + Clone> TierCell<F> {
     pub fn on_flush_completion(&mut self, token: CompletionToken, errno: Option<i32>) {
         let lane = token.slot() >> 8;
         let index = (token.slot() & 0xFF) as usize;
-        let all = self.namespaces.iter_mut().chain(self.round_drain.iter_mut());
-        let Some(t) = all.into_iter().find(|t| t.lane == lane) else {
-            self.flush_stats.stale_completions += 1;
-            return;
+        let t = match self.positions.get_mut(lane as usize) {
+            Some(Position::Live(t) | Position::Draining { ns: t, .. }) => t,
+            Some(Position::Vacant { .. }) | None => {
+                self.flush_stats.stale_completions += 1;
+                return;
+            }
         };
         let write_count = t.flush.round_write_count();
         let Some(round) = &mut t.round else {
             self.flush_stats.stale_completions += 1;
             return;
         };
-        if round.round_seq != token.generation() || round.states[index] != OpState::Sent {
+        let sent = t.flush.round_op_state(index) == Some(OpState::Sent);
+        if round.round_seq != token.generation() || !sent {
             self.flush_stats.stale_completions += 1;
             return;
         }
@@ -1153,27 +1630,30 @@ impl<F: SegmentFs + Clone> TierCell<F> {
                 inf_foundation::fault::fire(inf_log::fault::TIER_WRITE_NOSPACE).then_some(ENOSPC)
             }
         });
+        let completed = t.flush.complete_op(index, errno.is_some());
+        debug_assert!(completed, "a sent op completes");
         match errno {
-            None => round.states[index] = OpState::Done,
-            Some(e) if is_barrier => {
-                round.states[index] = OpState::Failed;
-                round.fatal = Some(e);
-            }
-            Some(e) => {
-                round.states[index] = OpState::Failed;
-                // ENOSPC dominates: it must reach the admission latch.
-                if e == ENOSPC || round.write_error.is_none() {
-                    round.write_error = Some(e);
-                }
-            }
+            None => {}
+            Some(e) if is_barrier => round.fatal = Some(e),
+            // ENOSPC dominates: it must reach the admission latch.
+            Some(e) if e == ENOSPC || round.write_error.is_none() => round.write_error = Some(e),
+            Some(_) => {}
         }
     }
 
-    /// Reactor-drive flush rounds currently in flight (INFO gauge).
+    /// The cell's tier window pools, live and draining: the capacity
+    /// reserved at their builds and the bytes of the windows written at
+    /// least once (`tier_window_capacity_bytes`, `tier_window_written_bytes`).
+    pub(crate) fn window_bytes(&self) -> (u64, u64) {
+        self.owners().map(|t| &t.flush).fold((0, 0), |(capacity, written), flush| {
+            (capacity + flush.window_capacity_bytes(), written + flush.window_written_bytes())
+        })
+    }
+
+    /// Reactor-drive flush rounds currently in flight, Live and Draining
+    /// owners alike (INFO gauge).
     pub(crate) fn flush_rounds_inflight(&self) -> u64 {
-        let live = self.namespaces.iter().filter(|t| t.round.is_some()).count();
-        let draining = self.round_drain.len();
-        (live + draining) as u64
+        self.owners().filter(|t| t.round.is_some()).count() as u64
     }
 }
 
@@ -1200,6 +1680,7 @@ fn visit_namespace<F: SegmentFs>(
     ops: &mut Vec<IoOp>,
     admission: &mut impl FlushAdmission,
 ) -> Visit {
+    let lane = t.lane();
     let Some(round) = t.round.as_mut() else { return Visit::Idle };
     let Some(group) = next_group(&t.flush, round, visits_left) else { return Visit::Idle };
     // A planted canary: a retry group reaches the driver with no
@@ -1221,9 +1702,8 @@ fn visit_namespace<F: SegmentFs>(
     if let Some(since) = round.ready_since_us {
         stats.group_wait_us_max = stats.group_wait_us_max.max(now_us.saturating_sub(since));
     }
-    emit_group(&t.flush, round, t.lane, granted, ops);
-    let (writes, op_count) = (t.flush.round_write_count(), t.flush.round_op_count());
-    round.ready_since_us = round.has_ready_group(writes, op_count).then_some(now_us);
+    emit_group(&mut t.flush, round, lane, granted, ops);
+    round.ready_since_us = round.has_ready_group(&t.flush).then_some(now_us);
     turn.holder = None;
     turn.served_last = Some(t.ns);
     Visit::Issued { visits: group.visits }
@@ -1293,49 +1773,45 @@ fn reclaim_extents<F: SegmentFs>(fs: &F, table: &mut TieredTable, t: &TierNs<F>)
     units
 }
 
-/// The retirement-unlink leg: a file with in-flight cold reads is never
-/// deleted, so the pins drain first; bounded by [`UNLINKS_PER_SLICE`].
-/// Returns the units.
-fn unlink_retired<F: SegmentFs>(fs: &F, cold: Option<&ColdReads>, t: &mut TierNs<F>) -> u32 {
-    let mut unlinked = 0;
-    let mut u = 0;
-    while u < t.retired.len() && unlinked < UNLINKS_PER_SLICE {
-        let pinned = cold.is_some_and(|c| c.inflight_on(TierFileId::new(t.retired[u].id)) > 0);
-        if pinned {
-            u += 1;
-            continue;
-        }
-        let meta = t.retired.remove(u);
-        t.files.retain(|(id, _)| *id != meta.id);
-        let _ = unlink_tier_file(fs, &meta); // non-fatal: re-queued by boot GC
-        unlinked += 1;
-    }
-    unlinked as u32
+/// The handle `files` holds for file `id`, taken out of it.
+fn take_handle<File>(files: &mut Vec<(u32, File)>, id: u32) -> Option<File> {
+    let at = files.iter().rposition(|(held, _)| *held == id)?;
+    Some(files.remove(at).1)
 }
 
-/// The teardown file list of a dropped namespace: the sealed catalog,
-/// staged-but-uncommitted seals, and the active file.
-fn teardown_files<F: SegmentFs>(gone: &TierNs<F>) -> Vec<TierFileMeta> {
-    let mut files: Vec<TierFileMeta> = gone.flush.sealed().to_vec();
-    for pending in gone.flush.pending_seals() {
-        files.push(TierFileMeta {
-            id: pending.id,
-            base: pending.base,
-            data_len: pending.data_len,
-            reason: inf_log::SealReason::Shutdown,
-            path: gone.dir.join("cold").join(inf_log::tier_file_name(pending.id)),
-        });
+/// The canary's drop: the owner's handles closed at its entry to Draining,
+/// as a drop that discarded the owner closed them, whatever the cold reads
+/// pinned on its files — its sealed files' at once, the pipeline's when no
+/// round is out — each file's record kept for its unlink.
+fn close_at_drop<F: SegmentFs>(t: &mut TierNs<F>) {
+    t.files.clear();
+    if t.round.is_none() {
+        while let Some((meta, _closed)) = t.flush.pop_catalog_end() {
+            let bytes = meta.disk_bytes();
+            t.retiring.push(RetiringFile { meta, handle: None, due: Nanos(0), bytes });
+        }
     }
-    if let Some((_, base, data_len, _, path)) = gone.flush.active() {
-        files.push(TierFileMeta {
-            id: u32::MAX,
-            base,
-            data_len,
-            reason: inf_log::SealReason::Shutdown,
-            path: path.to_path_buf(),
-        });
-    }
-    files
+}
+
+/// Whether a Files-phase owner's every child owner has ended: no file in
+/// its catalog or its retirement list, its residue slot empty, none out as
+/// a job (every result consumed), its compaction chain back, no
+/// extent reader's hold outstanding, and every blob `SET`'s extent barrier
+/// it registered settled in the commit ledger (`settled(fence)`).
+fn drained<F: SegmentFs>(t: &TierNs<F>, settled: impl Fn(u64) -> bool) -> bool {
+    // Canary `inf_canary_receipt_jobs_out_ignored`: the terminal step
+    // ignores the jobs out, so the receipt goes out with the worker holding
+    // the owner's files.
+    let files = t.flush.catalog_end_id().is_none()
+        && t.retiring.is_empty()
+        && matches!(t.flush.residue(), inf_log::flush::ResidueState::Empty)
+        && (t.jobs_out == 0 || cfg!(inf_canary_receipt_jobs_out_ignored));
+    let fence = t.extent_fence.get();
+    let held = Rc::strong_count(&t.holds) > 1 || (fence != 0 && !settled(fence));
+    // The canary: the terminal step ignores the extent readers' holds and
+    // the extent fence.
+    let held = held && !cfg!(inf_canary_lifetime_holds_ignored);
+    files && !t.compact_inflight && !held
 }
 
 /// Advances one namespace's round on the completions REAP recorded
@@ -1364,7 +1840,7 @@ fn advance_round<F: SegmentFs>(
         });
     }
     let (writes, op_count) = (t.flush.round_write_count(), t.flush.round_op_count());
-    match round.phase {
+    match round.phase() {
         RoundPhase::Writes => {
             if round.pending > 0 && !cfg!(inf_canary_tier_barrier_early) {
                 return Ok(());
@@ -1376,39 +1852,40 @@ fn advance_round<F: SegmentFs>(
                     table.note_flush_device_full();
                 }
                 stats.write_retries += 1;
-                for state in &mut round.states[..writes] {
-                    if *state == OpState::Failed {
-                        *state = OpState::Unsent;
-                    }
-                }
+                let requeued = t.flush.retry_failed_writes();
+                debug_assert!(requeued > 0, "a write error leaves a failed write");
                 // The failed writes lie below the old cursor: the cursor
                 // is placed from the round's start, at the first of them.
-                round.place_cursor(0, writes, op_count);
+                round.place_cursor(0, &t.flush);
                 round.ready_since_us = Some(now_us);
                 round.retry = true;
                 return Ok(());
             }
-            let all_done = round.states[..writes].iter().all(|s| *s == OpState::Done);
+            let state = |index| t.flush.round_op_state(index);
+            let all_done = (0..writes).all(|index| state(index) == Some(OpState::Done));
             // A planted canary: the barrier group is offered once every
             // write is sent, done or not — the write-then-barrier order
             // ADR-0178 T4 keeps (the cut's boot must refuse a tier frame
             // the device never held below the manifested watermark).
-            let all_sent = round.states[..writes].iter().all(|s| *s != OpState::Unsent);
+            let all_sent = (0..writes).all(|index| state(index) != Some(OpState::Unsent));
             if all_done || (cfg!(inf_canary_tier_barrier_early) && all_sent) {
-                round.phase = RoundPhase::Barriers;
-                round.place_cursor(writes, writes, op_count);
+                round.enter_barriers(&t.flush);
                 round.ready_since_us = Some(now_us);
                 round.retry = false;
             }
             Ok(())
         }
         RoundPhase::Barriers => {
-            let all_done = round.states[writes..op_count].iter().all(|s| *s == OpState::Done);
+            let all_done = (writes..op_count)
+                .all(|index| t.flush.round_op_state(index) == Some(OpState::Done));
             if round.pending > 0 || !all_done {
                 return Ok(());
             }
             let round = t.round.take().expect("matched above");
-            let _ = table.complete_flush_round(&mut t.flush);
+            // The completion hands back each file it sealed, with the
+            // creation-mode handle cold reads reuse (ADR-0054).
+            let (_, sealed) = table.complete_flush_round(&mut t.flush);
+            t.files.extend(sealed);
             stats.rounds += 1;
             stats.round_us.record(now_us.saturating_sub(round.staged_at_us));
             Ok(())
@@ -1416,34 +1893,13 @@ fn advance_round<F: SegmentFs>(
     }
 }
 
-/// Opens the staged round whole or not at all (ADR-0167 D4): every write
-/// position is checked before a [`FlushRound`] exists, so a refusal opens
-/// no round and advances no round sequence, and the round never checks a
-/// position again. Nothing is pushed: the round's groups are offered at
-/// the turn. `position_of(flush, index)` reads the staged write's
-/// position — the production source is `flush.round_op(index).offset`;
-/// tests plant through it. Fatal on a refusal: the check follows
-/// staging, and a retry would stage the same position.
-fn open_round<F: SegmentFs>(
-    t: &mut TierNs<F>,
-    now_us: u64,
-    position_of: impl Fn(&TierFlush<F>, usize) -> u64,
-) -> Result<(), TierFlushError> {
-    let writes = t.flush.round_write_count();
-    let mut write_positions = Vec::with_capacity(writes);
-    for index in 0..writes {
-        let position = FileOffset::new(position_of(&t.flush, index)).map_err(|refused| {
-            TierFlushError::Unaddressable {
-                path: t.dir.join("cold"),
-                offset_bytes: refused.offset_bytes(),
-            }
-        })?;
-        write_positions.push(position);
-    }
+/// Opens the staged round: its plan parsed every write position and
+/// reserved every window before the stage (ADR-0167 A1), so opening it
+/// cannot fail and checks nothing. Nothing is pushed: the round's groups
+/// are offered at the turn.
+fn open_round<F: SegmentFs>(t: &mut TierNs<F>, now_us: u64) {
     t.round_seq = t.round_seq.wrapping_add(1);
-    let op_count = t.flush.round_op_count();
-    t.round = Some(FlushRound::new(op_count, write_positions, t.round_seq, now_us));
-    Ok(())
+    t.round = Some(FlushRound::new(t.round_seq, now_us));
 }
 
 /// Builds the round's next group: the longest run of unsent ops from the
@@ -1465,10 +1921,10 @@ fn next_group<F: SegmentFs>(
     visits_left: NonZeroUsize,
 ) -> Option<Group> {
     let (writes, op_count) = (flush.round_write_count(), flush.round_op_count());
-    let first = round.first_unsent(writes, op_count)?;
+    let first = round.first_unsent(flush)?;
     let mut group = Group { first, end: first, ops: 0, bytes: 0, visits: 0 };
     for index in first..round.phase_range(writes, op_count).end {
-        if round.states[index] != OpState::Unsent {
+        if !unsent(flush, index) {
             continue;
         }
         if group.visits == visits_left.get() {
@@ -1515,7 +1971,7 @@ fn round_slot(lane: u32, index: usize) -> u32 {
 /// `finish_round` — the `StableBytes` custody argument lives in
 /// `log_bytes::tier_round_bytes`.
 fn emit_group<F: SegmentFs>(
-    flush: &TierFlush<F>,
+    flush: &mut TierFlush<F>,
     round: &mut FlushRound,
     lane: u32,
     group: GrantedGroup,
@@ -1523,7 +1979,7 @@ fn emit_group<F: SegmentFs>(
 ) {
     let mut emitted = 0usize;
     for index in group.first..group.end {
-        if round.states[index] != OpState::Unsent {
+        if !unsent(flush, index) {
             continue;
         }
         let view = flush.round_op(index);
@@ -1533,22 +1989,22 @@ fn emit_group<F: SegmentFs>(
             ops.push(IoOp::Fdatasync { fd: view.fd, token });
         } else {
             let token = CompletionToken::new(TokenClass::TierFlushWrite, slot, round.round_seq);
-            let position = round.write_positions[index];
-            debug_assert_eq!(position.bytes(), view.offset, "held position is the staged op's");
+            // The position is the round plan's, parsed once (ADR-0167 A1).
             ops.push(IoOp::LogWrite {
                 fd: view.fd,
-                offset: position,
+                offset: view.offset,
                 data: crate::log_bytes::tier_round_bytes(&view),
                 token,
                 barrier: WriteBarrier::None,
             });
         }
-        round.states[index] = OpState::Sent;
+        let sent = flush.mark_op_sent(index);
+        debug_assert!(sent, "an unsent op is sent once");
         round.pending += 1;
         emitted += 1;
     }
     debug_assert_eq!(emitted, group.ops, "the emit pushes exactly the granted group");
-    round.place_cursor(group.end, flush.round_write_count(), flush.round_op_count());
+    round.place_cursor(group.end, flush);
 }
 
 #[cfg(test)]

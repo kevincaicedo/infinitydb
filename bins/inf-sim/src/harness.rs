@@ -48,6 +48,7 @@
 //! client completions. Same seed ⇒ byte-identical trace (the determinism
 //! AC); the comparator just memcmps two runs.
 
+use crate::driver::Violations;
 use core::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::os::fd::RawFd;
@@ -64,22 +65,31 @@ use inf_server::{
     execute_slices, fold_live_entries, glob_match,
 };
 use inf_store::{
-    ExpireCond, ExpiryBudget, FIRST_NAMED_NS_ID, KeyHasher, Keyspace, NsId, NsMode, NsSpec,
-    SetOptions, StoreConfig, WheelNodesMax,
+    ExpireCond, ExpiryBudget, FIRST_NAMED_NS_ID, KeyHasher, Keyspace, KeyspaceSeed, NsId, NsMode,
+    NsSpec, SetOptions, StoreConfig, WheelNodesMax,
 };
 use inf_wire::{CommandId, Protocol, lookup};
 
 use crate::net::{CellNet, Plant, SimDriver, listener_fd};
 use crate::resp::{Reply, SubFrame, parse_reply, parse_sub_frame, reply_len};
 
+pub mod accept_retry;
 mod audit;
+pub mod capacity;
+pub(crate) mod create_clause;
+pub(crate) mod drop_clause;
 mod idle;
+pub(crate) mod owners;
+mod pub_cross;
+pub(crate) mod retire_window;
+pub(crate) mod retry_pace;
 pub mod shadow;
 
 use audit::{
     AuditState, fold_model_entries, fold_node_entries, plant_canary, reconcile_entries, run_audit,
 };
 use idle::{IdlePhase, REFUSAL_FRAME, drive_idle_phase};
+pub use pub_cross::PubTarget;
 
 // ---- shared data definitions (behaviour lives in the child modules) ----------
 
@@ -91,6 +101,58 @@ pub(super) struct Auditor {
     rx: Vec<u8>,
     bound: bool,
     closed: bool,
+    /// It has read a reply: it holds a slot by its own reading.
+    framed: bool,
+}
+
+/// O1 in the general harness (ADR-0177 D2): the judge, and the runner's
+/// last reading of its clients that hold a slot (each that has read a frame
+/// other than the `maxclients` refusal) as their cells and fds. A client's
+/// admission is monotone, so the audit and teardown iterations reuse the
+/// last reading; each client's close is read live from the net.
+pub(super) struct OwnersWatch {
+    judge: owners::OwnersJudge,
+    admitted: Vec<(usize, RawFd)>,
+}
+
+impl OwnersWatch {
+    fn new(cells: usize) -> OwnersWatch {
+        OwnersWatch { judge: owners::OwnersJudge::new(cells), admitted: Vec::new() }
+    }
+
+    /// Reads which of the runner's clients hold a slot.
+    fn read_clients(
+        &mut self,
+        clients: &[SimClient],
+        subs: &[SimSubscriber],
+        auditors: &[Auditor],
+        idle: &IdlePhase,
+    ) {
+        self.admitted.clear();
+        let framed_clients = clients.iter().filter(|c| c.replied > 0).map(|c| (c.cell, c.fd));
+        self.admitted.extend(framed_clients);
+        self.admitted.extend(subs.iter().filter(|s| s.framed()).map(|s| (s.cell, s.fd)));
+        self.admitted.extend(auditors.iter().filter(|a| a.framed).map(|a| (a.cell, a.fd)));
+        idle.admitted(&mut self.admitted);
+    }
+
+    /// O1's per-step clauses on every cell, `owners` in cell order.
+    pub(super) fn judge(
+        &mut self,
+        owners: impl Iterator<Item = inf_server::ConnOwners>,
+        nets: &[Rc<RefCell<CellNet>>],
+        at: &dyn std::fmt::Display,
+    ) {
+        let mut held = vec![0usize; nets.len()];
+        for &(cell, fd) in &self.admitted {
+            if !nets[cell].borrow().closed(fd) {
+                held[cell] += 1;
+            }
+        }
+        for (cell, owners) in owners.enumerate() {
+            self.judge.step(cell, owners, Some(held[cell]), at);
+        }
+    }
 }
 
 /// Scenario config (the DSL v0: a struct, not a language).
@@ -121,9 +183,10 @@ pub struct Scenario {
     pub channels: u64,
     /// PUBLISH share of the regular-client mix, percent. 0 = M0 mix.
     pub publish_percent: u64,
-    /// Max virtual nanoseconds per scheduler step (advance is seeded in
-    /// `1µs..=1µs+step_ns_max`). The m1 scenario uses bigger steps so its
-    /// PEXPIRE deadlines genuinely fire mid-run (wheel slices under load).
+    /// The seeded part of a scheduler step's advance, exclusive: a step
+    /// advances `STEP_NS_FLOOR` plus a draw in `0..step_ns_max`
+    /// ([`Scenario::step_ns_bound`]). The m1 scenario uses bigger steps so
+    /// its PEXPIRE deadlines genuinely fire mid-run (wheel slices under load).
     pub step_ns_max: u64,
     /// Adversarial-length share of the mix, percent (review of
     /// 2026-08-30, §5.5 Group 0 item 3: the frozen mixes are 9-byte keys
@@ -158,7 +221,7 @@ pub struct Scenario {
     /// exceed its share, and the folded `rejected_connections` must equal
     /// the refused count.
     pub maxclients: u32,
-    /// `timeout` seconds seeded into every cell's config (ADR-0123 D2;
+    /// `timeout` seconds seeded into every cell's config (ADR-0193 D3;
     /// 0 = off): the idle phase's deadline.
     pub timeout_secs: u32,
     /// Idle phase (runs once every regular client is done and every
@@ -172,7 +235,34 @@ pub struct Scenario {
     /// swept instead of scheduled (ADR-0008 A1): the run must see both a
     /// refusal and a sweep reap, or it is `VACUOUS`.
     pub wheel_nodes_max: Option<WheelNodesMax>,
+    /// `m1-pub-cross`'s publish target (`--pub-target`); `None` on every
+    /// other scenario, which keeps its placement and RNG stream exactly.
+    pub pub_target: Option<PubTarget>,
 }
+
+/// A simulator mesh, checked by the plane's one mesh check when the
+/// simulator is built: every scenario's mesh is a `const` through it, so a
+/// refused pair fails the build (ADR-0192 D5).
+pub(crate) const fn scenario_mesh(ring_capacity: usize, data_credits: u32) -> MeshConfig {
+    match inf_server::checked_mesh_config(ring_capacity, data_credits) {
+        Ok(mesh) => mesh,
+        Err(_) => panic!("a simulator mesh fails the plane's mesh check"),
+    }
+}
+
+/// The frozen scenarios' mesh and the durable runner's: 1,024 ring slots,
+/// 256 credits (a peer can never fill the 1,024-frame drain budget alone).
+pub(crate) const FROZEN_MESH: MeshConfig = scenario_mesh(1024, 256);
+
+/// The shipped binary's mesh, from the rows the binary reads.
+const BINARY_MESH: MeshConfig = scenario_mesh(
+    inf_server::limits::FABRIC_RING_SLOTS_PER_PEER,
+    inf_server::limits::FABRIC_CREDITS_PER_PEER,
+);
+
+/// `m1-pub-cross`'s mesh: eight credits per directed pair, a window its
+/// publishers fill within their first iterations.
+const PUB_CROSS_MESH: MeshConfig = scenario_mesh(1024, 8);
 
 /// Model-side plants for the content oracle's canary tests (F-L19-06's
 /// "planted-bug canary" ask): each must be caught by the quiescence
@@ -203,7 +293,7 @@ impl Scenario {
             key_space: 2_000,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -218,6 +308,7 @@ impl Scenario {
             timeout_secs: 0,
             idle_clients: 0,
             wheel_nodes_max: None,
+            pub_target: None,
         }
     }
 
@@ -238,7 +329,7 @@ impl Scenario {
             key_space: 500,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -253,6 +344,7 @@ impl Scenario {
             timeout_secs: 0,
             idle_clients: 0,
             wheel_nodes_max: None,
+            pub_target: None,
         }
     }
 
@@ -273,7 +365,7 @@ impl Scenario {
             key_space: 400,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -288,6 +380,7 @@ impl Scenario {
             timeout_secs: 0,
             idle_clients: 0,
             wheel_nodes_max: None,
+            pub_target: None,
         }
     }
 
@@ -309,7 +402,7 @@ impl Scenario {
             key_space: 1,
             pipelined_every: 1,
             pipeline_window: 256,
-            fabric: MeshConfig { ring_capacity: 4096, data_credits: 1024 },
+            fabric: BINARY_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -324,10 +417,11 @@ impl Scenario {
             timeout_secs: 0,
             idle_clients: 0,
             wheel_nodes_max: None,
+            pub_target: None,
         }
     }
 
-    /// F-L15-05 (ADR-0123): the admission bound and the idle reaper. 60
+    /// The admission bound (ADR-0123 D1) and the idle reaper (ADR-0193): 60
     /// clients on 3 cells under `maxclients 45` (15 per cell) — the
     /// seeded spread puts ~20 on a cell, so every cell refuses some; then
     /// an idle phase under `timeout 1` with 4 plain + 4 subscribed idle
@@ -342,7 +436,7 @@ impl Scenario {
             key_space: 500,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 0,
             channels: 0,
@@ -357,6 +451,7 @@ impl Scenario {
             timeout_secs: 1,
             idle_clients: 4,
             wheel_nodes_max: None,
+            pub_target: None,
         }
     }
 
@@ -369,7 +464,7 @@ impl Scenario {
             key_space: 2_000,
             pipelined_every: 5,
             pipeline_window: 4,
-            fabric: MeshConfig { ring_capacity: 1024, data_credits: 256 },
+            fabric: FROZEN_MESH,
             plant: Plant::None,
             subscribers: 8,
             channels: 8,
@@ -384,9 +479,61 @@ impl Scenario {
             timeout_secs: 0,
             idle_clients: 0,
             wheel_nodes_max: None,
+            pub_target: None,
         }
     }
+
+    /// Cross-cell publishes that fill the owners' credits: one pinned
+    /// `PSUBSCRIBE chan:*` per cell; 16 publishers pinned round-robin to the
+    /// cells, each pipelined 16 deep, each `PUBLISH` to a channel its target
+    /// cell owns (`target`: the next cell, any other, or its own) and every
+    /// fourth command a `SET` or `GET` on a key that cell owns. Eight
+    /// credits per directed pair, so both directions' unanswered `INF.PUB`s
+    /// can hold every credit while each owner's pump fans its legs back:
+    /// only a credit no deferred op can hold keeps the fan moving. Every
+    /// reply must be the cell count.
+    pub fn m1_pub_cross(seed: u64, target: PubTarget) -> Scenario {
+        Scenario {
+            seed,
+            cells: 2,
+            connections: 16,
+            commands: 8_192,
+            key_space: 1_024,
+            pipelined_every: 1,
+            pipeline_window: 16,
+            fabric: PUB_CROSS_MESH,
+            plant: Plant::None,
+            subscribers: 2,
+            channels: 256,
+            publish_percent: 0,
+            step_ns_max: 15_000,
+            adversarial_percent: 0,
+            namespaces: 0,
+            surface_percent: 0,
+            audit_every: 0,
+            canary: Canary::None,
+            maxclients: 0,
+            timeout_secs: 0,
+            idle_clients: 0,
+            wheel_nodes_max: None,
+            pub_target: Some(target),
+        }
+    }
+
+    /// The exclusive bound of one scheduler step's advance, in ns: every
+    /// step advances at least `STEP_NS_FLOOR` and less than this. An oracle
+    /// that bounds a delivery in steps reads it here, never a copy.
+    #[must_use]
+    pub fn step_ns_bound(&self) -> u64 {
+        STEP_NS_FLOOR.saturating_add(self.step_ns_max)
+    }
 }
+
+/// The floor of every scheduler step's advance: 1 µs of virtual time, added
+/// to the seeded draw below the step bound (`Scenario::step_ns_max` here,
+/// `DurableScenario::step_ns_max` in the durable runner's `Node::step`), so
+/// injected time moves on every step.
+pub(crate) const STEP_NS_FLOOR: u64 = 1_000;
 
 /// What a run produces. `trace` is the determinism artifact.
 #[derive(Debug)]
@@ -396,10 +543,13 @@ pub struct SimReport {
     pub state_hash: u64,
     pub events: u64,
     pub commands_done: u64,
-    pub oracle_violations: Vec<String>,
+    pub oracle_violations: Violations,
     /// Cap census rows read at the end of the run, summed over the cells
     /// (node sum): the census oracle's liveness.
     pub cap_rows_checked: u64,
+    /// Census rows the crossing rule judged (their `crossings > 0`), summed
+    /// the same way: the rule's engagement.
+    pub cap_rows_crossed: u64,
     pub stalled: bool,
     pub scheduler_steps: u64,
     /// Virtual time the run covered (nightly-fleet budget accounting).
@@ -424,19 +574,23 @@ pub struct SimReport {
     /// The `--plant` canary reached its arming point (engagement check —
     /// a plant that never fired proves nothing).
     pub plant_fired: bool,
-    /// Parked accept arms resumed (F-L11-02): the plane's retry wheel or
-    /// a `Close`. `--plant accept-error` needs ≥ 1 or the queued clients
+    /// Parked accept arms resumed, by the plane's retry timer or by a
+    /// `Close`. `--plant accept-error` needs ≥ 1 or the queued clients
     /// were never let in (and the run stalls).
     pub accept_resumes: u64,
+    /// The accept-retry oracle's reading, on its leg alone (`--plant
+    /// accept-broken`): each broken-parked accept arm and the plane's retry
+    /// that resumed it.
+    pub accept_retry: Option<accept_retry::RetryReport>,
     /// Longest run of budget-exhausted drains that skipped a peer with
     /// frames waiting, over every cell (F-L12-02; bound `cells − 2`).
     /// Disclosed so a fairness run that never exhausted a budget cannot
     /// pass as coverage.
     pub fabric_skip_streak_max: u32,
-    /// Admission oracle coverage (ADR-0123): clients refused at accept,
-    /// idle clients the server closed at their `timeout` deadline, idle
-    /// subscribers that outlived it. Disclosed so a run that never
-    /// refused or never reaped cannot pass as coverage.
+    /// Admission oracle coverage (ADR-0123 D1, ADR-0193 D1): clients
+    /// refused at accept, idle clients the server closed at their
+    /// `timeout` deadline, idle subscribers that outlived it. Disclosed so
+    /// a run that never refused or never reaped cannot pass as coverage.
     pub refused_clients: u64,
     pub idle_closed: u64,
     pub idle_survived: u64,
@@ -457,7 +611,7 @@ struct Oracle {
     trace: Vec<u8>,
     state: crate::state::StateHash,
     events: u64,
-    violations: Vec<String>,
+    violations: Violations,
     /// Scatter legs the replay oracle left to the audit oracle.
     replays_skipped: u64,
 }
@@ -468,9 +622,9 @@ struct Oracle {
 /// control plane, so `INF.NS CREATE` is not available to the sim; the DDL
 /// program has its own DST, `m2-ns-create-window`). Ids start at
 /// `FIRST_NAMED_NS_ID`, names are `ns0`, `ns1`, …
-pub(crate) fn seed_namespaces(ks: &mut Keyspace, namespaces: u16) {
-    for i in 0..namespaces {
-        ks.ns_create(NsSpec {
+pub(crate) fn namespace_specs(namespaces: u16) -> Vec<NsSpec> {
+    (0..namespaces)
+        .map(|i| NsSpec {
             id: NsId(FIRST_NAMED_NS_ID + u32::from(i)),
             name: format!("ns{i}").into_bytes(),
             mode: NsMode::Memory,
@@ -479,8 +633,7 @@ pub(crate) fn seed_namespaces(ks: &mut Keyspace, namespaces: u16) {
             maxmemory: None,
             tier: None,
         })
-        .expect("seeded namespace names are valid and unique");
-    }
+        .collect()
 }
 
 /// Appends the apply scope to a trace record (shared by every observer so
@@ -542,15 +695,18 @@ pub(crate) fn node_hasher(seed: u64) -> KeyHasher {
 
 impl Oracle {
     fn new(keys: usize, namespaces: u16) -> Oracle {
-        let mut model = Keyspace::new(StoreConfig { initial_keys: keys, ..Default::default() });
-        seed_namespaces(&mut model, namespaces);
+        let cfg = StoreConfig { initial_keys: keys, ..Default::default() };
+        // The model's keyspace is no plane's: its host builds its census.
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
+        let seed = KeyspaceSeed::Uncataloged { cfg, specs: namespace_specs(namespaces) };
+        let model = seed.build(&census).expect("seeded namespace names are valid and unique");
         Oracle {
             model,
             shadow: shadow::Shadow::default(),
             trace: Vec::new(),
             state: crate::state::StateHash::default(),
             events: 0,
-            violations: Vec::new(),
+            violations: Violations::new(),
             replays_skipped: 0,
         }
     }
@@ -595,17 +751,23 @@ impl PlaneObserver for SharedOracle {
         oracle.trace.extend_from_slice(&(reply.len() as u32).to_le_bytes());
         oracle.trace.extend_from_slice(reply);
 
-        // Scatter legs belong to the audit oracle (see `is_scatter_class`).
-        if lookup(argv[0]).is_some_and(|meta| is_scatter_class(meta.id)) {
+        // Scatter legs belong to the audit oracle (see `is_scatter_class`),
+        // and `CONFIG` to the hot-raise probe: its replies read the node's
+        // configuration, which a replay on a fresh model connection does
+        // not hold.
+        if lookup(argv[0])
+            .is_some_and(|meta| is_scatter_class(meta.id) || meta.id == CommandId::Config)
+        {
             oracle.replays_skipped += 1;
             return;
         }
         // Model replay: same argv, same store, same injected time, RESP2
         // (the scenario mixes never switch protocols).
-        let mut expected = Vec::new();
+        let mut expected = inf_wire::OpenReply::new(Vec::new());
         let mut cx = model_cx(scope);
         let Oracle { model, shadow, violations, .. } = &mut *oracle;
-        execute_slices(argv, model, &mut cx, now, &mut expected);
+        execute_slices(argv, model, &mut cx, now, expected.reply());
+        let expected = expected.finish().into_bytes();
         if expected != reply {
             let argv_text: Vec<String> =
                 argv.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
@@ -928,7 +1090,7 @@ impl SimClient {
         &mut self,
         check: Check,
         raw: &[u8],
-        violations: &mut Vec<String>,
+        violations: &mut Violations,
         scan_walks: &mut u64,
     ) {
         let who = format!("client {} ({})", self.id, self.scope.name());
@@ -1172,6 +1334,12 @@ pub(crate) struct SimSubscriber {
 }
 
 impl SimSubscriber {
+    /// It has read a frame (a confirmation): it holds a slot by its own
+    /// reading.
+    pub(crate) fn framed(&self) -> bool {
+        !matches!(self.state, SubState::Subscribing(left) if left == self.subscriptions())
+    }
+
     pub(crate) fn watches(&self, chan: u64) -> bool {
         match &self.plan {
             SubPlan::Channels(set) => set.contains(&chan),
@@ -1207,7 +1375,7 @@ impl SimSubscriber {
     /// Feeds one delivery, checking channel membership, payload shape, and
     /// the per-(channel, publisher) sequence. Violations describe the seed's
     /// finding precisely.
-    pub(crate) fn deliver(&mut self, channel: &[u8], payload: &[u8], violations: &mut Vec<String>) {
+    pub(crate) fn deliver(&mut self, channel: &[u8], payload: &[u8], violations: &mut Violations) {
         self.received += 1;
         let chan: u64 = match channel.strip_prefix(b"chan:") {
             Some(digits) => core::str::from_utf8(digits).ok().and_then(|s| s.parse().ok()),
@@ -1297,16 +1465,20 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         let pool = BufferPool::new(128, 1024);
         // Sim wall anchor stays (0, 0): wall time == virtual time, fully
         // deterministic; the RANDOMKEY stream is seeded from the scenario.
-        let node = Rc::new(NodeInfo::try_default().expect("fixture cache allocation"));
-        node.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
-        // ADR-0123: the admission and idle knobs are boot config here
-        // (the plane reads them at assembly — D5).
+        // ADR-0123, ADR-0193 D3: the admission and idle knobs are boot config
+        // here (the plane reads them at assembly — ADR-0123 D5); `maxclients`
+        // is the node's boot capacity, as `infinityd --maxclients` sets it
+        // (ADR-0123 A1).
+        let mut config = inf_server::ConfigStore::default();
         if scenario.maxclients != 0 {
-            node.config
-                .borrow_mut()
-                .set(b"maxclients", scenario.maxclients.to_string().as_bytes())
-                .expect("maxclients is hot");
+            let cells = inf_foundation::CellCount::new(scenario.cells).expect("a scenario's cells");
+            let capacity = inf_server::BootCapacity::new(scenario.maxclients, cells)
+                .expect("a scenario's boot capacity");
+            config = config.with_boot_capacity(capacity);
         }
+        let (node, admission) = NodeInfo::try_new(config).expect("fixture cache allocation");
+        let node = Rc::new(node);
+        node.rng_state.set(scenario.seed ^ (0xA11D_0000 + i as u64));
         if scenario.timeout_secs != 0 {
             node.config
                 .borrow_mut()
@@ -1318,24 +1490,32 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         // defaulted filesystem parameter (M2-S19).
         // Surface scenarios seed their memory namespaces into every cell
         // before it serves — the catalog seed a durable node's boot performs.
-        let mut keyspace = Keyspace::new(StoreConfig {
-            hasher: node_hasher(scenario.seed),
-            wheel_nodes_max: scenario.wheel_nodes_max.unwrap_or_default(),
-            ..Default::default()
-        });
-        seed_namespaces(&mut keyspace, scenario.namespaces);
-        let (plane, serve_mark) = ServerPlane::<_, inf_server::StdSegmentFs>::new(
-            CellId(i as u16),
-            scenario.cells,
-            listener_fd(i as u16),
-            keyspace,
-            fabric,
-            node,
-            oracle.clone(),
-            false,
-        );
+        let seed = KeyspaceSeed::Uncataloged {
+            cfg: StoreConfig {
+                hasher: node_hasher(scenario.seed),
+                wheel_nodes_max: scenario.wheel_nodes_max.unwrap_or_default(),
+                ..Default::default()
+            },
+            specs: namespace_specs(scenario.namespaces),
+        };
+        // A refused timer assembly ends the run with its text, never a
+        // derived `Debug`: the text carries the refusal's token.
+        let (plane, serve_mark, timer_set, executor) =
+            ServerPlane::<_, inf_server::StdSegmentFs>::new(
+                CellId(i as u16),
+                scenario.cells,
+                listener_fd(i as u16),
+                seed,
+                fabric,
+                node,
+                admission,
+                oracle.clone(),
+                false,
+            )
+            .unwrap_or_else(|refused| panic!("cell {i}'s assembly refused: {refused}"));
         let config = LoopConfig { spin_iters: 4, ..Default::default() };
-        let cell_loop = CellLoop::new(driver, Rc::clone(&clock), pool, config, serve_mark);
+        let cell_loop =
+            CellLoop::new(driver, Rc::clone(&clock), pool, config, serve_mark, timer_set, executor);
         nets.push(net);
         cells.push((cell_loop, plane));
     }
@@ -1346,7 +1526,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     let per_client = scenario.commands / scenario.connections as u64;
     let remainder = scenario.commands % scenario.connections as u64;
     for i in 0..scenario.connections {
-        let cell = (rng.next_u64() % u64::from(scenario.cells)) as usize;
+        let cell = pub_cross::placement(scenario, i, &mut rng);
         let fd = nets[cell].borrow_mut().connect();
         let window = if scenario.pipelined_every > 0 && i % scenario.pipelined_every == 0 {
             scenario.pipeline_window
@@ -1377,10 +1557,10 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     // gated on every confirmation (the plane's confirmed ⇒ reachable
     // happens-before, made assertable).
     let mut subs = Vec::new();
-    for s in 0..scenario.subscribers {
-        let cell = (rng.next_u64() % u64::from(scenario.cells)) as usize;
+    for s in 0..pub_cross::subscribers(scenario) {
+        let cell = pub_cross::placement(scenario, s, &mut rng);
         let fd = nets[cell].borrow_mut().connect();
-        let plan = subscription_plan(s, scenario.channels.max(1));
+        let plan = pub_cross::subscription(scenario, s);
         let sub = SimSubscriber {
             index: s,
             cell,
@@ -1404,7 +1584,15 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         for scope in ClientScope::all(scenario.namespaces) {
             let cell = (rng.next_u64() % u64::from(scenario.cells)) as usize;
             let fd = nets[cell].borrow_mut().connect();
-            auditors.push(Auditor { scope, cell, fd, rx: Vec::new(), bound: false, closed: false });
+            auditors.push(Auditor {
+                scope,
+                cell,
+                fd,
+                rx: Vec::new(),
+                bound: false,
+                closed: false,
+                framed: false,
+            });
         }
     }
     let mut audit_state = AuditState::Idle;
@@ -1436,8 +1624,9 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         state_hash: 0,
         events: 0,
         commands_done: 0,
-        oracle_violations: Vec::new(),
+        oracle_violations: Violations::new(),
         cap_rows_checked: 0,
+        cap_rows_crossed: 0,
         stalled: false,
         scheduler_steps: 0,
         sim_seconds: 0.0,
@@ -1451,18 +1640,36 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         shadow_unmodeled: BTreeMap::new(),
         plant_fired: false,
         accept_resumes: 0,
+        accept_retry: None,
         fabric_skip_streak_max: 0,
         refused_clients: 0,
         idle_closed: 0,
         idle_survived: 0,
     };
-    let mut violations: Vec<String> = Vec::new();
+    let mut violations = Violations::new();
+    // `m1-pub-cross`'s plan; a cell its load cannot reach is the run's
+    // violation, never a quiet pass.
+    let cross = match pub_cross::CrossPlan::new(scenario) {
+        Some(Ok(plan)) => Some(plan),
+        Some(Err(refusal)) => {
+            violations.push(refusal);
+            None
+        }
+        None => None,
+    };
 
     let mut last_progress = (0u64, 0u64);
     let mut idle_steps = 0u64;
     let mut idle: IdlePhase = IdlePhase::new(scenario.idle_clients);
     let mut order: VecDeque<usize> = (0..cells.len()).collect();
+    // The accept-retry oracle, on its leg alone: it reads the drivers and
+    // changes nothing a run does.
+    let mut retry_watch = scenario
+        .plant
+        .is_accept_retry_leg()
+        .then(|| accept_retry::RetryWatch::new(cells.len(), scenario.step_ns_bound()));
 
+    let mut watch = OwnersWatch::new(cells.len());
     loop {
         report.scheduler_steps += 1;
         oracle.0.borrow_mut().state.number(b"step", clock.now().0);
@@ -1477,6 +1684,14 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         for &i in &order {
             let (cell_loop, plane) = &mut cells[i];
             cell_loop.run_iteration(plane).expect("sim iteration");
+        }
+        // O1 on every step (ADR-0177 D2), judged here from each cell's raw
+        // owners and the runner's own reading of its clients.
+        watch.read_clients(&clients, &subs, &auditors, &idle);
+        let owners = cells.iter().map(|(cell_loop, plane)| plane.conn_owners(cell_loop.executor()));
+        watch.judge(owners, &nets, &format_args!("step {}", report.scheduler_steps));
+        if let Some(watch) = &mut retry_watch {
+            watch.sample(clock.now(), &nets);
         }
 
         // Subscriber pump: drain frames, classify, verify deliveries.
@@ -1565,7 +1780,10 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             // is quiescent; closing a finished client is not sending.
             if subs_ready && audit_state == AuditState::Idle {
                 while client.sent < client.quota && client.sent - client.replied < client.window {
-                    let (wire, check, publish) = client.next_command(scenario);
+                    let (wire, check, publish) = match &cross {
+                        Some(plan) => plan.next_command(client),
+                        None => client.next_command(scenario),
+                    };
                     let check = match publish {
                         Some(chan) => {
                             report.published += 1;
@@ -1611,6 +1829,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                         &label,
                         &mut report,
                         &mut violations,
+                        &mut watch,
                     );
                     next_audit_at += scenario.audit_every;
                     audit_state = AuditState::Idle;
@@ -1636,6 +1855,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                     "final audit",
                     &mut report,
                     &mut violations,
+                    &mut watch,
                 );
                 final_audit_done = true;
                 for auditor in &mut auditors {
@@ -1679,7 +1899,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             }
         }
 
-        // Idle phase (ADR-0123 D2): once every regular client is done and
+        // Idle phase (ADR-0193 D1): once every regular client is done and
         // every server-side connection unwound, idle clients connect,
         // speak once, and go silent under `timeout`.
         let idle_phase_done = drive_idle_phase(
@@ -1696,7 +1916,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         );
 
         // Virtual time per scheduler step, seeded (m0: 1–16 µs).
-        clock.advance(Nanos(1_000 + rng.next_u64() % scenario.step_ns_max));
+        clock.advance(Nanos(STEP_NS_FLOOR + rng.next_u64() % scenario.step_ns_max));
 
         let all_done = clients.iter().all(|c| c.closed)
             && subs.iter().all(|s| s.state == SubState::Closed)
@@ -1705,11 +1925,15 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             && nets.iter().all(|n| n.borrow().pending_bytes() == 0)
             && cells.iter().all(|(_, plane)| plane.suspended() == 0);
         if all_done {
-            // Run teardown iterations so server-side closes complete.
+            // Run teardown iterations so server-side closes complete, O1
+            // judged at each.
             for _ in 0..32 {
                 for (cell_loop, plane) in &mut cells {
                     cell_loop.run_iteration(plane).expect("teardown iteration");
                 }
+                let owners =
+                    cells.iter().map(|(cell_loop, plane)| plane.conn_owners(cell_loop.executor()));
+                watch.judge(owners, &nets, &"a teardown iteration");
             }
             break;
         }
@@ -1752,6 +1976,40 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         }
     }
 
+    // The publish fan's reserve (ADR-0192 D3): every cell's count of fan
+    // legs that found no reserved credit reads 0, stalled or not; any other
+    // reading is the reserve's arithmetic wrong.
+    for (i, node) in nodes.iter().enumerate() {
+        let legs = node.fabric_reserve_refused_cell.get();
+        if legs != 0 {
+            violations.push(format!("RESERVE REFUSED: cell {i}, {legs} legs"));
+        }
+    }
+
+    // The work parked for a peer (ADR-0177 D6): no op refused at a full
+    // per-origin deque on any cell, derived never as an origin holds at
+    // most its credits' un-replied ops.
+    for (i, node) in nodes.iter().enumerate() {
+        let refused = node.fabric_parked_refused.get();
+        if refused != 0 {
+            violations.push(format!("PARKED REFUSED: cell {i}, {refused} ops"));
+        }
+    }
+    // The waker's wiring check (ADR-0003 A1.4): every cell's `waker_foreign_ops`, the gauge
+    // INFO's `# Tripwires` renders, reads 0. The simulator runs every cell's loop on one thread,
+    // so a waker used from another cell's step takes the owner lane and is not counted: a
+    // reading above 0 here is the compare or the counter wrong, never evidence that a waker
+    // stayed on its cell (the binary at two cells is that leg).
+    for (i, node) in nodes.iter().enumerate() {
+        let ops = node.waker_foreign_ops.get();
+        if ops != 0 {
+            violations.push(format!(
+                "cell {i}: waker-foreign-ops {ops} on one thread, where every waker operation is \
+                 the owner lane's"
+            ));
+        }
+    }
+
     // Admission reconciliation (ADR-0123 D1): the cells' `rejected_
     // connections` fold equals the clients that saw the refusal frame,
     // per cell; and a scenario that seeds the bound must have reached it.
@@ -1775,6 +2033,20 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         if report.refused_clients == 0 {
             violations
                 .push("admission: no client was refused — the bound was never reached".into());
+        }
+        // The hot raise past the boot capacity changed no key on any cell
+        // (ADR-0123 A1): the raise's cell read it over the wire, the rest
+        // here, where no client of theirs asked.
+        let boot = scenario.maxclients.to_string();
+        for (i, node) in nodes.iter().enumerate() {
+            let config = node.config.borrow();
+            let (maxclients, maxmemory) = (config.get("maxclients"), config.get("maxmemory"));
+            if maxclients != Some(boot.as_str()) || maxmemory != Some("0") {
+                violations.push(format!(
+                    "hot-raise: cell {i} reads maxclients {maxclients:?} and maxmemory \
+                     {maxmemory:?} after a raise past its boot capacity {boot}"
+                ));
+            }
         }
     }
     if scenario.idle_clients != 0 && !report.stalled {
@@ -1809,11 +2081,14 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
     report.accept_resumes = nets.iter().map(|net| net.borrow().accept_resumes()).sum();
     if scenario.plant == Plant::AcceptError && report.plant_fired && report.accept_resumes == 0 {
         report.oracle_violations.push(
-            "accept-error plant: the parked accept arm was never resumed (F-L11-02: the plane \
-             must re-arm on its retry wheel)"
+            "accept-error plant: accept-never-resumed — the parked accept arm was never \
+             resumed (the plane re-arms it from its accept-retry timer)"
                 .to_string(),
         );
     }
+    // The accept-retry oracle writes the report's list, as the resume check
+    // does: the run's end keeps both lines by appending to it.
+    report.accept_retry = retry_watch.map(|watch| watch.finish(&mut report.oracle_violations));
 
     // Accounting reconciliation oracle (M1-S15): equalize active-vs-lazy
     // expiry at one instant, then live records must reconcile exactly; every
@@ -1825,7 +2100,7 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
             plane.drain_expiry(final_now);
             let live = plane.keyspace_report().live_records;
             node_live += live;
-            violations.extend(audit::expired_retained(i, live, plane, final_now));
+            audit::expired_retained(i, live, plane, final_now, &mut violations);
             let (channels, patterns, bytes) = plane.pubsub_gauges();
             if channels != 0 || patterns != 0 || bytes != 0 {
                 violations.push(format!(
@@ -1839,8 +2114,11 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
                     plane.connections()
                 ));
             }
+            // O1's leak clause (ADR-0177 D2): no `conn` header stays Retired.
+            let owners = plane.conn_owners(cells[i].0.executor());
+            watch.judge.settled(i, owners, &"quiescence");
         }
-        violations.extend(audit::small_cap_engagement(scenario, &cells));
+        audit::small_cap_engagement(scenario, &cells, &mut violations);
         {
             let mut oracle = oracle.0.borrow_mut();
             audit::drain_model_expiry(&mut oracle.model, final_now);
@@ -1878,16 +2156,25 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
 
     // The cap census oracle (ADR-0163 D2): every cell's census after its
     // last iteration — the cap bound per row, the assembly rule and their
-    // liveness.
+    // liveness — and the gates' derived counts, read from the plane, not the
+    // stats flush's copies.
     let mut census = crate::census::CensusVerdict::default();
     for (index, (_, plane)) in cells.iter().enumerate() {
         let facts = crate::census::CellFacts {
+            server_plane: true,
+            peers: scenario.cells - 1,
             tiered_tables: plane.keyspace().tiered_tables(),
             turn_refused: plane.durable_stats().map(|stats| stats.turn_refused),
+            maint_paced: nodes[index].tier_maint_task_waits.get(),
+            gate_full: plane.gate_full(),
+            gate_stale: plane.gate_stale(),
+            cold_gate_full: plane.cold_gate_full(),
+            wait_nodes_full: plane.wait_nodes_full(),
         };
         census.judge(index, plane.cap_census(), facts);
     }
     report.cap_rows_checked = census.rows_checked;
+    report.cap_rows_crossed = census.rows_crossed;
     violations.extend(census.violations);
 
     let oracle = oracle.0.borrow();
@@ -1905,7 +2192,11 @@ pub fn run_scenario(scenario: &Scenario) -> SimReport {
         state.keyspace(&plane.keyspace(), clock.now());
     }
     report.state_hash = state.value();
-    report.oracle_violations = oracle.violations.clone();
+    crate::net::drain_violations(&nets, &mut violations);
+    violations.extend(watch.judge.take_violations());
+    // Appended, never assigned: a check that wrote the report's list before
+    // this point keeps its line.
+    report.oracle_violations.extend(oracle.violations.clone());
     report.oracle_violations.extend(violations);
     report.sim_seconds = clock.now().0.saturating_sub(1) as f64 / 1e9;
     report

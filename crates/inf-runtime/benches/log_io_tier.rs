@@ -204,7 +204,8 @@ fn commit_frame(
 fn grouped_rows(dir: &Path, policy: Policy, secs: u64) {
     let path = dir.join(format!("log-io-tier-{}.seg", policy.name()));
     let fd = open_log(&path, policy);
-    let mut driver = UringDriver::new(64).expect("io_uring");
+    let mut driver = UringDriver::new(64, inf_runtime::UringConfig::from_lookup(std::env::var_os))
+        .expect("io_uring");
     let mut pool = BufferPool::new(4, 1024);
     let mut out = Vec::new();
     let cache_before = cached_plus_dirty_mib();
@@ -356,7 +357,9 @@ fn interference(dir: &Path, secs: u64) {
     for policy in [Policy::Buffered, Policy::Direct] {
         let path = dir.join(format!("log-io-tier-ix-{}.seg", policy.name()));
         let fd = open_log(&path, policy);
-        let mut driver = UringDriver::new(64).expect("io_uring");
+        let mut driver =
+            UringDriver::new(64, inf_runtime::UringConfig::from_lookup(std::env::var_os))
+                .expect("io_uring");
         let mut pool = BufferPool::new(4, 1024);
         let mut out = Vec::new();
         let payload = GROUP * RECORD_BYTES;

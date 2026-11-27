@@ -286,7 +286,7 @@ pub fn cmd_zipfian(args: &[String]) -> Result<(), String> {
     let cells = flags.u16_or("cells", 1)?;
     let window = flags.usize_or("window", 256)?.max(1);
     let threshold_pp = flags.f64_or("threshold-pp", 2.0)?;
-    let infinityd_bin = flags.str_or("infinityd-bin", "target/release/infinityd");
+    let infinityd_bin = flags.str_or("infinityd-bin", &crate::cli::default_infinityd_bin());
     let redis_bin = flags.str_or("redis-bin", "redis-server");
     let artifacts_root = flags.str_or("artifacts-root", ".artifacts/m1");
     let reference_box = flags.bool("reference-box");

@@ -144,6 +144,43 @@ fn unsafe_override_never_upgrades_a_failed_probe() {
 }
 
 #[test]
+fn a_binary_is_found_in_the_target_root_that_built_the_running_one() {
+    let want = |base: &str| {
+        vec![
+            PathBuf::from(format!("{base}/release/infinityd")),
+            PathBuf::from(format!("{base}/debug/infinityd")),
+        ]
+    };
+    assert_eq!(binaries_beside(Path::new("/r/release/inf-compare"), "infinityd"), want("/r"));
+    assert_eq!(binaries_beside(Path::new("/r/debug/inf-compare"), "infinityd"), want("/r"));
+    // A test binary sits in the profile's deps/.
+    assert_eq!(
+        binaries_beside(Path::new("/r/debug/deps/inf_compare-0a1b"), "infinityd"),
+        want("/r")
+    );
+    // A root CARGO_TARGET_DIR moved, and a cross-compiled profile.
+    assert_eq!(
+        binaries_beside(Path::new("/shared/checkout-0123/release/inf-compare"), "infinityd"),
+        want("/shared/checkout-0123")
+    );
+    assert_eq!(
+        binaries_beside(Path::new("/r/x86_64-unknown-linux-gnu/release/inf-compare"), "infinityd"),
+        want("/r/x86_64-unknown-linux-gnu")
+    );
+    assert!(binaries_beside(Path::new("/"), "infinityd").is_empty());
+    assert!(binaries_beside(Path::new("inf-compare"), "infinityd").is_empty());
+}
+
+#[test]
+fn the_running_binary_searches_its_own_root_never_the_working_directory() {
+    let exe = std::env::current_exe().unwrap();
+    let root = exe.parent().and_then(Path::parent).and_then(Path::parent).unwrap();
+    let found = built_binaries("inf-bench");
+    assert_eq!(found, vec![root.join("release/inf-bench"), root.join("debug/inf-bench")]);
+    assert!(found.iter().all(|path| path.is_absolute()), "{found:?}");
+}
+
+#[test]
 #[cfg(unix)]
 fn checker_execution_requires_an_executable_successful_process() {
     use std::os::unix::fs::PermissionsExt;

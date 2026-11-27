@@ -26,10 +26,11 @@ use inf_alloc::BufferPool;
 use inf_fabric::{CellFabric, Mesh, MeshConfig};
 use inf_foundation::time::{Clock, StdClock};
 use inf_foundation::{CellId, KeyHasher};
+use inf_runtime::limits::PARK_CEILING_MAX;
 use inf_runtime::net::{bound_port, listen_reuseport, pin_current_thread};
-use inf_runtime::{BackendDriver, CellLoop, LoopConfig};
+use inf_runtime::{BackendDriver, CellLoop, LoopConfig, ParkCeiling};
 use inf_server::{NodeInfo, NoopObserver, ServerPlane, StdSegmentFs};
-use inf_store::{Keyspace, StoreConfig};
+use inf_store::{KeyspaceSeed, StoreConfig};
 
 /// How often (iterations) each cell refreshes its INFO stats snapshot.
 const STATS_EVERY: u64 = 1024;
@@ -40,17 +41,40 @@ const DEFAULT_CELLS: inf_foundation::CellCount = match inf_foundation::CellCount
     Err(_) => panic!("four cells is a valid topology"),
 };
 
+/// The boot capacity when `--maxclients` is absent, at the default cells:
+/// checked when the binary is built (ADR-0123 A1).
+const DEFAULT_BOOT_CAPACITY: inf_server::BootCapacity =
+    match inf_server::BootCapacity::new(inf_server::limits::MAXCLIENTS_BOOT_DEFAULT, DEFAULT_CELLS)
+    {
+        Ok(capacity) => capacity,
+        Err(_) => panic!("the default maxclients fits the default cells"),
+    };
+
+/// The shipped fabric mesh: the two `limits` rows, checked when the binary
+/// is built, so a pair the plane's check refuses fails the build.
+const FABRIC_MESH: MeshConfig = match inf_server::checked_mesh_config(
+    inf_server::limits::FABRIC_RING_SLOTS_PER_PEER,
+    inf_server::limits::FABRIC_CREDITS_PER_PEER,
+) {
+    Ok(mesh) => mesh,
+    Err(_) => panic!("the shipped fabric mesh fails the plane's mesh check"),
+};
+
 #[derive(Clone, Debug)]
 struct Args {
     port: u16,
     /// The boot topology (ADR-0159 A1.1): checked once, at the flag.
     cells: inf_foundation::CellCount,
+    /// `--maxclients` against `--cells` (ADR-0123 A1): checked once, after
+    /// every flag is read, before any cell is built.
+    boot_capacity: inf_server::BootCapacity,
     buffers: usize,
     buf_size: usize,
     pin_start: Option<usize>,
     pin_stride: u16,
     route_local_only: bool,
-    park_us: Option<u64>,
+    /// `--park-us`, checked at the flag: at most `PARK_CEILING_MAX`.
+    park: Option<ParkCeiling>,
     /// Durable-plane root (M2-S08/S11): `--data-dir` enables the catalog,
     /// per-cell log recovery, checkpoints, and truncation. Absent = the
     /// memory-only node (the M2-S09 zero-cost posture).
@@ -137,6 +161,9 @@ struct Args {
     /// never refuses — it is a pacing point — so this is a latency/memory
     /// trade (resident = 2 × capacity × cells), and shrinking it is the
     /// deliberate way to provoke the pressure regime on a healthy device.
+    /// A segment holds at least one buffer's frame: `--segment-bytes` is at
+    /// least `--log-staging-mib` × 2²⁰ (and under the fua class a multiple
+    /// of 4096), or the node refuses to start before it listens (ADR-0191).
     log_staging_mib: u32,
     /// The graceful stop's bound per cell (ADR-0124 D3; Redis's
     /// `shutdown-timeout` is 10 s). Past it the node exits 1.
@@ -176,6 +203,10 @@ struct Args {
     /// ≥ +4% floor — the async machinery was already near-zero-cost (L6).
     /// Kept default-off as the A/B instrument for the S19 8-cell re-read.
     deasync_dispatch: bool,
+    /// The uring driver's selections (ADR-0209 D2): the shipped config until
+    /// `main` decodes the process environment, once, before any cell thread.
+    #[cfg(target_os = "linux")]
+    uring: inf_runtime::UringConfig,
 }
 
 /// `--device-probe auto|off` (M4.5-S42, ADR-0091 D1).
@@ -190,12 +221,13 @@ impl Default for Args {
         Args {
             port: 6379,
             cells: DEFAULT_CELLS,
+            boot_capacity: DEFAULT_BOOT_CAPACITY,
             buffers: 4096,
             buf_size: 4096,
             pin_start: None,
             pin_stride: 2,
             route_local_only: false,
-            park_us: None,
+            park: None,
             data_dir: None,
             ckpt_interval_bytes: inf_server::DEFAULT_CKPT_INTERVAL_BYTES,
             segment_bytes: inf_server::DEFAULT_SEGMENT_BYTES,
@@ -227,12 +259,15 @@ impl Default for Args {
             fabric_apply_prefetch: true,
             parse_batch_prefetch: true,
             deasync_dispatch: false,
+            #[cfg(target_os = "linux")]
+            uring: inf_runtime::UringConfig::from_lookup(|_| None),
         }
     }
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut args = Args::default();
+    let mut maxclients = inf_server::limits::MAXCLIENTS_BOOT_DEFAULT;
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut take = |name: &str| it.next().ok_or_else(|| format!("{name} requires a value"));
@@ -248,6 +283,10 @@ fn parse_args() -> Result<Args, String> {
             }
             "--buffers" => {
                 args.buffers = take("--buffers")?.parse().map_err(|e| format!("--buffers: {e}"))?;
+            }
+            "--maxclients" => {
+                maxclients =
+                    take("--maxclients")?.parse().map_err(|e| format!("--maxclients: {e}"))?;
             }
             "--buf-size" => {
                 args.buf_size =
@@ -271,8 +310,17 @@ fn parse_args() -> Result<Args, String> {
             "--deasync-dispatch" => args.deasync_dispatch = true,
             "--no-deasync-dispatch" => args.deasync_dispatch = false,
             "--park-us" => {
-                args.park_us =
-                    Some(take("--park-us")?.parse().map_err(|e| format!("--park-us: {e}"))?);
+                let micros: u64 =
+                    take("--park-us")?.parse().map_err(|e| format!("--park-us: {e}"))?;
+                // ADR-0003 A1.2.7: every park a cell loop issues ends within its ceiling, at
+                // most PARK_CEILING_MAX; a longer one is refused here, before any cell starts.
+                let ceiling = ParkCeiling::new(std::time::Duration::from_micros(micros));
+                args.park = Some(ceiling.map_err(|_| {
+                    format!(
+                        "--park-us must be <= {} (the longest park a cell loop takes)",
+                        PARK_CEILING_MAX.as_micros()
+                    )
+                })?);
             }
             "--data-dir" => args.data_dir = Some(take("--data-dir")?.into()),
             "--ckpt-interval-bytes" => {
@@ -410,11 +458,15 @@ fn parse_args() -> Result<Args, String> {
                 args.log_staging_mib = take("--log-staging-mib")?
                     .parse()
                     .map_err(|e| format!("--log-staging-mib: {e}"))?;
-                // 1 MiB holds any wire-legal command's record; 64 MiB is
-                // the frame decoder bound (every written frame must stay
-                // readable by a default-configured reader).
-                if !(1..=64).contains(&args.log_staging_mib) {
-                    return Err("--log-staging-mib is 1..=64 (the frame decoder bound)".into());
+                // 1 MiB holds any wire-legal command's record; the top is
+                // the frame decoder bound (every written frame stays
+                // readable by a default-configured reader), so `mib << 20`
+                // is exact in a u32.
+                let max_mib = inf_server::DEFAULT_MAX_FRAME_LEN >> 20;
+                if !(1..=max_mib).contains(&args.log_staging_mib) {
+                    return Err(format!(
+                        "--log-staging-mib is 1..={max_mib} (the frame decoder bound)"
+                    ));
                 }
             }
             "--shutdown-timeout-ms" => {
@@ -442,7 +494,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "infinityd [--port 6379] [--cells 4] [--buffers 4096] [--buf-size 4096] \
+                    "infinityd [--port 6379] [--cells 4] [--maxclients 10000] \
+                     [--buffers 4096] [--buf-size 4096] \
                      [--pin-start CORE] [--pin-stride 2] [--route-local-only] [--data-dir PATH] \
                      [--ckpt-interval-bytes N] [--segment-bytes N] [--segment-recycle-slots 1] \
                      [--no-segment-recycle] [--recycle-wait off|quarter|eighth] \
@@ -465,6 +518,10 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown flag {other}")),
         }
     }
+    // ADR-0123 A1: the boot capacity, against the cells the flags chose,
+    // before any cell or listener exists.
+    args.boot_capacity = inf_server::BootCapacity::new(maxclients, args.cells)
+        .map_err(|refused| refused.to_string())?;
     // The operator values that reach a cell-crate constructor are bounded
     // here, where a violation is a usage error — never at the constructor's
     // release assert (ADR-0107 D2: `buffer_pool.rs` / `router.rs` C rows
@@ -727,6 +784,35 @@ fn check_block_size(props: &inf_server::IoProperties) -> Result<(), String> {
     Ok(())
 }
 
+/// The boot's refusal of a log geometry (ADR-0191 D3): one stderr line
+/// naming both flags, the type's sentence and the move that makes the pair
+/// legal, then exit 2, the usage-error contract of the boot flags. It runs
+/// before any cell, pool or mesh exists and before the node listens.
+/// `floor` is the largest frame the staging ring seals under the class.
+fn refuse_log_geometry(refused: inf_server::LogGeometryError, floor: u32) -> ! {
+    use inf_server::LogGeometryError;
+    let fix = match refused {
+        LogGeometryError::SegmentBelowFrame { frame_bytes, .. } => {
+            format!("raise --segment-bytes to at least {frame_bytes}, or lower --log-staging-mib")
+        }
+        LogGeometryError::SegmentNotAligned { align, .. } => {
+            format!("make --segment-bytes a multiple of {align} of at least {floor}")
+        }
+        LogGeometryError::StagingBelowMinimalFrame { .. }
+        | LogGeometryError::StagingAboveDecoderBound { .. } => {
+            format!(
+                "give --log-staging-mib a value in 1..={}",
+                inf_server::DEFAULT_MAX_FRAME_LEN >> 20
+            )
+        }
+        LogGeometryError::FramesInFlightOutOfRange { max, .. } => {
+            format!("give --frames-in-flight auto or a value in 1..={max}")
+        }
+    };
+    eprintln!("infinityd: --segment-bytes/--log-staging-mib: {refused}; {fix}");
+    std::process::exit(2);
+}
+
 fn short_uuid(uuid: &str) -> String {
     if uuid.is_empty() {
         "(no uuid)".to_owned()
@@ -747,7 +833,9 @@ fn version_line() -> String {
 }
 
 fn main() {
-    let mut args = match parse_args() {
+    // The uring driver's selections ride the parse: decoded here, on the main
+    // thread, before any cell thread exists (ADR-0209 D2).
+    let mut args = match parse_args().map(with_uring_selections) {
         Ok(args) => args,
         Err(e) => {
             eprintln!("infinityd: {e}");
@@ -777,8 +865,7 @@ fn main() {
     // Linux-only (see the cfg block below); on other targets the binding is
     // consumed by `into_iter()` and never needs `mut`.
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut fabrics =
-        Mesh::new(args.cells.get(), MeshConfig { ring_capacity: 4096, data_credits: 1024 });
+    let mut fabrics = Mesh::new(args.cells.get(), FABRIC_MESH);
 
     // Doorbell wakeups (M0-R1, Linux): each cell adopts an eventfd watch;
     // peers wake a parked cell through the park board + LoopWaker. The dev
@@ -800,7 +887,7 @@ fn main() {
     #[cfg(target_os = "linux")]
     let mut wake_fds = Vec::new();
     #[cfg(target_os = "linux")]
-    {
+    let worker_wake = {
         let mut wakers = Vec::new();
         for _ in 0..args.cells.get() {
             let (fd, waker) = inf_runtime::net::wake_pair().expect("eventfd");
@@ -813,7 +900,15 @@ fn main() {
                 wakers[usize::from(cell.0)].wake();
             });
         }
-    }
+        // The control thread's retirement worker ends a parked cell's park
+        // after a publish to it the same way (ADR-0156 D3).
+        let flags = std::sync::Arc::clone(&park_flags);
+        Some(inf_server::CellWake::new(flags, move |cell| {
+            wakers[usize::from(cell)].wake();
+        }))
+    };
+    #[cfg(not(target_os = "linux"))]
+    let worker_wake: Option<inf_server::CellWake> = None;
 
     // The data directory's owner lock (ADR-0094 D7), before anything
     // else touches the directory — the secret, its binding scan, the
@@ -931,8 +1026,22 @@ fn main() {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let (control, ckpt_issuers) =
-            inf_server::spawn_control(dir.clone(), catalog.as_ref(), args.cells, boot_unix_ms);
+        // A catalog over the node's tiered namespace lifetimes is refused
+        // here, before any cell (ADR-0148 D5): nothing of it is served.
+        let (control, ckpt_issuers, parts) = match inf_server::spawn_control(
+            StdSegmentFs,
+            dir.clone(),
+            catalog.as_ref(),
+            args.cells,
+            boot_unix_ms,
+            worker_wake,
+        ) {
+            Ok(started) => started,
+            Err(refused) => {
+                eprintln!("infinityd: boot refused: {refused}");
+                std::process::exit(1);
+            }
+        };
         // Device-model lifecycle (M4.5-S42, ADR-0091 D1): the file, the
         // device's identity, and — under `auto` — the probe, before any
         // cell starts. A malformed or foreign file is a refusal, never a
@@ -1046,25 +1155,40 @@ fn main() {
                 seal_barriers_per_s / u64::from(args.cells.get())
             );
         }
-        if args.segment_bytes % inf_server::FRAME_ALIGN != 0
-            && io.io_mode == inf_server::SegmentIoMode::Direct
-        {
-            eprintln!(
-                "infinityd: --segment-bytes {} is not a multiple of {} — required by the fua class",
-                args.segment_bytes,
-                inf_server::FRAME_ALIGN
-            );
-            std::process::exit(1);
-        }
-        let boot = (dir, catalog, control, io, seal_barriers_per_s, frames_in_flight, provenance);
-        (boot, ckpt_issuers)
+        // ADR-0191 D3: the log's geometry is judged here, where the class
+        // is known, before any cell, pool or mesh exists and before the
+        // node listens. Every cell's ring and rotor are built from it.
+        let staging = inf_server::StagingConfig {
+            capacity_bytes: args.log_staging_mib << 20,
+            frames_in_flight,
+        };
+        let segment = inf_server::SegmentConfig {
+            segment_bytes: args.segment_bytes,
+            io_mode: io.io_mode,
+            fua_max_frame_bytes: io.fua_max_frame_bytes,
+            recycle_slots: args.segment_recycle_slots,
+            prealloc: args.recycle_wait,
+            ..Default::default()
+        };
+        let geometry = match inf_server::LogGeometry::new(staging, segment) {
+            Ok(geometry) => geometry,
+            Err(refused) => refuse_log_geometry(
+                refused,
+                inf_server::max_sealed_frame_bytes(staging, io.io_mode),
+            ),
+        };
+        let boot = (dir, catalog, control, io, seal_barriers_per_s, geometry, provenance);
+        (boot, ckpt_issuers, parts)
     });
     // Each cell takes its own checkpoint allowance (ADR-0159 A1.2). The
     // control writer's quota paid the boot restamp; this binary makes no
-    // direct requests, so the host drops it.
-    let (boot, mut cell_issuers) = match boot {
-        Some((boot, issuers)) => (Some(boot), issuers.cells.into_iter()),
-        None => (None, Vec::new().into_iter()),
+    // direct requests, so the host drops it. Each cell's tier-file
+    // transport part stays in this frame until its thread exists; no exit
+    // from here drops one (`exit_failed` and `process::exit` run no
+    // destructor).
+    let (boot, mut cell_issuers, mut cell_parts) = match boot {
+        Some((boot, issuers, parts)) => (Some(boot), issuers.cells.into_iter(), parts.into_iter()),
+        None => (None, Vec::new().into_iter(), Vec::new().into_iter()),
     };
 
     let mut cache_boot = inf_server::CacheBootGroup::new(args.cells.non_zero());
@@ -1082,36 +1206,46 @@ fn main() {
         let wake_fd = wake_fds[i].take();
         #[cfg(not(target_os = "linux"))]
         let wake_fd = None;
-        let launch = CellLaunch { cell: i as u16, fabric, wake_fd, cache_permit, ckpt_issuer };
-        handles.push(
-            std::thread::Builder::new()
-                .name(format!("cell-{i}"))
-                .spawn(move || {
-                    // Fail-stop at the thread boundary (M2.5-S01 mechanism 2):
-                    // the in-order join loop below blocks on cell 0 forever, so
-                    // a later cell's setup error would otherwise leave a dead
-                    // cell the narrator reports as stuck in its last phase —
-                    // the captured wedge was cell 3 exiting `setup:driver` on
-                    // an io_uring_setup failure nobody printed. A cell that
-                    // cannot run takes the node down loudly, here and now.
-                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        cell_main(launch, &args, boot, hasher, &wiring)
-                    }));
-                    match outcome {
-                        Ok(Ok(())) => Ok::<(), std::io::Error>(()),
-                        Ok(Err(e)) => {
-                            eprintln!("infinityd: cell {i} failed: {e}");
-                            std::process::exit(1);
-                        }
-                        Err(_) => {
-                            // The default hook already printed the panic.
-                            eprintln!("infinityd: cell {i} panicked — fail-stop");
-                            std::process::exit(101);
-                        }
-                    }
-                })
-                .expect("spawn cell thread"),
-        );
+        let cell = i as u16;
+        // The part crosses on a one-slot channel, sent only once the thread
+        // exists: the closure holds the receiver, never a part, so a refused
+        // spawn drops none.
+        let (part_tx, part_rx) = std::sync::mpsc::sync_channel(1);
+        let part = cell_parts.next();
+        let spawned = std::thread::Builder::new().name(format!("cell-{i}")).spawn(move || {
+            // The part arrives first, before `catch_unwind`: a refused receive
+            // (the assembly gone) is the cell's failure.
+            let part = match part_rx.recv() {
+                Ok(part) => part,
+                Err(error) => exit_failed(cell, &error),
+            };
+            let launch = CellLaunch { cell, fabric, wake_fd, cache_permit, ckpt_issuer, part };
+            // Fail-stop at the thread boundary (M2.5-S01 mechanism 2): the
+            // in-order join loop below blocks on cell 0 forever, so a later
+            // cell's setup error would otherwise leave a dead cell the
+            // narrator reports as stuck in its last phase — the captured
+            // wedge was cell 3 exiting `setup:driver` on an io_uring_setup
+            // failure nobody printed. A cell that cannot run takes the node
+            // down loudly, here and now: `cell_main` ends every failure in
+            // `exit_failed`, and returns only from a drained stop.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                cell_main(launch, &args, boot, hasher, &wiring)
+            }));
+            if outcome.is_err() {
+                // The default hook already printed the panic.
+                eprintln!("infinityd: cell {i} panicked — fail-stop");
+                std::process::exit(101);
+            }
+        });
+        let handle = match spawned {
+            Ok(handle) => handle,
+            Err(error) => exit_failed(cell, &error),
+        };
+        // The closure holds the receiver until it receives: never refused.
+        if part_tx.send(part).is_err() {
+            exit_failed(cell, &"its thread ended before its tier part arrived");
+        }
+        handles.push(handle);
     }
     // Unissued permits fail the group before supervision can wait on a cell.
     drop(cache_boot);
@@ -1126,10 +1260,7 @@ fn main() {
     );
     sample_until_cells_exit(&mut process_sampler, &handles);
     for handle in handles {
-        if let Err(e) = handle.join().expect("cell thread panicked") {
-            eprintln!("infinityd: cell failed: {e}");
-            std::process::exit(1);
-        }
+        handle.join().expect("a cell's panic exits the process first");
     }
     // Every cell returned `Ok` — only a drained stop does that.
     eprintln!("infinityd: clean stop ({} cells)", args.cells.get());
@@ -1154,7 +1285,7 @@ struct NodeWiring {
 /// boots. Sampling runs at most once a second; shutdown polls stay at 100 ms.
 fn sample_until_cells_exit(
     sampler: &mut inf_server::ProcessSampler,
-    handles: &[std::thread::JoinHandle<std::io::Result<()>>],
+    handles: &[std::thread::JoinHandle<()>],
 ) {
     while handles.iter().any(|h| !h.is_finished()) {
         sampler.sample();
@@ -1192,8 +1323,10 @@ type Boot = Option<(
     inf_server::IoProperties,
     // The seal pacer's device rate (ADR-0088 D2b arm; 0 = off).
     u64,
-    // K, resolved from the barrier class at boot (ADR-0087 D5 as amended).
-    u8,
+    // The log's checked geometry: the staging ring of K buffers, K resolved
+    // from the barrier class at boot (ADR-0087 D5 as amended), beside the
+    // segment (ADR-0191 D3).
+    inf_server::LogGeometry,
     inf_server::IoProvenance,
 )>;
 
@@ -1201,10 +1334,10 @@ type Boot = Option<(
 fn boot_node_info(
     config: inf_server::ConfigStore,
     permit: inf_server::CacheBootPermit,
-) -> std::io::Result<Rc<NodeInfo>> {
-    let node = NodeInfo::try_new(config)
+) -> std::io::Result<(Rc<NodeInfo>, inf_server::ClientAdmission)> {
+    let (node, admission) = NodeInfo::try_new(config)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
-    Ok(node.into_boot_group(permit))
+    Ok((node.into_boot_group(permit), admission))
 }
 
 /// The resources transferred once to their owning cell at thread launch.
@@ -1215,6 +1348,35 @@ struct CellLaunch {
     cache_permit: inf_server::CacheBootPermit,
     /// This cell's checkpoint allowance on a durable boot (ADR-0159 A1.2).
     ckpt_issuer: Option<inf_server::CellIssuer>,
+    /// This cell's tier-file transport part on a durable boot (ADR-0156 D2).
+    part: Option<inf_server::CellPart<inf_server::StdSegmentFile>>,
+}
+
+/// A cell's drained stop: made only at `Drained`, where its transport is
+/// Retired, so `cell_main` returns only from there; every failure ends in
+/// [`exit_failed`] instead, and no `?` compiles in it.
+struct CleanStop(());
+
+/// A cell's failure after the boot reservation: the cell's error line,
+/// then exit 1, which runs no destructor, so no part or backing the cell
+/// holds drops before its retirement (ADR-0157 D3).
+fn exit_failed(cell: u16, error: &dyn std::fmt::Display) -> ! {
+    eprintln!("infinityd: cell {cell} failed: {error}");
+    std::process::exit(1);
+}
+
+/// A fallible step of `cell_main`: its value, else [`exit_failed`] with its
+/// error.
+macro_rules! or_exit {
+    ($cell:expr, $step:expr) => {
+        match $step {
+            Ok(value) => value,
+            // Canary `inf_canary_cell_exit_drops_plane`: the error returns
+            // from the cell instead, dropping its plane and its part.
+            Err(_) if cfg!(inf_canary_cell_exit_drops_plane) => return CleanStop(()),
+            Err(error) => exit_failed($cell, &error),
+        }
+    };
 }
 
 fn cell_main(
@@ -1223,8 +1385,8 @@ fn cell_main(
     boot: Boot,
     hasher: KeyHasher,
     wiring: &NodeWiring,
-) -> std::io::Result<()> {
-    let CellLaunch { cell, fabric, wake_fd, cache_permit, ckpt_issuer } = launch;
+) -> CleanStop {
+    let CellLaunch { cell, fabric, wake_fd, cache_permit, ckpt_issuer, part } = launch;
     // Setup-phase narration (M2.5-S01): the 500-cycle storm caught cells
     // stalling BEFORE the first loop iteration ("spawned" forever) — every
     // setup step below publishes its phase so a kernel-side stall names
@@ -1234,16 +1396,20 @@ fn cell_main(
             control.recovery_board().slot(cell).publish_phase(code);
         }
     };
-    if let Some(cpu) = args.cell_cpu(cell).map_err(std::io::Error::other)? {
-        pin_current_thread(cpu)?;
+    if let Some(cpu) = or_exit!(cell, args.cell_cpu(cell)) {
+        or_exit!(cell, pin_current_thread(cpu));
     }
-    let config = inf_server::ConfigStore::with_path_cache_capacity(args.doc_path_cache_capacity);
-    let node = boot_node_info(config, cache_permit)?;
+    let config = inf_server::ConfigStore::with_path_cache_capacity(args.doc_path_cache_capacity)
+        .with_boot_capacity(args.boot_capacity);
+    let (node, admission) = or_exit!(cell, boot_node_info(config, cache_permit));
     mark(11); // setup:pool
     let mut pool = BufferPool::new(args.buffers, args.buf_size);
     mark(12); // setup:driver
-    let mut driver = make_driver()
-        .map_err(|e| std::io::Error::new(e.kind(), format!("driver setup (ring create): {e}")))?;
+    let mut driver = or_exit!(
+        cell,
+        make_driver(args)
+            .map_err(|e| std::io::Error::new(e.kind(), format!("driver setup (ring create): {e}")))
+    );
     // io_uring charges a ring and its registered buffers to the user's one
     // RLIMIT_MEMLOCK budget. The registration probe degrades on refusal, but
     // a refused probe first charges up to the limit, and a sibling creating
@@ -1253,7 +1419,7 @@ fn cell_main(
     mark(17); // setup:ring-barrier
     wiring.rings_created.wait();
     mark(13); // setup:register
-    driver.register_pool(&mut pool)?;
+    or_exit!(cell, driver.register_pool(&mut pool));
     #[cfg(target_os = "linux")]
     if let Some(fd) = wake_fd {
         driver.adopt_wake_fd(fd);
@@ -1262,14 +1428,16 @@ fn cell_main(
     let _ = wake_fd;
     if cell == 0 {
         eprintln!("infinityd: capabilities {:?}", driver.capabilities());
+        #[cfg(target_os = "linux")]
+        eprintln!("infinityd: uring selections {}", args.uring);
     }
     // The listener publishes the cell, so it binds after the ring and pool
     // are reserved: a boot that fails above refuses a connection instead of
     // accepting it into a backlog the exiting process then resets.
     mark(10); // setup:listen
-    let listener = listen_reuseport(args.port)?;
+    let listener = or_exit!(cell, listen_reuseport(args.port));
     if cell == 0 {
-        eprintln!("infinityd: listening on {}", bound_port(&listener)?);
+        eprintln!("infinityd: listening on {}", or_exit!(cell, bound_port(&listener)));
     }
 
     node.process_board.replace(Some(std::sync::Arc::clone(&wiring.process_board)));
@@ -1300,28 +1468,24 @@ fn cell_main(
     // blocking exception, now sliced). Progress/summary lines come from
     // the control thread's recovery board.
     mark(14); // setup:keyspace
-    let mut ks = Keyspace::new(StoreConfig { hasher, ..StoreConfig::default() });
+    // The node's keyspace is cataloged (ADR-0189 D4): seeded from `META`'s
+    // decode, or the empty catalog of a fresh data directory, so a
+    // namespace entry changes only with the catalog writer's receipt. A
+    // node with no data directory has no catalog writer and answers no DDL.
+    // The plane builds it from this seed on its cell's census.
+    let store_cfg = StoreConfig { hasher, ..StoreConfig::default() };
+    let seed = match &boot {
+        Some((_, catalog, ..)) => KeyspaceSeed::Cataloged {
+            cfg: store_cfg,
+            catalog: catalog.clone().unwrap_or_else(inf_store::NsCatalog::empty),
+        },
+        None => KeyspaceSeed::Uncataloged { cfg: store_cfg, specs: Vec::new() },
+    };
     let mut durable = None;
-    if let Some((dir, catalog, control, io, seal_barriers_per_s, frames_in_flight, provenance)) =
-        &boot
-    {
-        if let Some(catalog) = catalog {
-            ks.seed_catalog(catalog).map_err(|e| std::io::Error::other(format!("{e:?}")))?;
-        }
+    if let Some((dir, _catalog, control, io, seal_barriers_per_s, geometry, provenance)) = &boot {
         let cfg = inf_server::DurableConfig {
             data_dir: dir.clone(),
-            staging: inf_server::StagingConfig {
-                capacity_bytes: args.log_staging_mib << 20,
-                frames_in_flight: *frames_in_flight,
-            },
-            segment: inf_server::SegmentConfig {
-                segment_bytes: args.segment_bytes,
-                io_mode: io.io_mode,
-                fua_max_frame_bytes: io.fua_max_frame_bytes,
-                recycle_slots: args.segment_recycle_slots,
-                prealloc: args.recycle_wait,
-                ..Default::default()
-            },
+            geometry: *geometry,
             // ADR-0088 D4 as amended twice (M4.5-S34 campaign M3; the
             // second amendment): the cap's replay term is `min(qd1, qd4 ÷
             // cells)` when the model carries both read rows, `qd4 ÷
@@ -1368,27 +1532,36 @@ fn cell_main(
             group: inf_server::GroupHoldConfig {
                 window: inf_foundation::time::Nanos::from_micros(args.flush_group_window_us),
             },
+            ack_wakes_per_turn: inf_server::limits::ACK_WAKES_PER_TURN,
         };
         durable = Some((cfg, std::sync::Arc::clone(control)));
     }
     mark(15); // setup:plane
-    let (mut plane, serve_mark) = ServerPlane::new(
+    // A refused seed or timer assembly ends the cell's setup before its
+    // loop exists, and the cell's thread ends the process with its text.
+    let built = ServerPlane::new(
         CellId(cell),
         args.cells.get(),
         listener.into_raw_fd(), // the driver owns the listener fd now
-        ks,
+        seed,
         fabric,
         Rc::clone(&node),
+        admission,
         NoopObserver,
         args.route_local_only,
     );
+    let (mut plane, serve_mark, timer_set, executor) = or_exit!(cell, built);
+    // The part into the plane by an infallible store, before any fallible
+    // step: from here it lives in the plane, which no exit drops.
+    if let Some(part) = part {
+        plane.hold_tier_part(part);
+    }
     if let Some((cfg, control)) = durable {
-        let issuer = ckpt_issuer.ok_or_else(|| {
-            std::io::Error::other("a durable boot minted no checkpoint issuer for this cell")
-        })?;
-        plane
-            .set_control(control, issuer)
-            .map_err(|refused| std::io::Error::other(refused.to_string()))?;
+        let issuer = or_exit!(
+            cell,
+            ckpt_issuer.ok_or("a durable boot minted no checkpoint issuer for this cell")
+        );
+        or_exit!(cell, plane.set_control(control, issuer));
         // The bare filesystem is the plane's for the node's life; the
         // boot-read prefetch rides `cfg.recover.boot_prefetch` inside
         // `Recovery` and never escapes it (ADR-0109).
@@ -1416,13 +1589,20 @@ fn cell_main(
     plane.set_park_flags(std::sync::Arc::clone(&wiring.park_flags));
     // Multi-cell dev-tier (kqueue, no wakeups) still parks briefly so a
     // parked peer notices doorbells within the ceiling.
-    let park_us = args.park_us.unwrap_or(if args.cells.get() > 1 { 500 } else { 5_000 });
+    // These defaults are this binary's settings, not bounds: the bound is PARK_CEILING_MAX,
+    // which the flag's check and the ceiling's one constructor hold.
+    let park_us = if args.cells.get() > 1 { 500 } else { 5_000 };
+    let park = match args.park {
+        Some(ceiling) => ceiling,
+        None => or_exit!(cell, ParkCeiling::new(std::time::Duration::from_micros(park_us))),
+    };
     let config = LoopConfig {
-        park_default: Some(std::time::Duration::from_micros(park_us)),
+        park_default: park,
         remote_first_execute: args.remote_first_execute,
         ..Default::default()
     };
-    let mut cell_loop = CellLoop::new(driver, StdClock::new(), pool, config, serve_mark);
+    let mut cell_loop =
+        CellLoop::new(driver, StdClock::new(), pool, config, serve_mark, timer_set, executor);
 
     mark(16); // setup:loop — the next publish is drive_recovery's phase 1
     let mut iterations: u64 = 0;
@@ -1434,7 +1614,7 @@ fn cell_main(
     let mut counted_quiet = false;
     let mut counted = false;
     loop {
-        cell_loop.run_iteration(&mut plane)?;
+        or_exit!(cell, cell_loop.run_iteration(&mut plane));
         node.loop_snapshot
             .capture_if_requested(cell_loop.iteration_histogram(), cell_loop.counters());
         if let Some(err) = plane.take_boot_error() {
@@ -1471,21 +1651,29 @@ fn cell_main(
                 wiring.drained_cells.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             }
             if wiring.drained_cells.load(std::sync::atomic::Ordering::Acquire) == args.cells.get() {
-                return Ok(());
+                return CleanStop(());
             }
+            // Only a cell still draining takes the deadline, so the line
+            // names a cell that holds the stop and the wait that holds it
+            // (ADR-0199 D3); a drained cell keeps iterating for its peers.
             #[allow(
                 clippy::disallowed_methods,
                 reason = "the operator's wall-clock stop bound, never oracle input"
             )]
             let now = std::time::Instant::now();
-            if now > due {
-                return Err(std::io::Error::other(format!(
-                    "stop drain timed out after {} ms in phase {:?} ({} of {} cells drained)",
+            if phase != inf_server::StopPhase::Drained && now > due {
+                let hold = plane
+                    .stop_hold()
+                    .map_or_else(|| "no wait named yet".to_owned(), |hold| format!("{hold:?}"));
+                let timed_out: Result<(), String> = Err(format!(
+                    "stop drain timed out after {} ms in phase {:?}, held by {hold} ({} of {} \
+                     cells drained)",
                     args.shutdown_timeout_ms,
                     plane.stop_phase(),
                     wiring.drained_cells.load(std::sync::atomic::Ordering::Acquire),
                     args.cells.get()
-                )));
+                ));
+                or_exit!(cell, timed_out);
             }
         }
         iterations += 1;
@@ -1498,18 +1686,36 @@ fn cell_main(
     }
 }
 
+/// `args` with the uring driver's selections decoded from the process
+/// environment: the three variables `UringConfig::from_lookup` names, each
+/// selecting when present, read once at boot (ADR-0209 D2). No cell reads
+/// the environment. Off Linux there is no uring driver and `args` passes
+/// through.
 #[cfg(target_os = "linux")]
-fn make_driver() -> std::io::Result<inf_runtime::UringDriver> {
-    inf_runtime::UringDriver::new(4096)
+fn with_uring_selections(mut args: Args) -> Args {
+    #[allow(clippy::disallowed_methods, reason = "boot: decoded before any cell thread exists")]
+    let uring = inf_runtime::UringConfig::from_lookup(std::env::var_os);
+    args.uring = uring;
+    args
+}
+
+#[cfg(not(target_os = "linux"))]
+fn with_uring_selections(args: Args) -> Args {
+    args
+}
+
+#[cfg(target_os = "linux")]
+fn make_driver(args: &Args) -> std::io::Result<inf_runtime::UringDriver> {
+    inf_runtime::UringDriver::new(4096, args.uring)
 }
 
 #[cfg(target_os = "macos")]
-fn make_driver() -> std::io::Result<inf_runtime::KqueueDriver> {
+fn make_driver(_args: &Args) -> std::io::Result<inf_runtime::KqueueDriver> {
     inf_runtime::KqueueDriver::new()
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn make_driver() -> std::io::Result<never::NoBackend> {
+fn make_driver(_args: &Args) -> std::io::Result<never::NoBackend> {
     Err(std::io::Error::other("no backend: build with --features uring on Linux"))
 }
 

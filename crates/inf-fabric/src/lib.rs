@@ -19,6 +19,7 @@
 )]
 
 mod codec;
+pub mod limits;
 #[cfg(not(loom))]
 mod mesh;
 mod msg;
@@ -32,4 +33,8 @@ pub use codec::{
 #[cfg(not(loom))]
 pub use mesh::{CellFabric, FabricStats, Mesh, MeshConfig, SendError};
 pub use msg::{FabricMsg, FabricToken, INLINE_MSG_CAP};
-pub use ring::{Consumer, Producer, ring};
+pub use ring::{
+    Consumer, Permit, Producer, RETAINED_RING_SLOTS, Reservation, RetainedConsumer,
+    RetainedProducer, RetainedRing, RetireCause, RingBlock, RingLayoutRefused, RingPhase,
+    RingSteps, ring,
+};

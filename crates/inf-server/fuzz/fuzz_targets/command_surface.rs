@@ -19,7 +19,7 @@ fuzz_target!(|data: &[u8]| {
     // ADR-0110: explicitly reach the optional snapshot forms. Random argv
     // almost never spells IF/ABS and otherwise leaves their bodies untouched.
     let value = &data[..data.len().min(4096)];
-    let mut snapshot_reply = Vec::new();
+    let mut snapshot_reply = inf_wire::ReplyStream::new(Vec::new());
     for argv in [
         &[b"SET".as_slice(), b"move", value][..],
         &[b"INF.PEEK".as_slice(), b"move", b"ABS"],
@@ -31,11 +31,11 @@ fuzz_target!(|data: &[u8]| {
         &[b"INF.PUT".as_slice(), b"move", value, b"-1", b"NX"],
         &[b"INF.PUT".as_slice(), b"move", value, data, data],
     ] {
-        snapshot_reply.clear();
-        execute_slices(argv, &mut store, &mut cx, Nanos(1), &mut snapshot_reply);
+        snapshot_reply.discard();
+        execute_slices(argv, &mut store, &mut cx, Nanos(1), snapshot_reply.open());
     }
     let mut rest = data;
-    let mut out = Vec::new();
+    let mut out = inf_wire::ReplyStream::new(Vec::new());
     // Up to 8 commands per input. Each: [selector][argc][per-arg: u16-le
     // length + bytes, clamped to what remains]. Even selectors pick a
     // registry command name (the biased half); odd selectors use the raw
@@ -61,7 +61,7 @@ fuzz_target!(|data: &[u8]| {
             rest = &tail[len..];
         }
         let argv: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-        out.clear();
-        execute_slices(&argv, &mut store, &mut cx, Nanos(1), &mut out);
+        out.discard();
+        execute_slices(&argv, &mut store, &mut cx, Nanos(1), out.open());
     }
 });

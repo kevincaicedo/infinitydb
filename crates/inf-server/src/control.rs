@@ -2,23 +2,35 @@
 //! architecture always reserved (§4). Its first job: **single writer of
 //! the node catalog `META` file**. Cells must never block on file I/O, so
 //! DDL persists asynchronously: the origin cell's pump sends a request
-//! over a bounded channel and parks on a cell-local waitlist; this thread
-//! performs the write-new + fsync + rename + dir-fsync swap (`inf-log`'s
-//! `meta` protocol) and publishes a monotone **persist epoch**; every
-//! cell's MAINTAIN observes the epoch and wakes its parked pumps.
+//! over a bounded channel and parks on a cell-local waitlist. This thread
+//! numbers each request as it dequeues it (the **catalog epoch**, its
+//! alone), performs the write-new + fsync + rename + dir-fsync swap
+//! (`inf-log`'s `meta` protocol) and answers the request through its own
+//! slot after the swap returned, then publishes the **catalog word**, the
+//! highest answered epoch (ADR-0189 D2); every cell's MAINTAIN observes the
+//! word and wakes its parked pumps, and each pump reads its own answer.
 //!
-//! The thread also owns namespace-id allocation (ids are node-unique,
-//! allocated once, never reused — ADR-0015 D2): a shared `AtomicU32`
-//! seeded from the catalog's `next_id` at boot. One `fetch_add` per DDL is
-//! control-plane traffic; L1's no-shared-atomics rule binds the data plane.
+//! The writer also moves the namespace-id counter (ids are node-unique,
+//! issued once, never reused — ADR-0015 D2): a shared `AtomicU32` seeded
+//! from the catalog's `next_id` at boot. A `CREATE` reserves the counter's
+//! value under the DDL ticket without moving it, and only the writer's
+//! acceptance of that `CREATE` moves it, by one, in the persist that names
+//! the id (ADR-0148 D4): a refused `CREATE` leaves it where it was, and a
+//! counter at `u32::MAX` issues no id. A `CREATE` costs one store and a few
+//! loads of the counter, all on the control plane; L1's no-shared-atomics
+//! rule binds the data plane.
 //!
-//! Since ADR-0100 D2 the writer also owns the **drop-tombstone set**: a
-//! durable namespace's `DROP` adds its id to every payload the writer
-//! emits until every cell has published a `MANIFEST` past the drop (the
-//! origin requests that checkpoint and stamps the tombstone with its
-//! epoch; the writer retires stamped tombstones at the next persist once
-//! every cell's published epoch covers them). Recovery reads the set to
-//! tell dropped residue from corruption.
+//! The writer also owns the **tombstone book** (ADR-0189 D6): a durable
+//! namespace's `DROP` adds its id to every payload the writer emits until
+//! every cell has published a `MANIFEST` past the drop (the origin requests
+//! that checkpoint and posts its epoch with the drop's notice; the writer
+//! retires stamped tombstones at the next accepted request once every
+//! cell's published epoch covers them), and at 256 tombstones the writer
+//! alone admits, refuses, or answers the one pace a durable DDL may take.
+//! Recovery reads the set to tell dropped residue from corruption. And it owns the **one
+//! pending DDL** (ADR-0189 D3): an accepted `CREATE` or `DROP` whose fan
+//! may not have reached every cell, kept in every payload until the
+//! origin's notice retires it.
 //!
 //! Checkpoint requests are issued, not counted (ADR-0159 A1): a boot's
 //! partition mints one quota per cell, one for this writer and one final
@@ -27,24 +39,41 @@
 //! any effect.
 
 use core::cell::Cell;
+use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 // denylist-allow: the cell->control DDL channel (ADR-0015 D3), drained on this thread only.
 use std::sync::mpsc;
-use std::time::Duration;
 
+use inf_foundation::grants::{
+    BellWake, DirectoryPublished, DirectoryWriter, GrantDirectory, GrantPos, POSITIONS,
+    ReceiptBoard, ReceiptWriter, RetireBoard,
+};
 use inf_foundation::issue::{
     self, FinalCredit, IssueClock, IssueCredit, IssueExhausted, IssueQuota, IssueSpace, Issued,
     Partition, PartitionRefused, RequestWord,
 };
 use inf_foundation::{CellCount, CellId};
-use inf_log::fs::StdSegmentFs;
+use inf_log::fs::{SegmentFile, SegmentFs, StdSegmentFs};
 use inf_log::meta::{read_meta, write_meta};
-use inf_store::{FIRST_INDEX_GENERATION, FIRST_INDEX_ID, FIRST_NAMED_NS_ID, NsCatalog, NsSpec};
+use inf_store::ddl::{
+    self, AnswerSlot, CatalogEpochs, CatalogWord, CreatePersisted, DdlRefusal, DdlVerdict,
+    DropPersisted, Requested, SetPersisted, TieredHeld, TombstoneHeld,
+};
+use inf_store::{
+    FIRST_INDEX_GENERATION, FIRST_INDEX_ID, FIRST_NAMED_NS_ID, NsCatalog, NsId, NsMode, NsSpec,
+};
+use inf_wire::{Domain, Refusal};
 
-use crate::limits::CKPT_BOARD_VISITS_PER_TURN;
+use crate::limits::{
+    CKPT_BOARD_VISITS_PER_TURN, NS_IDS_EXHAUSTED, TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX,
+};
+use crate::tier_retire::{
+    BootReservation, CellPart, CellWake, DetachedTier, FinalClose, RetireWorker, TierBoot,
+    TierLifetimeBoot, TierShared, WorkerInbox,
+};
 
 /// Recycled-life residue recovery proved at boot (M4.5-S39b, ADR-0090
 /// D2/D4 as amended): how many segments ended their data at a foreign-
@@ -99,6 +128,10 @@ pub struct CellRecoverySlot {
     /// [`TierReplayStats::FIELDS`](crate::recover::TierReplayStats::FIELDS)
     /// order — `INFO persistence` renders the node fold.
     tier_replay: [AtomicU64; crate::recover::TIER_REPLAY_FIELDS],
+    /// ADR-0174 A1.2: this cell's step facts — the largest work one step
+    /// did and the liveness counters — in
+    /// [`StepFacts::FIELDS`](crate::recover::StepFacts::FIELDS) order.
+    step_facts: [AtomicU64; crate::recover::STEP_FACT_FIELDS],
     /// Recovery phase about to run (M2.5-S01): published *before* each
     /// step so a step stalled inside the kernel names itself — the
     /// ADR-0022 D7 wedge was invisible precisely because nothing was
@@ -152,6 +185,21 @@ impl CellRecoverySlot {
         for (slot, value) in self.tier_replay.iter().zip(stats.to_array()) {
             slot.store(value, Ordering::Relaxed);
         }
+    }
+
+    /// Publishes this cell's step facts (owning cell, once, before
+    /// [`mark_ready`](Self::mark_ready), as the tiered facts are).
+    pub fn publish_step_facts(&self, facts: crate::recover::StepFacts) {
+        for (slot, value) in self.step_facts.iter().zip(facts.to_array()) {
+            slot.store(value, Ordering::Relaxed);
+        }
+    }
+
+    /// This cell's step facts, valid once ready.
+    pub fn step_facts(&self) -> crate::recover::StepFacts {
+        crate::recover::StepFacts::from_array(std::array::from_fn(|i| {
+            self.step_facts[i].load(Ordering::Relaxed)
+        }))
     }
 
     /// This cell's tiered boot replay facts, valid once ready.
@@ -302,6 +350,16 @@ impl RecoveryBoard {
         self.cells.iter().fold(crate::recover::TierReplayStats::default(), |total, slot| {
             total.fold(slot.tier_replay())
         })
+    }
+
+    /// The node fold of the cells' step facts (ADR-0174 A1.2): the work
+    /// gauge the largest, the counters summed — valid once
+    /// [`all_ready`](Self::all_ready). Bound: one pass over the cells.
+    #[must_use]
+    pub fn step_facts_totals(&self) -> crate::recover::StepFacts {
+        self.cells
+            .iter()
+            .fold(crate::recover::StepFacts::default(), |total, slot| total.fold(slot.step_facts()))
     }
 
     /// Aggregate (done, total) bytes across cells.
@@ -1098,207 +1156,434 @@ impl IndexBoard {
     }
 }
 
-/// One catalog snapshot to persist (the origin cell's post-apply export).
-struct PersistReq {
-    catalog: NsCatalog,
-    /// The epoch value published once this snapshot is durable.
-    epoch: u64,
-    /// The durable namespace this persist drops (ADR-0100 D2): its
-    /// tombstone joins the writer's set before the payload encodes.
-    drop: Option<u32>,
-    /// Any namespace this persist drops (ADR-0103 D2): retired from the
-    /// pending-create set whatever its mode.
-    dropped: Option<u32>,
-    /// The `CREATE` this persist carries (ADR-0103 D1/D2): merged into
-    /// the payload and the pending set, its verdict written before the
-    /// epoch publishes.
-    create: Option<(NsSpec, CreateVerdict)>,
+/// One catalog request as the writer dequeues it (ADR-0189 D2): the change
+/// it asks for, the export it was shaped from, and the writer half of its
+/// answer slot. Cell 0's readiness persist asks for no change and is
+/// answered through no slot.
+pub(crate) struct CatalogRequest {
+    intent: Option<DdlIntent>,
+    /// The requester's catalog export, before the writer's state applies.
+    export: NsCatalog,
+    slot: Option<AnswerSlot>,
+    /// The planted canary's epoch, taken at send (the shape the writer's
+    /// numbering at dequeue replaces).
+    #[cfg(inf_canary_ns_epoch_at_send)]
+    numbered: u64,
 }
 
-/// The catalog writer's answer to one `CREATE` (ADR-0103 D2), read by
-/// the origin after `persisted(epoch)`: one atomic the origin owns, set
-/// by the writer before it publishes the epoch (Release/Acquire pairs
-/// through `persisted_epoch`).
-#[derive(Clone, Debug)]
-pub struct CreateVerdict(Arc<AtomicU8>);
+impl CatalogRequest {
+    fn new(intent: Option<DdlIntent>, export: NsCatalog, slot: Option<AnswerSlot>) -> Self {
+        CatalogRequest {
+            intent,
+            export,
+            slot,
+            #[cfg(inf_canary_ns_epoch_at_send)]
+            numbered: 0,
+        }
+    }
+}
 
-/// What the writer decided about a `CREATE`.
+/// The change a DDL request asks the writer for.
+enum DdlIntent {
+    /// A new namespace, its id the requester reserved: committed only if
+    /// the writer accepts it, and only when it is the counter's next.
+    Create { spec: NsSpec, reserved: NsId },
+    /// Namespace `id` goes; `tombstone` for a durable one.
+    Drop { id: NsId, tombstone: bool },
+}
+
+/// The one DDL the writer accepted and has not yet seen fanned
+/// (ADR-0189 D3): its effect stays in every payload until its notice
+/// arrives, so no lagging export drops or revives it.
+#[derive(Debug)]
+enum PendingDdl {
+    /// An accepted `CREATE`, until its `CreateApplied`.
+    Create(NsSpec),
+    /// An accepted `DROP` or rollback, until its `DropFanned`.
+    Drop(NsId),
+}
+
+/// A DDL's notice to the writer (ADR-0189 D3, D5): it retires the pending
+/// DDL of its own kind and id, and changes nothing else.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum CreateOutcome {
-    /// The name was free across existing and pending entries: the
-    /// definition is durable, the origin may apply and fan.
-    Accepted,
-    /// An existing or earlier-pending entry holds the name.
-    NameExists,
-    /// The pending set is at [`PENDING_CREATE_MAX`].
-    AtCapacity,
+pub(crate) enum DdlNotice {
+    /// A `CREATE`'s fan completed, or the `CREATE` stopped after its answer:
+    /// every cell's export carries what `META` holds of it from now on.
+    CreateApplied { id: NsId },
+    /// A `DROP`'s or a rollback's fan completed, or it stopped after its
+    /// answer; `stamp` is the epoch of the checkpoint that retires a
+    /// durable drop's tombstone, `None` when the drop leaves it unstamped.
+    DropFanned { id: NsId, stamp: Option<u64> },
 }
 
-impl CreateVerdict {
-    fn new() -> CreateVerdict {
-        CreateVerdict(Arc::new(AtomicU8::new(0)))
-    }
+/// One live tombstone of the writer's book (ADR-0189 D6).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct Tombstone {
+    id: u32,
+    /// The checkpoint epoch whose publication on every cell retires it; 0
+    /// is unstamped (every issued epoch is nonzero, ADR-0159 A1.2).
+    stamp: u64,
+}
 
-    fn set(&self, outcome: CreateOutcome) {
-        let code = match outcome {
-            CreateOutcome::Accepted => 1,
-            CreateOutcome::NameExists => 2,
-            CreateOutcome::AtCapacity => 3,
-        };
-        self.0.store(code, Ordering::Release);
-    }
+/// The book's fold at one request (ADR-0189 D6): its live tombstones and
+/// how many are ready (stamped at an epoch every cell has published),
+/// paceable (stamped past it: a pacing checkpoint makes them ready) and
+/// blocked (unstamped with no drop of it pending: a fault arm left before
+/// the stamp, and the next boot re-stamps it). The three are disjoint; the
+/// pending drop's own tombstone is none of them.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct BookFold {
+    live: usize,
+    ready: usize,
+    paceable: usize,
+    blocked: usize,
+}
 
-    /// The writer's decision; `None` until the persist that carried the
-    /// request ran (callers read after `persisted(epoch)`).
-    #[must_use]
-    pub fn get(&self) -> Option<CreateOutcome> {
-        match self.0.load(Ordering::Acquire) {
-            1 => Some(CreateOutcome::Accepted),
-            2 => Some(CreateOutcome::NameExists),
-            3 => Some(CreateOutcome::AtCapacity),
-            _ => None,
+impl BookFold {
+    /// D6's cap rows for an admission that adds a tombstone or a
+    /// reservation: `None` when `live − ready + 1 ≤ 256` (step 4 retires
+    /// the ready ones first), else the first row of the refusal that holds.
+    /// Every count is at most `live`, so no difference underflows.
+    fn held(self) -> Option<TombstoneHeld> {
+        let after_ready = self.live - self.ready;
+        // Canary `inf_canary_ns_cap_unreserved`: the verdict forgets the
+        // slot the admission itself takes.
+        let taken = usize::from(!cfg!(inf_canary_ns_cap_unreserved));
+        if after_ready + taken <= DROPPED_NS_MAX {
+            return None;
         }
-    }
-}
-
-/// Bound on creates in flight between their catalog swap and their
-/// fan's completion (ADR-0103 D2). At the cap the origin answers a
-/// typed `BUSY` before requesting; the writer refuses too, so a race of
-/// origins past the gauge cannot overshoot.
-pub const PENDING_CREATE_MAX: usize = 256;
-
-/// The catalog writer's pending-create set (ADR-0103 D2): every
-/// namespace whose definition is durable but whose fan may not have
-/// reached every cell. Merged into each payload so a concurrent
-/// origin's stale export cannot drop an accepted definition; retired
-/// once the origin's fan completed (every export carries it from then
-/// on) or a `DROP` names the id. Single owner — the thread or the sim's
-/// inline inbox. Empty at boot: `META` already holds every accepted
-/// create.
-#[derive(Debug, Default)]
-struct PendingCreates {
-    /// Sorted by id.
-    entries: Vec<NsSpec>,
-}
-
-impl PendingCreates {
-    fn retire(&mut self, id: u32) {
-        self.entries.retain(|e| e.id.0 != id);
-    }
-
-    /// Adds every pending spec the payload lacks (by id).
-    fn merge(&self, catalog: &mut NsCatalog) {
-        for spec in &self.entries {
-            if !catalog.entries.iter().any(|e| e.id == spec.id) {
-                catalog.entries.push(spec.clone());
-            }
+        if after_ready - self.paceable < DROPPED_NS_MAX {
+            return Some(TombstoneHeld::Paceable);
         }
-    }
-
-    /// Decides one create against the merged payload and, when
-    /// accepted, adds it to both.
-    fn admit(&mut self, catalog: &mut NsCatalog, spec: NsSpec) -> CreateOutcome {
-        if catalog.entries.iter().any(|e| e.name == spec.name) {
-            return CreateOutcome::NameExists;
+        if self.blocked < DROPPED_NS_MAX {
+            return Some(TombstoneHeld::Busy);
         }
-        if self.entries.len() >= PENDING_CREATE_MAX {
-            return CreateOutcome::AtCapacity;
-        }
-        let at = self.entries.partition_point(|e| e.id < spec.id);
-        self.entries.insert(at, spec.clone());
-        catalog.entries.push(spec);
-        CreateOutcome::Accepted
-    }
-
-    fn len(&self) -> usize {
-        self.entries.len()
+        Some(TombstoneHeld::Limit)
     }
 }
 
-/// The catalog writer's live tombstone set (ADR-0100 D2/D3): one entry
-/// per durable namespace dropped since every cell last published a
-/// `MANIFEST` past the drop. Single owner — the thread (or the sim's
-/// inline inbox); cells only read the boot snapshot the catalog carries.
-#[derive(Debug, Default)]
-struct DropTombstones {
-    /// `(namespace id, checkpoint epoch that retires it)` — unstamped
-    /// entries never retire. Kept sorted by id (the wire order).
-    entries: Vec<(u32, Option<u64>)>,
+/// The catalog writer's tombstone book (ADR-0189 D6, D7): one entry per
+/// durable namespace dropped and not yet retired, sorted by id (the wire
+/// order), reserved at boot to the ceiling so no admission allocates.
+/// Single owner, the writer; cells read only the boot snapshot the catalog
+/// carries.
+#[derive(Debug)]
+struct TombstoneBook {
+    entries: Vec<Tombstone>,
+    /// `max(DROPPED_NS_MAX, T)` for the boot's `T` tombstones, at most
+    /// `DROPPED_IDS_MAX` (the decoder refuses more): the most this boot's
+    /// book holds, since no admission leaves it above the cap.
+    ceiling: usize,
 }
 
-/// Bound on live tombstones (ADR-0100 D3): at the cap a `DROP` waits for
-/// its own node-wide checkpoint before persisting, so `META` never
-/// carries more than 1 KiB of tombstones.
+/// Bound on live tombstones and reserved slots (ADR-0189 D6), the writer's
+/// alone: a durable `CREATE` or a `DROP` that leaves a tombstone is
+/// admitted only while `live − ready + 1 ≤ 256`; past it the writer
+/// refuses it before any effect (`TombstoneCapacity`), and the program
+/// paces once or answers the refusal. So `META` never carries more than 1
+/// KiB of tombstones outside a boot over the cap (D7).
 pub const DROPPED_NS_MAX: usize = 256;
 
-impl DropTombstones {
-    fn seed(ids: &[u32]) -> DropTombstones {
-        DropTombstones { entries: ids.iter().map(|&id| (id, None)).collect() }
+impl TombstoneBook {
+    /// The boot's book (ADR-0189 D7): every tombstone `META` carries,
+    /// unstamped, its ceiling `max(256, T)`, reserved now.
+    fn seed(ids: &[u32]) -> TombstoneBook {
+        let ceiling = ids.len().max(DROPPED_NS_MAX);
+        let mut entries = Vec::with_capacity(ceiling);
+        entries.extend(ids.iter().map(|&id| Tombstone { id, stamp: 0 }));
+        TombstoneBook { entries, ceiling }
     }
 
+    /// A durable drop's tombstone, unstamped; (I) keeps the book within
+    /// the ceiling it reserved, so this never reallocates.
     fn add(&mut self, id: u32) {
-        match self.entries.binary_search_by_key(&id, |e| e.0) {
+        match self.entries.binary_search_by_key(&id, |t| t.id) {
             Ok(_) => {}
-            Err(at) => self.entries.insert(at, (id, None)),
+            Err(at) => self.entries.insert(at, Tombstone { id, stamp: 0 }),
         }
     }
 
-    fn stamp(&mut self, id: u32, ckpt_epoch: u64) {
-        if let Ok(at) = self.entries.binary_search_by_key(&id, |e| e.0) {
-            // A re-stamp only ever comes from boot (every survivor gets
-            // one fresh epoch); a later stamp never lowers the bar.
-            let slot = &mut self.entries[at].1;
-            *slot = Some(slot.map_or(ckpt_epoch, |e| e.max(ckpt_epoch)));
+    /// Stamps `id` with the checkpoint epoch that retires it; a later stamp
+    /// never lowers the bar.
+    fn stamp(&mut self, id: u32, epoch: u64) {
+        if let Ok(at) = self.entries.binary_search_by_key(&id, |t| t.id) {
+            let stamp = &mut self.entries[at].stamp;
+            *stamp = (*stamp).max(epoch);
         }
     }
 
-    /// Stamps every unstamped survivor (the boot re-stamp, ADR-0100 D3).
-    fn stamp_unstamped(&mut self, ckpt_epoch: u64) {
-        for entry in &mut self.entries {
-            if entry.1.is_none() {
-                entry.1 = Some(ckpt_epoch);
+    /// Stamps every unstamped tombstone (the boot re-stamp, ADR-0159 A1.2).
+    fn stamp_unstamped(&mut self, epoch: u64) {
+        for t in self.entries.iter_mut().filter(|t| t.stamp == 0) {
+            t.stamp = epoch;
+        }
+    }
+
+    /// Ready (ADR-0189 D6 (i), (ii)): stamped at an epoch every cell has
+    /// published, `min_published`.
+    fn ready(t: &Tombstone, min_published: u64) -> bool {
+        t.stamp != 0 && t.stamp <= min_published
+    }
+
+    /// Retires every ready tombstone (an accepted answer's step 4).
+    fn retire(&mut self, min_published: u64) {
+        self.entries.retain(|t| !Self::ready(t, min_published));
+    }
+
+    /// The fold at `min_published`, the pending drop's id aside: one pass
+    /// over at most the ceiling's entries, at DDL rate.
+    fn fold(&self, min_published: u64, pending_drop: Option<NsId>) -> BookFold {
+        let mut fold = BookFold { live: self.entries.len(), ..BookFold::default() };
+        for t in &self.entries {
+            if Self::ready(t, min_published) {
+                fold.ready += 1;
+            } else if t.stamp != 0 {
+                fold.paceable += 1;
+            } else if pending_drop != Some(NsId(t.id)) {
+                fold.blocked += 1;
             }
         }
+        fold
     }
 
-    /// Retires every tombstone whose checkpoint every cell has published.
-    fn retire(&mut self, min_published: u64) {
-        self.entries.retain(|(_, epoch)| !epoch.is_some_and(|e| e <= min_published));
+    /// Whether `id` is tombstoned: ids never reuse, so an entry an export
+    /// carries for it is replica lag from a concurrent DDL, never a live
+    /// namespace.
+    fn contains(&self, id: u32) -> bool {
+        self.entries.binary_search_by_key(&id, |t| t.id).is_ok()
     }
 
-    /// Merges the set into `catalog` (ADR-0100 D2): the payload carries
-    /// the ids, and an entry whose id is tombstoned is dropped — ids
-    /// never reuse, so such an entry is replica lag from a concurrent
-    /// DDL, never a live namespace.
-    fn reconcile(&self, catalog: &mut NsCatalog) {
-        catalog.dropped = self.entries.iter().map(|e| e.0).collect();
-        if !self.entries.is_empty() {
-            catalog
-                .entries
-                .retain(|e| self.entries.binary_search_by_key(&e.id.0, |t| t.0).is_err());
-        }
+    /// The tombstoned ids, ascending (the payload's `dropped`).
+    fn ids(&self) -> Vec<u32> {
+        self.entries.iter().map(|t| t.id).collect()
     }
 
     fn len(&self) -> usize {
         self.entries.len()
+    }
+}
+
+/// The book's node gauges as one word (ADR-0189 D11): live, ready,
+/// paceable and blocked, 16 bits each (the ceiling is at most 4,096), as
+/// the writer's last fold found them. Observation only: no decision reads
+/// it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TombstoneGauges {
+    pub live: u16,
+    pub ready: u16,
+    pub paceable: u16,
+    pub blocked: u16,
+}
+
+impl TombstoneGauges {
+    fn of(fold: BookFold) -> TombstoneGauges {
+        let narrow = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+        TombstoneGauges {
+            live: narrow(fold.live),
+            ready: narrow(fold.ready),
+            paceable: narrow(fold.paceable),
+            blocked: narrow(fold.blocked),
+        }
+    }
+
+    fn pack(self) -> u64 {
+        u64::from(self.live)
+            | u64::from(self.ready) << 16
+            | u64::from(self.paceable) << 32
+            | u64::from(self.blocked) << 48
+    }
+
+    fn unpack(word: u64) -> TombstoneGauges {
+        let field = |shift: u32| u16::try_from((word >> shift) & 0xFFFF).unwrap_or(u16::MAX);
+        TombstoneGauges {
+            live: field(0),
+            ready: field(16),
+            paceable: field(32),
+            blocked: field(48),
+        }
+    }
+}
+
+/// One position of the writer's grant book (ADR-0148 D2): one tiered
+/// namespace's lifetime, from its `CREATE`'s acceptance until every cell's
+/// receipt for it returns the position.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Grant {
+    Vacant,
+    /// Granted by an accepted `CREATE` whose `META` write has not returned:
+    /// it lasts inside that one answer.
+    Reserved(NsId),
+    /// The catalog names the namespace: a cell may install its owner.
+    Declared(NsId),
+    /// A durable drop or rollback removed it from the catalog; the
+    /// position returns once every cell's receipt names this id.
+    Retiring(NsId),
+}
+
+// The writer's book is a measured term of the boot (ADR-0148 D4): at most
+// 512 B a node, inline in the writer.
+const _: () = assert!(size_of::<[Grant; POSITIONS]>() <= 512, "the writer's book is 512 B at most");
+
+/// The writer's book's bytes (the boot test reports it beside the bill).
+pub(crate) const fn writer_book_bytes() -> usize {
+    size_of::<[Grant; POSITIONS]>()
+}
+
+/// The Retiring positions whose every cell's receipt names their id, read
+/// once at a tiered `CREATE`'s admission (ADR-0148 D4), one bit a position:
+/// returned to Vacant only if that `CREATE` is accepted.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct Reclaimable(u64);
+
+// One bit a position.
+const _: () = assert!(POSITIONS <= 64, "a position's bit fits a Reclaimable word");
+
+/// Where an admitted tiered `CREATE`'s grant lands (ADR-0148 D2, D4): the
+/// lowest position that is Vacant once the reclaimable positions return.
+/// Made only by [`TierNamespaceGrants::room`] and consumed by
+/// [`TierNamespaceGrants::grant`]: an accepted tiered `CREATE` holds the
+/// position its own verdict found, and one the book had no room for is
+/// refused before it can be accepted.
+#[derive(Debug)]
+struct GrantPermit {
+    pos: GrantPos,
+    reclaimable: Reclaimable,
+}
+
+/// The writer's tiered grant book (ADR-0148 D2, D4): one grant a position,
+/// [`TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX`] positions, each one position
+/// on every cell. It moves only on an accepted answer (step 4: a grant, a
+/// flip to Retiring, the reclaim) and publishes Declared and Retiring
+/// through the directory at step 7, after the `META` write and before the
+/// epoch; a refusal moves nothing. Single owner, the writer; cells read the
+/// directory and write the receipts.
+#[derive(Debug)]
+struct TierNamespaceGrants {
+    book: [Grant; POSITIONS],
+    directory: DirectoryWriter,
+    receipts: Arc<ReceiptBoard>,
+}
+
+impl TierNamespaceGrants {
+    /// The boot's book (ADR-0148 D2's boot row): the catalog's `k` live
+    /// tiered definitions Declared at positions `0..k` in id order, every
+    /// other position Vacant, published before any cell exists. Drop
+    /// tombstones take no position. The boot's count refused `k > 64`
+    /// first, so every definition has its position.
+    fn seed(
+        catalog: Option<&NsCatalog>,
+        mut directory: DirectoryWriter,
+        receipts: Arc<ReceiptBoard>,
+    ) -> TierNamespaceGrants {
+        // The live tiered ids, inline: the boot's count refused more than
+        // `POSITIONS` first, so they fit, and the boot allocates nothing here
+        // beyond its reservation (ADR-0148 D4).
+        let mut live = [NsId(0); POSITIONS];
+        let mut count = 0;
+        let tiered =
+            catalog.into_iter().flat_map(|c| c.entries.iter()).filter(|e| e.tier.is_some());
+        for entry in tiered.take(POSITIONS) {
+            live[count] = entry.id;
+            count += 1;
+        }
+        let live = &mut live[..count];
+        live.sort_unstable();
+        let mut book = [Grant::Vacant; POSITIONS];
+        for (pos, &id) in directory.positions().zip(live.iter()) {
+            book[pos.index()] = Grant::Declared(id);
+            directory.stage_declared(pos, id.0);
+        }
+        // No epoch is published at boot: each cell is built after this, on
+        // a thread its assembly starts, and reads the directory as it is.
+        let _boot = directory.publish();
+        TierNamespaceGrants { book, directory, receipts }
+    }
+
+    /// Step 1 for a tiered `CREATE` (ADR-0148 D1, D4; ADR-0172 D3): the
+    /// reclaim scan, each Retiring position whose every cell's receipt
+    /// names its exact id (at most `Retiring × cells` receipt loads, at DDL
+    /// rate, on the writer), then the permit for the lowest position Vacant
+    /// or reclaimable; else why every position is held, step 2's tiered
+    /// row: `Busy` while one is Retiring (it returns with no operator),
+    /// `Limit` when every one names a live namespace.
+    fn room(&self) -> Result<GrantPermit, TieredHeld> {
+        let mut bits = 0u64;
+        for pos in self.directory.positions() {
+            if let Grant::Retiring(id) = self.book[pos.index()]
+                && self.receipts.all_name(pos, id.0)
+            {
+                bits |= 1 << pos.index();
+            }
+        }
+        let free = |pos: &GrantPos| {
+            self.book[pos.index()] == Grant::Vacant || bits & 1 << pos.index() != 0
+        };
+        if let Some(pos) = self.directory.positions().find(free) {
+            return Ok(GrantPermit { pos, reclaimable: Reclaimable(bits) });
+        }
+        if self.book.iter().any(|grant| matches!(grant, Grant::Retiring(_))) {
+            return Err(TieredHeld::Busy);
+        }
+        Err(TieredHeld::Limit)
+    }
+
+    /// Step 4 for an accepted tiered `CREATE` of `id`: the reclaimed
+    /// positions return to Vacant, then the permit's position, the lowest
+    /// Vacant one now, is Reserved, its Declared staged for step 7.
+    fn grant(&mut self, permit: GrantPermit, id: NsId) {
+        let GrantPermit { pos, reclaimable } = permit;
+        for at in self.directory.positions() {
+            if reclaimable.0 & 1 << at.index() != 0 {
+                self.book[at.index()] = Grant::Vacant;
+                self.directory.vacate(at);
+            }
+        }
+        debug_assert_eq!(self.book[pos.index()], Grant::Vacant, "a permit names a free position");
+        self.book[pos.index()] = Grant::Reserved(id);
+        self.directory.reserve(pos, id.0);
+        self.directory.stage_declared(pos, id.0);
+    }
+
+    /// Step 4 for an accepted drop or rollback of `id`: its grant, when it
+    /// holds one, Retiring, staged for step 7. A drop of a namespace with no
+    /// tier holds none.
+    fn retire(&mut self, id: NsId) {
+        let held =
+            self.directory.positions().find(|pos| self.book[pos.index()] == Grant::Declared(id));
+        if let Some(pos) = held {
+            self.book[pos.index()] = Grant::Retiring(id);
+            self.directory.stage_retiring(pos, id.0);
+        }
+    }
+
+    /// The canary's early return of `id`'s grant (see `notice`).
+    fn release_planted(&mut self, id: NsId) {
+        let held =
+            self.directory.positions().find(|pos| self.book[pos.index()] == Grant::Declared(id));
+        if let Some(pos) = held {
+            self.book[pos.index()] = Grant::Vacant;
+            self.directory.vacate(pos);
+        }
+    }
+
+    /// Step 7: the Reserved grant becomes Declared, and the directory makes
+    /// every staged store, then bumps its generation, before the epoch.
+    fn publish(&mut self) -> DirectoryPublished {
+        for grant in &mut self.book {
+            if let Grant::Reserved(id) = *grant {
+                *grant = Grant::Declared(id);
+            }
+        }
+        self.directory.publish()
     }
 }
 
 /// Control-thread work (single receiver, bounded — L3).
-enum ControlMsg {
-    Persist(PersistReq),
-    /// The origin fanned a `DROP` and requested the node-wide checkpoint
-    /// that retires its tombstone (ADR-0100 D3).
-    StampDrop {
-        id: u32,
-        ckpt_epoch: u64,
-    },
-    /// The origin's `CREATE` fan completed (or failed) — every cell's
-    /// export carries the namespace from now on, so its pending entry
-    /// retires (ADR-0103 D2).
-    CreateApplied {
-        id: u32,
-    },
+pub(crate) enum ControlMsg {
+    /// A catalog request, answered in queue order.
+    Request(CatalogRequest),
+    /// A DDL's notice: it retires the writer's pending DDL.
+    Notice(DdlNotice),
     /// Blocking unlink delegated by a cell (M2-S11/S12, ADR-0017):
     /// freeing a truncated segment's or stale checkpoint's pages is
     /// O(file size) in the kernel — a measured multi-ms stall when done
@@ -1306,18 +1591,214 @@ enum ControlMsg {
     /// unit (below the durable manifest's floor / not the named `.ick`),
     /// so any thread may delete it; failure is re-collected by boot GC.
     Unlink(PathBuf),
+    /// The canary's wake as a message: the bell rings into this channel
+    /// instead of the worker's own wake.
+    #[cfg(inf_canary_retire_bell_in_channel)]
+    Wake,
+}
+
+/// The control thread's one-slot wake (ADR-0156 D3): the bell's ring and
+/// every control post send it, and only the worker's wait consumes it, so
+/// at most one wake is pending at any cell count and it holds no slot of
+/// the control channel. A full slot means a wake is already pending; a
+/// disconnected one, that the control thread is gone.
+#[derive(Clone)]
+pub(crate) struct RetireWake {
+    tx: mpsc::SyncSender<()>,
+    /// The canary's control channel, the planted wake's way in.
+    #[cfg(inf_canary_retire_bell_in_channel)]
+    planted: mpsc::SyncSender<ControlMsg>,
+}
+
+impl RetireWake {
+    /// The wake over `tx`, its planted channel `control` (the worker tests).
+    #[cfg(test)]
+    pub(crate) fn over(tx: mpsc::SyncSender<()>, control: &mpsc::SyncSender<ControlMsg>) -> Self {
+        let _ = control;
+        RetireWake {
+            tx,
+            #[cfg(inf_canary_retire_bell_in_channel)]
+            planted: control.clone(),
+        }
+    }
+
+    /// A wake whose receiver is gone: a ring sends into nothing (a
+    /// standalone test cell, whose worker the test steps).
+    #[cfg(test)]
+    pub(crate) fn unwired() -> RetireWake {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        RetireWake {
+            tx,
+            #[cfg(inf_canary_retire_bell_in_channel)]
+            planted: mpsc::sync_channel(1).0,
+        }
+    }
+}
+
+impl BellWake for RetireWake {
+    fn wake(&self) {
+        // Canary `inf_canary_retire_bell_in_channel`: the wake is a control
+        // message, which takes a message's slot and an iteration's turn.
+        #[cfg(inf_canary_retire_bell_in_channel)]
+        {
+            let _ = self.planted.try_send(ControlMsg::Wake);
+        }
+        #[cfg(not(inf_canary_retire_bell_in_channel))]
+        {
+            let _ = self.tx.try_send(());
+        }
+    }
+}
+
+/// The control channel's one sender: every message enters through
+/// [`post`](Self::post) or [`try_post`](Self::try_post), which send the
+/// worker's wake after the send, so a worker that found the channel empty
+/// and waits returns to take it.
+pub(crate) struct ControlSender {
+    tx: mpsc::SyncSender<ControlMsg>,
+    wake: RetireWake,
+}
+
+impl ControlSender {
+    /// The sender over `tx` and `wake` (the worker tests' poster).
+    #[cfg(test)]
+    pub(crate) fn over(tx: mpsc::SyncSender<ControlMsg>, wake: RetireWake) -> ControlSender {
+        ControlSender { tx, wake }
+    }
+
+    /// A blocking send, then the wake. A full channel waits for the next
+    /// receive (DDL-rate senders only).
+    pub(crate) fn post(&self, msg: ControlMsg) {
+        self.tx.send(msg).expect("control thread alive (fail-stop)");
+        inf_foundation::grants::wake_posted(&self.wake);
+    }
+
+    /// A send that never blocks, then the wake when it was sent; `false`
+    /// when the channel is full.
+    pub(crate) fn try_post(&self, msg: ControlMsg) -> bool {
+        let sent = self.tx.try_send(msg).is_ok();
+        if sent {
+            inf_foundation::grants::wake_posted(&self.wake);
+        }
+        sent
+    }
+}
+
+/// The catalog writer's node gauges and counters (ADR-0189 D11), node
+/// scope: every cell's `INFO` reads them as it renders, so no cell copies
+/// them each iteration, and no decision reads them.
+#[derive(Debug)]
+pub struct DdlGauges {
+    /// The catalog word: the highest request the writer answered.
+    word: Arc<CatalogWord>,
+    /// The tombstone book's gauge word ([`TombstoneGauges`]), stored by the
+    /// writer at each answer and stamp.
+    tombstones: AtomicU64,
+    /// 1 while the writer holds a pending DDL, else 0.
+    pending: AtomicU64,
+    /// Notices that matched no pending DDL (zero by design: the ticket
+    /// admits one DDL and each posts its own notice).
+    notices_stale: AtomicU64,
+    /// Pacing checkpoints the DDL programs issued at the cap.
+    paced: AtomicU64,
+    /// `Paceable` answers after a program's one pace (zero by design).
+    repaced: AtomicU64,
+    /// Durable DDLs refused at the cap, `-TRYAGAIN` and `-ERR`.
+    refused_busy: AtomicU64,
+    refused_limit: AtomicU64,
+    /// Tiered `CREATE`s refused with every lifetime held, `-TRYAGAIN` (a
+    /// grant Retiring) and `-ERR` (ADR-0148 D1).
+    tiered_refused_busy: AtomicU64,
+    tiered_refused_limit: AtomicU64,
+    /// `CREATE`s refused with the namespace id space spent (ADR-0148 D4).
+    ns_id_refused_exhausted: AtomicU64,
+}
+
+impl DdlGauges {
+    fn new(word: Arc<CatalogWord>) -> DdlGauges {
+        DdlGauges {
+            word,
+            tombstones: AtomicU64::new(0),
+            pending: AtomicU64::new(0),
+            notices_stale: AtomicU64::new(0),
+            paced: AtomicU64::new(0),
+            repaced: AtomicU64::new(0),
+            refused_busy: AtomicU64::new(0),
+            refused_limit: AtomicU64::new(0),
+            tiered_refused_busy: AtomicU64::new(0),
+            tiered_refused_limit: AtomicU64::new(0),
+            ns_id_refused_exhausted: AtomicU64::new(0),
+        }
+    }
+
+    /// The catalog word (`catalog_epoch`).
+    pub fn catalog_epoch(&self) -> u64 {
+        self.word.load()
+    }
+
+    /// The tombstone book's gauge word, read whole.
+    pub fn tombstones(&self) -> TombstoneGauges {
+        TombstoneGauges::unpack(self.tombstones.load(Ordering::Acquire))
+    }
+
+    /// 1 while the writer holds a pending DDL, else 0.
+    pub fn pending(&self) -> u64 {
+        self.pending.load(Ordering::Relaxed)
+    }
+
+    /// Notices that retired no pending DDL.
+    pub fn notices_stale(&self) -> u64 {
+        self.notices_stale.load(Ordering::Relaxed)
+    }
+
+    /// Pacing checkpoints the DDL programs issued at the cap.
+    pub fn paced(&self) -> u64 {
+        self.paced.load(Ordering::Relaxed)
+    }
+
+    /// `Paceable` answers after a program's one pace.
+    pub fn repaced(&self) -> u64 {
+        self.repaced.load(Ordering::Relaxed)
+    }
+
+    /// Durable DDLs refused at the cap, `(busy, limit)`.
+    pub fn refused_capacity(&self) -> (u64, u64) {
+        let busy = self.refused_busy.load(Ordering::Relaxed);
+        (busy, self.refused_limit.load(Ordering::Relaxed))
+    }
+
+    /// Tiered `CREATE`s refused with every lifetime held, `(busy, limit)`.
+    pub fn tiered_refused(&self) -> (u64, u64) {
+        let busy = self.tiered_refused_busy.load(Ordering::Relaxed);
+        (busy, self.tiered_refused_limit.load(Ordering::Relaxed))
+    }
+
+    /// `CREATE`s refused with the namespace id space spent.
+    pub fn ns_id_refused_exhausted(&self) -> u64 {
+        self.ns_id_refused_exhausted.load(Ordering::Relaxed)
+    }
 }
 
 /// Shared handle the assembly wires into every cell's plane.
 pub struct ControlHandle {
-    tx: mpsc::SyncSender<ControlMsg>,
+    sender: ControlSender,
+    /// The next namespace id (ADR-0148 D4): stored only by the catalog
+    /// writer, when it accepts the `CREATE` that reserved it;
+    /// [`NS_IDS_EXHAUSTED`] once the last id is issued.
     next_ns_id: AtomicU32,
     /// Index-id + generation allocators (M4.5-S03, ADR-0075 D1): both
     /// node-unique, allocated once, never reused — the ns-id discipline.
     next_index_id: AtomicU32,
     next_index_generation: AtomicU64,
-    next_epoch: AtomicU64,
-    persisted_epoch: Arc<AtomicU64>,
+    /// Catalog requests sent this boot (tests: a DDL parked on its answer
+    /// has sent its request). Not an epoch: the writer numbers requests
+    /// at dequeue.
+    requests_sent: AtomicU64,
+    /// The planted canary's send-time numbering.
+    #[cfg(inf_canary_ns_epoch_at_send)]
+    numbered: AtomicU64,
+    /// The catalog word (ADR-0189 D2), stored by the writer alone.
+    word: Arc<CatalogWord>,
     /// The boot's checkpoint clock and the board it owns (ADR-0159 A1):
     /// the all-cell request word and the per-cell request/publication
     /// slots. Only a partition credit advances the clock.
@@ -1328,12 +1809,15 @@ pub struct ControlHandle {
     memory_board: Arc<MemoryBoard>,
     /// Per-cell index readiness (M4.5-S03, ADR-0075 D5).
     index_board: Arc<IndexBoard>,
-    /// Live drop tombstones (ADR-0100 D7 gauge + the D3 cap input);
-    /// written by the catalog writer after every change.
-    drop_tombstones: AtomicUsize,
-    /// Creates in flight in the writer's pending set (ADR-0103 D2 —
-    /// the cap input); written by the writer after every change.
-    pending_creates: AtomicUsize,
+    /// The catalog writer's node gauges and counters (ADR-0189 D11),
+    /// shared with every cell's `INFO`.
+    gauges: Arc<DdlGauges>,
+    /// The tiered grant directory the writer's book publishes (ADR-0148
+    /// D2), which every cell reads; every cell's terminal receipts, each
+    /// cell writing its own row and the writer's reclaim reading them all
+    /// (D4); and the retirement board with the node's one bell (ADR-0156
+    /// D3). Reserved at boot, before any cell.
+    tier: TierShared,
     /// The node-wide DDL ticket (ADR-0108 D1): `0` = free, `cell + 1` =
     /// the cell whose DDL program holds it. One namespace DDL program
     /// runs at a time — its fan legs never cross another's. Taken by
@@ -1362,15 +1846,126 @@ impl Drop for DdlTicket {
     }
 }
 
+impl DdlTicket {
+    /// Reserves the next namespace id for this program's `CREATE`, moving
+    /// nothing (ADR-0148 D4): the writer moves the counter past it only
+    /// when it accepts that `CREATE`. One program holds the ticket, so the
+    /// value it reads is the next one the writer will commit; the previous
+    /// program's commit is ordered before it by that program's read of its
+    /// answer and its ticket's release.
+    ///
+    /// # Errors
+    /// `IdentityExhausted(Namespace)` once the last id, `u32::MAX − 1`, is
+    /// issued: before any effect, for the data directory's life.
+    pub fn reserve_ns_id(&self) -> Result<NsIdReservation<'_>, Refusal> {
+        let next = self.handle.next_ns_id.load(Ordering::Acquire);
+        // Canary `inf_canary_ns_id_wraps`: the exhaustion check is off, so a
+        // spent counter issues `u32::MAX` and the commit wraps (the wire's
+        // ids oracle sees an id with no successor).
+        if next == NS_IDS_EXHAUSTED && !cfg!(inf_canary_ns_id_wraps) {
+            self.handle.gauges.ns_id_refused_exhausted.fetch_add(1, Ordering::Relaxed);
+            return Err(Refusal::IdentityExhausted(Domain::Namespace));
+        }
+        // Canary `inf_canary_ns_id_spent_on_refusal`: the reservation commits
+        // when made, as an allocator would, so every refusal after it spends
+        // the id (the wire's ids oracle sees the next id skip).
+        if cfg!(inf_canary_ns_id_spent_on_refusal) {
+            self.handle.next_ns_id.store(next.wrapping_add(1), Ordering::Release);
+        }
+        Ok(NsIdReservation { id: NsId(next), ticket: PhantomData })
+    }
+}
+
+/// A namespace id one `CREATE` reserved under the DDL ticket (ADR-0148
+/// D4): the counter's next value, not moved. Made only by
+/// [`DdlTicket::reserve_ns_id`] and consumed by
+/// [`ControlHandle::request_create`]; dropped, it changes nothing, so a
+/// `CREATE` refused before its request spends no id. Not `Clone`, and it
+/// borrows its ticket, so it cannot outlive the program that holds it; the
+/// writer still refuses one that is not the counter's next (`IdNotNext`).
+#[derive(Debug)]
+pub struct NsIdReservation<'t> {
+    id: NsId,
+    ticket: PhantomData<&'t DdlTicket>,
+}
+
+impl NsIdReservation<'_> {
+    /// The reserved id.
+    #[must_use]
+    pub fn id(&self) -> NsId {
+        self.id
+    }
+}
+
 impl ControlHandle {
-    /// Live drop tombstones in the catalog writer (ADR-0100 D3/D7).
-    pub fn drop_tombstones(&self) -> usize {
-        self.drop_tombstones.load(Ordering::Relaxed)
+    /// The writer's node gauges and counters (ADR-0189 D11), which every
+    /// cell's `INFO` reads as it renders.
+    #[must_use]
+    pub fn ddl_gauges(&self) -> &Arc<DdlGauges> {
+        &self.gauges
     }
 
-    /// Creates in flight in the writer's pending set (ADR-0103 D2).
-    pub fn pending_creates(&self) -> usize {
-        self.pending_creates.load(Ordering::Relaxed)
+    /// Live drop tombstones, as the writer's last fold found them
+    /// (ADR-0189 D11).
+    pub fn drop_tombstones(&self) -> usize {
+        usize::from(self.tombstone_gauges().live)
+    }
+
+    /// The tombstone book's gauge word, read whole (ADR-0189 D11).
+    #[must_use]
+    pub fn tombstone_gauges(&self) -> TombstoneGauges {
+        self.gauges.tombstones()
+    }
+
+    /// Node counter: pacing checkpoints the DDL programs issued at the cap.
+    pub fn ddl_paced(&self) -> u64 {
+        self.gauges.paced()
+    }
+
+    /// Node counter: `Paceable` answers after a program's one pace, each
+    /// answered as `Busy` (zero by design: one pace suffices, ADR-0189 D6).
+    pub fn ddl_repaced(&self) -> u64 {
+        self.gauges.repaced()
+    }
+
+    /// Node counters: durable DDLs refused at the cap, `(busy, limit)`.
+    pub fn drop_refused_capacity(&self) -> (u64, u64) {
+        self.gauges.refused_capacity()
+    }
+
+    /// Counts a pacing checkpoint a DDL program issued.
+    pub(crate) fn note_ddl_paced(&self) {
+        self.gauges.paced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a `Paceable` answer after the program's one pace.
+    pub(crate) fn note_ddl_repaced(&self) {
+        self.gauges.repaced.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a durable DDL refused at the cap as the client sees it.
+    pub(crate) fn note_capacity_refused(&self, busy: bool) {
+        let gauges = &self.gauges;
+        let counter = if busy { &gauges.refused_busy } else { &gauges.refused_limit };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a tiered `CREATE` refused with every lifetime held, as the
+    /// client sees it.
+    pub(crate) fn note_tiered_refused(&self, busy: bool) {
+        let gauges = &self.gauges;
+        let counter = if busy { &gauges.tiered_refused_busy } else { &gauges.tiered_refused_limit };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Node gauge: 1 while the writer holds a pending DDL (ADR-0189 D11).
+    pub fn ddl_pending(&self) -> u64 {
+        self.gauges.pending()
+    }
+
+    /// Node counter: notices that retired no pending DDL (ADR-0189 D11).
+    pub fn ddl_notices_stale(&self) -> u64 {
+        self.gauges.notices_stale()
     }
 
     /// Takes the DDL ticket for `cell` (ADR-0108 D1), or `None` while
@@ -1393,27 +1988,15 @@ impl ControlHandle {
         self.ddl_generation.load(Ordering::Acquire)
     }
 
-    /// The origin's post-fan notice for a `CREATE` (ADR-0103 D2): the
-    /// pending entry retires — every cell's export carries it now.
-    pub fn create_applied(&self, id: u32) {
-        self.tx.send(ControlMsg::CreateApplied { id }).expect("control thread alive (fail-stop)");
+    /// A DDL's notice to the writer (ADR-0189 D5), a blocking send like
+    /// every request: it retires the pending DDL of its own kind and id.
+    pub(crate) fn post_notice(&self, notice: DdlNotice) {
+        self.sender.post(ControlMsg::Notice(notice));
     }
-
-    /// The origin's post-fan notice (ADR-0100 D3): `id`'s tombstone
-    /// retires once every cell publishes `ckpt_epoch`.
-    pub fn stamp_drop(&self, id: u32, ckpt_epoch: u64) {
-        self.tx
-            .send(ControlMsg::StampDrop { id, ckpt_epoch })
-            .expect("control thread alive (fail-stop)");
-    }
-    /// Allocates one namespace id (never reused — ADR-0015 D2).
-    pub fn alloc_ns_id(&self) -> u32 {
-        self.next_ns_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// The id the allocator would hand out next (catalog `next_id`).
+    /// The next namespace id (the catalog's `next_id`): the id a
+    /// `CREATE` reserves, [`NS_IDS_EXHAUSTED`] once none is left.
     pub fn next_ns_id(&self) -> u32 {
-        self.next_ns_id.load(Ordering::Relaxed)
+        self.next_ns_id.load(Ordering::Acquire)
     }
 
     /// Allocates one index id (never reused — ADR-0075 D1).
@@ -1442,62 +2025,102 @@ impl ControlHandle {
         &self.index_board
     }
 
-    /// Queues `catalog` for a durable swap; returns the epoch to await.
-    /// The bounded channel makes DDL admission explicit: a full queue
-    /// blocks the *sender* briefly (DDL-rate traffic, never the data path
-    /// of other connections — the pump yields between commands).
-    pub fn request_persist(&self, catalog: NsCatalog) -> u64 {
-        self.send_persist(catalog, None, None, None)
-    }
-
-    /// [`request_persist`](Self::request_persist) for a `DROP` of
-    /// namespace `id`: a durable namespace's tombstone joins the payload
-    /// (ADR-0100 D2, `tombstone`); any mode retires from the
-    /// pending-create set (ADR-0103 D2).
-    pub fn request_persist_drop(&self, catalog: NsCatalog, id: u32, tombstone: bool) -> u64 {
-        self.send_persist(catalog, tombstone.then_some(id), Some(id), None)
-    }
-
-    /// [`request_persist`](Self::request_persist) for a `CREATE`
-    /// (ADR-0103 D1/D2): `spec` joins the payload and the writer's
-    /// pending set; the returned verdict is readable once
-    /// [`persisted`](Self::persisted) holds for the epoch.
-    pub fn request_persist_create(&self, catalog: NsCatalog, spec: NsSpec) -> (u64, CreateVerdict) {
-        let verdict = CreateVerdict::new();
-        let epoch = self.send_persist(catalog, None, None, Some((spec, verdict.clone())));
-        (epoch, verdict)
-    }
-
-    fn send_persist(
+    /// Asks the writer for the `META` that names `spec` (ADR-0103 D1,
+    /// ADR-0189 D2), its id the one `reservation` holds; the token reads
+    /// the answer. The writer commits the id only if it accepts.
+    #[must_use]
+    pub fn request_create(
         &self,
-        catalog: NsCatalog,
-        drop: Option<u32>,
-        dropped: Option<u32>,
-        create: Option<(NsSpec, CreateVerdict)>,
-    ) -> u64 {
-        let epoch = self.next_epoch.fetch_add(1, Ordering::Relaxed) + 1;
-        self.tx
-            .send(ControlMsg::Persist(PersistReq { catalog, epoch, drop, dropped, create }))
-            .expect("control thread alive (fail-stop)");
-        epoch
+        export: NsCatalog,
+        spec: NsSpec,
+        reservation: NsIdReservation<'_>,
+    ) -> Requested<CreatePersisted> {
+        let (slot, requested) = ddl::answer_slot(spec.id);
+        let intent = Some(DdlIntent::Create { spec, reserved: reservation.id });
+        self.send_request(CatalogRequest::new(intent, export, Some(slot)));
+        requested
     }
 
+    /// Asks the writer for the `META` that drops namespace `id`, with its
+    /// tombstone when `tombstone` (a durable namespace, ADR-0100 D2).
+    #[must_use]
+    pub fn request_drop(
+        &self,
+        export: NsCatalog,
+        id: NsId,
+        tombstone: bool,
+    ) -> Requested<DropPersisted> {
+        let (slot, requested) = ddl::answer_slot(id);
+        let intent = Some(DdlIntent::Drop { id, tombstone });
+        self.send_request(CatalogRequest::new(intent, export, Some(slot)));
+        requested
+    }
+
+    /// Asks the writer for a `META` shaped from `export`, the new
+    /// configuration of namespace `id` already in it (`SET` applies and
+    /// fans first, ADR-0015 D3).
+    #[must_use]
+    pub fn request_set(&self, export: NsCatalog, id: NsId) -> Requested<SetPersisted> {
+        let (slot, requested) = ddl::answer_slot(id);
+        self.send_request(CatalogRequest::new(None, export, Some(slot)));
+        requested
+    }
+
+    /// Queues a `META` shaped from `export` with no answer to wait for
+    /// (cell 0's index-readiness persist, ADR-0075 D4). The bounded channel
+    /// makes admission explicit: a full queue blocks the *sender* briefly
+    /// (DDL-rate traffic, never the data path of other connections — the
+    /// pump yields between commands).
+    pub fn request_persist(&self, export: NsCatalog) {
+        self.send_request(CatalogRequest::new(None, export, None));
+    }
+
+    /// The one send of every catalog request: a blocking send on the
+    /// bounded channel, counted once sent. No epoch is taken here: the
+    /// writer numbers requests as it dequeues them (ADR-0189 D2).
+    fn send_request(&self, req: CatalogRequest) {
+        #[cfg(inf_canary_ns_epoch_at_send)]
+        let req =
+            CatalogRequest { numbered: self.numbered.fetch_add(1, Ordering::Relaxed) + 1, ..req };
+        // Test builds only: a test holds this sender here to order it
+        // after another (the point's row in `crate::fault`).
+        if inf_foundation::fault::fire(crate::fault::DDL_REQUEST_HELD) {
+            inf_foundation::fault::hold(crate::fault::DDL_REQUEST_HELD);
+        }
+        self.sender.post(ControlMsg::Request(req));
+        self.requests_sent.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Catalog requests sent this boot (tests: a DDL parked on its answer
+    /// has sent its request, answered or not).
+    #[must_use]
+    pub fn persist_requests_sent(&self) -> u64 {
+        self.requests_sent.load(Ordering::Relaxed)
+    }
     /// Delegates one blocking unlink to the control thread (M2-S11/S12).
     /// Non-blocking: `false` = queue full — the caller keeps the path and
     /// retries next MAINTAIN slice (bounded local queue, never a stall).
     pub fn request_unlink(&self, path: PathBuf) -> bool {
-        self.tx.try_send(ControlMsg::Unlink(path)).is_ok()
+        self.sender.try_post(ControlMsg::Unlink(path))
     }
 
-    /// True once every persist up to `epoch` is durable. Cells poll this
-    /// from MAINTAIN (one relaxed load) and wake their parked DDL pumps.
+    /// True once the writer has answered every request numbered at or
+    /// below `epoch` (the word covers it): each accepted one is durable.
+    /// A teardown hold reads it for a drop's epoch (ADR-0100 D5).
     pub fn persisted(&self, epoch: u64) -> bool {
-        self.persisted_epoch.load(Ordering::Acquire) >= epoch
+        self.word.covers(epoch)
     }
 
-    /// The highest durable epoch (the MAINTAIN edge-detection input).
+    /// The catalog word (the MAINTAIN edge-detection input, and the
+    /// `catalog_epoch` gauge).
     pub fn persisted_epoch(&self) -> u64 {
-        self.persisted_epoch.load(Ordering::Acquire)
+        self.word.load()
+    }
+
+    /// The word a request's token reads its answer against.
+    #[must_use]
+    pub fn catalog_word(&self) -> &CatalogWord {
+        &self.word
     }
 
     /// The checkpoint board (the request word and the per-cell
@@ -1528,6 +2151,33 @@ impl ControlHandle {
     pub fn memory_board(&self) -> &Arc<MemoryBoard> {
         &self.memory_board
     }
+
+    /// The tiered grant directory (ADR-0148 D2): a cell installs a tiered
+    /// namespace's owner only at the position it names Declared.
+    #[must_use]
+    pub fn tier_directory(&self) -> &Arc<GrantDirectory> {
+        &self.tier.directory
+    }
+
+    /// The node's retirement board (ADR-0156 D3): the one bell, each cell's
+    /// `closing` and the worker's counters.
+    #[must_use]
+    pub fn retire_board(&self) -> &Arc<RetireBoard> {
+        &self.tier.board
+    }
+
+    /// The control thread's wake, which a cell's bell ring sends.
+    pub(crate) fn retire_wake(&self) -> RetireWake {
+        self.sender.wake.clone()
+    }
+
+    /// Cell `cell`'s writer of its terminal receipts (ADR-0148 D4), the
+    /// first time it is asked for; `None` after, or for a cell the node
+    /// does not have.
+    #[must_use]
+    pub fn take_tier_receipts(&self, cell: u16) -> Option<ReceiptWriter> {
+        ReceiptBoard::writer(&self.tier.receipts, cell)
+    }
 }
 
 /// Reads the catalog at boot (`None` = fresh node). Corruption is a typed
@@ -1553,41 +2203,330 @@ pub fn load_catalog_from<F: inf_log::fs::SegmentFs>(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
-/// One catalog persist as the writer performs it (ADR-0015 D3 + ADR-0100
-/// D2/D3): counters cover their allocators, the drop joins the tombstone
-/// set, stamped tombstones every cell has checkpointed past retire, the
-/// set merges into the payload. Shared by the thread and the sim inbox
-/// so DST runs the same writer. Returns the encoded payload.
-fn prepare_persist(
-    handle: &ControlHandle,
-    tombstones: &mut DropTombstones,
-    pending: &mut PendingCreates,
-    req: PersistReq,
-) -> (Vec<u8>, u64) {
-    let mut catalog = req.catalog;
-    catalog.next_id = catalog.next_id.max(handle.next_ns_id());
-    catalog.index.next_id = catalog.index.next_id.max(handle.next_index_id());
-    catalog.index.next_generation =
-        catalog.index.next_generation.max(handle.next_index_generation());
-    if let Some(id) = req.dropped {
-        pending.retire(id);
+/// The catalog writer (ADR-0189 D3): `META`'s single writer and the
+/// catalog epoch's single owner, with the tombstone book and the one
+/// pending DDL. Its work per request is at DDL rate under one ticket:
+/// the book's fold is one pass over at most its ceiling's entries, and the
+/// verdict and the payload walk the export's E entries and I index
+/// records, each with a binary search over the T tombstones,
+/// `O((E + I)·log T)`. Both hosts (the control thread, the simulator's inline
+/// inbox) drive this one value, so the simulator runs the writer the node
+/// runs.
+struct CatalogWriter {
+    handle: Arc<ControlHandle>,
+    epochs: CatalogEpochs,
+    tombstones: TombstoneBook,
+    /// The tiered lifetimes' grant book (ADR-0148 D2).
+    grants: TierNamespaceGrants,
+    /// One at a time: the DDL ticket admits one program, whose notice
+    /// precedes its release.
+    pending: Option<PendingDdl>,
+}
+
+impl CatalogWriter {
+    /// Answers one request: number it and decide; a refusal is answered
+    /// with nothing written and nothing moved but the epoch and the word;
+    /// an acceptance moves the state, shapes the payload from it, writes
+    /// `META`, and only then answers.
+    ///
+    /// # Errors
+    /// The `META` swap failed: the host's fail-stop. The moved state dies
+    /// with the node.
+    fn answer<F: inf_log::fs::SegmentFs>(
+        &mut self,
+        req: CatalogRequest,
+        fs: &F,
+        data_dir: &Path,
+    ) -> std::io::Result<()> {
+        #[cfg(not(inf_canary_ns_epoch_at_send))]
+        let taken = self.epochs.take();
+        #[cfg(inf_canary_ns_epoch_at_send)]
+        let taken = self.epochs.take_numbered(req.numbered);
+        let min_published = self.handle.ckpt_board().min_published();
+        let CatalogRequest { intent, export, slot, .. } = req;
+        let room = self.tiered_room(intent.as_ref());
+        let fold = self.fold_at(min_published);
+        let permit = match self.decide(intent.as_ref(), &export, fold, room) {
+            Ok(permit) => permit,
+            Err(refusal) => {
+                if cfg!(inf_canary_ns_refusal_writes_meta) {
+                    write_meta(fs, data_dir, &self.shape(export).encode())?;
+                }
+                self.publish_gauges();
+                let published = self.grants.publish();
+                self.epochs.answer(taken, slot, DdlVerdict::Refused(refusal), published);
+                return Ok(());
+            }
+        };
+        self.tombstones.retire(min_published);
+        let adds_slot = self.adds_slot(intent.as_ref());
+        let payload = if cfg!(inf_canary_ns_intent_after_shape) {
+            let payload = self.shape(export).encode();
+            self.accept(intent, permit);
+            payload
+        } else {
+            self.accept(intent, permit);
+            self.shape(export).encode()
+        };
+        self.assert_capacity(adds_slot);
+        if cfg!(inf_canary_ns_answer_before_swap) {
+            self.publish_gauges();
+            let published = self.grants.publish();
+            self.epochs.answer(taken, slot, DdlVerdict::Accepted, published);
+            return write_meta(fs, data_dir, &payload);
+        }
+        write_meta(fs, data_dir, &payload)?;
+        self.publish_gauges();
+        let published = self.grants.publish();
+        self.epochs.answer(taken, slot, DdlVerdict::Accepted, published);
+        Ok(())
     }
-    if let Some(id) = req.drop {
-        tombstones.add(id);
+
+    /// Step 1's reclaim scan and room, for a tiered `CREATE` only (ADR-0148
+    /// D4): its grant's permit, or why every position is held. A readiness
+    /// persist, a `SET`, a `DROP` or a `CREATE` with no tier pays no receipt
+    /// load and holds no permit.
+    fn tiered_room(&self, intent: Option<&DdlIntent>) -> Result<Option<GrantPermit>, TieredHeld> {
+        match intent {
+            Some(DdlIntent::Create { spec, .. }) if spec.tier.is_some() => {
+                self.grants.room().map(Some)
+            }
+            Some(DdlIntent::Create { .. } | DdlIntent::Drop { .. }) | None => Ok(None),
+        }
     }
-    tombstones.retire(handle.ckpt_board().min_published());
-    // ADR-0103 D2: pending creates join before the tombstones prune, so
-    // a since-dropped pending entry is dropped like any other; the
-    // verdict is decided against the merged view and written before
-    // the epoch publishes (the origin reads it after `persisted`).
-    pending.merge(&mut catalog);
-    if let Some((spec, verdict)) = req.create {
-        verdict.set(pending.admit(&mut catalog, spec));
+
+    /// The book's fold at `min_published`, the pending drop aside.
+    fn fold_at(&self, min_published: u64) -> BookFold {
+        self.tombstones.fold(min_published, self.pending_drop())
     }
-    tombstones.reconcile(&mut catalog);
-    handle.drop_tombstones.store(tombstones.len(), Ordering::Relaxed);
-    handle.pending_creates.store(pending.len(), Ordering::Relaxed);
-    (catalog.encode(), req.epoch)
+
+    /// The pending DDL's id when it is a drop.
+    fn pending_drop(&self) -> Option<NsId> {
+        match &self.pending {
+            Some(PendingDdl::Drop(id)) => Some(*id),
+            Some(PendingDdl::Create(_)) | None => None,
+        }
+    }
+
+    /// The slot a pending durable `CREATE` reserves (ADR-0189 D3 step 4):
+    /// its rollback's tombstone takes it over.
+    fn reserved(&self) -> usize {
+        let durable = |spec: &NsSpec| spec.mode == NsMode::Durable;
+        usize::from(matches!(&self.pending, Some(PendingDdl::Create(spec)) if durable(spec)))
+    }
+
+    /// Whether accepting `intent` takes a tombstone slot: a durable
+    /// `CREATE`'s reservation, or a durable `DROP`'s tombstone other than a
+    /// rollback's, which takes over its `CREATE`'s.
+    fn adds_slot(&self, intent: Option<&DdlIntent>) -> bool {
+        match intent {
+            None => false,
+            Some(DdlIntent::Create { spec, .. }) => spec.mode == NsMode::Durable,
+            Some(DdlIntent::Drop { id, tombstone }) => {
+                let rollback = matches!(&self.pending, Some(PendingDdl::Create(s)) if s.id == *id);
+                *tombstone && !rollback
+            }
+        }
+    }
+
+    /// Assert (I) (ADR-0189 D6, N7), on the writer's own state after an
+    /// accepted request moved it: live tombstones and reserved slots fit
+    /// the ceiling the book reserved, and a step that took a slot leaves
+    /// them within the cap. The verdict precedes the move, so either firing
+    /// is the writer's own defect: a class-I fail-stop.
+    fn assert_capacity(&self, took_slot: bool) {
+        if cfg!(inf_canary_ns_cap_unreserved) {
+            return;
+        }
+        let held = self.tombstones.len() + self.reserved();
+        assert!(held <= self.tombstones.ceiling, "tombstones and reservations past the ceiling");
+        if took_slot {
+            assert!(held <= DROPPED_NS_MAX, "an admission left tombstones past the cap");
+        }
+    }
+
+    /// The verdict, pure on the writer's state, the request and the book's
+    /// fold: the first row of ADR-0189 D3's table that holds, after a
+    /// `CREATE`'s own check that its reserved id is the counter's next
+    /// (ADR-0148 D4). A tiered `CREATE` meets the grant book's row after
+    /// `NameExists` and before the tombstone cap (ADR-0148 D2): step 1's
+    /// `room`, which carries the grant's permit into an acceptance or why
+    /// every position is held into the refusal. The cap's rows (D6) refuse
+    /// a durable `CREATE` and a `DROP` that leaves a tombstone, a
+    /// rollback's never. `Ok` is the acceptance, with the permit a tiered
+    /// `CREATE` takes its grant by.
+    fn decide(
+        &self,
+        intent: Option<&DdlIntent>,
+        export: &NsCatalog,
+        fold: BookFold,
+        room: Result<Option<GrantPermit>, TieredHeld>,
+    ) -> Result<Option<GrantPermit>, DdlRefusal> {
+        let Some(intent) = intent else { return Ok(None) };
+        match intent {
+            DdlIntent::Create { spec, reserved } => {
+                let next = self.handle.next_ns_id();
+                // The canaries' reservation moved the counter or issued its
+                // spent value (`reserve_ns_id`): their writer commits as it.
+                let not_next = reserved.0 != next && !cfg!(inf_canary_ns_id_spent_on_refusal);
+                let spent = next == NS_IDS_EXHAUSTED && !cfg!(inf_canary_ns_id_wraps);
+                if *reserved != spec.id || not_next || spent {
+                    return Err(DdlRefusal::IdNotNext);
+                }
+                if self.pending.is_some() {
+                    return Err(DdlRefusal::PendingConflict);
+                }
+                let taken = export
+                    .entries
+                    .iter()
+                    .any(|e| e.name == spec.name && !self.tombstones.contains(e.id.0));
+                if taken {
+                    return Err(DdlRefusal::NameExists);
+                }
+                let permit = room.map_err(DdlRefusal::TieredCapacity)?;
+                match fold.held() {
+                    Some(held) if spec.mode == NsMode::Durable => {
+                        Err(DdlRefusal::TombstoneCapacity(held))
+                    }
+                    Some(_) | None => Ok(permit),
+                }
+            }
+            DdlIntent::Drop { id, tombstone } => match &self.pending {
+                // A rollback replaces its own `CREATE`, whose reservation
+                // pays for its tombstone: never refused.
+                Some(PendingDdl::Create(spec)) if spec.id == *id => Ok(None),
+                Some(PendingDdl::Create(_) | PendingDdl::Drop(_)) => {
+                    Err(DdlRefusal::PendingConflict)
+                }
+                None => match fold.held() {
+                    Some(held) if *tombstone => Err(DdlRefusal::TombstoneCapacity(held)),
+                    Some(_) | None => Ok(None),
+                },
+            },
+        }
+    }
+
+    /// An accepted request's state change (infallible): a `CREATE` commits
+    /// its id, a tiered one takes its grant at its verdict's permit (the
+    /// reclaimed positions returned first), and it becomes the pending DDL;
+    /// a `DROP` flips the namespace's grant to Retiring and becomes the
+    /// pending DDL (a rollback's `DROP` replaces its `CREATE`), and a
+    /// durable drop's tombstone joins the set, unstamped.
+    fn accept(&mut self, intent: Option<DdlIntent>, permit: Option<GrantPermit>) {
+        match intent {
+            None => {}
+            Some(DdlIntent::Create { spec, .. }) => {
+                self.commit_ns_id(spec.id);
+                if let Some(permit) = permit {
+                    self.grants.grant(permit, spec.id);
+                }
+                self.pending = Some(PendingDdl::Create(spec));
+            }
+            Some(DdlIntent::Drop { id, tombstone }) => {
+                self.grants.retire(id);
+                self.pending = Some(PendingDdl::Drop(id));
+                if tombstone {
+                    self.tombstones.add(id.0);
+                }
+            }
+        }
+    }
+
+    /// Moves the namespace-id counter past `id`, the `CREATE` just
+    /// accepted (ADR-0148 D4), before the payload is shaped, so the `META`
+    /// that names `id` carries `next_id = id + 1`. `decide` refused any id
+    /// that is not the counter's next or a counter with none left, so
+    /// `id < u32::MAX` and the successor is representable.
+    fn commit_ns_id(&self, id: NsId) {
+        if cfg!(inf_canary_ns_id_spent_on_refusal) {
+            return;
+        }
+        // The wrap canary's writer commits the spent value, as an unchecked
+        // allocator would: its oracle, not this check, must see it.
+        debug_assert!(
+            cfg!(inf_canary_ns_id_wraps) || id.0 < NS_IDS_EXHAUSTED,
+            "decide refused a spent counter"
+        );
+        let next = if cfg!(inf_canary_ns_id_wraps) { id.0.wrapping_add(1) } else { id.0 + 1 };
+        self.handle.next_ns_id.store(next, Ordering::Release);
+    }
+
+    /// The payload, from an export and the writer's state (ADR-0189 D3
+    /// step 5; ADR-0182 D1's strip): counters cover their allocators so
+    /// ids and generations never regress across restart (ADR-0015 D2,
+    /// ADR-0075 D1); a pending `CREATE` joins the entries if its id is
+    /// absent; a pending `DROP`'s id and every tombstoned id lose their
+    /// entry and every index record naming them; `dropped` is the set.
+    fn shape(&self, mut catalog: NsCatalog) -> NsCatalog {
+        let handle = &self.handle;
+        catalog.next_id = catalog.next_id.max(handle.next_ns_id());
+        catalog.index.next_id = catalog.index.next_id.max(handle.next_index_id());
+        catalog.index.next_generation =
+            catalog.index.next_generation.max(handle.next_index_generation());
+        let pending_drop = match &self.pending {
+            Some(PendingDdl::Create(spec)) => {
+                if !catalog.entries.iter().any(|e| e.id == spec.id) {
+                    catalog.entries.push(spec.clone());
+                }
+                None
+            }
+            // Canary `inf_canary_ns_pending_drop_kept`: the pending drop
+            // is not stripped from the payload.
+            Some(PendingDdl::Drop(id)) => (!cfg!(inf_canary_ns_pending_drop_kept)).then_some(*id),
+            None => None,
+        };
+        let gone = |id: NsId| pending_drop == Some(id) || self.tombstones.contains(id.0);
+        catalog.entries.retain(|e| !gone(e.id));
+        if !cfg!(inf_canary_ns_index_record_kept) {
+            catalog.index.entries.retain(|r| !gone(r.ns));
+        }
+        catalog.dropped = self.tombstones.ids();
+        catalog
+    }
+
+    /// A notice from a DDL's origin: it retires the pending DDL of its own
+    /// kind and id (a `DropFanned` with a stamp stamps the tombstone); any
+    /// other changes nothing and is counted.
+    fn notice(&mut self, notice: DdlNotice) {
+        let retires = match (&self.pending, notice) {
+            (Some(PendingDdl::Create(spec)), DdlNotice::CreateApplied { id }) => spec.id == id,
+            (Some(PendingDdl::Drop(pending)), DdlNotice::DropFanned { id, .. }) => *pending == id,
+            // Canary `inf_canary_ns_notice_at_replacement`: notices match
+            // by id alone, so a `CREATE`'s retires its rollback's drop.
+            (Some(PendingDdl::Drop(pending)), DdlNotice::CreateApplied { id }) => {
+                cfg!(inf_canary_ns_notice_at_replacement) && *pending == id
+            }
+            (Some(PendingDdl::Create(_)), DdlNotice::DropFanned { .. })
+            | (None, DdlNotice::CreateApplied { .. } | DdlNotice::DropFanned { .. }) => false,
+        };
+        if !retires {
+            self.handle.gauges.notices_stale.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.pending = None;
+        // Canary `inf_canary_grant_return_at_create_applied`: the grant
+        // returns at the CREATE's notice, while every cell holds its owner,
+        // so the next tiered CREATE is granted a position a cell holds.
+        if cfg!(inf_canary_grant_return_at_create_applied)
+            && let DdlNotice::CreateApplied { id } = notice
+        {
+            self.grants.release_planted(id);
+        }
+        match notice {
+            DdlNotice::DropFanned { id, stamp: Some(epoch) } => self.tombstones.stamp(id.0, epoch),
+            DdlNotice::DropFanned { stamp: None, .. } | DdlNotice::CreateApplied { .. } => {}
+        }
+        self.publish_gauges();
+    }
+
+    /// The writer's node gauges (ADR-0189 D11): the book's word, folded
+    /// now, and the pending DDL.
+    fn publish_gauges(&self) {
+        let fold = self.fold_at(self.handle.ckpt_board().min_published());
+        let gauges = &self.handle.gauges;
+        gauges.tombstones.store(TombstoneGauges::of(fold).pack(), Ordering::Release);
+        gauges.pending.store(u64::from(self.pending.is_some()), Ordering::Relaxed);
+    }
 }
 
 /// The receiving end of a detached control plane (M2-S19, ADR-0021 D2):
@@ -1599,11 +2538,15 @@ fn prepare_persist(
 /// run inside the deterministic loop.
 pub struct ControlInbox {
     rx: mpsc::Receiver<ControlMsg>,
+    /// The worker's one-slot wake, held so a ring finds it open; the
+    /// detached worker never waits on it (its receive is this drain).
+    _wake: mpsc::Receiver<()>,
     handle: Arc<ControlHandle>,
-    /// The writer's tombstone set (ADR-0100 D2) — inline, deterministic.
-    tombstones: DropTombstones,
-    /// The writer's pending-create set (ADR-0103 D2) — inline too.
-    pending: PendingCreates,
+    /// The writer itself — inline, deterministic.
+    writer: CatalogWriter,
+    /// A request [`ControlInbox::drain_requests`] took past its bound:
+    /// first in line for the next drain, so queue order holds.
+    next: Option<ControlMsg>,
 }
 
 impl std::fmt::Debug for ControlInbox {
@@ -1622,9 +2565,11 @@ impl ControlInbox {
         self.handle.ckpt_board().min_published()
     }
 
-    /// Drains queued control work against `fs`. A failed catalog swap is
-    /// an error (the control thread's fail-stop analog — the caller owns
-    /// the verdict); failed unlinks are ignored (boot GC re-collects).
+    /// Drains queued control work against `fs`, every queued catalog
+    /// request answered: bounded by what the queue holds (256 messages;
+    /// senders block on a full queue). A failed catalog swap is an error
+    /// (the control thread's fail-stop analog — the caller owns the
+    /// verdict); failed unlinks are ignored (boot GC re-collects).
     ///
     /// # Errors
     /// The catalog META swap failed — a DDL was acked against it (§8.4).
@@ -1633,86 +2578,177 @@ impl ControlInbox {
         fs: &F,
         data_dir: &Path,
     ) -> std::io::Result<()> {
-        while let Ok(msg) = self.rx.try_recv() {
+        self.drain_requests(fs, data_dir, None).map(|_| ())
+    }
+
+    /// [`drain`](Self::drain), answering at most `requests_max` catalog
+    /// requests when it is `Some` (every queued one when `None`): a
+    /// request past the bound stays queued, first in line for the next
+    /// drain. Returns the requests answered, refused ones included. Tests:
+    /// a harness lets one swap land and holds the next.
+    ///
+    /// # Errors
+    /// As [`drain`](Self::drain).
+    pub fn drain_requests<F: inf_log::fs::SegmentFs>(
+        &mut self,
+        fs: &F,
+        data_dir: &Path,
+        requests_max: Option<u32>,
+    ) -> std::io::Result<u32> {
+        let mut answered = 0u32;
+        while let Some(msg) = self.next.take().or_else(|| self.rx.try_recv().ok()) {
+            let is_request = match &msg {
+                ControlMsg::Request(_) => true,
+                ControlMsg::Notice(_) | ControlMsg::Unlink(_) => false,
+                #[cfg(inf_canary_retire_bell_in_channel)]
+                ControlMsg::Wake => false,
+            };
+            if is_request && requests_max == Some(answered) {
+                self.next = Some(msg);
+                break;
+            }
+            answered += u32::from(is_request);
             match msg {
-                ControlMsg::Persist(req) => {
-                    let (payload, epoch) =
-                        prepare_persist(&self.handle, &mut self.tombstones, &mut self.pending, req);
-                    write_meta(fs, data_dir, &payload)?;
-                    self.handle.persisted_epoch.store(epoch, Ordering::Release);
-                }
-                ControlMsg::StampDrop { id, ckpt_epoch } => {
-                    self.tombstones.stamp(id, ckpt_epoch);
-                }
-                ControlMsg::CreateApplied { id } => {
-                    self.pending.retire(id);
-                    self.handle.pending_creates.store(self.pending.len(), Ordering::Relaxed);
-                }
+                ControlMsg::Request(req) => self.writer.answer(req, fs, data_dir)?,
+                ControlMsg::Notice(notice) => self.writer.notice(notice),
                 ControlMsg::Unlink(path) => {
                     let _ = fs.remove_file(&path);
                 }
+                #[cfg(inf_canary_retire_bell_in_channel)]
+                ControlMsg::Wake => {}
             }
         }
-        Ok(())
+        Ok(answered)
     }
 }
 
 /// A detached control plane (M2-S19): the handle, the writer's inbox the
-/// host drains inline, and the boot's checkpoint issuers (ADR-0159 A1.2).
-pub type DetachedControl = (Arc<ControlHandle>, ControlInbox, CkptIssuers);
+/// host drains inline, the boot's checkpoint issuers (ADR-0159 A1.2), and
+/// the tier-file transport: the worker the host steps and the cells' parts
+/// it hands to their planes (ADR-0156 D3's planeless adapter).
+pub type DetachedControl<J> = (Arc<ControlHandle>, ControlInbox, CkptIssuers, DetachedTier<J>);
+
+/// A spawned control plane: the handle, the boot's checkpoint issuers, and
+/// each cell's tier-file transport part, in cell order, for the assembly to
+/// hand to that cell's thread once it exists.
+pub type SpawnedControl<J> = (Arc<ControlHandle>, CkptIssuers, Vec<CellPart<J>>);
+
+/// Why the control plane refuses a data directory at boot, before any cell
+/// exists: nothing of the catalog is truncated, deleted, rewritten or
+/// served.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ControlBootRefused {
+    /// The catalog names `live` live tiered namespace definitions, more
+    /// than the node's [`TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX`] lifetimes
+    /// (ADR-0148 D5, A1.2): a data directory with more is refused, with no
+    /// migration. Drop tombstones and their residue take no lifetime.
+    TieredLifetimes { live: usize },
+    /// The tiered namespaces' boot storage could not be reserved
+    /// (ADR-0148 D4): what was built of it was retired, and no cell exists.
+    TierReservation(BootReservation),
+}
+
+impl std::fmt::Display for ControlBootRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ControlBootRefused::TieredLifetimes { live } => write!(
+                f,
+                "the catalog names {live} live tiered namespaces, more than the \
+                 {TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX} tiered namespace lifetimes a node \
+                 holds: a data directory with more is refused at boot, with no migration"
+            ),
+            ControlBootRefused::TierReservation(refused) => write!(f, "{refused}"),
+        }
+    }
+}
+
+impl std::error::Error for ControlBootRefused {}
+
+/// The boot's count of live tiered definitions (ADR-0148 D5): at most the
+/// node's lifetimes, else the typed refusal. One pass over the catalog's
+/// entries, before any cell.
+fn check_tiered_lifetimes(seed: Option<&NsCatalog>) -> Result<(), ControlBootRefused> {
+    let live = seed.map_or(0, |c| c.entries.iter().filter(|e| e.tier.is_some()).count());
+    if live > TIERED_NAMESPACE_LIFETIMES_PER_NODE_MAX {
+        return Err(ControlBootRefused::TieredLifetimes { live });
+    }
+    Ok(())
+}
 
 impl ControlHandle {
     /// A control plane without the thread (M2-S19): the caller drains the
-    /// returned [`ControlInbox`] inline. Production nodes use
-    /// [`spawn`]; the sim's determinism forbids the thread.
-    #[must_use]
-    pub fn detached(cells: CellCount, start_unix_ms: u64) -> DetachedControl {
-        ControlHandle::detached_in(None, CkptSpace::full(cells), start_unix_ms)
+    /// returned [`ControlInbox`] inline and steps its [`DetachedTier`].
+    /// Production nodes use [`spawn`]; the sim's determinism forbids the
+    /// thread. `F` is the cells' file system: a tier-file job carries its
+    /// handle.
+    ///
+    /// # Errors
+    /// [`ControlBootRefused`]: the boot reservation was refused; an empty
+    /// catalog names no tiered namespace.
+    pub fn detached<F: SegmentFs>(
+        cells: CellCount,
+        start_unix_ms: u64,
+    ) -> Result<DetachedControl<F::File>, ControlBootRefused>
+    where
+        F::File: FinalClose,
+    {
+        ControlHandle::detached_in::<F>(None, CkptSpace::full(cells), start_unix_ms)
     }
 
     /// A detached control plane seeded from a recovered catalog (the
     /// reboot path: ids never regress across restart — ADR-0015 D2;
     /// index counters follow the same rule, ADR-0075 D1).
-    #[must_use]
-    pub fn detached_with_catalog(
+    ///
+    /// # Errors
+    /// [`ControlBootRefused`]: the catalog is refused before any cell.
+    pub fn detached_with_catalog<F: SegmentFs>(
         seed: Option<&NsCatalog>,
         cells: CellCount,
         start_unix_ms: u64,
-    ) -> DetachedControl {
-        ControlHandle::detached_in(seed, CkptSpace::full(cells), start_unix_ms)
+    ) -> Result<DetachedControl<F::File>, ControlBootRefused>
+    where
+        F::File: FinalClose,
+    {
+        ControlHandle::detached_in::<F>(seed, CkptSpace::full(cells), start_unix_ms)
     }
 
     /// [`detached_with_catalog`](Self::detached_with_catalog) over an
     /// explicit issuance space — the A1.5 headroom seam for tests.
-    #[must_use]
-    pub fn detached_in(
+    ///
+    /// # Errors
+    /// [`ControlBootRefused`]: the catalog is refused before any cell.
+    pub fn detached_in<F: SegmentFs>(
         seed: Option<&NsCatalog>,
         space: CkptSpace,
         start_unix_ms: u64,
-    ) -> DetachedControl {
-        let (handle, rx, tombstones, issuers) =
-            ControlHandle::new_parts(seed, space, start_unix_ms);
-        let inbox = ControlInbox {
-            rx,
-            handle: Arc::clone(&handle),
-            tombstones,
-            pending: PendingCreates::default(),
-        };
-        (handle, inbox, issuers)
+    ) -> Result<DetachedControl<F::File>, ControlBootRefused>
+    where
+        F::File: FinalClose,
+    {
+        let parts = ControlHandle::new_parts::<F::File>(seed, space, start_unix_ms)?;
+        let ControlParts { handle, rx, wake, writer, issuers, worker, parts } = parts;
+        let inbox =
+            ControlInbox { rx, _wake: wake, handle: Arc::clone(&handle), writer, next: None };
+        Ok((handle, inbox, issuers, DetachedTier::new(worker, parts)))
     }
 
-    /// The handle, the writer's inbox, the writer's tombstone set seeded
-    /// from the boot catalog, and the boot's checkpoint issuers. Every
-    /// surviving tombstone is re-stamped with one fresh all-cell request
-    /// (ADR-0100 D3: cells edge-detect it after recovery, and the next
-    /// persist retires what they cover), paid by the control writer's
-    /// quota before any cell serves (ADR-0159 A1.2).
-    fn new_parts(
+    /// The handle, the writer's inbox, the writer with its tombstone set
+    /// seeded from the boot catalog, the boot's checkpoint issuers, and the
+    /// tier-file transport. Every surviving tombstone is re-stamped with one
+    /// fresh all-cell request (ADR-0100 D3: cells edge-detect it after
+    /// recovery, and the next persist retires what they cover), paid by the
+    /// control writer's quota before any cell serves (ADR-0159 A1.2). A
+    /// catalog over the node's tiered lifetimes is refused first, with
+    /// nothing built; the boot reservation runs next, before every other
+    /// allocation here, and a refused one builds nothing more.
+    fn new_parts<J: SegmentFile + FinalClose>(
         seed: Option<&NsCatalog>,
         space: CkptSpace,
         start_unix_ms: u64,
-    ) -> (Arc<ControlHandle>, mpsc::Receiver<ControlMsg>, DropTombstones, CkptIssuers) {
+    ) -> Result<ControlParts<J>, ControlBootRefused> {
+        check_tiered_lifetimes(seed)?;
         let cells = space.cells.get();
+        let TierBoot { shared, writer: directory, worker, parts } = reserve_tier::<J>(cells)?;
         let Partition { clock, owner, participants } =
             issue::partition(CkptBoard::new(space.cells), space.space);
         let next_id = seed.map_or(FIRST_NAMED_NS_ID, |c| c.next_id.max(FIRST_NAMED_NS_ID));
@@ -1721,19 +2757,31 @@ impl ControlHandle {
             c.index.next_generation.max(FIRST_INDEX_GENERATION)
         });
         let (tx, rx) = mpsc::sync_channel::<ControlMsg>(256);
+        // The worker's one-slot wake (ADR-0156 D3), beside the channel and
+        // made as it is (class F at boot): it holds no message's slot.
+        let (wake_tx, wake_rx) = mpsc::sync_channel::<()>(1);
+        let wake = RetireWake {
+            tx: wake_tx,
+            #[cfg(inf_canary_retire_bell_in_channel)]
+            planted: tx.clone(),
+        };
+        let (epochs, word) = CatalogEpochs::new();
+        let grants = TierNamespaceGrants::seed(seed, directory, Arc::clone(&shared.receipts));
         let handle = Arc::new(ControlHandle {
-            tx,
+            sender: ControlSender { tx, wake },
             next_ns_id: AtomicU32::new(next_id),
             next_index_id: AtomicU32::new(next_index_id),
             next_index_generation: AtomicU64::new(next_index_generation),
-            next_epoch: AtomicU64::new(0),
-            persisted_epoch: Arc::new(AtomicU64::new(0)),
+            requests_sent: AtomicU64::new(0),
+            #[cfg(inf_canary_ns_epoch_at_send)]
+            numbered: AtomicU64::new(0),
+            gauges: Arc::new(DdlGauges::new(Arc::clone(&word))),
+            word,
             ckpt_clock: clock,
             recovery: Arc::new(RecoveryBoard::new(cells, start_unix_ms)),
             memory_board: Arc::new(MemoryBoard::new(cells)),
             index_board: Arc::new(IndexBoard::new(cells)),
-            drop_tombstones: AtomicUsize::new(0),
-            pending_creates: AtomicUsize::new(0),
+            tier: shared,
             ddl_holder: AtomicU16::new(0),
             ddl_generation: AtomicU64::new(0),
         });
@@ -1749,253 +2797,144 @@ impl ControlHandle {
                 },
             })
             .collect();
-        let mut tombstones = DropTombstones::seed(seed.map_or(&[][..], |c| &c.dropped));
+        // D7: the book holds every tombstone `META` carries (T ≤ 4,096, the
+        // decoder's bound), its ceiling max(256, T); a boot over the cap
+        // serves, and admissions that add a tombstone meet D6's rows until
+        // the book drains.
+        let mut tombstones = TombstoneBook::seed(seed.map_or(&[][..], |c| &c.dropped));
         if tombstones.len() > 0 {
             let epoch = host
                 .request(CkptTarget::All)
                 .expect("a fresh quota holds at least one unit (IssueSpace: Q >= 1)");
             tombstones.stamp_unstamped(epoch.get());
-            handle.drop_tombstones.store(tombstones.len(), Ordering::Relaxed);
         }
-        (handle, rx, tombstones, CkptIssuers { host, cells: cell_issuers })
+        // No DDL is pending at boot: `META` holds every answered one.
+        let writer = CatalogWriter {
+            handle: Arc::clone(&handle),
+            epochs,
+            tombstones,
+            grants,
+            pending: None,
+        };
+        writer.publish_gauges();
+        let issuers = CkptIssuers { host, cells: cell_issuers };
+        Ok(ControlParts { handle, rx, wake: wake_rx, writer, issuers, worker, parts })
     }
 }
 
-/// Spawns the control thread. `seed` is the boot-loaded catalog (its
-/// `next_id` seeds the allocator; a fresh node starts at the named floor).
+/// The boot reservation of the tier-file transport and the grants' storage
+/// (ADR-0148 D4), its refusal the boot's typed error.
+fn reserve_tier<J: SegmentFile + FinalClose>(
+    cells: u16,
+) -> Result<TierBoot<J>, ControlBootRefused> {
+    match TierLifetimeBoot::reserve::<J>(cells) {
+        Ok(boot) => Ok(boot),
+        // Canary `inf_canary_boot_reservation_ignored`: the assembly goes on
+        // after a refused reservation, building the node regardless.
+        Err(_) if cfg!(inf_canary_boot_reservation_ignored) => {
+            TierLifetimeBoot::reserve::<J>(cells).map_err(ControlBootRefused::TierReservation)
+        }
+        Err(refused) => Err(ControlBootRefused::TierReservation(refused)),
+    }
+}
+
+/// What [`ControlHandle::new_parts`] builds: the handle, the writer's
+/// inbox and the worker's wake, the writer, the boot's checkpoint issuers,
+/// and the tier-file transport's worker and parts.
+struct ControlParts<J> {
+    handle: Arc<ControlHandle>,
+    rx: mpsc::Receiver<ControlMsg>,
+    wake: mpsc::Receiver<()>,
+    writer: CatalogWriter,
+    issuers: CkptIssuers,
+    worker: RetireWorker<J>,
+    parts: Vec<CellPart<J>>,
+}
+
+#[cfg(test)]
+impl<J: SegmentFile + FinalClose> ControlParts<J> {
+    /// The handle and the writer a test drives, the transport as a detached
+    /// host whose drop cuts it.
+    fn into_test(self) -> (Arc<ControlHandle>, CatalogWriter, DetachedTier<J>) {
+        (self.handle, self.writer, DetachedTier::new(self.worker, self.parts))
+    }
+}
+
+mod runner;
+pub use runner::spawn_in;
+
+/// Spawns the control thread over the cells' file system `fs`, which its
+/// retirement worker unlinks through. `seed` is the boot-loaded catalog (its
+/// `next_id` seeds the allocator; a fresh node starts at the named floor);
+/// `cell_wake`, the park board the worker ends a parked cell's park through.
 ///
 /// The thread fail-stops the process on a failed swap: the catalog is
 /// durability metadata and a lost DDL after its `+OK` would be a §8.2
 /// violation — same rule class as fsync failure.
-pub fn spawn(
+///
+/// # Errors
+/// [`ControlBootRefused`]: the catalog or the boot reservation is refused
+/// before any cell, and no thread is spawned.
+pub fn spawn<F: SegmentFs + Send + 'static>(
+    fs: F,
     data_dir: PathBuf,
     seed: Option<&NsCatalog>,
     cells: CellCount,
     start_unix_ms: u64,
-) -> (Arc<ControlHandle>, CkptIssuers) {
-    spawn_in(data_dir, seed, CkptSpace::full(cells), start_unix_ms)
+    cell_wake: Option<CellWake>,
+) -> Result<SpawnedControl<F::File>, ControlBootRefused>
+where
+    F::File: FinalClose + Send,
+{
+    spawn_in(fs, data_dir, seed, CkptSpace::full(cells), start_unix_ms, cell_wake)
 }
 
-/// [`spawn`] over an explicit issuance space — the A1.5 headroom seam for
-/// tests. Returns the handle and the boot's checkpoint issuers.
-pub fn spawn_in(
-    data_dir: PathBuf,
-    seed: Option<&NsCatalog>,
-    space: CkptSpace,
-    start_unix_ms: u64,
-) -> (Arc<ControlHandle>, CkptIssuers) {
-    let cells = space.cells.get();
-    let (handle, rx, tombstones, issuers) = ControlHandle::new_parts(seed, space, start_unix_ms);
-    let allocator = Arc::clone(&handle);
-    let persisted = Arc::clone(&handle.persisted_epoch);
-    let board = Arc::clone(&handle.recovery);
-    // denylist-allow: the control thread itself (ADR-0015 D3) - the slow plane, never a cell.
-    std::thread::Builder::new()
-        .name("inf-control".into())
-        .spawn(move || {
-            // This thread is detached (the JoinHandle drops below): a
-            // swallowed unwind would leave cells serving with catalog
-            // persistence, checkpoint epochs, and delegated unlinks
-            // silently dead — the ADR-0026 D2 class. Same boundary as
-            // the cell threads (M2.5-S01/S16): panic ⇒ loud process exit.
-            let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                control_main(&data_dir, &allocator, &persisted, &board, &rx, cells, tombstones);
-            }));
-            if body.is_err() {
-                // The default hook already printed the panic.
-                eprintln!("infinityd: control thread panicked — fail-stop");
-                std::process::exit(101);
-            }
-        })
-        .expect("spawn control thread");
-    (handle, issuers)
-}
-
-/// The control thread's message loop + boot narration (M2-S15/M2.5-S01),
-/// extracted so [`spawn`] can wrap it in the panic fail-stop boundary.
-fn control_main(
-    data_dir: &Path,
-    allocator: &Arc<ControlHandle>,
-    persisted: &Arc<AtomicU64>,
-    board: &Arc<RecoveryBoard>,
-    rx: &mpsc::Receiver<ControlMsg>,
-    cells: u16,
-    mut tombstones: DropTombstones,
-) {
-    let mut pending = PendingCreates::default();
-    {
-        let mut handle_msg = |msg: ControlMsg| match msg {
-            ControlMsg::Persist(req) => {
-                // The persisted counters must always cover their
-                // allocators so ids and generations never regress
-                // across restart, even for DDL that raced this
-                // snapshot (ADR-0015 D2; index counters ADR-0075 D1);
-                // the tombstone set merges in (ADR-0100 D2), the
-                // pending creates too (ADR-0103 D2).
-                let (payload, epoch) =
-                    prepare_persist(allocator, &mut tombstones, &mut pending, req);
-                if let Err(err) = write_meta(&StdSegmentFs, data_dir, &payload) {
-                    // §8.4 fail-stop: a DDL was acked against this
-                    // swap. `process::exit`, never `panic!` — this
-                    // thread is detached (the JoinHandle is dropped),
-                    // so an unwind would kill only the control plane
-                    // and leave cells serving with catalog
-                    // persistence, checkpoint epochs, and delegated
-                    // unlinks silently dead (the ADR-0026 D2
-                    // swallowed-death class; M2.5-S16 audit fix).
-                    eprintln!("FATAL: catalog META swap failed (fail-stop): {err}");
-                    std::process::exit(crate::EXIT_DURABLE_FAILSTOP);
-                }
-                persisted.store(epoch, Ordering::Release);
-            }
-            ControlMsg::StampDrop { id, ckpt_epoch } => tombstones.stamp(id, ckpt_epoch),
-            ControlMsg::CreateApplied { id } => {
-                pending.retire(id);
-                allocator.pending_creates.store(pending.len(), Ordering::Relaxed);
-            }
-            ControlMsg::Unlink(path) => {
-                // Never fatal: the file is outside every recovery
-                // unit; a survivor is re-collected at boot.
-                #[allow(clippy::disallowed_methods, reason = "control-thread: retired file unlink")]
-                if let Err(err) = std::fs::remove_file(&path)
-                    && err.kind() != std::io::ErrorKind::NotFound
-                {
-                    eprintln!("control: unlink {} failed: {err}", path.display());
-                }
-            }
-        };
-        // Boot narration (M2-S15): until every cell reports ready,
-        // poll the channel with a timeout and print per-cell ready
-        // lines + a periodic aggregate progress line (segments/bytes/
-        // ETA). Log-line clocks are ambient wall time — control-plane
-        // narration only, never oracle input (those ride the
-        // injected clocks).
-        let mut announced = vec![false; usize::from(cells)];
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "clock: control-thread boot narration, never oracle input (ADR-0015 D3)"
-        )]
-        // denylist-allow: boot-narration wall clock on the control thread, never oracle input.
-        let boot_started = std::time::Instant::now();
-        let mut next_progress = boot_started + Duration::from_secs(1);
-        while !board.all_ready() {
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(msg) => handle_msg(msg),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
-            }
-            for (cell, seen) in announced.iter_mut().enumerate() {
-                let slot = board.slot(cell as u16);
-                if !*seen && slot.ready() {
-                    *seen = true;
-                    let (_, total) = slot.bytes();
-                    let (segs, _) = slot.segments();
-                    let torn = slot.torn_truncated_at().map_or(String::new(), |lsn| {
-                        format!(", torn tail truncated at {lsn} (M2-S14)")
-                    });
-                    let residue = slot.residue();
-                    let recycled = if residue == RecoveredResidue::default() {
-                        String::new()
-                    } else {
-                        format!(
-                            ", recycled residue: {} segment stops, {} slacks (ADR-0090)",
-                            residue.segment_residue_stops, residue.recycled_residue_slacks
-                        )
-                    };
-                    let (ns, bytes) = slot.phases();
-                    let ms = |i: usize| ns[i] as f64 / 1e6;
-                    let unknown = match slot.records_skipped_unknown_ns() {
-                        0 => String::new(),
-                        n => format!(
-                            ", {n} records of untombstoned unknown namespaces skipped \
-                             (foreign log or corruption — ADR-0103 D4)"
-                        ),
-                    };
-                    eprintln!(
-                        "control: cell {cell} recovered ({segs} segments, {total} bytes, {} \
-                         records{torn}{recycled}{unknown}; phases ms: start {:.1}, ckpt {:.1} \
-                         [{} B], replay {:.1} [{} B], audit {:.1} [{} B], finish {:.1}, \
-                         total {:.1})",
-                        slot.records(),
-                        ms(0),
-                        ms(1),
-                        bytes[0],
-                        ms(2),
-                        bytes[1],
-                        ms(3),
-                        bytes[2],
-                        ms(4),
-                        ns.iter().sum::<u64>() as f64 / 1e6,
-                    );
-                }
-            }
-            #[allow(
-                clippy::disallowed_methods,
-                reason = "clock: control-thread boot narration, never oracle input (ADR-0015 D3)"
-            )]
-            // denylist-allow: boot-narration wall clock on the control thread, never oracle input.
-            let now = std::time::Instant::now();
-            if now >= next_progress && !board.all_ready() {
-                next_progress = now + Duration::from_secs(1);
-                let (done, total) = board.bytes();
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "clock: boot narration, never oracle input (ADR-0015 D3)"
-                )]
-                let elapsed = boot_started.elapsed().as_secs_f64();
-                let eta = if done > 0 {
-                    (elapsed * (total.saturating_sub(done)) as f64 / done as f64).ceil()
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "control: recovery {}/{} cells ready, {done}/{total} bytes ({:.1}%), eta \
-                         {eta:.0}s",
-                    board.ready_cells(),
-                    board.cell_count(),
-                    if total > 0 { done as f64 * 100.0 / total as f64 } else { 100.0 },
-                );
-                // Stuck-cell narration (M2.5-S01): after 5 s, name each
-                // not-ready cell and the phase it published before its
-                // current step — the ADR-0022 D7 wedge signature was a
-                // silent cell; a stalled boot must say where it stalled.
-                if elapsed >= 5.0 {
-                    for cell in 0..cells {
-                        let slot = board.slot(cell);
-                        if !slot.ready() {
-                            let (done, total) = slot.bytes();
-                            eprintln!(
-                                "control: cell {cell} not ready — in {} ({done}/{total} bytes) for \
-                                     {elapsed:.0}s",
-                                CellRecoverySlot::phase_name(slot.phase()),
-                            );
-                        }
-                    }
-                }
+/// One message's handling on the control thread.
+fn handle_msg(writer: &mut CatalogWriter, data_dir: &Path, msg: ControlMsg) {
+    match msg {
+        ControlMsg::Request(req) => {
+            if let Err(err) = writer.answer(req, &StdSegmentFs, data_dir) {
+                // §8.4 fail-stop: a DDL was acked against this
+                // swap. `process::exit`, never `panic!` — this
+                // thread is detached (the JoinHandle is dropped),
+                // so an unwind would kill only the control plane
+                // and leave cells serving with catalog
+                // persistence, checkpoint epochs, and delegated
+                // unlinks silently dead (the ADR-0026 D2
+                // swallowed-death class; M2.5-S16 audit fix).
+                eprintln!("FATAL: catalog META swap failed (fail-stop): {err}");
+                std::process::exit(crate::EXIT_DURABLE_FAILSTOP);
             }
         }
-        #[allow(
-            clippy::disallowed_methods,
-            reason = "clock: control-thread boot narration, never oracle input (ADR-0015 D3)"
-        )]
-        let boot_ms = boot_started.elapsed().as_millis();
-        eprintln!(
-            "control: recovery complete — {} cells serving ({boot_ms} ms)",
-            board.cell_count()
-        );
-        while let Ok(msg) = rx.recv() {
-            handle_msg(msg);
+        ControlMsg::Notice(notice) => writer.notice(notice),
+        ControlMsg::Unlink(path) => {
+            // Never fatal: the file is outside every recovery
+            // unit; a survivor is re-collected at boot.
+            #[allow(clippy::disallowed_methods, reason = "control-thread: retired file unlink")]
+            if let Err(err) = std::fs::remove_file(&path)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                eprintln!("control: unlink {} failed: {err}", path.display());
+            }
         }
-        // Channel closed = node shutdown; nothing to flush (every
-        // acked DDL already persisted before its reply).
+        #[cfg(inf_canary_retire_bell_in_channel)]
+        ControlMsg::Wake => {}
     }
 }
 
 #[cfg(test)]
 mod drop_tombstone_tests {
+    use inf_store::ddl::{Answer, DdlRefusal};
     use inf_store::{IndexCatalog, NsCatalog, NsMode, NsSpec};
 
-    use super::DropTombstones;
+    use inf_store::ddl::TombstoneHeld;
+
+    use inf_log::fs::mem::MemFile;
+
+    use super::{
+        BookFold, CatalogRequest, CatalogWriter, CkptSpace, ControlHandle, DROPPED_NS_MAX,
+        DdlIntent, DdlNotice, PendingDdl, Tombstone, TombstoneBook,
+    };
 
     fn entry(id: u32) -> NsSpec {
         NsSpec {
@@ -2009,116 +2948,541 @@ mod drop_tombstone_tests {
         }
     }
 
-    /// ADR-0100 D2/D3: add → stamp → retire once every cell published the
-    /// stamped epoch; unstamped tombstones never retire; the payload
-    /// carries the sorted set and loses any entry the set names.
+    fn catalog(entries: Vec<NsSpec>) -> NsCatalog {
+        NsCatalog { next_id: 64, entries, index: IndexCatalog::default(), dropped: Vec::new() }
+    }
+
+    impl CatalogWriter {
+        /// `decide` with step 1's room read as `answer` reads it, its
+        /// result as the verdict the epoch carries.
+        fn decide_as_answered(
+            &self,
+            intent: Option<&DdlIntent>,
+            export: &NsCatalog,
+            fold: BookFold,
+        ) -> super::DdlVerdict {
+            match self.decide(intent, export, fold, self.tiered_room(intent)) {
+                Ok(_) => super::DdlVerdict::Accepted,
+                Err(refusal) => super::DdlVerdict::Refused(refusal),
+            }
+        }
+    }
+
+    fn writer() -> CatalogWriter {
+        let cells = inf_foundation::CellCount::new(2).expect("two cells");
+        let parts = ControlHandle::new_parts::<MemFile>(None, CkptSpace::full(cells), 0);
+        let (_handle, writer, _tier) = parts.expect("the catalog boots").into_test();
+        writer
+    }
+
+    /// A durable tiered definition of `id`.
+    fn tiered(id: u32) -> NsSpec {
+        NsSpec { tier: Some(inf_store::TierSpec::for_budget(3 << 20)), ..entry(id) }
+    }
+
+    /// The boot's count (ADR-0148 D5): 64 live tiered definitions boot, with
+    /// any number of memory and plain durable ones and of tombstones beside
+    /// them; 65 are refused with the count, before anything is built.
     #[test]
-    fn tombstones_add_stamp_retire_and_reconcile() {
-        let mut t = DropTombstones::default();
+    fn a_boot_holds_at_most_sixty_four_live_tiered_definitions() {
+        let cells = inf_foundation::CellCount::new(2).expect("two cells");
+        let boot = |live: u32| {
+            let mut seed = catalog((16..16 + live).map(tiered).collect());
+            seed.entries.extend((200..203).map(entry));
+            seed.next_id = 300;
+            seed.dropped = vec![250, 251];
+            ControlHandle::new_parts::<MemFile>(Some(&seed), CkptSpace::full(cells), 0)
+                .map(|parts| drop(parts.into_test()))
+        };
+        assert_eq!(boot(64), Ok(()), "64 live tiered definitions and two tombstones boot");
+        assert_eq!(boot(65), Err(super::ControlBootRefused::TieredLifetimes { live: 65 }));
+    }
+
+    /// Answers one request through the writer and reads its token: an
+    /// export naming nothing, carrying the counter as a program's does.
+    #[allow(clippy::disallowed_methods, reason = "test-only: the writer's scratch directory")]
+    fn answered<R: inf_store::ddl::Receipt>(
+        w: &mut CatalogWriter,
+        dir: &std::path::Path,
+        intent: DdlIntent,
+        id: inf_log::NsId,
+    ) -> Answer<R> {
+        let (slot, requested) = inf_store::ddl::answer_slot::<R>(id);
+        let mut export = catalog(Vec::new());
+        export.next_id = w.handle.next_ns_id();
+        let req = CatalogRequest::new(Some(intent), export, Some(slot));
+        w.answer(req, &inf_log::fs::StdSegmentFs, dir).expect("the META write");
+        requested.answer(w.handle.catalog_word())
+    }
+
+    /// The tiered grant book on a two-cell node (ADR-0148 D1, D2, D4):
+    /// 64 tiered `CREATE`s are accepted, each Declared at the lowest Vacant
+    /// position once its `META` write returned; the 65th is refused `Limit`
+    /// with nothing written and no id spent, while a memory `CREATE` meets
+    /// no grant row; a durable drop flips its grant to Retiring, so the next
+    /// is refused `Busy`; one cell's receipt, or a receipt naming another
+    /// id, reclaims nothing; once both cells name the id, the next tiered
+    /// `CREATE` takes that position, and the old receipts never return it.
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "test-only: the writer's scratch directory")]
+    fn the_grant_book_holds_sixty_four_lifetimes_and_reclaims_by_exact_receipt() {
+        use inf_foundation::grants::GrantSlot;
+        use inf_store::ddl::{CreatePersisted, DropPersisted, TieredHeld};
+        let dir = std::env::temp_dir().join(format!("inf-ctl-grants-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut w = writer();
+        let handle = std::sync::Arc::clone(&w.handle);
+        let directory = std::sync::Arc::clone(handle.tier_directory());
+        let (cell0, cell1) = (handle.take_tier_receipts(0), handle.take_tier_receipts(1));
+        let (cell0, cell1) = (cell0.expect("cell 0's receipts"), cell1.expect("cell 1's"));
+        assert!(handle.take_tier_receipts(0).is_none(), "one receipt writer a cell");
+        let tiered_create = |w: &mut CatalogWriter| {
+            let id = w.handle.next_ns_id();
+            let intent = create(w, tiered(id));
+            (id, answered::<CreatePersisted>(w, &dir, intent, inf_log::NsId(id)))
+        };
+        let mut live = Vec::new();
+        for _ in 0..64 {
+            let (id, answer) = tiered_create(&mut w);
+            assert!(matches!(answer, Answer::Accepted(_)), "tiered CREATE {id}: {answer:?}");
+            w.notice(DdlNotice::CreateApplied { id: inf_log::NsId(id) });
+            live.push(id);
+        }
+        for (index, &id) in live.iter().enumerate() {
+            let pos = directory.find_declared(id).map(|pos| pos.index());
+            assert_eq!(pos, Some(index), "grant {id} at the lowest Vacant position");
+        }
+        let meta = std::fs::read(dir.join("META")).expect("META");
+        let next = handle.next_ns_id();
+        let (_, answer) = tiered_create(&mut w);
+        let limit = DdlRefusal::TieredCapacity(TieredHeld::Limit);
+        assert!(matches!(answer, Answer::Refused(r) if r == limit), "the 65th: {answer:?}");
+        assert_eq!(std::fs::read(dir.join("META")).expect("META"), meta, "the refusal wrote");
+        assert_eq!(handle.next_ns_id(), next, "the refusal spent an id");
+        let memory = entry(next);
+        let intent = create(&w, NsSpec { mode: NsMode::Memory, fsync: None, ..memory });
+        let answer = answered::<CreatePersisted>(&mut w, &dir, intent, inf_log::NsId(next));
+        assert!(matches!(answer, Answer::Accepted(_)), "a memory CREATE takes no grant");
+        w.notice(DdlNotice::CreateApplied { id: inf_log::NsId(next) });
+        let dropped = live[5];
+        let pos = directory.find_declared(dropped).expect("its grant");
+        let intent = DdlIntent::Drop { id: inf_log::NsId(dropped), tombstone: true };
+        let answer = answered::<DropPersisted>(&mut w, &dir, intent, inf_log::NsId(dropped));
+        assert!(matches!(answer, Answer::Accepted(_)), "the drop: {answer:?}");
+        w.notice(DdlNotice::DropFanned { id: inf_log::NsId(dropped), stamp: None });
+        assert_eq!(directory.slot(pos), GrantSlot::Retiring(dropped), "published Retiring");
+        let busy = DdlRefusal::TieredCapacity(TieredHeld::Busy);
+        let (_, answer) = tiered_create(&mut w);
+        assert!(matches!(answer, Answer::Refused(r) if r == busy), "a grant Retiring: {answer:?}");
+        cell0.publish(pos, dropped);
+        cell1.publish(pos, live[4]);
+        let (_, answer) = tiered_create(&mut w);
+        assert!(matches!(answer, Answer::Refused(r) if r == busy), "a cell names another id");
+        cell1.publish(pos, dropped);
+        let (reused, answer) = tiered_create(&mut w);
+        assert!(matches!(answer, Answer::Accepted(_)), "every receipt names it: {answer:?}");
+        w.notice(DdlNotice::CreateApplied { id: inf_log::NsId(reused) });
+        assert_eq!(directory.find_declared(reused), Some(pos), "the reclaimed position reused");
+        let intent = DdlIntent::Drop { id: inf_log::NsId(reused), tombstone: true };
+        let answer = answered::<DropPersisted>(&mut w, &dir, intent, inf_log::NsId(reused));
+        assert!(matches!(answer, Answer::Accepted(_)), "the second drop: {answer:?}");
+        w.notice(DdlNotice::DropFanned { id: inf_log::NsId(reused), stamp: None });
+        let (_, answer) = tiered_create(&mut w);
+        assert!(matches!(answer, Answer::Refused(r) if r == busy), "an old receipt reclaimed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The boot's book (ADR-0148 D2): each live tiered definition Declared
+    /// at positions `0..k` in id order, whatever the catalog's order; a
+    /// memory definition and a tombstone take none.
+    #[test]
+    fn a_boot_declares_each_live_tiered_definition_in_id_order() {
+        use inf_foundation::grants::GrantSlot;
+        let cells = inf_foundation::CellCount::new(2).expect("two cells");
+        let mut seed = catalog(vec![tiered(30), entry(18), tiered(16), tiered(20)]);
+        seed.dropped = vec![25];
+        let (handle, _writer, _tier) =
+            ControlHandle::new_parts::<MemFile>(Some(&seed), CkptSpace::full(cells), 0)
+                .expect("the catalog boots")
+                .into_test();
+        let directory = handle.tier_directory();
+        let found: Vec<_> =
+            [16, 20, 30].iter().map(|&id| directory.find_declared(id).map(|p| p.index())).collect();
+        assert_eq!(found, vec![Some(0), Some(1), Some(2)]);
+        let pos = directory.find_declared(30).expect("position 2");
+        assert_eq!(directory.slot(pos), GrantSlot::Declared(30));
+        assert_eq!(directory.find_declared(18), None, "a memory definition takes no grant");
+        assert_eq!(directory.find_declared(25), None, "a tombstone takes no grant");
+    }
+
+    /// `spec`'s `CREATE`, its id reserved: the counter is set to it first,
+    /// as the ticket's reservation finds it.
+    fn create(w: &CatalogWriter, spec: NsSpec) -> DdlIntent {
+        w.handle.next_ns_id.store(spec.id.0, std::sync::atomic::Ordering::Relaxed);
+        DdlIntent::Create { reserved: spec.id, spec }
+    }
+
+    fn stone(id: u32, stamp: u64) -> Tombstone {
+        Tombstone { id, stamp }
+    }
+
+    /// A writer whose book holds `count` tombstones, ids 100 up, each
+    /// stamped by `stamp(index)` (0 = unstamped).
+    fn writer_with_book(count: u32, stamp: impl Fn(u32) -> u64) -> CatalogWriter {
+        let mut w = writer();
+        for index in 0..count {
+            w.tombstones.add(100 + index);
+            w.tombstones.stamp(100 + index, stamp(index));
+        }
+        w
+    }
+
+    /// ADR-0189 D6: add → stamp → retire once every cell published the
+    /// stamped epoch; unstamped tombstones never retire; the book answers
+    /// membership and its ascending ids, and its fold sorts each live
+    /// tombstone into ready, paceable or blocked.
+    #[test]
+    fn the_book_adds_stamps_retires_and_folds() {
+        let mut t = TombstoneBook::seed(&[]);
+        assert_eq!(t.ceiling, DROPPED_NS_MAX, "a boot with no tombstone reserves the cap");
         t.add(18);
         t.add(16);
         t.add(18);
-        assert_eq!(t.entries, vec![(16, None), (18, None)]);
+        assert_eq!(t.entries, vec![stone(16, 0), stone(18, 0)]);
         t.retire(u64::MAX);
         assert_eq!(t.len(), 2, "unstamped tombstones never retire");
         t.stamp(16, 3);
+        assert_eq!(t.fold(2, None), BookFold { live: 2, ready: 0, paceable: 1, blocked: 1 });
+        assert_eq!(t.fold(3, None), BookFold { live: 2, ready: 1, paceable: 0, blocked: 1 });
+        let pending = Some(inf_log::NsId(18));
+        assert_eq!(t.fold(3, pending).blocked, 0, "the pending drop's own is not blocked");
         t.retire(2);
         assert_eq!(t.len(), 2, "not every cell published epoch 3 yet");
         t.retire(3);
-        assert_eq!(t.entries, vec![(18, None)]);
+        assert_eq!(t.entries, vec![stone(18, 0)]);
         // Boot re-stamp: only the unstamped survivor takes the epoch; a
         // later stamp never lowers an existing bar.
         t.add(20);
         t.stamp(20, 9);
         t.stamp_unstamped(5);
-        assert_eq!(t.entries, vec![(18, Some(5)), (20, Some(9))]);
+        assert_eq!(t.entries, vec![stone(18, 5), stone(20, 9)]);
         t.stamp(20, 7);
-        assert_eq!(t.entries[1], (20, Some(9)));
-        let mut catalog = NsCatalog {
-            next_id: 21,
-            entries: vec![entry(17), entry(18)],
-            index: IndexCatalog::default(),
-            dropped: Vec::new(),
-        };
-        t.reconcile(&mut catalog);
-        assert_eq!(catalog.dropped, vec![18, 20]);
-        assert_eq!(catalog.entries.len(), 1, "a tombstoned entry is replica lag, never live");
-        assert_eq!(catalog.entries[0].id.0, 17);
-        assert_eq!(NsCatalog::decode(&catalog.encode()).expect("v4 payload"), catalog);
+        assert_eq!(t.entries[1], stone(20, 9));
+        assert!(t.contains(18));
+        assert!(!t.contains(17));
+        assert_eq!(t.ids(), vec![18, 20]);
     }
 
-    /// ADR-0103 D2: a pending create joins every payload that lacks it,
-    /// a same-name create is refused against the merged view, the cap
-    /// refuses, retirement frees the name, and the verdict slot reads
-    /// exactly what the writer set.
+    /// ADR-0189 D6's cap rows at the writer, at 256 live tombstones: one
+    /// ready admits a durable `CREATE` and a durable `DROP`; paceable ones,
+    /// none ready, answer `Paceable`, also beside blocked ones; all blocked
+    /// answer `Limit`; a memory `CREATE` and a `DROP` that leaves no
+    /// tombstone proceed; the rollback of a durable `CREATE` accepted at 255
+    /// is accepted at 256. `Busy` needs a tombstone neither ready, paceable
+    /// nor blocked, which no fold of this book makes: its row is read on a
+    /// fold built by hand.
     #[test]
-    fn pending_creates_merge_admit_retire_and_verdict() {
-        use super::{CreateOutcome, CreateVerdict, PENDING_CREATE_MAX, PendingCreates};
-        let mut pending = PendingCreates::default();
-        let mut catalog = NsCatalog {
-            next_id: 17,
-            entries: vec![entry(16)],
-            index: IndexCatalog::default(),
-            dropped: Vec::new(),
+    fn the_cap_admits_paces_or_refuses_by_the_writers_fold() {
+        let cap = u32::try_from(DROPPED_NS_MAX).expect("256");
+        let export = catalog(Vec::new());
+        let durable = |w: &CatalogWriter, id: u32| create(w, entry(id));
+        let memory = |w: &CatalogWriter, id: u32| {
+            let mut spec = entry(id);
+            spec.mode = NsMode::Memory;
+            spec.fsync = None;
+            create(w, spec)
         };
-        // Accepted: joins the payload and the set.
-        assert_eq!(pending.admit(&mut catalog, entry(17)), CreateOutcome::Accepted);
-        assert_eq!(catalog.entries.len(), 2);
-        assert_eq!(pending.len(), 1);
-        // A concurrent origin's stale export (no 17) gets it merged in.
-        let mut stale = NsCatalog {
-            next_id: 18,
-            entries: vec![entry(16)],
-            index: IndexCatalog::default(),
-            dropped: Vec::new(),
-        };
-        pending.merge(&mut stale);
-        assert_eq!(stale.entries.iter().map(|e| e.id.0).collect::<Vec<_>>(), vec![16, 17]);
-        // The same name from another origin (fresh id) is refused
-        // against the merged view — existing and pending alike.
-        let mut dup = entry(18);
-        dup.name = b"ns17".to_vec();
-        assert_eq!(pending.admit(&mut stale, dup), CreateOutcome::NameExists);
-        let mut dup16 = entry(19);
-        dup16.name = b"ns16".to_vec();
-        assert_eq!(pending.admit(&mut stale, dup16), CreateOutcome::NameExists);
-        assert_eq!(pending.len(), 1, "a refused create never joins the set");
-        // Retirement frees the name.
-        pending.retire(17);
-        assert_eq!(pending.len(), 0);
-        let mut again = NsCatalog {
-            next_id: 20,
-            entries: vec![entry(16)],
-            index: IndexCatalog::default(),
-            dropped: Vec::new(),
-        };
-        let mut reuse = entry(20);
-        reuse.name = b"ns17".to_vec();
-        assert_eq!(pending.admit(&mut again, reuse), CreateOutcome::Accepted);
-        pending.retire(20);
-        // The cap.
-        for id in 100..(100 + PENDING_CREATE_MAX as u32) {
-            let mut c = NsCatalog {
-                next_id: id + 1,
-                entries: Vec::new(),
-                index: IndexCatalog::default(),
-                dropped: Vec::new(),
-            };
-            assert_eq!(pending.admit(&mut c, entry(id)), CreateOutcome::Accepted);
+        let drop_of =
+            |id: u32, tombstone: bool| DdlIntent::Drop { id: inf_log::NsId(id), tombstone };
+        let paceable =
+            super::DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(TombstoneHeld::Paceable));
+        let limit = super::DdlVerdict::Refused(DdlRefusal::TombstoneCapacity(TombstoneHeld::Limit));
+        let accepted = super::DdlVerdict::Accepted;
+        // One ready (stamped 5, published 5), the rest stamped past it.
+        let w = writer_with_book(cap, |i| if i == 0 { 5 } else { 9 });
+        let fold = w.fold_at(5);
+        assert_eq!(fold, BookFold { live: 256, ready: 1, paceable: 255, blocked: 0 });
+        assert_eq!(w.decide_as_answered(Some(&durable(&w, 40)), &export, fold), accepted);
+        assert_eq!(w.decide_as_answered(Some(&drop_of(16, true)), &export, fold), accepted);
+        // Paceable: every one stamped past the fold, none ready.
+        let fold = w.fold_at(4);
+        assert_eq!(w.decide_as_answered(Some(&durable(&w, 40)), &export, fold), paceable);
+        assert_eq!(w.decide_as_answered(Some(&drop_of(16, true)), &export, fold), paceable);
+        assert_eq!(
+            w.decide_as_answered(Some(&memory(&w, 40)), &export, fold),
+            accepted,
+            "a memory CREATE"
+        );
+        assert_eq!(
+            w.decide_as_answered(Some(&drop_of(16, false)), &export, fold),
+            accepted,
+            "no tombstone"
+        );
+        // One paceable beside 255 blocked still paces: 256 − 1 + 1 ≤ 256.
+        let w = writer_with_book(cap, |i| if i == 0 { 9 } else { 0 });
+        assert_eq!(w.decide_as_answered(Some(&durable(&w, 40)), &export, w.fold_at(4)), paceable);
+        // Every one blocked: an operator, or a restart's re-stamp, frees one.
+        let w = writer_with_book(cap, |_| 0);
+        let fold = w.fold_at(u64::MAX);
+        assert_eq!(fold, BookFold { live: 256, ready: 0, paceable: 0, blocked: 256 });
+        assert_eq!(w.decide_as_answered(Some(&durable(&w, 40)), &export, fold), limit);
+        assert_eq!(w.decide_as_answered(Some(&drop_of(16, true)), &export, fold), limit);
+        // Busy's row, on a fold no book of this slice makes.
+        let busy = BookFold { live: 300, ready: 0, paceable: 0, blocked: 255 };
+        assert_eq!(busy.held(), Some(TombstoneHeld::Busy));
+        // The rollback: a durable CREATE accepted at 255 blocked reserves
+        // the 256th slot; its rollback's drop takes it over.
+        let mut w = writer_with_book(cap - 1, |_| 0);
+        let fold = w.fold_at(u64::MAX);
+        assert_eq!(w.decide_as_answered(Some(&durable(&w, 40)), &export, fold), accepted);
+        let intent = durable(&w, 40);
+        w.accept(Some(intent), None);
+        w.assert_capacity(true);
+        let fold = w.fold_at(u64::MAX);
+        assert_eq!(
+            w.decide_as_answered(Some(&drop_of(40, true)), &export, fold),
+            accepted,
+            "the rollback"
+        );
+        assert!(!w.adds_slot(Some(&drop_of(40, true))), "it takes over the reservation");
+        w.accept(Some(drop_of(40, true)), None);
+        w.assert_capacity(false);
+        assert_eq!(w.tombstones.len(), DROPPED_NS_MAX, "the rollback's tombstone is the 256th");
+    }
+
+    /// (I) (ADR-0189 D6, N7): an admission that leaves a 257th tombstone,
+    /// planted past the verdict, fires the class-I fail-stop: on a book
+    /// whose ceiling is the cap, its ceiling half.
+    #[test]
+    #[should_panic(expected = "tombstones and reservations past the ceiling")]
+    fn a_planted_257th_tombstone_fires_the_ceiling_assert() {
+        let cap = u32::try_from(DROPPED_NS_MAX).expect("256");
+        let mut w = writer_with_book(cap, |_| 0);
+        let planted = DdlIntent::Drop { id: inf_log::NsId(40), tombstone: true };
+        assert!(w.adds_slot(Some(&planted)));
+        w.accept(Some(planted), None);
+        w.assert_capacity(true);
+    }
+
+    /// (I)'s cap half: a boot over the cap reserved a ceiling of 300, the
+    /// book drained, and a planted admission leaves 257 under that ceiling.
+    #[test]
+    #[should_panic(expected = "an admission left tombstones past the cap")]
+    fn a_planted_257th_tombstone_under_a_higher_ceiling_fires_the_cap_assert() {
+        let cells = inf_foundation::CellCount::new(2).expect("two cells");
+        let mut seed = catalog(Vec::new());
+        seed.next_id = 16 + 300;
+        seed.dropped = (16..16 + 300).collect();
+        let (handle, mut w, _tier) =
+            ControlHandle::new_parts::<MemFile>(Some(&seed), CkptSpace::full(cells), 0)
+                .expect("the catalog boots")
+                .into_test();
+        let stamp = handle.ckpt_last_issued();
+        (0..2).for_each(|cell| handle.ckpt_board().slot(cell).publish(stamp, 1, 1));
+        w.tombstones.retire(handle.ckpt_board().min_published());
+        assert_eq!((w.tombstones.len(), w.tombstones.ceiling), (0, 300), "drained under 300");
+        for index in 0..u32::try_from(DROPPED_NS_MAX).expect("256") {
+            w.tombstones.add(400 + index);
         }
-        let mut full = NsCatalog {
-            next_id: 1_000,
-            entries: Vec::new(),
-            index: IndexCatalog::default(),
-            dropped: Vec::new(),
-        };
-        assert_eq!(pending.admit(&mut full, entry(999)), CreateOutcome::AtCapacity);
-        assert!(full.entries.is_empty(), "a refused create never joins the payload");
-        // The verdict slot.
-        let verdict = CreateVerdict::new();
-        assert_eq!(verdict.get(), None, "unset until the writer ran");
-        verdict.set(CreateOutcome::NameExists);
-        assert_eq!(verdict.get(), Some(CreateOutcome::NameExists));
+        w.accept(Some(DdlIntent::Drop { id: inf_log::NsId(40), tombstone: true }), None);
+        w.assert_capacity(true);
+    }
+
+    /// ADR-0189 D7: a boot seeds every tombstone `META` carries, 256, 257 or
+    /// 4,096, re-stamps them with one checkpoint and reserves the ceiling
+    /// max(256, T); none is ready before every cell publishes the stamp,
+    /// and the gauge word says so.
+    #[test]
+    fn a_boot_seeds_every_tombstone_under_its_ceiling() {
+        let cells = inf_foundation::CellCount::new(2).expect("two cells");
+        for count in [256u32, 257, 4096] {
+            let mut seed = catalog(Vec::new());
+            seed.next_id = 16 + count;
+            seed.dropped = (16..16 + count).collect();
+            let (handle, w, _tier) =
+                ControlHandle::new_parts::<MemFile>(Some(&seed), CkptSpace::full(cells), 0)
+                    .expect("the catalog boots")
+                    .into_test();
+            let count = usize::try_from(count).expect("fits");
+            assert_eq!(w.tombstones.len(), count);
+            assert_eq!(w.tombstones.ceiling, count.max(DROPPED_NS_MAX));
+            assert!(w.tombstones.entries.capacity() >= w.tombstones.ceiling, "reserved at boot");
+            let stamp = handle.ckpt_last_issued();
+            assert!(w.tombstones.entries.iter().all(|t| t.stamp == stamp), "one re-stamp");
+            let gauges = handle.tombstone_gauges();
+            assert_eq!(usize::from(gauges.live), count);
+            assert_eq!((gauges.ready, usize::from(gauges.paceable)), (0, count));
+            w.assert_capacity(false);
+        }
+    }
+
+    /// ADR-0189 D3's verdict table, row by row, and the state each row
+    /// leaves: a request with no change is accepted; a `CREATE` is refused
+    /// while a DDL is pending and when the export holds its name (a
+    /// tombstoned id's entry aside); a `DROP` of the pending `CREATE`'s id
+    /// (the rollback) is accepted and replaces it; any other `DROP` is
+    /// refused while a DDL is pending.
+    #[test]
+    fn the_writer_decides_each_row_of_its_table() {
+        let mut w = writer();
+        let drop_of = |id: u32| DdlIntent::Drop { id: inf_log::NsId(id), tombstone: true };
+        let export = catalog(vec![entry(16)]);
+        let fold = w.fold_at(0);
+        assert_eq!(w.decide_as_answered(None, &export, fold), super::DdlVerdict::Accepted);
+        let mut taken = entry(40);
+        taken.name = b"ns16".to_vec();
+        let name_exists = super::DdlVerdict::Refused(DdlRefusal::NameExists);
+        assert_eq!(
+            w.decide_as_answered(Some(&create(&w, taken.clone())), &export, fold),
+            name_exists
+        );
+        w.tombstones.add(16);
+        assert_eq!(
+            w.decide_as_answered(Some(&create(&w, taken)), &export, w.fold_at(0)),
+            super::DdlVerdict::Accepted,
+            "a tombstoned id's lagging entry holds no name"
+        );
+        let fold = w.fold_at(0);
+        assert_eq!(
+            w.decide_as_answered(Some(&create(&w, entry(41))), &export, fold),
+            super::DdlVerdict::Accepted
+        );
+        let intent = create(&w, entry(41));
+        w.accept(Some(intent), None);
+        assert_eq!(w.handle.next_ns_id(), 42, "the acceptance commits the id");
+        let conflict = super::DdlVerdict::Refused(DdlRefusal::PendingConflict);
+        let fold = w.fold_at(0);
+        assert_eq!(w.decide_as_answered(Some(&create(&w, entry(42))), &export, fold), conflict);
+        assert_eq!(w.decide_as_answered(Some(&drop_of(42)), &export, fold), conflict);
+        assert_eq!(
+            w.decide_as_answered(Some(&drop_of(41)), &export, fold),
+            super::DdlVerdict::Accepted,
+            "the rollback's drop of its own pending CREATE"
+        );
+        w.accept(Some(drop_of(41)), None);
+        let replaced = matches!(w.pending, Some(PendingDdl::Drop(id)) if id.0 == 41);
+        assert!(replaced, "the drop replaced it");
+        assert!(w.tombstones.contains(41));
+        assert_eq!(w.decide_as_answered(Some(&drop_of(41)), &export, w.fold_at(0)), conflict);
+    }
+
+    /// ADR-0148 D4 at the writer: a `CREATE` whose reserved id is not the
+    /// counter's next (a second `CREATE` on one reservation, a reservation
+    /// whose spec names another id), or a counter with no id left, is
+    /// refused before any other row, and commits nothing.
+    #[test]
+    fn a_create_whose_id_is_not_the_counter_next_is_refused() {
+        let w = writer();
+        let export = catalog(Vec::new());
+        let not_next = super::DdlVerdict::Refused(DdlRefusal::IdNotNext);
+        let next = w.handle.next_ns_id();
+        let stale = DdlIntent::Create { reserved: entry(next - 1).id, spec: entry(next - 1) };
+        let fold = w.fold_at(0);
+        assert_eq!(
+            w.decide_as_answered(Some(&stale), &export, fold),
+            not_next,
+            "an id below the counter"
+        );
+        let ahead = DdlIntent::Create { reserved: entry(next + 1).id, spec: entry(next + 1) };
+        assert_eq!(
+            w.decide_as_answered(Some(&ahead), &export, fold),
+            not_next,
+            "an id past the counter"
+        );
+        let mismatched = DdlIntent::Create { reserved: entry(next).id, spec: entry(next + 1) };
+        assert_eq!(
+            w.decide_as_answered(Some(&mismatched), &export, fold),
+            not_next,
+            "a spec of another id"
+        );
+        let exhausted = create(&w, entry(super::NS_IDS_EXHAUSTED));
+        assert_eq!(
+            w.decide_as_answered(Some(&exhausted), &export, fold),
+            not_next,
+            "a counter with none left"
+        );
+        assert_eq!(w.handle.next_ns_id(), super::NS_IDS_EXHAUSTED, "nothing committed");
+    }
+
+    /// A notice retires the pending DDL of its own kind and id and nothing
+    /// else: a stale one changes nothing and is counted.
+    #[test]
+    fn a_notice_retires_only_its_own_kind_and_id() {
+        let mut w = writer();
+        let intent = create(&w, entry(40));
+        w.accept(Some(intent), None);
+        let (ns40, ns41) = (inf_log::NsId(40), inf_log::NsId(41));
+        w.notice(DdlNotice::DropFanned { id: ns40, stamp: Some(7) });
+        w.notice(DdlNotice::CreateApplied { id: ns41 });
+        assert_eq!(w.handle.ddl_notices_stale(), 2);
+        assert!(matches!(&w.pending, Some(PendingDdl::Create(spec)) if spec.id.0 == 40));
+        w.notice(DdlNotice::CreateApplied { id: ns40 });
+        assert!(w.pending.is_none());
+        assert_eq!(w.handle.ddl_pending(), 0);
+        w.accept(Some(DdlIntent::Drop { id: ns40, tombstone: true }), None);
+        w.notice(DdlNotice::DropFanned { id: ns40, stamp: Some(7) });
+        assert!(w.pending.is_none());
+        assert_eq!(w.tombstones.entries, vec![stone(40, 7)], "the notice's stamp");
+        w.notice(DdlNotice::CreateApplied { id: ns40 });
+        assert_eq!(w.handle.ddl_notices_stale(), 3, "none pending: stale");
+    }
+
+    /// A refused request writes nothing and moves nothing but the epoch
+    /// and the word: the tombstone set keeps a tombstone every cell has
+    /// published past, and the token reads the refusal. The next accepted
+    /// request retires that tombstone, writes `META`, and its token reads
+    /// its receipt.
+    #[test]
+    #[allow(clippy::disallowed_methods, reason = "test-only: the writer's scratch directory")]
+    fn a_refusal_moves_nothing_but_the_epoch_and_the_word() {
+        let dir = std::env::temp_dir().join(format!("inf-ctl-refusal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut w = writer();
+        let handle = std::sync::Arc::clone(&w.handle);
+        // A stamped tombstone the board's fold covers: any accepted request
+        // retires it.
+        w.tombstones.add(18);
+        w.tombstones.stamp(18, 3);
+        let board = handle.ckpt_board();
+        (0..2).for_each(|cell| board.slot(cell).publish(3, 1, 1));
+        assert_eq!(board.min_published(), 3, "every cell published past the stamp");
+        let (slot, requested) =
+            inf_store::ddl::answer_slot::<inf_store::ddl::CreatePersisted>(entry(40).id);
+        let mut taken = entry(40);
+        taken.name = b"ns16".to_vec();
+        let req =
+            CatalogRequest::new(Some(create(&w, taken)), catalog(vec![entry(16)]), Some(slot));
+        w.answer(req, &inf_log::fs::StdSegmentFs, &dir).expect("a refusal writes nothing");
+        assert!(!dir.join("META").exists() && !dir.join("META.new").exists(), "no META write");
+        assert!(w.pending.is_none());
+        assert_eq!(handle.next_ns_id(), 40, "the refusal committed no id");
+        assert_eq!(w.tombstones.entries, vec![stone(18, 3)], "the refusal retired nothing");
+        assert_eq!(handle.persisted_epoch(), 1, "the word moved");
+        assert!(matches!(
+            requested.answer(handle.catalog_word()),
+            Answer::Refused(DdlRefusal::NameExists)
+        ));
+        let (slot, requested) =
+            inf_store::ddl::answer_slot::<inf_store::ddl::CreatePersisted>(entry(41).id);
+        // The export a program sends carries the counter it reserved from.
+        let mut export = catalog(vec![entry(16)]);
+        export.next_id = 41;
+        let req = CatalogRequest::new(Some(create(&w, entry(41))), export, Some(slot));
+        w.answer(req, &inf_log::fs::StdSegmentFs, &dir).expect("the META write");
+        assert!(dir.join("META").exists(), "an acceptance writes META");
+        assert_eq!(handle.next_ns_id(), 42, "the acceptance committed its id");
+        let written = super::load_catalog(&dir).expect("META decodes").expect("META");
+        assert_eq!(written.next_id, 42, "the META that names id 41 carries its successor");
+        assert!(w.tombstones.entries.is_empty(), "the acceptance retired the covered tombstone");
+        assert_eq!(handle.persisted_epoch(), 2);
+        match requested.answer(handle.catalog_word()) {
+            Answer::Accepted(receipt) => {
+                assert_eq!(receipt.id(), entry(41).id);
+                assert_eq!(receipt.fan_epoch(), 2, "the receipt carries its own epoch");
+            }
+            Answer::Pending(_) | Answer::Refused(_) => panic!("an accepted request's receipt"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -2129,8 +3493,9 @@ mod tests {
 
     use inf_foundation::time::Nanos;
     use inf_foundation::{CellCount, CellId, SLOT_COUNT};
+    use inf_log::fs::mem::MemFs;
     use inf_store::{Keyspace, StoreConfig};
-    use inf_wire::{Protocol, RespWriter};
+    use inf_wire::{Protocol, ReplyStream, RespWriter};
 
     use super::{
         BoardObservation, BoardSweep, CkptBoard, CkptSlot, CkptSpace, CkptTarget, ControlHandle,
@@ -2183,7 +3548,8 @@ mod tests {
     #[test]
     fn ckpt_issue_at_u64_max_never_repeats() {
         let space = CkptSpace::with_headroom(cells(2), headroom(2)).expect("fits");
-        let (handle, _inbox, issuers) = ControlHandle::detached_in(None, space, 0);
+        let (handle, _inbox, issuers, _tier) =
+            ControlHandle::detached_in::<MemFs>(None, space, 0).expect("the catalog boots");
         assert_eq!(handle.ckpt_last_issued(), u64::MAX - (3 * 2 + 2), "(N + 1)·h + N below");
         let mut ledger = BTreeSet::new();
         let mut previous = handle.ckpt_last_issued();
@@ -2221,7 +3587,8 @@ mod tests {
     /// observation, so the wake fires.
     #[test]
     fn published_sum_at_2_pow_63_is_not_the_initial_state() {
-        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(2), 0);
+        let (handle, _inbox, _issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(2), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         board.slot(0).publish(1 << 63, 1, 1);
         board.slot(1).publish(1 << 63, 1, 1);
@@ -2239,7 +3606,8 @@ mod tests {
     /// 2^63 + 2^63, and the alias oracle sees it.
     #[test]
     fn canary_the_u64_fold_aliases_the_initial_state() {
-        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(2), 0);
+        let (handle, _inbox, _issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(2), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         board.slot(0).publish(1 << 63, 1, 1);
         board.slot(1).publish(1 << 63, 1, 1);
@@ -2251,7 +3619,8 @@ mod tests {
     #[test]
     fn one_exhausted_quota_leaves_the_others_reserving() {
         let space = CkptSpace::with_headroom(cells(2), headroom(1)).expect("fits");
-        let (_handle, _inbox, issuers) = ControlHandle::detached_in(None, space, 0);
+        let (_handle, _inbox, issuers, _tier) =
+            ControlHandle::detached_in::<MemFs>(None, space, 0).expect("the catalog boots");
         let mut quotas = issuers.cells.into_iter().map(|issuer| issuer.quota);
         let (mut first, mut second) = (quotas.next().expect("cell 0"), quotas.next().expect("1"));
         assert!(first.request(CkptTarget::All).is_ok());
@@ -2264,7 +3633,8 @@ mod tests {
     /// any point is observed within two completed sweeps.
     #[test]
     fn a_full_board_sweeps_in_256_bounded_turns_and_sees_an_advance_within_two() {
-        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(SLOT_COUNT), 0);
+        let (handle, _inbox, _issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(SLOT_COUNT), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         let mut sweep = BoardSweep::new(CellId(0));
         let mut turns = 0u32;
@@ -2295,7 +3665,8 @@ mod tests {
     /// the two-sweep oracle goes red.
     #[test]
     fn canary_a_stalled_sweep_is_caught() {
-        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(SLOT_COUNT), 0);
+        let (handle, _inbox, _issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(SLOT_COUNT), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         let mut sweep = BoardSweep::new(CellId(0));
         board.slot(3).publish(7, 1, 1_000);
@@ -2324,7 +3695,8 @@ mod tests {
     #[test]
     fn at_64_cells_or_fewer_one_step_equals_the_old_fold() {
         for count in [1u16, 2, 7, 64] {
-            let (handle, _inbox, _issuers) = ControlHandle::detached(cells(count), 0);
+            let (handle, _inbox, _issuers, _tier) =
+                ControlHandle::detached::<MemFs>(cells(count), 0).expect("the catalog boots");
             let board = handle.ckpt_board();
             for cell in 0..count {
                 let epoch = u64::from(cell) * 7 + 3;
@@ -2395,7 +3767,8 @@ mod tests {
     /// progress already read (any other slot when the sweep is at its
     /// start): the observation that ends the term must carry both.
     fn turns_until_an_own_publication_is_observed(count: u16, me: u16, steps_in: u32) -> u32 {
-        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(count), 0);
+        let (handle, _inbox, _issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(count), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         let lastsave = LastSave::default();
         let mut sweep = BoardSweep::new(CellId(me));
@@ -2437,7 +3810,8 @@ mod tests {
     /// wire such a pair).
     #[test]
     fn a_sweep_of_a_cell_off_the_board_has_no_own_slot_term() {
-        let (handle, _inbox, _issuers) = ControlHandle::detached(cells(2), 0);
+        let (handle, _inbox, _issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(2), 0).expect("the catalog boots");
         let board = handle.ckpt_board();
         let mut sweep = BoardSweep::new(CellId(2));
         board.slot(0).publish(3, 1, 1_000);
@@ -2457,7 +3831,8 @@ mod tests {
     /// raise) must fail this test.
     #[test]
     fn lastsave_after_wait_cell_covers_the_fenced_checkpoint() {
-        let (handle, _inbox, issuers) = ControlHandle::detached(cells(2), 0);
+        let (handle, _inbox, issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(2), 0).expect("the catalog boots");
         let mut quota = issuers.cells.into_iter().next().expect("cell 0").quota;
         let epoch = quota.request(CkptTarget::Cell(CellId(1))).expect("a unit");
         let board = handle.ckpt_board();
@@ -2483,10 +3858,10 @@ mod tests {
     fn info_rdb_last_save_time(node: &NodeInfo) -> u64 {
         let keyspace = Keyspace::new(StoreConfig::default());
         let argv: [&[u8]; 2] = [b"INFO", b"persistence"];
-        let mut reply = Vec::new();
-        let mut writer = RespWriter::new(&mut reply, Protocol::Resp2);
+        let mut reply = ReplyStream::new(Vec::new());
+        let mut writer = RespWriter::new(reply.open(), Protocol::Resp2);
         crate::admin::info(&argv[..], &keyspace, node, Nanos(1), &mut writer);
-        let text = String::from_utf8(reply).expect("INFO is text");
+        let text = String::from_utf8(reply.into_vec()).expect("INFO is text");
         text.lines()
             .find_map(|line| line.strip_prefix("rdb_last_save_time:"))
             .and_then(|value| value.trim().parse().ok())
@@ -2505,10 +3880,11 @@ mod tests {
     /// the sweep's term alone (`inf_canary_info_lastsave_from_observation`).
     #[test]
     fn lastsave_and_the_info_gauge_answer_one_value_after_a_wait_cell() {
-        let (handle, _inbox, issuers) = ControlHandle::detached(cells(2), 0);
+        let (handle, _inbox, issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(2), 0).expect("the catalog boots");
         let mut quota = issuers.cells.into_iter().next().expect("cell 0").quota;
         let board = handle.ckpt_board();
-        let node = NodeInfo::try_default().expect("fixture cache allocation");
+        let (node, _) = NodeInfo::try_default().expect("fixture cache allocation");
         let mut sweep = BoardSweep::new(CellId(0));
         assert_eq!((node.lastsave.unix_s(), info_rdb_last_save_time(&node)), (0, 0));
         // One completed sweep over an older publication: both surfaces
@@ -2541,7 +3917,8 @@ mod tests {
     #[test]
     fn control_constructors_take_a_cell_count_up_to_the_slot_count() {
         assert!(CellCount::new(SLOT_COUNT + 1).is_err());
-        let (handle, _inbox, issuers) = ControlHandle::detached(cells(SLOT_COUNT), 0);
+        let (handle, _inbox, issuers, _tier) =
+            ControlHandle::detached::<MemFs>(cells(SLOT_COUNT), 0).expect("the catalog boots");
         assert_eq!(handle.ckpt_board().cell_count(), usize::from(SLOT_COUNT));
         assert_eq!(issuers.cells.len(), usize::from(SLOT_COUNT));
         assert!(issuers.host.remaining() >= 1 << 49, "Q >= 2^49 at 16,384 cells (A1.2)");

@@ -34,7 +34,7 @@ use inf_log::{
     tier_frame_span,
 };
 use inf_runtime::{
-    BackendDriver, CellExecutor, CompletionResult, CompletionToken, GateWait, IoGate, IoOp,
+    BackendDriver, CompletionResult, CompletionToken, IoGate, IoOp, KeyedAdmission, KeyedWait,
     PollImmediate, RawFd, StableBytesMut, TokenClass, UringDriver, Wait,
 };
 use inf_store::KeyHasher;
@@ -43,6 +43,20 @@ use inf_store::{
     TieredLookup, TieredTable,
 };
 
+#[path = "support/tasks.rs"]
+mod tasks;
+use tasks::TestExecutor;
+
+#[path = "support/uring_env.rs"]
+mod uring_env;
+
+/// The file's one ring: the test environment's selections, checked engaged.
+fn make_ring(entries: u32) -> UringDriver {
+    let driver = UringDriver::new(entries, uring_env::config()).expect("io_uring");
+    uring_env::assert_engaged(&driver.capabilities());
+    driver
+}
+
 const NS: NsId = NsId(42);
 const RING: usize = 1 << 21; // 2 MiB — fits the corpus incl. the big record
 const PAGE: usize = 1 << 12;
@@ -50,7 +64,7 @@ const PAGE: usize = 1 << 12;
 /// exercises the exact second read.
 const POOL_BUF: usize = 16 * TIER_FRAME_BYTES;
 
-type Waiter = GateWait<CompletionToken, CompletionResult>;
+type Waiter = KeyedWait<CompletionToken, CompletionResult>;
 type Answer = Option<(Vec<u8>, u32, bool)>;
 
 struct Ctx {
@@ -137,7 +151,10 @@ fn plan_first_window(
                 buf: stable,
                 token,
             });
-            let waiter = ctx.gate.waiter(token);
+            let KeyedAdmission::Granted(permit) = ctx.gate.reserve(token) else {
+                panic!("the test mints each token once, into a gate of room");
+            };
+            let waiter = permit.register();
             Planned::Fetch(WindowPlan { buf, addr, frame_count, skip }, waiter)
         }
     }
@@ -202,7 +219,10 @@ fn resume_first_window(
                 buf: stable,
                 token,
             });
-            let waiter = ctx.gate.waiter(token);
+            let KeyedAdmission::Granted(permit) = ctx.gate.reserve(token) else {
+                panic!("the test mints each token once, into a gate of room");
+            };
+            let waiter = permit.register();
             Resumed::Oversized { boxed, waiter, addr, skip, len }
         }
     }
@@ -282,7 +302,7 @@ async fn steel_get(ctx: Rc<RefCell<Ctx>>, key: Vec<u8>) -> Answer {
 /// bounded, never spinning past the answer.
 fn pump_until<T>(
     ctx: &Rc<RefCell<Ctx>>,
-    ex: &mut CellExecutor,
+    ex: &mut TestExecutor,
     done: &Rc<RefCell<Option<T>>>,
 ) -> T {
     let mut recv_pool = BufferPool::new(2, 4096); // signature-required; unused by TierRead
@@ -317,7 +337,7 @@ fn pump_until<T>(
 /// suspended when `expect_suspend` says so.
 fn run_get(
     ctx: &Rc<RefCell<Ctx>>,
-    ex: &mut CellExecutor,
+    ex: &mut TestExecutor,
     key: &[u8],
     expect_suspend: bool,
 ) -> Answer {
@@ -347,11 +367,18 @@ struct Corpus {
     values: std::collections::HashMap<Vec<u8>, Vec<u8>>,
 }
 
+/// The test's I/O gate: past the reads the test has in flight at once.
+const IO_GATE_HOLDERS: inf_foundation::bounded::Cap = inf_foundation::bounded::Cap::entries::<64>(
+    "io-gate-holders",
+    inf_foundation::bounded::CapFill::Serving,
+);
+
 /// Builds the table, seals + flushes + demotes everything, and returns
 /// the corpus — the §3.1 lifecycle up to "disk-only".
 fn build_demoted_corpus(
     dir: &std::path::Path,
 ) -> (Rc<RefCell<Ctx>>, Corpus, TierWriter<StdSegmentFs>) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(StoreConfig::default());
     assert!(
         ks.materialize_tiered(
@@ -363,6 +390,7 @@ fn build_demoted_corpus(
             },
             DemotionConfig::for_budget(RING as u64, PAGE as u64),
             64,
+            &census,
         )
         .is_ok()
     );
@@ -419,8 +447,8 @@ fn build_demoted_corpus(
     let ctx = Rc::new(RefCell::new(Ctx {
         ks,
         pool: AlignedPool::new(4, POOL_BUF),
-        driver: UringDriver::new(64).expect("io_uring"),
-        gate: IoGate::new(),
+        driver: make_ring(64),
+        gate: IoGate::build(IO_GATE_HOLDERS, &census).expect("the steel thread's gate"),
         tier_fd: writer.raw_fd().expect("std fs has real fds"),
         tier_base: base.to_raw(),
         tier_frames,
@@ -435,7 +463,7 @@ fn steel_thread_write_flush_demote_cold_read() {
     let dir = std::env::temp_dir().join(format!("inf-steel-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp shard dir");
     let (ctx, corpus, _writer) = build_demoted_corpus(&dir);
-    let mut ex = CellExecutor::new(8);
+    let mut ex = TestExecutor::new();
 
     // Cold reads: every record served byte-exact through real suspension.
     for key in &corpus.small_keys {
@@ -507,7 +535,7 @@ fn cold_read_histogram() {
         .join(format!("inf-steel-hist-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp shard dir");
     let (ctx, corpus, _writer) = build_demoted_corpus(&dir);
-    let mut ex = CellExecutor::new(8);
+    let mut ex = TestExecutor::new();
 
     let fd = ctx.borrow().tier_fd;
     let mut lat_us: Vec<f64> = Vec::new();

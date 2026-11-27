@@ -41,6 +41,8 @@ cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 STRIP="$SCRIPT_DIR/strip-test-modules.awk"
 NOCOMMENT="$SCRIPT_DIR/rust-strip-comments.awk"
 [ -f "$STRIP" ] && [ -f "$NOCOMMENT" ] || { echo "FSYNC SCOPE ERROR: helper awk missing next to $0"; exit 2; }
+# shellcheck source=source-files.sh
+. "$SCRIPT_DIR/source-files.sh"
 
 work=$(mktemp -d)
 [ -n "$work" ] && [ -d "$work" ] || { echo "FSYNC SCOPE ERROR: mktemp failed"; exit 2; }
@@ -48,14 +50,42 @@ trap '[ -n "$work" ] && [ -d "$work" ] && rm -rf "$work"' EXIT
 
 fail=0
 
+# Every listing is read whole before its loop, so a walk that fails fails the gate: the crate
+# directories (tree_dirs, which fails on one it cannot search) and each directory's files.
+# dirs_of <top>: sets `dirs` to the src/ directories under <top>, or fails the gate.
+dirs_of() {
+    dirs=$(tree_dirs src "$1") || {
+        echo "FSYNC SCOPE ERROR: the directories under $1/ are unknown (scripts/source-files.sh, above)"
+        exit 2
+    }
+}
+# files_of <dir>: sets `listing` to the .rs files under <dir>, sorted, or fails the gate.
+files_of() {
+    listing=$(find "$1" -name '*.rs' | sort) || {
+        echo "FSYNC SCOPE ERROR: the walk of $1 failed, so its files are unread"
+        exit 2
+    }
+}
+dirs_of crates
+crate_srcs=$dirs
+dirs_of bins
+bin_srcs=$dirs
+
 # ---- 1. derive the fsync-error type set --------------------------------
 # The audited minimum: the set this gate's allow-list was reviewed against.
 # The derivation may only GROW it; a shrink means the parser broke.
 REQUIRED="LogError::Fsync FsyncFailed on_fsync_error TierWriteFailure::Fsync TierFlushError::Fsync ExtentWriteFailure::Fsync"
 : >"$work/derived"
-for dir in crates/*/src; do
-    [ -d "$dir" ] || continue
+while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    files_of "$dir"
     while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        # A file the gate cannot read fails it here, before any read whose status is lost.
+        [ -f "$f" ] && [ -r "$f" ] || {
+            echo "FSYNC SCOPE ERROR: $f cannot be read, so it is unscanned"
+            exit 2
+        }
         awk -f "$NOCOMMENT" "$f" | awk '
             /^[[:space:]]*(pub[[:space:]]+)?enum[[:space:]]+[A-Za-z0-9_]+/ {
                 n = $0
@@ -78,8 +108,8 @@ for dir in crates/*/src; do
             }
             /pub fn on_fsync_error/ { print "on_fsync_error" }
         ' >>"$work/derived"
-    done < <(find "$dir" -name '*.rs' | sort)
-done
+    done <<<"$listing"
+done <<<"$crate_srcs"
 sort -u "$work/derived" -o "$work/derived"
 for p in $REQUIRED; do
     grep -qx "$p" "$work/derived" || {
@@ -125,11 +155,19 @@ END {
     }
 }
 AWK
-for dir in crates/*/src bins/*/src; do
-    [ -d "$dir" ] || continue
+while IFS= read -r dir; do
+    [ -n "$dir" ] || continue
+    files_of "$dir"
     while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        # A file the gate cannot read fails it here, before any read whose status is lost.
+        [ -f "$f" ] && [ -r "$f" ] || {
+            echo "FSYNC SCOPE ERROR: $f cannot be read, so it is unscanned"
+            exit 2
+        }
         files=$((files + 1))
-        lines=$((lines + $(wc -l <"$f")))
+        n=$(wc -l <"$f") || { echo "FSYNC SCOPE ERROR: $f cannot be counted"; exit 2; }
+        lines=$((lines + n))
         # `use` / `pub use` statements are blanked: an import or a
         # re-export names the typed error, it can never catch one.
         awk -f "$STRIP" "$f" | awk -f "$NOCOMMENT" | awk '
@@ -189,8 +227,9 @@ for dir in crates/*/src bins/*/src; do
                 fail=1
             fi
         done < <(grep -n 'fsync-fail-stop-allow:' "$f" || true)
-    done < <(find "$dir" -name '*.rs' | sort)
-done
+    done <<<"$listing"
+done <<<"$crate_srcs
+$bin_srcs"
 
 scope="$derived_count derived fsync-error patterns, $files files / $lines lines scanned, $sites typed sites ($allowed audited), $syncs raw sync call sites"
 if [ "$fail" -ne 0 ]; then

@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! M4-S17 — blob-extent reference counting (plan AC 3, ADR-0061): random
 //! create/overwrite/delete storms over mixed inline + out-of-line values,
 //! with real (MemFs) extent files, the real flush pipeline demoting the
@@ -28,7 +32,7 @@ use inf_log::blob::{
 use inf_log::fs::mem::MemFs;
 use inf_log::tier::{TIER_FRAME_BYTES, tier_extract, tier_frame_offset, tier_frame_span};
 use inf_log::{
-    CkptConfig, Lsn, MutationEffect, NsId, RecordView, SegmentId, StagingConfig, StagingRing,
+    CkptConfig, LogGeometry, Lsn, MutationEffect, NsId, RecordView, SegmentId, StagingRing,
     SyncIckWriter, TierFlush, TierFlushConfig, TierIoMode, write_manifest,
 };
 use inf_store::KeyHasher;
@@ -96,6 +100,7 @@ impl Rig {
     }
 
     fn with_budget(budget: u64) -> Rig {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let demote = DemotionConfig::for_budget(budget, PAGE);
         let mut table = TieredTable::new(
             AddressSpaceConfig {
@@ -106,6 +111,7 @@ impl Rig {
             demote,
             2048,
             KeyHasher::default(),
+            &census,
         )
         .expect("ring");
         table.set_blob_config(BlobConfig { threshold_bytes: THRESHOLD, max_bytes: 1 << 20 });
@@ -119,14 +125,16 @@ impl Rig {
                 mode: TierIoMode::Buffered,
                 file_capacity: FILE_CAPACITY,
                 slice_bytes: PAGE,
+                record_len_max: 16 << 20,
             },
             0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
         Rig {
             fs,
             table,
             flush,
-            ring: StagingRing::new(StagingConfig::default()),
+            ring: StagingRing::new(LogGeometry::default()),
             tail: Vec::new(),
             model: BTreeMap::new(),
             ckpt_id: 0,
@@ -150,7 +158,7 @@ impl Rig {
         if self.table.stage_wal(&mut self.ring, effect).is_err() {
             // The modeled tail is the durable record; the ring is only
             // the staging admission — recycle it wholesale.
-            self.ring = StagingRing::new(StagingConfig::default());
+            self.ring = StagingRing::new(LogGeometry::default());
             self.table.stage_wal(&mut self.ring, effect).expect("a fresh ring has room");
         }
     }
@@ -670,6 +678,7 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
             mode: TierIoMode::Buffered,
             file_capacity: FILE_CAPACITY,
             slice_bytes: PAGE,
+            record_len_max: 16 << 20,
         },
         AddressSpaceConfig {
             reserve_bytes: demote.ring_reserve_bytes().expect("valid budget"),
@@ -679,6 +688,7 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
         demote,
         2048,
         KeyHasher::default(),
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
     .expect("recovery");
     assert!(
@@ -697,7 +707,7 @@ fn recovery_rebuilds_refcounts_serves_content_and_sweeps_orphans() {
     // the header-valid orphan quarantines (rename, bytes survive the
     // life), and only the next boot's second verdict unlinks; nothing
     // live is ever handed out.
-    let revive = table.extent_sweep_seed(&recovered.extents_listed, &[]);
+    let revive = table.extent_sweep_seed(&recovered.extents_listed.to_vec(), &[]);
     assert!(revive.is_empty(), "nothing was quarantined before this boot");
     let mut quarantined: Vec<u64> = Vec::new();
     loop {

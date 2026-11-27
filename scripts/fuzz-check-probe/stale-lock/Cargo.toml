@@ -1,0 +1,16 @@
+# The `--locked` plant of scripts/check-fuzz-targets.sh (ADR-0198 D2): the
+# committed lock names this package at 0.0.0 and the manifest says 0.1.0, so
+# cargo refuses the lock under --locked and rewrites it without. A workspace
+# of its own, because a lock refusal stops a whole workspace before any unit
+# compiles, which would hide the other plants.
+[package]
+name = "fuzz-check-stale-lock"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "stale_lock"
+path = "fuzz_targets/stale_lock.rs"

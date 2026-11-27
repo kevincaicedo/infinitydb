@@ -31,17 +31,28 @@
 # `AliasView` with no enumeration behind it), for bare-tree suites.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=source-files.sh
+. "$SCRIPT_DIR/source-files.sh"
 cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 
 BANNED='collision-oracle|fault-points|test-support'
 # Resolver rows: `<package>:<its banned features>`.
-FENCED=('inf-foundation:collision-oracle|fault-points' 'inf-store:collision-oracle|test-support')
+# `inf-runtime` and `inf-server` forward `fault-points` (the fabric gate's
+# first-generation hook and wrap count): fenced the same way.
+FENCED=('inf-foundation:collision-oracle|fault-points' 'inf-store:collision-oracle|test-support'
+    'inf-runtime:fault-points' 'inf-server:fault-points|test-support')
 fail=0
 
 manifests=()
 for dir in crates bins tests; do
     [ -d "$dir" ] || continue
-    while IFS= read -r f; do manifests+=("$f"); done < <(find "$dir" -name Cargo.toml -not -path '*/target/*' | sort)
+    # A build's output, a directory holding CACHEDIR.TAG, holds no manifest of the workspace.
+    # The listing is read whole before the loop, so a walk that fails fails the fence.
+    listing=$(source_files Cargo.toml "$dir" | sort) || {
+        echo "SHIPPING-FEATURE SCOPE ERROR: the walk of $dir/ failed, so its manifests are unread"
+        exit 1
+    }
+    while IFS= read -r f; do [ -z "$f" ] || manifests+=("$f"); done <<<"$listing"
 done
 if [ "${#manifests[@]}" -eq 0 ]; then
     echo "SHIPPING-FEATURE SCOPE ERROR: no Cargo.toml under crates/, bins/ or tests/ from $(pwd)"

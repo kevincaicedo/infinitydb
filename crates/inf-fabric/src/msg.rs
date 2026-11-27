@@ -20,18 +20,20 @@ pub const INLINE_MSG_CAP: usize = 62;
 const SEQ_BITS: u32 = 48;
 const SEQ_MASK: u64 = (1 << SEQ_BITS) - 1;
 
-/// Reply-routing key: `{origin_cell:16, seq:48}`. Minted by
-/// [`crate::CellFabric::next_token`], monotonic per cell, unique node-wide.
+/// Reply-routing key: `{origin_cell:16, seq:48}`, unique node-wide among
+/// the ops in flight. A fabric gate mints a request's (its sequence's top
+/// bit set, ADR-0177 D4); [`crate::CellFabric::next_token`] the accept
+/// hand-off's, below that bit.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct FabricToken(pub u64);
 
 impl FabricToken {
-    /// The largest sequence a token carries (48 bits). The one
-    /// production minter, [`crate::CellFabric::next_token`], wraps to 0
-    /// past it: a token only has to be unique among the ops in flight
-    /// (bounded by the ring capacities), never over a node's lifetime —
-    /// at 10 M sends/s a cell reaches 2^48 in under a year, which is an
-    /// uptime, not a bug (batch 12 of the 2026-08-30 review, Theme 4).
+    /// The largest sequence a token carries (48 bits). A token only has to
+    /// be unique among the ops in flight (bounded by the ring capacities),
+    /// never over a node's lifetime: the hand-off minter,
+    /// [`crate::CellFabric::next_token`], wraps below the top bit, and a
+    /// fabric gate's keys carry that bit with its holder's index and
+    /// generation (ADR-0177 D4).
     pub const MAX_SEQ: u64 = SEQ_MASK;
 
     /// Packs an origin cell and per-cell sequence number.

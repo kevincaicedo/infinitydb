@@ -190,14 +190,27 @@ measured_by = "CI client-smoke job: redis-py, node-redis, go-redis, lettuce"
 # Idle RSS bill, N = 4 cells: receive pools pinned by fixed-buffer
 # registration N × 4096 × 4 KiB = 64 MiB; mesh ring slots N(N−1) × 4096 ×
 # 64 B = 3 MiB; io_uring SQ + CQ N × 4096 × 96 B = 1.5 MiB; per-cell
-# remainder 4 MiB × N = 16 MiB; per-node remainder 16 MiB. Σ 100.5 MiB.
+# remainder 4 MiB × N = 16 MiB; per-node remainder 16 MiB; task slots
+# N × Σ_j (W_j × stride_j + D_j × 2 KiB), each class j in chunks of
+# c_j = c(stride_j) slots, W_j its cap T_j rounded up to whole chunks and
+# D_j its directories, none for a one-chunk class (ADR-0177 A1.1, ADR-0194
+# A1): conn T 2,500, 3,104 B, c 16, W 2,512, D 1: 7,799,296 B; ns-apply 3,
+# 1,504 B, c 32: 48,128 B; owner-pub 1, 1,208 B, c 32: 38,656 B; gated 1,
+# 96 B, c 64: 6,144 B; compact 64, 200 B, c 64: 12,800 B; shadow 256,
+# 264 B, c 64, D 1: 69,632 B; 7,974,656 B a cell, 30.421 MiB; gate holders
+# N × (W(H) × stride + D(H) × 2 KiB), every slot of each 64-slot chunk and
+# each directory written at the build (ADR-0177 D8 with A1.1): H 83,075
+# (2,500 × 32 + 3 units and 3 × 1,024 orphans), 48 B, W 83,136, D 7:
+# 4,004,864 B a cell, 15.278 MiB. Σ 146.198 MiB, rounded up to 0.01 MiB.
+# The task headers stay in the per-cell remainder. Each stride is the class slot's size as the build reads it;
+# a term is recomputed when a stride moves, never raised to a reading.
 # Scope: memory-only node; every cell's registration proven by VmPin over
 # 2(N−1) × 4096 × 4 KiB (else the row is withheld). Plant: --buffers 8192
 # must rise ≥ 0.9 × 64 MiB and read over the bill.
 [[gate]]
 id = "empty_idle_rss"
 name = "Empty node: idle RSS"
-threshold = 100.5
+threshold = 146.20
 comparator = "<="
 unit = "MiB (VmRSS, node)"
 tier = "linux-reference-box"
@@ -230,16 +243,24 @@ measured_by = "gate-run m1: durable 4-cell node, walked after each warm boot's i
 # Warm boot bill, spawn to the first +PONG on a warm directory: exec and
 # loader 2 ms; main-thread setup 3 ms (rings, eventfds, lock, key-hash,
 # the io-properties identity check with no probe, topology); per cell in
-# parallel 7 ms (ring 1, pool + pin of 16 MiB 5, keyspace 1); empty
-# recovery 5 ms (MANIFEST, the stop checkpoint, no replayed frame, boot
-# GC); first reply 1 ms. Σ 18 ms, rounded up to 20 ms. The boot instant is
-# the first +PONG, never the accept: the listener binds before the cells
-# serve. Plant: the probing first boot must read over the bill and ≥ 2 s
-# over the median warm boot.
+# parallel 7 ms (ring 1, pool + pin of 16 MiB 5, keyspace 1), and the
+# executor's class slabs and task headers each cell writes at boot,
+# 8,051,008 B at the pool's 16 MiB in 5 ms, 2.40 ms; empty recovery 5 ms
+# (MANIFEST, the stop checkpoint, no replayed frame, boot GC); first reply
+# 1 ms; and the boot's slack audit, which reads the two retained log
+# segments' unwritten tails through the page cache, holes included:
+# 2S − 4 KiB a cell, S = 256 MiB, 536,866,816 B at the pool's rate,
+# 160.0 ms (each cell its own, in parallel). Σ 180.40 ms,
+# rounded up to the next 1-2-5 step, 200 ms. The audit's term leaves when
+# the audit reads only the data past its start; 200 ms is a deviation,
+# owner Kevin Caicedo, expiry 2026-12-31 or the first public tag: then
+# 50 ms, fixed or not. The boot instant is the first +PONG, never the
+# accept: the listener binds before the cells serve. Plant: the probing
+# first boot must read over the bill and ≥ 2 s over the median warm boot.
 [[gate]]
 id = "empty_warm_boot"
 name = "Empty node: warm boot to first PONG"
-threshold = 20
+threshold = 200
 comparator = "<="
 unit = "ms"
 tier = "linux-reference-box"

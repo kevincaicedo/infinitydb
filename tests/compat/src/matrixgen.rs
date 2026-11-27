@@ -21,6 +21,9 @@
 //! - `extension` — InfinityDB `INF.*` surface, unknown to Redis.
 //! - `internal` — fabric program primitives, not a client surface.
 
+// nextest-stall-default: this file creates and writes no namespace; it names the
+// tiering keys only in the text of the compatibility matrix it renders.
+
 use inf_wire::{COMMANDS, CmdFlags};
 
 use crate::candidate::Candidate;
@@ -87,9 +90,23 @@ pub static DECLARED: &[Declared] = &[
         "QUIT",
         Status::Partial,
         "M1",
-        "replies +OK and closes the connection (Redis-equivalent); not in the byte-diff corpus \
-             because closing tears down the shared oracle connection — covered by a unit test and \
-             the client-smoke suite",
+        "replies +OK once the replies before it are sent, then closes the connection; not in \
+             the byte-diff corpus, because closing tears down the shared oracle connection, and \
+             compared with Redis by the real-node lanes on connections of their own. Every \
+             command a connection read before its peer ended the stream runs, whatever the \
+             connection's state when it is parsed. While the peer can read, each is answered, and \
+             the connection closes once the replies are sent; Redis frees the client when it \
+             reads the end of the stream, dropping the replies its socket had not taken, a \
+             `QUIT`'s `+OK` among them, and its `CLIENT LIST` row, so this server sends more and \
+             lists the client longer. If the peer is gone (a reset or a failed write), the \
+             commands it sent run and are not answered. Nothing after a `QUIT`, inline or queued, \
+             runs. After a `QUIT`, a protocol error or the end of the stream no published message \
+             is written. A subscriber counts as a receiver until the server reads its end of \
+             stream or closes it, so one marked by `QUIT` counts while its stream is open, as \
+             Redis's does. After a `QUIT` with input behind it Redis may reset the connection, \
+             when it closes with that input unread; this server may end it with a FIN. After a \
+             write error this server runs the commands it had read; Redis may not (ADR-0196 D6, \
+             A1.6)",
     ),
     d("GET", Status::Full, "M0", ""),
     d(
@@ -162,9 +179,10 @@ pub static DECLARED: &[Declared] = &[
              worst wheel debt across every store); `# Tiering` and `# Tripwires` are this \
              cell's slice only (`tripwire_scope:cell`; ADR-0122 D3 + A1 + A2); `# Persistence` \
              is this cell's slice except the values it renders from node state, among them \
-             `loading` and the `loading_*` fields, `ns_drop_tombstones` and the \
-             `recover_node_tier_` fields; an unknown section name selects nothing (empty body, \
-             Redis shape); client-smoke CI is the open M1-S14 AC",
+             `loading` and the `loading_*` fields, the catalog writer's `ns_drop_*`, `ns_ddl_*` \
+             and `catalog_epoch` fields and the `recover_node_tier_` fields; an unknown \
+             section name selects nothing (empty body, Redis shape); client-smoke CI is the \
+             open M1-S14 AC",
     ),
     d(
         "COMMAND",
@@ -299,7 +317,10 @@ pub static DECLARED: &[Declared] = &[
         "subset: SLEEP / JMAP / OBJECT / SET-ACTIVE-EXPIRE (accepted and ignored — the wheel \
              stays on; lazy expiry alone upholds visibility); OBJECT routes to the key's owner \
              cell and COMMAND GETKEYS reports that key (ADR-0104); SLEEP stalls one cell, never \
-             the node",
+             the node; a `SLEEP` past `timeout` answers every client of the stalled cell, and \
+             `timeout` counts each one's idle time from the stall's end at the earliest; Redis \
+             closes each client idle past `timeout` at the sleep's end, the issuer's reply unsent \
+             and a request that arrived during the sleep unread (ADR-0193)",
     ),
     d(
         "EXPIREAT",
@@ -323,9 +344,16 @@ pub static DECLARED: &[Declared] = &[
         "typed M1 key subset with frozen hot-reload classes; `proto-max-bulk-len` defaults to 16 \
              MiB (Redis 512 MiB), floors at Redis's 1 MiB and applies per cell on the next \
              MAINTAIN (ADR-0122); `maxclients` is divided per cell like `maxmemory` (a full cell \
-             refuses with Redis's error while a sibling may have headroom), `timeout` closes idle \
-             unsubscribed connections at MAINTAIN resolution, `tcp-keepalive` applies to \
-             connections accepted after the change (ADR-0123); `client-output-buffer-limit` \
+             refuses with Redis's error while a sibling may have headroom) and is at most the \
+             boot capacity `--maxclients` (default 10,000): a raise above it answers `-ERR \
+             maxclients exceeds boot capacity; restart with --maxclients` and changes no key of \
+             the `CONFIG SET`, and below the cell count every cell keeps one slot (ADR-0123 \
+             A1); `timeout` closes idle \
+             unsubscribed connections at MAINTAIN resolution, and a connection the server owes a \
+             reply (a command queued or held, a byte unparsed, a reply not yet offered, its cell \
+             stalled) is not closed by `timeout`, and a send is activity (ADR-0193); \
+             `tcp-keepalive` applies to connections accepted after the change (ADR-0123); \
+             `client-output-buffer-limit` \
              enforces `normal` and `pubsub`, the `slave` class is accepted and inert until M9 \
              replicas exist; `save`/`appendonly` are accepted and inert (no RDB/AOF); \
              `doc-path-cache-size` is BootOnly, 0–4,096 entries per cell (default 1,024; \
@@ -338,7 +366,10 @@ pub static DECLARED: &[Declared] = &[
         "M1",
         "KILL supports the ID filter form; LIST/INFO report the tracked fields (id, name, age, \
              resp, db, sub, psub) — addr/fd are placeholders until peername capture, and \
-             idle/cmd/tot-*/buffer gauges are untracked zeros",
+             idle/cmd/tot-*/buffer gauges are untracked zeros; a client whose end of stream the \
+             server has read keeps its LIST row, its `connected_clients` count and its admission \
+             share until its replies are sent and its connection closes, where Redis drops them \
+             when it reads the end of the stream (ADR-0196 A1.6)",
     ),
     d(
         "LOLWUT",
@@ -376,7 +407,13 @@ pub static DECLARED: &[Declared] = &[
          `STALLED tiered write timed out waiting for flush progress (TAIL-STALL-TIMEOUT)` \
          (ADR-0053 D4 — retryable). Deviations on tiered namespaces: no expiry (the `EXPIRE` \
          family + `SET` expiry options refuse typed; `TTL` = -1 for live keys), non-string \
-         families refuse typed, multi-key ops resolve sequentially. M4-S27 (ADR-0068): \
+         families refuse typed, multi-key ops resolve sequentially, and a data directory whose \
+         catalog names more than 64 live tiered namespaces is refused at boot, with no \
+         migration (ADR-0148 D5, A1.2). A node holds at most 64 tiered namespace lifetimes, a \
+         dropped one counted until its runtime owners have ended on every cell: past that a \
+         tiered `CREATE` answers `-TRYAGAIN tiered namespace capacity in use` while a dropped \
+         one's owners are still ending, else `-ERR tiered namespace limit reached`, before any \
+         effect (ADR-0148 D1, ADR-0172 D3). M4-S27 (ADR-0068): \
          `MAXMEMORY`/`EVICTION` on named *memory* namespaces are enforced and Hot via `SET` \
          (`inherit`/`0` reset them); a namespace with its own budget answers the Redis-exact \
          OOM error scoped to that namespace, reclaims only its own keys, and its bytes leave \
@@ -384,7 +421,20 @@ pub static DECLARED: &[Declared] = &[
          budget-less namespaces (ADR-0068 A1); durable and tiered namespaces refuse both keys \
          typed (tiered budgets belong to `MEM-BUDGET`). A durable `CREATE`/`DROP` reserves two \
          checkpoint units of its cell's quota before any effect; an exhausted quota answers \
-         `-ERR checkpoint identity space exhausted` and changes nothing (ADR-0159 A1.2)",
+         `-ERR checkpoint identity space exhausted` and changes nothing (ADR-0159 A1.2). A \
+         `CREATE` spends a namespace id only when the catalog accepts it, so a refused one \
+         leaves the next id unchanged; once the last id (4294967294) is issued, every `CREATE` \
+         answers `-ERR namespace identity space exhausted` before any effect, for the data \
+         directory's life (ADR-0148 D4, ADR-0172 `IdentityExhausted`). A node holds at most 256 \
+         durable-drop tombstones and reserved slots; at the cap the catalog writer alone decides \
+         a durable `CREATE` or a `DROP` that leaves a tombstone: it proceeds once the tombstones \
+         every cell has checkpointed past retire, it waits for one node-wide checkpoint when \
+         that would ready them, and when every held slot waits on an operator or a restart it \
+         answers `-ERR catalog limit reached` before any effect (ADR-0189 D6, ADR-0172 \
+         `LimitReached`). A cell's cold-read host issues each tiered read one identity pair, at \
+         most 2^55 in the host's life; past that every read that must reach the tier file \
+         answers `-ERR cold-read identity space exhausted` before any effect, and the reads \
+         admitted before still answer (ADR-0181 R4, ADR-0172 `IdentityExhausted`)",
     ),
     d(
         "INF.CKPT",
@@ -470,7 +520,9 @@ pub static DECLARED: &[Declared] = &[
         Status::Partial,
         "M3",
         "S21 corpus exact; per-key atomicity only — no cross-cell snapshot (each cell serves \
-         its key at its own serve time)",
+         its key at its own serve time); a reply over doc-max-reply-bytes (128 MiB by default), \
+         counted over the whole array, answers ERR reply too large and serves nothing, where \
+         RedisJSON answers the array",
     ),
     d(
         "JSON.DEL",

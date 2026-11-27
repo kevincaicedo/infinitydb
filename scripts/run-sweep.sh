@@ -32,9 +32,14 @@ if [ -n "${INF_SIM_BIN:-}" ]; then
     sim=$INF_SIM_BIN
 else
     # ADR-0107: a DST binary is built with its `dst` feature (fault points +
-    # collision oracle) — never through the workspace graph.
-    cargo build --release -p inf-sim --features dst --bin inf-sim
-    sim=./target/release/inf-sim
+    # collision oracle) — never through the workspace graph. It is built and
+    # run in this checkout's target root, whatever CARGO_TARGET_DIR holds
+    # (ADR-0198 A2).
+    # shellcheck source=target-root.sh
+    . "$SCRIPT_DIR/target-root.sh"
+    target_root_setup "$(pwd -P)"
+    cargo build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT"
+    sim="$TARGET_ROOT/release/inf-sim"
 fi
 [ -x "$sim" ] || { echo "run-sweep: simulator not executable: $sim" >&2; exit 2; }
 

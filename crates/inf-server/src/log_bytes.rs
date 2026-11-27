@@ -18,9 +18,10 @@ use inf_runtime::StableBytes;
 /// lets a frame exceed their capacity, so the `Vec` never reallocates; the
 /// sealed buffer is not reset until `release(lease)`, which the plane
 /// calls only on the write's terminal completion (`LogWritten`/`Error`).
-/// Callers must keep the lease alive (in `DurableCell::in_flight`) until
-/// that completion — the type system enforces the lease's existence, the
-/// plane's REAP arm enforces the timing.
+/// Callers hand the lease to the ledger's frame queue as they queue the
+/// write (`GroupCommit::note_frame_queued`), which holds it until that
+/// completion hands it back (`note_frame_written`) — the type system
+/// enforces the lease's existence, the plane's REAP arm the timing.
 pub(crate) fn sealed_frame(staging: &StagingRing, lease: &FrameLease) -> StableBytes {
     let bytes = staging.leased_frame(lease);
     // SAFETY: per the lease argument above — the pointee is stable (no
@@ -51,10 +52,11 @@ pub(crate) fn ckpt_block(stream: &IckStream, lease: &SectionLease) -> StableByte
 /// Captures one tier-flush round op's window for a driver `LogWrite`
 /// (M4.5-S31, ADR-0084 D3).
 ///
-/// The round is the stability proof: windows are pool-owned `Box<[u8]>`
-/// blocks inside the namespace's `TierFlush` — heap storage that never
-/// moves when the owning structs move — staged once per round and never
-/// written again (error retries resubmit byte-identical). They return
+/// The round is the stability proof: windows are pool-owned buffers
+/// inside the namespace's `TierFlush`, each reserved whole at the
+/// pipeline's build and never reallocated — heap storage that never moves
+/// when the owning structs move — staged once per round and never written
+/// again (error retries resubmit byte-identical). They return
 /// to the pool only in `finish_round`, which the plane calls strictly
 /// after every op of the round reached a terminal completion (the
 /// `FlushRound::pending` count in `tier_cell`), and a namespace dropped

@@ -94,16 +94,20 @@ fn durable_keyspace() -> Keyspace {
 }
 
 fn durable_keyspace_with(cfg: StoreConfig) -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(cfg);
-    ks.ns_create(NsSpec {
-        id: NS,
-        name: b"docs".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: None,
-    })
+    ks.ns_create(
+        NsSpec {
+            id: NS,
+            name: b"docs".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: None,
+        },
+        &census,
+    )
     .expect("namespace");
     ks
 }
@@ -379,12 +383,14 @@ fn rebooted_with(
     corpus: &[(Vec<u8>, Vec<u8>)],
     now: Nanos,
 ) -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = Keyspace::new(cfg);
-    ks.seed_catalog(&source.export_catalog(100, 100, 100)).expect("seed");
+    ks.seed_catalog(&source.export_catalog(100, 100, 100), &census).expect("seed");
     for (key, idoc) in corpus {
         let full =
             RecordView::DocFull { ns: NS, key, lineage: DocLineage::FIRST, version: 1, idoc };
-        ks.apply_record(&full, now, ANCHOR, &mut NoSpill).expect("phase-A replay");
+        inf_store::drive_record(&mut ks, &full, now, ANCHOR, &mut NoSpill, u64::MAX)
+            .expect("phase-A replay");
     }
     ks
 }
@@ -398,7 +404,8 @@ fn replay_tail(ks: &mut Keyspace, tail: &[TailOp], now: Nanos) {
             TailOp::Del(key) => RecordView::Delete { ns: NS, key },
             TailOp::Str(key, value) => RecordView::StringPostImage { ns: NS, key, value },
         };
-        ks.apply_record(&record, now, ANCHOR, &mut NoSpill).expect("tail replay");
+        inf_store::drive_record(ks, &record, now, ANCHOR, &mut NoSpill, u64::MAX)
+            .expect("tail replay");
     }
 }
 

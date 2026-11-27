@@ -10,7 +10,8 @@
 //!
 //! ```text
 //! catalog := version: u8 (= 2 | 3 | 4)
-//!            next_id: u32          # node id counter; named ids start at 16
+//!            next_id: u32          # node id counter; named ids start at 16;
+//!                                  # above every entry's and tombstone's id
 //!            count:   u32          # entry count
 //!            entry*count
 //!            [index_section]       # v3+ (ADR-0075 D2); always present in v4
@@ -31,7 +32,8 @@
 //!                  encoding_version: u16     # must equal 1 (ADR-0074 D1)
 //!                  program_len: u16 · program bytes  # M3 bytecode v1
 //!                  name_len: u16 · name
-//! entry   := id:        u32        # ≥ 16 (0..16 are the implicit defaults)
+//! entry   := id:        u32        # ≥ 16 (0..16 are the implicit defaults),
+//!                                  # < next_id (ids never reuse)
 //!            mode:      u8         # 0 = memory, 1 = durable, 2 = topic
 //!            fsync:     u8         # 0 = none, 1 = everysec, 2 = always
 //!            policy:    u8         # 0 = inherit, else EvictionPolicy
@@ -68,8 +70,10 @@
 //!
 //! Decode is **fail-stop** for callers (§8.4 honesty): unknown version,
 //! truncation, trailing bytes, invalid mode/fsync/policy/tier bytes,
-//! invalid or reserved names, reserved ids, and duplicate ids are all
-//! typed errors — nothing is skipped or repaired. Cross-field rules are
+//! invalid or reserved names, reserved ids, duplicate ids, and an entry
+//! id at or above `next_id` (a counter that would issue it again, ADR-0015
+//! D2; the boot's counter check, ADR-0148 D4) are all typed errors —
+//! nothing is skipped or repaired. Cross-field rules are
 //! enforced too: encode always writes the *resolved* fsync class for
 //! durable entries (`None` normalizes to `everysec`, the registry
 //! default), so decode requires durable ⇒ fsync ≠ 0 and non-durable ⇒
@@ -157,7 +161,8 @@ impl IndexCatalog {
 /// persists it through the `META` swap.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NsCatalog {
-    /// Next id the node-level allocator hands out (≥ [`FIRST_NAMED_NS_ID`]).
+    /// Next id the node-level counter issues (≥ [`FIRST_NAMED_NS_ID`]):
+    /// above every live and tombstoned id, `u32::MAX` once none is left.
     pub next_id: u32,
     pub entries: Vec<NsSpec>,
     /// Index declarations + counters (M4.5-S03, ADR-0075 D2).
@@ -193,6 +198,9 @@ pub enum CatalogError {
     ReservedId(u32),
     /// Two entries claim the same id (ids are never reused).
     DuplicateId(u32),
+    /// A live entry's id is at or above `next_id`: an id the counter never
+    /// issued, which it would issue again (ids are never reused).
+    IdNotIssued { id: u32, next_id: u32 },
     /// Tier presence byte outside `0..=1` (M4-S19, ADR-0062 D6).
     InvalidTierByte(u8),
     /// Tier block violates a cross-field or range rule; the reason names
@@ -241,6 +249,11 @@ impl fmt::Display for CatalogError {
             CatalogError::InvalidName => write!(f, "invalid namespace name"),
             CatalogError::ReservedId(id) => write!(f, "namespace id {id} is reserved"),
             CatalogError::DuplicateId(id) => write!(f, "duplicate namespace id {id}"),
+            CatalogError::IdNotIssued { id, next_id } => write!(
+                f,
+                "namespace id {id} is at or above the catalog's next id {next_id}: the counter \
+                 would issue it again"
+            ),
             CatalogError::InvalidTierByte(b) => write!(f, "invalid tier presence byte {b}"),
             CatalogError::InvalidTierConfig(reason) => write!(f, "invalid tier config: {reason}"),
             CatalogError::TierOwnsBudget(id) => {
@@ -279,6 +292,18 @@ impl fmt::Display for CatalogError {
 impl std::error::Error for CatalogError {}
 
 impl NsCatalog {
+    /// The catalog of a data directory no DDL has written (no `META`): no
+    /// namespace, no index and no tombstone.
+    #[must_use]
+    pub fn empty() -> NsCatalog {
+        NsCatalog {
+            next_id: FIRST_NAMED_NS_ID,
+            entries: Vec::new(),
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        }
+    }
+
     /// Encodes the catalog (see module docs): v4 when a drop tombstone is
     /// live, v3 when the index feature has been used, v2 byte-identically
     /// otherwise (ADR-0075 D2.2, ADR-0100 D1). Durable entries always
@@ -363,6 +388,9 @@ impl NsCatalog {
             let entry = decode_entry(&mut r, version)?;
             if entries.iter().any(|e: &NsSpec| e.id == entry.id) {
                 return Err(CatalogError::DuplicateId(entry.id.0));
+            }
+            if entry.id.0 >= next_id {
+                return Err(CatalogError::IdNotIssued { id: entry.id.0, next_id });
             }
             entries.push(entry);
         }
@@ -956,7 +984,7 @@ mod tests {
         e.fsync = Some(FsyncClass::Always);
         e.tier = Some(tier);
         let cat = NsCatalog {
-            next_id: 17,
+            next_id: 18,
             entries: vec![e, entry(17, b"plain", NsMode::Memory)],
             index: IndexCatalog::default(),
             dropped: Vec::new(),
@@ -1055,6 +1083,30 @@ mod tests {
             dropped: Vec::new(),
         };
         assert_eq!(NsCatalog::decode(&cat.encode()), Err(CatalogError::DuplicateId(16)));
+    }
+
+    /// Boot's counter check (ADR-0148 D4): a live id at or above `next_id`
+    /// is one the counter would issue again, so the catalog is refused; the
+    /// last issuable id under a spent counter decodes.
+    #[test]
+    fn an_entry_id_at_or_above_the_counter_is_refused() {
+        for (next_id, id) in [(16, 16), (17, 20), (u32::MAX, u32::MAX)] {
+            let cat = NsCatalog {
+                next_id,
+                entries: vec![entry(id, b"ahead", NsMode::Memory)],
+                index: IndexCatalog::default(),
+                dropped: Vec::new(),
+            };
+            let refused = CatalogError::IdNotIssued { id, next_id };
+            assert_eq!(NsCatalog::decode(&cat.encode()), Err(refused), "id {id}, next {next_id}");
+        }
+        let last = NsCatalog {
+            next_id: u32::MAX,
+            entries: vec![entry(u32::MAX - 1, b"last", NsMode::Memory)],
+            index: IndexCatalog::default(),
+            dropped: Vec::new(),
+        };
+        assert_eq!(NsCatalog::decode(&last.encode()), Ok(last));
     }
 
     #[test]

@@ -528,6 +528,7 @@ pub(crate) fn survival_audit(
     cut_time: Nanos,
     tally: &mut AuditTally,
 ) {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     debug_assert_eq!(scenario.workload, DurableWorkload::KeyValue);
     let data_dir = PathBuf::from("node");
     let catalog = match load_catalog_from(disk, &data_dir) {
@@ -543,7 +544,7 @@ pub(crate) fn survival_audit(
     };
     let mut ks =
         Keyspace::new(StoreConfig { hasher: node_hasher(scenario.seed), ..Default::default() });
-    if let Err(err) = ks.seed_catalog(&catalog) {
+    if let Err(err) = ks.seed_catalog(&catalog, &census) {
         tally.violations.push(format!("survival audit: seed_catalog failed: {err:?}"));
         return;
     }
@@ -567,9 +568,16 @@ pub(crate) fn survival_audit(
         if let Some(manifest) = &manifest {
             let ick = shard.join("ckpt").join(ick_file_name(manifest.ckpt_id));
             let loaded = read_ick(disk, &ick, IckReaderConfig::default(), |record| {
-                ks.apply_record(&record, now, anchor, &mut inf_store::NoSpill)
-                    .map(|_| ())
-                    .map_err(|e| format!("{e:?}"))
+                inf_store::drive_record(
+                    &mut ks,
+                    &record,
+                    now,
+                    anchor,
+                    &mut inf_store::NoSpill,
+                    u64::MAX,
+                )
+                .map(|_| ())
+                .map_err(|e| format!("{e:?}"))
             });
             if let Err(err) = loaded {
                 tally.violations.push(format!(
@@ -607,7 +615,14 @@ pub(crate) fn survival_audit(
                             if begin.is_some_and(|b| lsn < b) {
                                 continue;
                             }
-                            let _ = ks.apply_record(&record, now, anchor, &mut inf_store::NoSpill);
+                            let _ = inf_store::drive_record(
+                                &mut ks,
+                                &record,
+                                now,
+                                anchor,
+                                &mut inf_store::NoSpill,
+                                u64::MAX,
+                            );
                         }
                     }
                     Ok(None) => break,

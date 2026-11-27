@@ -54,21 +54,39 @@ fi
 
 # ---- 2. no shadow config ------------------------------------------------
 shadows=0
-for cfg in crates/*/clippy.toml crates/*/.clippy.toml bins/*/clippy.toml bins/*/.clippy.toml tests/*/clippy.toml tests/*/.clippy.toml; do
-    [ -e "$cfg" ] || continue
-    echo "CLOCK-BAN violation: $cfg shadows the workspace clippy.toml (clippy stops at the nearest config — every ban vanishes for that crate)"
-    shadows=$((shadows + 1))
-    fail=1
+# Each top's crate directories come from tree_dirs (scripts/source-files.sh), which fails on one
+# it cannot search: a shadow config inside it would go unseen.
+for top in crates bins tests; do
+    crate_dirs=$(tree_dirs . "$top") || {
+        echo "CLOCK-BAN SCOPE ERROR: the directories under $top/ are unknown (scripts/source-files.sh, above)"
+        exit 2
+    }
+    for name in clippy.toml .clippy.toml; do
+        while IFS= read -r dir; do
+            cfg="$dir/$name"
+            [ -n "$dir" ] && [ -e "$cfg" ] || continue
+            echo "CLOCK-BAN violation: $cfg shadows the workspace clippy.toml (clippy stops at the nearest config — every ban vanishes for that crate)"
+            shadows=$((shadows + 1))
+            fail=1
+        done <<<"$crate_dirs"
+    done
 done
 
 # ---- 3. source membership; the sole allow audit is check-lint-scopes.sh ----
 # ADR-0144 I8: all suppression classes/scopes, including clock:, are audited
 # together. Do not add a second reason scan here.
-dirs=$(cell_crate_dirs)
+dirs=$(cell_crate_dirs) || {
+    echo "CLOCK-BAN SCOPE ERROR: the cell crate set is unknown (scripts/cell-crates.sh, above)"
+    exit 2
+}
 files=0
-# `find`, as every sibling gate: the CI runners ship no ripgrep.
+# `find`, as every sibling gate: the CI runners ship no ripgrep. A walk that fails fails the
+# count, never a smaller one.
 while IFS= read -r dir; do
-    n=$(find "$dir" -name '*.rs' | wc -l)
+    n=$(find "$dir" -name '*.rs' | wc -l) || {
+        echo "CLOCK-BAN SCOPE ERROR: the walk of $dir failed, so its files are uncounted"
+        exit 2
+    }
     files=$((files + n))
 done <<< "$dirs"
 if [ "$files" -eq 0 ]; then
@@ -96,7 +114,14 @@ else
     # The verdict parses clippy's human-readable lines, so colour is pinned
     # off: CI sets CARGO_TERM_COLOR=always, whose escapes hide every plant.
     probe_target || { echo "CLOCK-BAN SCOPE ERROR: the probe's target architecture is unknown"; exit 1; }
-    (cd "$work/probe" && env -u CLIPPY_CONF_DIR cargo clippy --quiet --color never --target "$PROBE_TARGET" --target-dir "$work/target" --message-format=short -- -W clippy::disallowed-methods -W clippy::disallowed-types >"$diag" 2>&1) || true
+    # The probe builds cold, in a directory no earlier run wrote (ADR-0204 D4):
+    # exit 2 is that check's refusal with nothing run, a scope error; any other
+    # status is clippy's, which the plants below judge.
+    # shellcheck source=target-root.sh
+    . "$SCRIPT_DIR/target-root.sh"
+    probe_status=0
+    (cd "$work/probe" && target_root_cargo_fresh "$work/target" env -u CLIPPY_CONF_DIR cargo clippy --quiet --color never --target "$PROBE_TARGET" --message-format=short -- -W clippy::disallowed-methods -W clippy::disallowed-types >"$diag" 2>&1) || probe_status=$?
+    [ "$probe_status" -ne 2 ] || { echo "CLOCK-BAN SCOPE ERROR: the probe did not run:"; sed 's/^/    | /' "$diag"; exit 1; }
     plants=0
     controls=0
     foreign_plants=0

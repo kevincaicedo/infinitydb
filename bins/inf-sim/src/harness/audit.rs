@@ -2,6 +2,7 @@
 //! equalization, the round-trip audit, and the planted canary.
 
 use super::*;
+use crate::driver::Violations;
 
 // ---- quiescent audits + content reconciliation (review of 2026-08-30) ---------------
 
@@ -22,11 +23,7 @@ type Cells = Vec<(CellLoop<SimDriver, Rc<VirtualClock>>, Plane)>;
 
 /// Every cell's live entries at `now`. A key present on two cells breaks
 /// slot ownership and is reported as such rather than folded away.
-pub(super) fn fold_node_entries(
-    cells: &Cells,
-    now: Nanos,
-    violations: &mut Vec<String>,
-) -> Entries {
+pub(super) fn fold_node_entries(cells: &Cells, now: Nanos, violations: &mut Violations) -> Entries {
     let mut node: Entries = BTreeMap::new();
     for (i, (_, plane)) in cells.iter().enumerate() {
         plane.fold_live_entries(now, |scope, key, value, deadline| {
@@ -107,40 +104,48 @@ pub(super) fn expired_retained(
     live: u64,
     plane: &Plane,
     now: Nanos,
-) -> Option<String> {
+    violations: &mut Violations,
+) {
     let mut emitted = 0u64;
     let skipped = plane.fold_live_entries(now, |_, _, _, _| emitted += 1);
     if skipped > 0 {
-        return Some(format!(
+        violations.push(format!(
             "VACUOUS: cell {cell}: the expired-retained check cannot run: the fold skipped \
              {skipped} tiered namespaces"
         ));
+        return;
     }
-    (live != emitted).then(|| {
-        format!(
+    if live != emitted {
+        violations.push(format!(
             "EXPIRED RETAINED: cell {cell}: {live} live records vs {emitted} live entries \
              after the expiry drain (a record outlived its deadline without a reap)"
-        )
-    })
+        ));
+    }
 }
 
 /// The small-cap run's engagement (ADR-0008 A1 O3): a run under
 /// `--wheel-nodes-max` must have refused a placement and reaped through
 /// the sweep node-wide, or it proved nothing — `VACUOUS`, never green.
-pub(super) fn small_cap_engagement(scenario: &Scenario, cells: &Cells) -> Option<String> {
-    scenario.wheel_nodes_max?;
+pub(super) fn small_cap_engagement(
+    scenario: &Scenario,
+    cells: &Cells,
+    violations: &mut Violations,
+) {
+    if scenario.wheel_nodes_max.is_none() {
+        return;
+    }
     let (mut refused, mut swept) = (0u64, 0u64);
     for (_, plane) in cells {
         let stats = plane.keyspace().stats();
         refused += stats.wheel_fallback;
         swept += stats.expired_swept;
     }
-    (refused == 0 || swept == 0).then(|| {
-        format!(
+    if refused == 0 || swept == 0 {
+        violations.push(format!(
             "VACUOUS: the small-cap expiry run refused {refused} placements and swept \
              {swept} records node-wide (both must be > 0)"
-        )
-    })
+        ));
+    }
 }
 
 /// Reaps every already-expired entry on both sides at `now` (active vs lazy
@@ -174,15 +179,19 @@ fn audit_roundtrip(
     nets: &[Rc<RefCell<CellNet>>],
     auditor: &mut Auditor,
     wire: &[u8],
+    watch: &mut OwnersWatch,
 ) -> Result<Vec<u8>, String> {
     nets[auditor.cell].borrow_mut().client_send(auditor.fd, wire);
     for _ in 0..STALL_STEPS {
         for (cell_loop, plane) in cells.iter_mut() {
             cell_loop.run_iteration(plane).expect("audit iteration");
         }
+        let owners = cells.iter().map(|(cell_loop, plane)| plane.conn_owners(cell_loop.executor()));
+        watch.judge(owners, nets, &"an audit iteration");
         let rx = nets[auditor.cell].borrow_mut().client_recv(auditor.fd);
         auditor.rx.extend_from_slice(&rx);
         if let Some(n) = reply_len(&auditor.rx) {
+            auditor.framed = true;
             return Ok(auditor.rx.drain(..n).collect());
         }
     }
@@ -224,7 +233,8 @@ pub(super) fn run_audit(
     auditors: &mut [Auditor],
     label: &str,
     report: &mut SimReport,
-    violations: &mut Vec<String>,
+    violations: &mut Violations,
+    watch: &mut OwnersWatch,
 ) {
     let now = clock.now();
     report.audits += 1;
@@ -245,7 +255,7 @@ pub(super) fn run_audit(
         if !auditor.bound
             && let Some(bind) = auditor.scope.bind_wire()
         {
-            match audit_roundtrip(cells, nets, auditor, &bind) {
+            match audit_roundtrip(cells, nets, auditor, &bind, watch) {
                 Ok(reply) if reply == b"+OK\r\n" => {}
                 Ok(reply) => violations
                     .push(format!("{who}: binding refused: {:?}", String::from_utf8_lossy(&reply))),
@@ -257,7 +267,7 @@ pub(super) fn run_audit(
         let expected: BTreeSet<Vec<u8>> =
             model.keys().filter(|(s, _)| *s == scope).map(|(_, k)| k.clone()).collect();
         // DBSIZE: the scope's node-wide count.
-        match audit_roundtrip(cells, nets, auditor, &encode(&[b"DBSIZE".to_vec()])) {
+        match audit_roundtrip(cells, nets, auditor, &encode(&[b"DBSIZE".to_vec()]), watch) {
             Ok(reply) => {
                 let want = Reply::Int(expected.len() as i64);
                 let got = parse_reply(&reply);
@@ -279,7 +289,7 @@ pub(super) fn run_audit(
                 b"COUNT".to_vec(),
                 count.to_string().into_bytes(),
             ];
-            let reply = match audit_roundtrip(cells, nets, auditor, &encode(&argv)) {
+            let reply = match audit_roundtrip(cells, nets, auditor, &encode(&argv), watch) {
                 Ok(reply) => parse_reply(&reply),
                 Err(e) => {
                     violations.push(format!("{who}: {e}"));
@@ -330,7 +340,13 @@ pub(super) fn run_audit(
         let glob = auditor.scope.glob(rng.next_u64() % 10);
         let want: BTreeSet<Vec<u8>> =
             expected.iter().filter(|k| glob_match(&glob, k, false)).cloned().collect();
-        match audit_roundtrip(cells, nets, auditor, &encode(&[b"KEYS".to_vec(), glob.clone()])) {
+        match audit_roundtrip(
+            cells,
+            nets,
+            auditor,
+            &encode(&[b"KEYS".to_vec(), glob.clone()]),
+            watch,
+        ) {
             Ok(reply) => match parse_reply(&reply) {
                 Reply::Array(items) if bulk_set(&items).is_some_and(|got| got == want) => {}
                 other @ (Reply::Simple(_)
@@ -347,7 +363,7 @@ pub(super) fn run_audit(
             Err(e) => violations.push(format!("{who}: {e}")),
         }
         // RANDOMKEY: membership (the two-level draw is the recorded deviation).
-        match audit_roundtrip(cells, nets, auditor, &encode(&[b"RANDOMKEY".to_vec()])) {
+        match audit_roundtrip(cells, nets, auditor, &encode(&[b"RANDOMKEY".to_vec()]), watch) {
             Ok(reply) => match parse_reply(&reply) {
                 Reply::Nil if expected.is_empty() => {}
                 Reply::Bulk(key) if expected.contains(&key) => {}
@@ -375,14 +391,15 @@ pub(super) fn run_audit(
             vec![b"FLUSHDB".to_vec()]
         };
         let who = format!("{label}, auditor {}", auditor.scope.name());
-        let mut expected = Vec::new();
+        let mut expected = inf_wire::OpenReply::new(Vec::new());
         {
             let slices: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
             let mut cx = model_cx(auditor.scope.exec_scope());
             let mut oracle = oracle.0.borrow_mut();
-            execute_slices(&slices, &mut oracle.model, &mut cx, now, &mut expected);
-            // The independent model follows an acknowledged flush only.
-            if expected == b"+OK\r\n" {
+            execute_slices(&slices, &mut oracle.model, &mut cx, now, expected.reply());
+            // The independent model follows an acknowledged flush only: a
+            // flush is acknowledged exactly when the model's reply succeeds.
+            if expected.outcome() == inf_wire::ReplyOutcome::Success {
                 if argv[0] == b"FLUSHALL" {
                     oracle.shadow.flush_all();
                 } else {
@@ -390,7 +407,8 @@ pub(super) fn run_audit(
                 }
             }
         }
-        match audit_roundtrip(cells, nets, auditor, &encode(&argv)) {
+        let expected = expected.finish().into_bytes();
+        match audit_roundtrip(cells, nets, auditor, &encode(&argv), watch) {
             Ok(reply) if reply == expected => {}
             Ok(reply) => violations.push(format!(
                 "{who}: {:?} answered {:?}, model {:?}",

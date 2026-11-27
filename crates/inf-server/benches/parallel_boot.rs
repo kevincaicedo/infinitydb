@@ -2,6 +2,10 @@
     clippy::disallowed_types,
     reason = "benchmark: fixture files outside cell code (ADR-0144 D5)"
 )]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "bench target: the ring decodes the bench's environment, not cell code (ADR-0209 D3)"
+)]
 //! M2-S15 parallel cold-boot rehearsal — target root.
 //!
 //! The rehearsal boots a real N-cell node (`UringDriver` + SO_REUSEPORT

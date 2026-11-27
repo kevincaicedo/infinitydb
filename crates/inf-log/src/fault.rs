@@ -44,9 +44,23 @@
 //!   round keeps only ops whose handles the pipeline owns and the creation retries next slice; on
 //!   the seam drive the create refuses with no file left behind — at boot, the demote step's typed
 //!   refusal (ADR-0174 D5)
-//! - `tier_unlink_fail` — `flush::unlink_tier_file` — typed I/O error, **non-fatal and counted**
-//!   (M4-S15, ADR-0059 D3): the durable truth already excludes the file — space is deferred, never
-//!   durability; the retry and the boot GC both re-drive it
+//! - `tier_create_fail` — `SimDisk::create_tier`, before the file exists — typed I/O error with no
+//!   file made: the shape of a `create_new` refused with no file (`EMFILE`, inode `ENOSPC`,
+//!   `EACCES`). The create's residue is still owned and unlinked (`NotFound` answers it), since
+//!   whether a file exists is never inferred from the error. It fires in the simulated disk only
+//! - `tier_create_post_fail` — `SimDisk::create_tier`, after the file is made and named — typed
+//!   I/O error with the file left on the disk and its handle closed: the shape of a real create
+//!   whose `create_new` succeeded and whose `set_len`, `O_DIRECT` probe (a `/proc` open, so
+//!   `EMFILE` reaches it) or `sync_all` failed. It fires in the simulated disk only, so every
+//!   create path running on that disk meets it, and no other filesystem carries it
+//! - `tier_close_fail` — `SimFile::close_reporting`, after the handle's fd left the disk's open
+//!   table — `EIO`, Linux's order: the number is released, then the error reported. The final
+//!   close of a retiring tier file's handle (ADR-0156 D3) reports it and never closes again; the
+//!   disk logs the close with the point's name. It fires in the simulated disk only
+//! - `tier_unlink_fail` — `SegmentFs::unlink_tier`, the trait's default and inside the simulated
+//!   disk's own call, which logs the attempt — typed I/O error with no OS errno, **non-fatal and
+//!   counted** (M4-S15, ADR-0059 D3): the durable truth already excludes the file — space is
+//!   deferred, never durability; the owner's paced retry and the boot GC both re-drive it
 //! - `blob_short_write` — `blob::device_write` — extent write cut short, typed I/O error — the
 //!   append fails whole and the extent is abandoned (M4-S17, ADR-0061 D9)
 //! - `blob_fsync_err` — `ExtentWriter::finish` — typed
@@ -68,6 +82,18 @@
 //!   record's key window, ADR-0174 D3) — typed I/O error on the held handle: the boot refuses
 //!   typed, naming the namespace and the address; no boundary or cursor passed the unread record
 //!   and a `DEL` has changed nothing
+//! - `dir_listing_open_fail` — `MemFs::open_listing` and `SimDisk::open_listing` (the in-memory
+//!   and simulated tiers' streams, ADR-0202 D5) — the registry's injected error from the open:
+//!   every recovery consumer of a listing refuses the boot typed, as a listing error does; the std
+//!   tier's errors are the kernel's
+//! - `dir_listing_next_fail` — the same tiers' `next_batch` — the injected error from a batch, the
+//!   batch left holding no name: the consumer refuses the boot typed, its stream dropped
+//! - `ckpt_create_fail` — `SimDisk::create_meta` and `SimDisk::create_meta_direct` on a
+//!   checkpoint's staging name (`ckpt-NNNNNN.ick.new`), before the file exists — typed I/O error
+//!   with no file left (`EMFILE` or `ENOSPC` at the open): the walk aborts as on any failed create
+//!   and publishes nothing, and the automatic trigger's next walk publishes. It fires in the
+//!   simulated disk only, whose call log records each refusal beside the creates that succeed, so
+//!   an oracle matches every attempt to a create
 //!
 //! **Torn-prefix physics (F-L04-14, ADR-0119 A1).** Every point that
 //! lands a prefix (`*_torn_frame`, `*_short_write`) lands it on the
@@ -100,12 +126,18 @@ pub const TIER_FSYNC_ERR: &str = "tier_fsync_err";
 pub const TIER_FOOTER_TORN: &str = "tier_footer_torn";
 pub const TIER_UNLINK_FAIL: &str = "tier_unlink_fail";
 pub const TIER_DIR_OPEN_FAIL: &str = "tier_dir_open_fail";
+pub const TIER_CREATE_FAIL: &str = "tier_create_fail";
+pub const TIER_CREATE_POST_FAIL: &str = "tier_create_post_fail";
+pub const TIER_CLOSE_FAIL: &str = "tier_close_fail";
 pub const BLOB_SHORT_WRITE: &str = "blob_short_write";
 pub const BLOB_FSYNC_ERR: &str = "blob_fsync_err";
 pub const BLOB_UNLINK_FAIL: &str = "blob_unlink_fail";
 pub const TIER_WRITE_NOSPACE: &str = "tier_write_nospace";
 pub const BLOB_WRITE_NOSPACE: &str = "blob_write_nospace";
 pub const REPLAY_SETTLE_READ_FAIL: &str = "replay_settle_read_fail";
+pub const DIR_LISTING_OPEN_FAIL: &str = "dir_listing_open_fail";
+pub const DIR_LISTING_NEXT_FAIL: &str = "dir_listing_next_fail";
+pub const CKPT_CREATE_FAIL: &str = "ckpt_create_fail";
 
 /// Inventory for the CI coverage check and the S18 sim-disk scheduler.
 pub const ALL: &[&str] = &[
@@ -123,12 +155,18 @@ pub const ALL: &[&str] = &[
     TIER_FOOTER_TORN,
     TIER_UNLINK_FAIL,
     TIER_DIR_OPEN_FAIL,
+    TIER_CREATE_FAIL,
+    TIER_CREATE_POST_FAIL,
+    TIER_CLOSE_FAIL,
     BLOB_SHORT_WRITE,
     BLOB_FSYNC_ERR,
     BLOB_UNLINK_FAIL,
     TIER_WRITE_NOSPACE,
     BLOB_WRITE_NOSPACE,
     REPLAY_SETTLE_READ_FAIL,
+    DIR_LISTING_OPEN_FAIL,
+    DIR_LISTING_NEXT_FAIL,
+    CKPT_CREATE_FAIL,
 ];
 
 /// The injected error a firing point surfaces (named, greppable).

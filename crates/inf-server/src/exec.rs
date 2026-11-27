@@ -25,10 +25,10 @@ use inf_store::{
     CellStore, CopyResult, ExpireCond, InternalDeadline, Keyspace, MAX_KEY_LEN, MAX_VAL_LEN,
     OpError, SetCond, SetExpire, SetOptions, SetOutcome, Ttl, TtlUpdate,
 };
-use inf_wire::{ArgvRef, CmdFlags, CommandId, Protocol, RespWriter, arity_ok, lookup};
+use inf_wire::{ArgvRef, CmdFlags, CommandId, Protocol, ReplyBuf, RespWriter, arity_ok, lookup};
 
 use crate::admin;
-use crate::clients::ClientRegistry;
+use crate::clients::{ClientAdmission, ClientRegistry};
 use crate::config::{ConfigStore, DATABASES};
 use crate::glob::glob_match;
 #[cfg(feature = "doc")]
@@ -68,10 +68,44 @@ pub enum TierFlushGauge {
     TurnContended,
     /// Rounds the plan pass staged.
     RoundsPlanned,
+    /// Plans refused because a namespace's tier file ids are spent.
+    FileIdsExhausted,
 }
 
 /// The number of [`TierFlushGauge`] slots.
-pub const TIER_FLUSH_GAUGES: usize = TierFlushGauge::RoundsPlanned as usize + 1;
+pub const TIER_FLUSH_GAUGES: usize = TierFlushGauge::FileIdsExhausted as usize + 1;
+
+/// The slots of [`NodeState::cold`], one gauge each, cell scope: the cold
+/// host's delivery service (ADR-0181 R1, R7) and its identity issuer
+/// (R4), flushed by the tiered MAINTAIN.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum ColdGauge {
+    /// Member visits the delivery service spent, cumulative.
+    DeliveryWork = 0,
+    /// The most member visits one turn spent: at most 64.
+    DeliveryWorkTurnMax,
+    /// Members of ready windows not yet visited.
+    DeliveryPendingMembers,
+    /// Windows with members left to visit.
+    DeliveryPendingWindows,
+    /// Receipt-to-delivery delay p99 of delivered values, injected µs.
+    DeliveryDelayP99Us,
+    /// Receipts that named no issued read, refused and counted.
+    ReceiptsForeign,
+    /// Ready-list links that named no ready window: a defect, 0.
+    LinksStale,
+    /// Requests refused for a spent identity space, cumulative.
+    IdentityExhausted,
+    /// The identity issuer's position: pairs spent or skipped.
+    IdentityPairsUsed,
+    /// Requests the cold gate refused for no free route or holder,
+    /// cumulative: derived never while its cap is its product.
+    GateFull,
+}
+
+/// The number of [`ColdGauge`] slots.
+pub const COLD_GAUGES: usize = ColdGauge::GateFull as usize + 1;
 
 /// Default-initializable state surfaced through the command layer (M0-S19 + M1-S03):
 /// the frozen tripwire snapshot, the memory-attribution domains the store
@@ -101,9 +135,14 @@ pub struct NodeState {
     /// ADR-0178 D5), flushed by MAINTAIN, in [`TierFlushGauge`]'s order.
     /// Identically zero on nodes that never created a tiered namespace.
     pub tier_flush: Cell<[u64; TIER_FLUSH_GAUGES]>,
+    /// The cold host's delivery and identity gauges, in [`ColdGauge`]'s
+    /// order, flushed by the tiered MAINTAIN. Identically zero on nodes
+    /// that never created a tiered namespace.
+    pub cold: Cell<[u64; COLD_GAUGES]>,
     /// The cell's cap census (ADR-0163 D2), attached by the plane at its
-    /// construction: INFO's `# Caps` renders it, cell scope. A bare harness
-    /// that attaches none renders no `# Caps` section.
+    /// construction, or on a host with no plane by its first planeless
+    /// `CREATE`: INFO's `# Caps` renders it, cell scope. A bare harness that
+    /// attaches none renders no `# Caps` section.
     pub cap_census: RefCell<Option<Rc<inf_foundation::bounded::CapCensus>>>,
     /// Raw lifetime counters (submits, sqes, cqes, iterations, commands,
     /// fabric_msgs) — scrapers diff two snapshots for under-load ratios.
@@ -121,8 +160,44 @@ pub struct NodeState {
     pub reply_pool_bytes: Cell<u64>,
     pub cmd_pool_bytes: Cell<u64>,
     pub cold_pool_bytes: Cell<u64>,
+    /// The tier flush pipelines' window pools on this cell: the capacity
+    /// reserved at their builds, and the bytes of the windows written at
+    /// least once — the LIFO high water of windows out (ADR-0155 D2/D3).
+    /// Render-only, like the pools above.
+    pub tier_window_capacity_bytes: Cell<u64>,
+    pub tier_window_written_bytes: Cell<u64>,
+    /// The cell's grant positions holding a tiered namespace owner, Live or
+    /// Draining (ADR-0148 D3: at most 64), and the installs and drops that
+    /// met a position in a state its grant rules out (zero by design).
+    /// Render-only, cell scope.
+    pub tier_ns_positions: Cell<u64>,
+    pub tier_position_conflicts: Cell<u64>,
+    /// The cell's tier-file retirement (ADR-0156 D3): its jobs out (a gauge,
+    /// 0–8: at 8 its offers wait), the files whose terminal result it
+    /// consumed, the `Retry` results it consumed by errno class, and the
+    /// results whose owner it could not find (zero on a correct build).
+    /// Render-only, cell scope.
+    pub tier_retire_jobs_out: Cell<u64>,
+    pub tier_files_retired: Cell<u64>,
+    pub tier_retire_errors_transient: Cell<u64>,
+    pub tier_retire_errors_operator: Cell<u64>,
+    pub tier_retire_results_stale: Cell<u64>,
+    /// The cell's retiring owners plus its dropped namespaces' catalogs (a
+    /// gauge: the retirement walk's depth), and its failed creates' files
+    /// still owned, held or out for their unlink (a gauge). Render-only,
+    /// cell scope.
+    pub tier_retire_pending: Cell<u64>,
+    pub tier_create_residues: Cell<u64>,
+    /// Namespaces a MAINTAIN pass left for a later one because their task
+    /// class had no room (ADR-0177 D2's `compact` and `shadow` crossing,
+    /// counted at the room): at the shipped caps reached only while a
+    /// finished task's slot is still held. Cell scope; a statistic.
+    pub tier_maint_task_waits: Cell<u64>,
     pub connections: Cell<u64>,
     pub recv_dropped: Cell<u64>,
+    /// The cell executor's `waker_foreign_ops`: waker operations made off the cell's thread,
+    /// which no product path makes (ADR-0003 A1.4). Cell scope, flushed by MAINTAIN.
+    pub waker_foreign_ops: Cell<u64>,
     pub fabric_rtt_p50_ns: Cell<u64>,
     pub cell: Cell<u16>,
     pub cells: Cell<u16>,
@@ -177,13 +252,57 @@ pub struct NodeState {
     pub pubsub_fan_msgs: Cell<u64>,
     pub pubsub_delivered: Cell<u64>,
     pub cob_disconnections: Cell<u64>,
-    /// Idle connections closed by `timeout` (ADR-0123 D2; `INFO stats
+    /// The work this cell parks for its peers (ADR-0177 D6; cell scope,
+    /// `# Tripwires`): the lengths, not the capacities, of the request and
+    /// reply bytes behind the entries now in the three per-origin deques
+    /// (`fabric_parked_bytes`), added as an entry is filled and subtracted
+    /// as it is popped; their high water since boot; and the ops answered
+    /// `Refused` at a full deque, derived never (`fabric_parked_refused`).
+    pub fabric_parked_bytes: Cell<u64>,
+    pub fabric_parked_bytes_max: Cell<u64>,
+    pub fabric_parked_refused: Cell<u64>,
+    /// The fabric gate's derived-never counters (ADR-0177 D4; cell scope,
+    /// `# Tripwires`), published at the stats flush: reserves that found
+    /// every holder taken (`gate_full`) and completions for no holder that
+    /// awaits one (`gate_stale`).
+    pub gate_full: Cell<u64>,
+    pub gate_stale: Cell<u64>,
+    /// First polls that found the cell's wait pool empty or their list
+    /// without their key (`wait_nodes_full`; ADR-0177 D5, cell scope,
+    /// `# Tripwires`): derived never, published at the stats flush.
+    pub wait_nodes_full: Cell<u64>,
+    /// Publish fan legs this cell's owner pump could not stage on the
+    /// credit general sends leave free, each then sent as a general op
+    /// (ADR-0192 D3). Cell scope; 0 by the reserve's proof, so any other
+    /// reading is a finding (`INFO` `# Tripwires`).
+    pub fabric_reserve_refused_cell: Cell<u64>,
+    /// Idle connections closed by `timeout` (ADR-0193 D4; `INFO stats
     /// idle_disconnections`, cell scope).
     pub idle_disconnections: Cell<u64>,
-    /// `JSON.*` replies this cell refused over `doc-max-reply-bytes` (a
-    /// refused `JSON.MGET` element counts one) and the reply bytes those
-    /// refusals built and discarded — the CPU the limit cost (ADR-0099 A1;
-    /// `INFO stats`, cell scope). Lifetime counters that saturate at
+    /// Sweep visits that found a connection the server owes work past
+    /// `timeout` by its clock, and kept it (ADR-0193 D4; `INFO stats
+    /// idle_sweep_deferrals_cell`). Its unit is visits, one per such
+    /// connection per MAINTAIN, not connections.
+    pub idle_sweep_deferrals_cell: Cell<u64>,
+    /// A close's drain (ADR-0123 A2, ADR-0196; `INFO stats`, cell scope):
+    /// commands dequeued from a closing or draining slot; inbox entries a
+    /// draining slot's parser parsed; `Peer` run-outs that found no take of
+    /// the inbox since their stamp and waited; deliveries a flushing slot
+    /// answered with nothing written. Lifetime counters, statistics only.
+    pub closed_queue_commands: Cell<u64>,
+    pub closed_reader_entries: Cell<u64>,
+    pub reader_take_waits: Cell<u64>,
+    pub flushing_deliveries_dropped: Cell<u64>,
+    /// Replies PARSE wrote while the pump owed the connection earlier ones
+    /// (a `-LOADING` refusal, a protocol error), queued behind them so they
+    /// leave in pipeline order (`INFO stats`, cell scope).
+    pub parse_replies_queued: Cell<u64>,
+    /// Draining slots: ADR-0123 A1's third population, beside `active`
+    /// (`connected_clients`); a gauge, cell scope, flushed by MAINTAIN.
+    pub draining_connections: Cell<u64>,
+    /// `JSON.*` replies this cell refused over `doc-max-reply-bytes` and
+    /// the reply bytes those refusals built and discarded — the CPU the
+    /// limit cost (ADR-0099 A1; `INFO stats`, cell scope). Lifetime counters that saturate at
     /// `u64::MAX`: metrics only, no accounting reads them.
     #[cfg(feature = "doc")]
     pub json_reply_refusals_cell: Cell<u64>,
@@ -313,6 +432,10 @@ pub struct NodeState {
     /// (summed; the step-charge gauge the largest), taken once when every
     /// cell is ready — zero without a recovery board.
     pub recover_tier_replay: Cell<crate::recover::TierReplayStats>,
+    /// ADR-0174 A1.2: the node fold of every cell's step facts (the work
+    /// gauge the largest, the counters summed), taken with the tiered fold
+    /// — zero without a recovery board.
+    pub recover_step_facts: Cell<crate::recover::StepFacts>,
     /// M4.5-S37 step 1 (`bench-diagnostics` only): plain SETs the
     /// ceiling arm wrote blind over a cold candidate.
     #[cfg(feature = "bench-diagnostics")]
@@ -324,6 +447,13 @@ pub struct NodeState {
     pub frame_waits_barrier: Cell<u64>,
     pub frame_waits_rotation: Cell<u64>,
     pub frame_waits_reorder: Cell<u64>,
+    /// The fsync ledger's holds, cell scope, once per held frame: a frame
+    /// held for the rotation's unfolded seal, and one held for a full ack
+    /// map; and MAINTAIN ticks that skipped a prealloc or zero-fill barrier
+    /// at its class's budget. The last two are derived never to occur.
+    pub frame_waits_ledger: Cell<u64>,
+    pub frame_waits_ack_map: Cell<u64>,
+    pub ledger_prealloc_deferrals: Cell<u64>,
     /// The extent-seal window (ADR-0163 D2), cell scope: frames held for an
     /// outstanding extent barrier, per episode; blob writers' park episodes;
     /// turns that found the window full (0 by `len + w ≤ 16`).
@@ -333,6 +463,10 @@ pub struct NodeState {
     pub frame_waits_fill: Cell<u64>,
     pub fill_window_us: Cell<u64>,
     pub fill_target_bytes: Cell<u64>,
+    /// The most timers this cell has held armed at once since its loop was
+    /// built, cell scope: published by MAINTAIN on every cell, durable or
+    /// not, so a memory-only cell shows its accept retry too.
+    pub timers_armed_max: Cell<u64>,
     /// M4.5-S43 (ADR-0092): the FLUSH-class group hold — episodes, the
     /// window in force, the adaptive target.
     pub frame_waits_group: Cell<u64>,
@@ -363,9 +497,13 @@ pub struct NodeState {
     /// with it (`interfaces-m2.md`, "Cells never fold the whole board").
     pub ckpt_in_progress: Cell<u64>,
     pub lastsave: crate::control::LastSave,
-    /// ADR-0100 D7: live drop tombstones in the catalog writer (node
-    /// scope, refreshed at MAINTAIN from the control handle).
-    pub ns_drop_tombstones: Cell<u64>,
+    /// ADR-0189 D11: the catalog writer's node gauges and counters, which
+    /// `INFO persistence` reads as it renders (`None` with no control
+    /// plane: every one renders 0).
+    pub ddl_gauges: RefCell<Option<std::sync::Arc<crate::control::DdlGauges>>>,
+    /// The node's retirement board (ADR-0156 D3), whose worker counters
+    /// `INFO` reads as it renders (`None` with no control plane: 0).
+    pub retire_board: RefCell<Option<std::sync::Arc<inf_foundation::grants::RetireBoard>>>,
     /// M2-S21: windowed rates (previous everysec-tick window) + fsync
     /// latency percentiles (µs) + checkpoint age (s).
     pub fsyncs_per_sec: Cell<u64>,
@@ -391,8 +529,10 @@ pub struct NodeState {
     /// Read-only process gauges; the process supervisor alone samples the OS.
     /// Bare deterministic harnesses render zeros until they attach a board.
     pub process_board: RefCell<Option<std::sync::Arc<crate::ProcessBoard>>>,
-    /// CLIENT registry for this cell's connections (single-threaded).
-    pub clients: RefCell<ClientRegistry>,
+    /// CLIENT registry for this cell's connections (single-threaded),
+    /// shared with the [`ClientAdmission`] minted with it, which alone
+    /// inserts a row; every reader of the node can update one only.
+    pub clients: Rc<RefCell<ClientRegistry>>,
     /// Typed CONFIG store (M1-S03 freeze: keys + hot-reload classes).
     pub config: RefCell<ConfigStore>,
     /// Per-cell recycled JSON parser (M3-S11): scratch buffers survive
@@ -482,19 +622,26 @@ pub(crate) fn memory_gauges_of(
 
 impl NodeInfo {
     /// Assemble this cell's state from validated boot configuration before accepting
-    /// connections. A refused cache reservation publishes no node or config.
-    pub fn try_new(config: ConfigStore) -> Result<Self, std::collections::TryReserveError> {
+    /// connections. A refused cache reservation publishes no node or config. The
+    /// client registry is minted here with its one admission, returned beside the
+    /// node for the plane that accepts this cell's connections; a node built with
+    /// no plane drops it.
+    pub fn try_new(
+        config: ConfigStore,
+    ) -> Result<(Self, ClientAdmission), std::collections::TryReserveError> {
         #[cfg(feature = "doc")]
         let path_cache = inf_doc::ProgramCache::try_new(config.path_cache_capacity())?;
-        Ok(Self {
-            state: NodeState { config: RefCell::new(config), ..NodeState::default() },
+        let (clients, admission) = ClientRegistry::with_admission();
+        let node = Self {
+            state: NodeState { config: RefCell::new(config), clients, ..NodeState::default() },
             cache_boot: crate::cache_boot::CacheBootReadiness::Standalone,
             #[cfg(feature = "doc")]
             path_cache: RefCell::new(path_cache),
-        })
+        };
+        Ok((node, admission))
     }
 
-    pub fn try_default() -> Result<Self, std::collections::TryReserveError> {
+    pub fn try_default() -> Result<(Self, ClientAdmission), std::collections::TryReserveError> {
         Self::try_new(ConfigStore::default())
     }
 
@@ -589,21 +736,16 @@ pub struct ConnCx {
 impl ConnCx {
     /// Mirrors db and subscription counts into the cell's client registry
     /// (F-L15-09) — called where they change, so `CLIENT LIST` from any
-    /// connection reads tracked state. `program` contexts (fabric legs)
-    /// are never clients and never register.
-    pub(crate) fn publish_client_state(&self, now: Nanos) {
+    /// connection reads tracked state; an update, so an id whose row
+    /// left the registry gains none. `program` contexts (fabric legs) are
+    /// never clients.
+    pub(crate) fn publish_client_state(&self) {
         if self.program {
             return;
         }
         let sub = u32::try_from(self.sub_channels.len()).unwrap_or(u32::MAX);
         let psub = u32::try_from(self.sub_patterns.len()).unwrap_or(u32::MAX);
-        self.node.clients.borrow_mut().note_conn_state(
-            self.id,
-            now.as_millis(),
-            self.db,
-            sub,
-            psub,
-        );
+        self.node.clients.borrow_mut().note_conn_state(self.id, self.db, sub, psub);
     }
 }
 
@@ -611,7 +753,11 @@ impl ConnCx {
     /// Standalone connection state for embedded command harnesses. Production
     /// connections share their plane's already constructed NodeInfo.
     pub fn try_default() -> Result<ConnCx, std::collections::TryReserveError> {
-        let node = Rc::new(NodeInfo::try_default()?);
+        let (node, admission) = NodeInfo::try_default()?;
+        // Id 1's row, as a connection's at admission: no plane key, the
+        // placeholder address, created at 0.
+        admission.register(1, None, "0.0.0.0:0".to_string(), 0);
+        let node = Rc::new(node);
         Ok(ConnCx {
             proto: Protocol::Resp2,
             id: 1,
@@ -693,7 +839,7 @@ pub fn execute(
     ks: &mut Keyspace,
     cx: &mut ConnCx,
     now: Nanos,
-    out: &mut Vec<u8>,
+    out: &mut ReplyBuf,
 ) {
     let Some(meta) = lookup(argv.arg(0)) else {
         let mut w = RespWriter::new(out, cx.proto);
@@ -747,7 +893,7 @@ pub fn execute(
         // ---- keyspace-level commands (M1-E3/E4) ----
         CommandId::Select => {
             let mut w = RespWriter::new(out, cx.proto);
-            select(argv, ks, cx, now, &mut w);
+            select(argv, ks, cx, &mut w);
         }
         CommandId::Flushall => {
             let mut w = RespWriter::new(out, cx.proto);
@@ -785,7 +931,7 @@ pub fn execute(
         CommandId::InfNs => {
             let node = Rc::clone(&cx.node);
             let mut w = RespWriter::new(out, cx.proto);
-            admin::inf_ns(argv, ks, cx, &node, now, &mut w);
+            admin::inf_ns(argv, ks, cx, &node, &mut w);
         }
         // ---- pub/sub (M1-S10): conn-state ops here; registries, delivery,
         // and fan-out are plane state, so inside a node the plane intercepts
@@ -799,7 +945,7 @@ pub fn execute(
                 pubsub::SubKind::Pattern
             };
             let names: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
-            pubsub::apply_subscribe(&names, kind, cx, now, out);
+            pubsub::apply_subscribe(&names, kind, cx, out);
         }
         CommandId::Unsubscribe | CommandId::Punsubscribe => {
             let kind = if meta.id == CommandId::Unsubscribe {
@@ -809,7 +955,7 @@ pub fn execute(
             };
             let names: Vec<&[u8]> = (1..argv.len()).map(|i| argv.arg(i)).collect();
             let names = if names.is_empty() { None } else { Some(names.as_slice()) };
-            pubsub::apply_unsubscribe(names, kind, cx, now, out);
+            pubsub::apply_unsubscribe(names, kind, cx, out);
         }
         CommandId::Publish => pubsub::publish_fallback(argv.arg(1), argv.arg(2), cx, out),
         CommandId::Pubsub => {
@@ -863,7 +1009,7 @@ fn execute_db(
     store: &mut CellStore,
     cx: &mut ConnCx,
     now: Nanos,
-    out: &mut Vec<u8>,
+    out: &mut ReplyBuf,
 ) {
     let mut w = RespWriter::new(out, cx.proto);
     match meta.id {
@@ -888,7 +1034,7 @@ fn execute_db(
             }
         }
         CommandId::Echo => w.bulk(argv.arg(1)),
-        CommandId::Hello => admin::hello(argv, cx, now, out),
+        CommandId::Hello => admin::hello(argv, cx, out),
         // QUIT: acknowledge, then ask the plane to close after the reply
         // flushes (Redis `quitCommand`). Allowed in RESP2 subscriber mode.
         CommandId::Quit => {
@@ -1190,7 +1336,7 @@ pub fn execute_slices(
     ks: &mut Keyspace,
     cx: &mut ConnCx,
     now: Nanos,
-    out: &mut Vec<u8>,
+    out: &mut ReplyBuf,
 ) {
     debug_assert!(!argv.is_empty(), "empty argv is a caller bug");
     execute(argv, ks, cx, now, out);
@@ -1526,7 +1672,7 @@ fn flush(
 
 // ---- KEYS / SCAN ---------------------------------------------------------------
 
-fn keys(pattern: &[u8], store: &mut CellStore, now: Nanos, proto: Protocol, out: &mut Vec<u8>) {
+fn keys(pattern: &[u8], store: &mut CellStore, now: Nanos, proto: Protocol, out: &mut ReplyBuf) {
     // Bounded per-cell slice semantics arrive with the plane's scatter
     // (M1-S02); locally this is one full home-group sweep.
     let mut hits: Vec<Vec<u8>> = Vec::new();
@@ -1553,7 +1699,7 @@ fn scan(
     store: &mut CellStore,
     now: Nanos,
     proto: Protocol,
-    out: &mut Vec<u8>,
+    out: &mut ReplyBuf,
 ) {
     let mut w = RespWriter::new(out, proto);
     let Some(cursor) = parse_cursor(argv.arg(1)) else {
@@ -1689,20 +1835,14 @@ fn object_subcommand_error(sub: &[u8], w: &mut RespWriter<'_>) {
 /// `SELECT 0..15` maps to the default namespaces (M1-S08). The selection
 /// is connection state — the plane serializes it in pipeline order exactly
 /// like HELLO's protocol switch (a conn-state barrier).
-fn select(
-    argv: &(impl Argv + ?Sized),
-    ks: &mut Keyspace,
-    cx: &mut ConnCx,
-    now: Nanos,
-    w: &mut RespWriter<'_>,
-) {
+fn select(argv: &(impl Argv + ?Sized), ks: &mut Keyspace, cx: &mut ConnCx, w: &mut RespWriter<'_>) {
     match parse_i64(argv.arg(1)) {
         Ok(n) if (0..i64::from(DATABASES)).contains(&n) => {
             cx.db = n as u16;
             cx.ns = ConnNamespace::Default; // explicit escape from a required default
             // Materialize eagerly: a SELECTed db is about to be used.
             let _ = ks.db_mut(n as usize);
-            cx.publish_client_state(now);
+            cx.publish_client_state();
             w.simple("OK");
         }
         Ok(_) => w.error("ERR DB index is out of range"),
@@ -1937,7 +2077,7 @@ const UNKNOWN_ARGS_BUDGET: usize = 128;
 // (ADR-0097 — review finding C6, where these bytes forged a second reply).
 /// The unknown-command reply for a client-typed `INTERNAL` row, refused
 /// at the plane's dispatch funnels before any routing (ADR-0115).
-pub(crate) fn unknown_command_reply(argv: &[&[u8]], proto: Protocol, out: &mut Vec<u8>) {
+pub(crate) fn unknown_command_reply(argv: &[&[u8]], proto: Protocol, out: &mut ReplyBuf) {
     unknown_command(argv, &mut RespWriter::new(out, proto));
 }
 
@@ -2122,7 +2262,7 @@ pub fn stall_request(argv: &[&[u8]]) -> Option<Nanos> {
 mod tests {
     use super::*;
     use inf_store::StoreConfig;
-    use inf_wire::{ConnParser, Parsed, ParserLimits};
+    use inf_wire::{ConnParser, Parsed, ParserLimits, ReplyStream};
 
     /// M4-S21 (ADR-0063 D1): the `DISKFULL` extension error's wire
     /// shapes, byte-pinned — the compat register's shape source until
@@ -2133,24 +2273,24 @@ mod tests {
     fn diskfull_error_shapes() {
         use inf_store::DiskFullCause;
         for proto in [inf_wire::Protocol::Resp2, inf_wire::Protocol::Resp3] {
-            let mut out = Vec::new();
-            let mut w = RespWriter::new(&mut out, proto);
+            let mut out = ReplyStream::new(Vec::new());
+            let mut w = RespWriter::new(out.open(), proto);
             op_error(
                 OpError::DiskFull(DiskFullCause::Budget { used: 16_252_928, budget: 16_777_216 }),
                 &mut w,
             );
             assert_eq!(
-                out,
+                out.as_bytes(),
                 b"-DISKFULL tiered namespace disk budget exhausted (used=16252928 \
                   budget=16777216)\r\n"
                     .to_vec(),
                 "{proto:?}"
             );
-            let mut out = Vec::new();
-            let mut w = RespWriter::new(&mut out, proto);
+            let mut out = ReplyStream::new(Vec::new());
+            let mut w = RespWriter::new(out.open(), proto);
             op_error(OpError::DiskFull(DiskFullCause::Device), &mut w);
             assert_eq!(
-                out,
+                out.as_bytes(),
                 b"-DISKFULL tier device out of space (ENOSPC)\r\n".to_vec(),
                 "{proto:?}"
             );
@@ -2167,9 +2307,9 @@ mod tests {
         let mut parser = ConnParser::new(ParserLimits::default());
         let mut iter = parser.feed(&wire);
         let Some(Parsed::Command(argv)) = iter.next() else { panic!("one command") };
-        let mut out = Vec::new();
-        execute(&argv, store, cx, now, &mut out);
-        out
+        let mut out = ReplyStream::new(Vec::new());
+        execute(&argv, store, cx, now, out.open());
+        out.into_vec()
     }
 
     fn run(cx: &mut ConnCx, store: &mut Keyspace, parts: &[&[u8]]) -> Vec<u8> {
@@ -2556,10 +2696,12 @@ mod tests {
                     .chain(shape.iter().map(|tok| fill(tok)))
                     .collect();
                 let argv: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
-                let mut reply = Vec::new();
-                execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut reply);
+                let mut reply = ReplyStream::new(Vec::new());
+                let out = reply.open();
+                execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), out);
                 cases += 1;
-                if reply.first() == Some(&b'-') {
+                assert!(!out.bytes().is_empty(), "{name} {shape:?} wrote no frame");
+                if out.is_error() {
                     errors_seen += 1;
                     errors_for_this += 1;
                     let after = digest(&mut cx, &mut store);
@@ -2568,7 +2710,7 @@ mod tests {
                         before,
                         "{name} {:?} replied {:?} and mutated the keyspace",
                         shape,
-                        String::from_utf8_lossy(&reply[..reply.len().min(80)])
+                        String::from_utf8_lossy(&out.bytes()[..out.bytes().len().min(80)])
                     );
                 }
             }
@@ -2586,6 +2728,40 @@ mod tests {
         eprintln!("{} write rows, {cases} cases, {errors_seen} error replies", covered.len());
         let minimum_cases = if cfg!(feature = "doc") { 150 } else { 128 };
         assert!(cases >= minimum_cases && errors_seen >= 80, "{cases} cases, {errors_seen} errors");
+    }
+
+    /// Every command writes at least one top-level frame (ADR-0190 D2): a
+    /// reply opened past an earlier reply's bytes ends longer than it
+    /// began, for every registry row, at its arity's shapes (none, exact,
+    /// one over) and in both connection kinds. The origin refuses a
+    /// zero-byte leg, so an arm that writes nothing would turn a command
+    /// into a cross-cell refusal; this row names the arm instead.
+    #[test]
+    fn every_command_writes_at_least_one_frame() {
+        use inf_wire::COMMANDS;
+
+        const ARGS: [&[u8]; 8] = [b"k", b"1", b"v", b"0", b"x", b"2", b"y", b"3"];
+        for meta in &COMMANDS {
+            let exact = usize::from(meta.arity.unsigned_abs());
+            for program in [false, true] {
+                let mut cx = ConnCx { program, ..ConnCx::try_default().expect("fixture cache") };
+                let mut store = Keyspace::new(StoreConfig::default());
+                for argc in [1, exact, exact + 1] {
+                    let argv: Vec<&[u8]> = std::iter::once(meta.name.as_bytes())
+                        .chain(ARGS.iter().copied().cycle().take(argc.saturating_sub(1)))
+                        .collect();
+                    let mut buf = ReplyStream::new(Vec::new());
+                    RespWriter::new(buf.open(), Protocol::Resp2).simple("earlier");
+                    let out = buf.open();
+                    execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), out);
+                    assert!(
+                        !out.bytes().is_empty(),
+                        "{} with {argc} args wrote no frame",
+                        meta.name
+                    );
+                }
+            }
+        }
     }
 
     /// Review of 2026-08-30 (H2 / F-L13-06, F-L17-11, ADR-0098): `MSET` is
@@ -2611,8 +2787,9 @@ mod tests {
         // frame cap, and the queued/remote paths execute slices anyway).
         let big_val = vec![b'v'; MAX_VAL_LEN + 1];
         let argv: Vec<&[u8]> = vec![b"MSET", b"fresh", b"x", b"b", &big_val];
-        let mut reply = Vec::new();
-        execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), &mut reply);
+        let mut reply = ReplyStream::new(Vec::new());
+        execute(argv.as_slice(), &mut store, &mut cx, Nanos(1), reply.open());
+        let reply = reply.into_vec();
         assert!(reply.starts_with(b"-ERR key or value exceeds"), "{reply:?}");
         assert_eq!(run(&mut cx, &mut store, &[b"GET", b"fresh"]), b"$-1\r\n");
     }
@@ -3164,11 +3341,11 @@ mod tests {
             assert_eq!(at(&[b"EXISTS", b"o"]), b":0\r\n", "PEXPIREAT 1 LT at {now}");
             // The cross-cell move's destination put carries a snapshot
             // deadline through the same seam.
-            let mut out = Vec::new();
-            let mut w = RespWriter::new(&mut out, Protocol::Resp2);
+            let mut out = ReplyStream::new(Vec::new());
+            let mut w = RespWriter::new(out.open(), Protocol::Resp2);
             let put: &[&[u8]] = &[b"INF.PUT", b"m", b"v", b"1"];
             inf_move_put(put, store.db_mut(0), &cx.node, now, &mut w);
-            assert_eq!(out, b"+OK\r\n");
+            assert_eq!(out.as_bytes(), b"+OK\r\n");
             assert_eq!(run_at(&mut cx, &mut store, now, &[b"EXISTS", b"m"]), b":0\r\n", "{now}");
         }
     }

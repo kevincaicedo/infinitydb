@@ -94,17 +94,31 @@
 //! the dead switch (every op, every file) cannot express. The fault is
 //! consumed by whichever tier issues the op (blocking or driver) and
 //! touches no byte; [`SimDisk::faults_fired`] is the engagement witness.
+//!
+//! **Call log** ([`SimDisk::logged_calls`]): the disk logs each checkpoint
+//! staging create and each rename onto a `MANIFEST` from inside the call,
+//! with its result and the harness's last [`SimDisk::mark`], so an oracle
+//! reads what the cell asked of the disk and when, never the cell's counters.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use inf_foundation::rng::{Entropy, SplitMix64};
 use inf_foundation::{FileOffset, hash64};
 
-use super::{SegmentFile, SegmentFs, SegmentIoMode, TierIoMode};
+use super::{
+    BatchEnd, DirStream, NameBatch, OpenedDir, ResumeKey, SegmentFile, SegmentFs, SegmentIoMode,
+    TierIoMode,
+};
+
+mod calls;
+
+use calls::CallLog;
+pub use calls::{CallResult, DiskCall, DiskMark, DiskPhase, LoggedCall};
 
 /// Fake-fd base for file handles (dir handles sit above it). High
 /// enough that no simulated socket fd space collides. One fd per
@@ -120,11 +134,20 @@ pub const DEFAULT_SECTOR_BYTES: u32 = 512;
 pub struct SimDiskConfig {
     /// Tear granularity: pending writes survive per-sector on this grid.
     pub sector_bytes: u32,
+    /// ADR-0202 D5, drawn per seed by the DST: at its next batch, a listing
+    /// returns once more, before any new name, each name of its last batch
+    /// removed since — clause (b)'s repeat, which a stream may make, so each
+    /// boot consumer's `Gone` arm runs on this disk: the dropped sweep's
+    /// under the simulator's draw, the live map's in the store's and the
+    /// server's tests (ADR-0202 A1). A repeat moves no resume key, counts
+    /// toward the batch's two bounds and is not repeated again;
+    /// [`SimDisk::listing_repeats_served`] is its engagement counter.
+    pub listing_repeats_removed: bool,
 }
 
 impl Default for SimDiskConfig {
     fn default() -> Self {
-        SimDiskConfig { sector_bytes: DEFAULT_SECTOR_BYTES }
+        SimDiskConfig { sector_bytes: DEFAULT_SECTOR_BYTES, listing_repeats_removed: false }
     }
 }
 
@@ -718,6 +741,49 @@ fn apply_meta(names: &mut BTreeMap<PathBuf, u64>, op: &MetaOp) {
     }
 }
 
+/// Which barriers a hold keeps from the device.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HoldScope {
+    /// Standalone fdatasyncs alone ([`SimDisk::hold_syncs`]).
+    Standalone,
+    /// Every barrier: standalone fdatasyncs, writes with a linked
+    /// fdatasync and write-through writes ([`SimDisk::hold_barriers`]).
+    EveryBarrier,
+}
+
+impl HoldScope {
+    /// Whether a hold of this scope keeps a barrier of `kind`.
+    #[must_use]
+    pub fn admits(self, kind: BarrierKind) -> bool {
+        match self {
+            HoldScope::EveryBarrier => true,
+            HoldScope::Standalone => match kind {
+                BarrierKind::Standalone => true,
+                BarrierKind::Linked | BarrierKind::WriteThrough => false,
+            },
+        }
+    }
+}
+
+/// The barrier one driver op carries to the device, as a hold reads it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BarrierKind {
+    /// A standalone fdatasync.
+    Standalone,
+    /// A write with its linked fdatasync.
+    Linked,
+    /// A write-through write: the write is the barrier.
+    WriteThrough,
+}
+
+/// The disk's one hold: the files its predicate names and the barriers its
+/// scope keeps. Arming a hold replaces the one armed before.
+#[derive(Copy, Clone, Debug)]
+struct SyncHold {
+    named: fn(&Path) -> bool,
+    scope: HoldScope,
+}
+
 #[derive(Debug, Default)]
 struct DiskState {
     cfg: SimDiskConfig,
@@ -735,6 +801,11 @@ struct DiskState {
     /// an index below `next_file_fd` and absent here is a closed fd.
     open_files: BTreeMap<u64, OpenFile>,
     next_file_fd: u64,
+    /// Driver ops that named a closed file descriptor (the `EBADF` arm of
+    /// `open_file_mut`): on Linux the number would be reused, so each is an
+    /// op landing on another file. The custody oracle reads it, and a
+    /// correct node keeps it at zero.
+    closed_fd_ops: u64,
     /// Dir-handle fd → directory (driver dir-fsync routing).
     dir_fds: BTreeMap<i64, PathBuf>,
     next_dir_fd: i64,
@@ -765,9 +836,22 @@ struct DiskState {
     stall: Option<StallModel>,
     /// Per-file faults consumed (F-L04-02): the engagement witness.
     faults_fired: u64,
-    /// `Some`: fdatasyncs on files whose name the predicate accepts are
-    /// held by the driver until the hold lifts ([`SimDisk::hold_syncs`]).
-    hold_syncs: Option<fn(&Path) -> bool>,
+    /// `Some`: the barriers its scope admits, on files whose name its
+    /// predicate accepts, are held by the driver until the hold lifts
+    /// ([`SimDisk::hold_syncs`], [`SimDisk::hold_barriers`]).
+    hold: Option<SyncHold>,
+    /// `Some`: tier reads on files whose name the predicate accepts are
+    /// held by the driver until the hold lifts ([`SimDisk::hold_reads`]).
+    hold_reads: Option<fn(&Path) -> bool>,
+    /// Listings opened on a present directory (ADR-0202 D5).
+    listings_opened: u64,
+    /// `next_batch` calls served.
+    listing_batches: u64,
+    /// Removed names a listing returned again (the repeat mode's
+    /// engagement witness).
+    listing_repeats_served: u64,
+    /// The call log an oracle reads (`calls.rs`).
+    calls: CallLog,
 }
 
 impl DiskState {
@@ -799,6 +883,7 @@ impl DiskState {
             return Err(io::Error::new(io::ErrorKind::NotFound, format!("bad sim fd {fd}")));
         }
         let Some(open) = self.open_files.get(&index).copied() else {
+            self.closed_fd_ops += 1;
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         };
         let inode = self
@@ -840,6 +925,25 @@ impl DiskState {
     /// commit (ADR-0020 D6 resurrection), no open handle. A removed or
     /// clobbered file otherwise keeps its full image for the life of the
     /// sim.
+    /// Removes the name `path`: its directory's journal queues the op for
+    /// its barrier, and the inode goes once no name or handle holds it.
+    fn remove_name(&mut self, path: &Path) -> io::Result<()> {
+        self.tick_op()?;
+        let Some(ino) = self.os_names.remove(path) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no file {}", path.display()),
+            ));
+        };
+        let parent = parent_dir(path);
+        self.pending_meta
+            .entry(parent)
+            .or_default()
+            .push(MetaOp::Remove { name: path.to_path_buf() });
+        self.release_if_orphan(ino);
+        Ok(())
+    }
+
     fn release_if_orphan(&mut self, ino: u64) {
         let named = self.os_names.values().any(|&i| i == ino)
             || self.durable_names.values().any(|&i| i == ino);
@@ -960,6 +1064,47 @@ impl SimDisk {
         self.state.borrow().stall.as_ref().is_some_and(|m| m.cfg.opens_write_reorder_window())
     }
 
+    /// Driver ops that named a closed file descriptor (the state's
+    /// `closed_fd_ops`): zero on a correct node.
+    #[must_use]
+    pub fn closed_fd_ops(&self) -> u64 {
+        self.state.borrow().closed_fd_ops
+    }
+
+    /// Under each `shard-N` directory, the distinct `ns-<id>` directories
+    /// holding a file an open description names (a tier file, an extent):
+    /// the lifetime oracle's count, read from the disk's own tables, never
+    /// from a cell. One pass over the names and one over the open
+    /// descriptions; a file no name reaches counts under no directory.
+    #[must_use]
+    pub fn open_ns_dirs(&self) -> BTreeMap<String, usize> {
+        let state = self.state.borrow();
+        let open: BTreeSet<u64> = state.open_files.values().map(|f| f.ino).collect();
+        let mut dirs: BTreeSet<(String, String)> = BTreeSet::new();
+        for (path, ino) in &state.os_names {
+            if !open.contains(ino) {
+                continue;
+            }
+            let mut shard = None;
+            for part in path.components() {
+                let part = part.as_os_str().to_string_lossy();
+                if part.starts_with("shard-") {
+                    shard = Some(part.into_owned());
+                } else if part.starts_with("ns-")
+                    && let Some(shard) = shard.take()
+                {
+                    dirs.insert((shard, part.into_owned()));
+                    break;
+                }
+            }
+        }
+        let mut counts = BTreeMap::new();
+        for (shard, _) in dirs {
+            *counts.entry(shard).or_insert(0) += 1;
+        }
+        counts
+    }
+
     /// Inodes resident in the model (F-L04-04): a removed or clobbered
     /// file's inode is freed once no name in either namespace, no pending
     /// create and no open handle reaches it.
@@ -991,25 +1136,83 @@ impl SimDisk {
         self.state.borrow().os_names.keys().filter(|name| named(name)).cloned().collect()
     }
 
-    /// Holds every fdatasync on a file whose OS name `named` accepts until
-    /// the hold is lifted with `None`: a device that keeps one class of
-    /// barrier in its queue, the driver submitting the op only once the
-    /// hold lifts. With no hold armed every trace is unchanged.
+    /// Holds every standalone fdatasync on a file whose OS name `named`
+    /// accepts until the hold is lifted with `None`: a device that keeps one
+    /// class of barrier in its queue, the driver submitting the op only once
+    /// the hold lifts. A write's linked sync and a write-through write pass.
+    /// Arming replaces any hold armed before; with none armed every trace is
+    /// unchanged.
     pub fn hold_syncs(&self, named: Option<fn(&Path) -> bool>) {
-        self.state.borrow_mut().hold_syncs = named;
+        self.arm_hold(named, HoldScope::Standalone);
     }
 
-    /// Whether an fdatasync on the driver file fd `fd` is held now: a hold
-    /// is armed and its predicate accepts a name of the fd's inode.
-    #[must_use]
-    pub fn sync_held(&self, fd: i32) -> bool {
-        let state = self.state.borrow();
-        let Some(named) = state.hold_syncs else { return false };
-        let Some(open) = file_fd_index(fd).ok().and_then(|index| state.open_files.get(&index))
-        else {
-            return false;
+    /// Holds every barrier on a file whose OS name `named` accepts until the
+    /// hold is lifted with `None`: a standalone fdatasync, a write with its
+    /// linked fdatasync and a write-through write are each kept whole, the
+    /// driver submitting the op only once the hold lifts, so nothing of it
+    /// is observed or drawn while it is held. A write with no barrier
+    /// passes. Arming replaces any hold armed before.
+    pub fn hold_barriers(&self, named: Option<fn(&Path) -> bool>) {
+        // Premise plant: the hold keeps standalone syncs alone, the hold the
+        // driver test's oracle reads as too narrow.
+        let scope = if cfg!(inf_canary_barrier_hold_standalone_only) {
+            HoldScope::Standalone
+        } else {
+            HoldScope::EveryBarrier
         };
-        state.os_names.iter().any(|(name, &ino)| ino == open.ino && named(name))
+        self.arm_hold(named, scope);
+    }
+
+    fn arm_hold(&self, named: Option<fn(&Path) -> bool>, scope: HoldScope) {
+        self.state.borrow_mut().hold = named.map(|named| SyncHold { named, scope });
+    }
+
+    /// Holds every tier read on a file whose OS name `named` accepts until
+    /// the hold is lifted with `None`: a device that keeps one class of read
+    /// in its queue, the driver submitting the op, against the descriptor
+    /// it names, only once the hold lifts. A read whose descriptor closes
+    /// while it is held names no file, so the driver submits it at once and
+    /// the closed descriptor answers `EBADF`. With no hold armed every trace
+    /// is unchanged.
+    pub fn hold_reads(&self, named: Option<fn(&Path) -> bool>) {
+        self.state.borrow_mut().hold_reads = named;
+    }
+
+    /// Whether a tier read on the driver file fd `fd` is held now: a hold is
+    /// armed and its predicate accepts a name of the fd's open inode.
+    #[must_use]
+    pub fn read_held(&self, fd: i32) -> bool {
+        let Some(named) = self.state.borrow().hold_reads else { return false };
+        self.fd_named(fd, named)
+    }
+
+    /// Whether a barrier of `kind` on the driver file fd `fd` is held now: a
+    /// hold is armed, its scope admits the kind and its predicate accepts a
+    /// name of the fd's inode. With no hold armed it reads nothing more.
+    #[must_use]
+    pub fn barrier_held(&self, fd: i32, kind: BarrierKind) -> bool {
+        let Some(hold) = self.state.borrow().hold else { return false };
+        hold.scope.admits(kind) && self.fd_named(fd, hold.named)
+    }
+
+    /// Whether the driver file fd `fd` is open on an inode that has an OS
+    /// name `named` accepts: an op's file family, read from the model's own
+    /// descriptor table. A directory fd, or a closed one, names no file.
+    #[must_use]
+    pub fn fd_named(&self, fd: i32, named: fn(&Path) -> bool) -> bool {
+        let state = self.state.borrow();
+        file_fd_names_in(&state, fd).any(|name| named(name))
+    }
+
+    /// The OS names of the inode the driver file fd `fd` is open on, in
+    /// name order: the file an op names, read from the model's own
+    /// descriptor table by the lookup [`SimDisk::fd_named`] makes. Empty for
+    /// a directory fd, a closed one, or one the model never issued. One
+    /// pass over the OS names.
+    #[must_use]
+    pub fn file_fd_names(&self, fd: i32) -> Vec<PathBuf> {
+        let state = self.state.borrow();
+        file_fd_names_in(&state, fd).cloned().collect()
     }
 
     /// Model a filesystem without `O_DIRECT`: every `create_meta_direct`
@@ -1053,6 +1256,26 @@ impl SimDisk {
         Ok(())
     }
 
+    /// Listings opened on a present directory so far (ADR-0202 D5).
+    #[must_use]
+    pub fn listings_opened(&self) -> u64 {
+        self.state.borrow().listings_opened
+    }
+
+    /// `next_batch` calls served so far, every listing's.
+    #[must_use]
+    pub fn listing_batches(&self) -> u64 {
+        self.state.borrow().listing_batches
+    }
+
+    /// Removed names the repeat mode returned again so far: a run that
+    /// draws the mode and reads 0 here never ran a consumer's `Gone` arm
+    /// (`VACUOUS`).
+    #[must_use]
+    pub fn listing_repeats_served(&self) -> u64 {
+        self.state.borrow().listing_repeats_served
+    }
+
     /// Injected faults consumed so far (an armed fault that never fired
     /// is a vacuous run, not a green one — batch 34's rule).
     #[must_use]
@@ -1078,6 +1301,25 @@ impl SimDisk {
     #[must_use]
     pub fn sync_dir_calls(&self) -> u64 {
         self.state.borrow().sync_dir_calls
+    }
+
+    /// Sets the mark every call logged from now on carries: the phase the
+    /// harness runs and the injected time it gave it.
+    pub fn mark(&self, phase: DiskPhase, at: inf_foundation::time::Nanos) {
+        self.state.borrow_mut().calls.mark(DiskMark { phase, at });
+    }
+
+    /// The logged calls from index `first` on, in call order: a reader
+    /// that keeps its own index reads each entry once.
+    #[must_use]
+    pub fn logged_calls(&self, first: usize) -> Vec<LoggedCall> {
+        self.state.borrow().calls.entries_from(first)
+    }
+
+    /// Calls the log could not hold: a log a reader finds incomplete.
+    #[must_use]
+    pub fn calls_unlogged(&self) -> u64 {
+        self.state.borrow().calls.unlogged()
     }
 
     /// The power cut (ADR-0020 D6): per directory, a seeded prefix of
@@ -1332,6 +1574,72 @@ impl SimDisk {
         let fd = state.open_fd(ino, direct);
         Ok(SimFile { state: Rc::clone(&self.state), target: Target::File { ino, fd, direct } })
     }
+
+    /// A create the call log records when it makes a checkpoint's staging
+    /// file: its result and whether the name exists after it. Every other
+    /// create runs unlogged. `ckpt_create_fail` fires here, before the
+    /// create, so a refused create leaves no file, and the log records the
+    /// refusal as it records every other result.
+    fn create_logged(
+        &self,
+        path: &Path,
+        create: impl FnOnce() -> io::Result<SimFile>,
+    ) -> io::Result<SimFile> {
+        if !calls::is_checkpoint_staging(path) {
+            return create();
+        }
+        let (created, result) = if inf_foundation::fault::fire(crate::fault::CKPT_CREATE_FAIL) {
+            let point = crate::fault::CKPT_CREATE_FAIL;
+            (Err(crate::fault::injected(point)), CallResult::Injected(point))
+        } else {
+            let created = create();
+            let result = CallResult::of(&created);
+            (created, result)
+        };
+        let mut state = self.state.borrow_mut();
+        let call = DiskCall::CheckpointCreate { left_file: state.os_names.contains_key(path) };
+        state.calls.record(call, path, result);
+        drop(state);
+        created
+    }
+
+    /// The rename itself: the OS names move at once, the directory's
+    /// journal queues the op for its barrier.
+    fn rename_names(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let mut state = self.state.borrow_mut();
+        state.tick_op()?;
+        let parent = parent_dir(to);
+        if parent_dir(from) != parent {
+            // Same-directory only: every caller's swap protocol is, and a
+            // cross-directory rename would need two-journal ordering the
+            // model deliberately does not define.
+            return Err(io::Error::other(format!(
+                "sim disk models same-directory renames only ({} -> {})",
+                from.display(),
+                to.display()
+            )));
+        }
+        if !state.dirs.contains(&parent) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no dir {}", parent.display()),
+            ));
+        }
+        let ino = state.os_names.remove(from).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("no file {}", from.display()))
+        })?;
+        // Replaces an existing destination atomically, like POSIX rename.
+        let clobbered = state.os_names.insert(to.to_path_buf(), ino);
+        state
+            .pending_meta
+            .entry(parent)
+            .or_default()
+            .push(MetaOp::Rename { from: from.to_path_buf(), to: to.to_path_buf() });
+        if let Some(old) = clobbered {
+            state.release_if_orphan(old);
+        }
+        Ok(())
+    }
 }
 
 /// A direct open takes only aligned writes — the `O_DIRECT` contract
@@ -1356,6 +1664,17 @@ fn file_fd_index(fd: i32) -> io::Result<u64> {
     } else {
         Err(io::Error::new(io::ErrorKind::InvalidInput, format!("not a sim file fd: {fd}")))
     }
+}
+
+/// The OS names of the inode the driver file fd `fd` is open on, in name
+/// order: none for a directory fd, a closed one, or one never issued, and
+/// then no name is read.
+fn file_fd_names_in(state: &DiskState, fd: i32) -> impl Iterator<Item = &PathBuf> {
+    let ino = file_fd_index(fd).ok().and_then(|index| state.open_files.get(&index));
+    let ino = ino.map(|open| open.ino);
+    ino.into_iter().flat_map(move |ino| {
+        state.os_names.iter().filter(move |&(_, &named)| named == ino).map(|(name, _)| name)
+    })
 }
 
 /// One open handle — one open file description with its own fd and
@@ -1388,6 +1707,37 @@ impl Drop for SimFile {
                 state.dir_fds.remove(fd);
             }
         }
+    }
+}
+
+impl SimFile {
+    /// This handle's final close (a retired tier file's, ADR-0156 D3): its
+    /// fd leaves the disk's open table as the handle's drop does, then
+    /// `tier_close_fail` fires and reports `EIO`, Linux's order (the number
+    /// is gone before the error is reported), and the disk logs the close
+    /// under the harness's mark with the first name reaching its inode.
+    ///
+    /// # Errors
+    /// `EIO` when `tier_close_fail` fires; the handle is closed either way.
+    pub fn close_reporting(self) -> io::Result<()> {
+        let state = Rc::clone(&self.state);
+        let path = match &self.target {
+            Target::File { ino, .. } => {
+                let disk = state.borrow();
+                let named = disk.os_names.iter().find(|&(_, &named)| named == *ino);
+                named.map(|(name, _)| name.clone()).unwrap_or_default()
+            }
+            Target::Dir(dir, _) => dir.clone(),
+        };
+        drop(self);
+        let (result, logged) = if inf_foundation::fault::fire(crate::fault::TIER_CLOSE_FAIL) {
+            let point = crate::fault::TIER_CLOSE_FAIL;
+            (Err(io::Error::from_raw_os_error(libc::EIO)), CallResult::Injected(point))
+        } else {
+            (Ok(()), CallResult::Ok)
+        };
+        state.borrow_mut().calls.record(DiskCall::FinalClose, &path, logged);
+        result
     }
 }
 
@@ -1518,8 +1868,115 @@ impl SegmentFile for SimFile {
     }
 }
 
+/// The simulated disk's open listing (ADR-0202 D5): the disk's own handle
+/// (it borrows the state only inside a call), the directory's path and the
+/// greatest name returned, so each batch takes the OS view's names after it
+/// in ascending byte order. Both calls answer the dead switch as every read
+/// does.
+#[derive(Debug)]
+pub struct SimDirStream {
+    state: Rc<RefCell<DiskState>>,
+    dir: PathBuf,
+    key: ResumeKey,
+    /// Under the repeat mode, the new names of the last batch, by path:
+    /// the ones removed since are returned once more at the next batch.
+    last: Vec<PathBuf>,
+}
+
+impl DirStream for SimDirStream {
+    fn next_batch(&mut self, batch: &mut NameBatch) -> io::Result<BatchEnd> {
+        batch.clear();
+        let filled = self.fill(batch);
+        if filled.is_err() {
+            batch.clear();
+        }
+        filled
+    }
+}
+
+impl SimDirStream {
+    fn fill(&mut self, batch: &mut NameBatch) -> io::Result<BatchEnd> {
+        let mut state = self.state.borrow_mut();
+        state.dead_check()?;
+        if inf_foundation::fault::fire(crate::fault::DIR_LISTING_NEXT_FAIL) {
+            return Err(crate::fault::injected(crate::fault::DIR_LISTING_NEXT_FAIL));
+        }
+        state.listing_batches += 1;
+        let repeat = state.cfg.listing_repeats_removed;
+        let mut repeats = 0u64;
+        if repeat {
+            // Bound: the last batch's names, each taken again at most once;
+            // a subset of a batch fits an empty one.
+            for path in self.last.drain(..) {
+                if state.os_names.contains_key(&path)
+                    || !path.file_name().is_some_and(|name| batch.push(name.as_bytes()))
+                {
+                    continue;
+                }
+                repeats += 1;
+            }
+        }
+        state.listing_repeats_served += repeats;
+        // The planted canary lets a repeat take a fresh name's place: a call
+        // that served one moves its key past the next name, never returned.
+        if cfg!(inf_canary_listing_repeat_skips) && repeats > 0 {
+            skip_next_name(&state.os_names, &self.dir, &mut self.key);
+        }
+        let repeated = batch.len();
+        let end = super::fill_after(&state.os_names, &self.dir, &mut self.key, batch)?;
+        // After `End` every call answers an empty `End`: the stream repeats
+        // nothing past it.
+        if repeat && end == BatchEnd::More {
+            let names = (repeated..batch.len()).filter_map(|i| batch.name(i));
+            self.last.extend(names.map(|name| self.dir.join(name)));
+        }
+        Ok(end)
+    }
+}
+
+/// The planted canary's skip: moves `key` past the next name of `dir`
+/// after it, as if that name had been returned.
+fn skip_next_name<V>(names: &BTreeMap<PathBuf, V>, dir: &Path, key: &mut ResumeKey) {
+    use std::ops::Bound;
+    let next = {
+        let from = match &*key {
+            ResumeKey::First => dir,
+            ResumeKey::After(path) => path.as_path(),
+            ResumeKey::Ended => return,
+        };
+        names
+            .range::<Path, _>((Bound::Excluded(from), Bound::Unbounded))
+            .map(|(path, _)| path)
+            .take_while(|path| path.starts_with(dir))
+            .find(|path| path.parent() == Some(dir))
+            .cloned()
+    };
+    if let Some(path) = next {
+        *key = ResumeKey::After(path);
+    }
+}
+
 impl SegmentFs for SimDisk {
     type File = SimFile;
+    type DirStream = SimDirStream;
+
+    fn open_listing(&self, dir: &Path) -> io::Result<OpenedDir<SimDirStream>> {
+        let mut state = self.state.borrow_mut();
+        state.dead_check()?;
+        if inf_foundation::fault::fire(crate::fault::DIR_LISTING_OPEN_FAIL) {
+            return Err(crate::fault::injected(crate::fault::DIR_LISTING_OPEN_FAIL));
+        }
+        if !state.dirs.contains(dir) {
+            return Ok(OpenedDir::Absent);
+        }
+        state.listings_opened += 1;
+        Ok(OpenedDir::Open(SimDirStream {
+            state: Rc::clone(&self.state),
+            dir: dir.to_path_buf(),
+            key: ResumeKey::First,
+            last: Vec::new(),
+        }))
+    }
 
     fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
@@ -1548,24 +2005,6 @@ impl SegmentFs for SimDisk {
         Ok(())
     }
 
-    fn list_dir(&self, dir: &Path) -> io::Result<Vec<String>> {
-        let state = self.state.borrow();
-        state.dead_check()?;
-        if !state.dirs.contains(dir) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no dir {}", dir.display()),
-            ));
-        }
-        Ok(state
-            .os_names
-            .keys()
-            .filter(|path| path.parent() == Some(dir))
-            .filter_map(|path| path.file_name())
-            .map(|name| name.to_string_lossy().into_owned())
-            .collect())
-    }
-
     fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
         // StdSegmentFs syncs the file at create: the prealloc length is
         // durable-if-the-name-survives (the blocks are holes — ADR-0119
@@ -1584,12 +2023,46 @@ impl SegmentFs for SimDisk {
         self.create_inode(path, vec![0; len], Vec::new())
     }
 
+    /// A tier file's create, logged with its result and whether its name
+    /// exists after the call. Both create points fire inside this call, so
+    /// the log holds every injected create failure: `tier_create_fail`
+    /// before the inode exists (`create_new` refused, `EMFILE`'s shape),
+    /// `tier_create_post_fail` after it is made and named (a later step of
+    /// the same call failed: `set_len`, the `O_DIRECT` probe's `/proc`
+    /// open or `sync_all`), its handle then closed and the file left.
     fn create_tier(&self, path: &Path, mode: TierIoMode) -> io::Result<Self::File> {
         // Synced at create like the std tier (empty either way); `Direct`
         // flags the inode so every tier write is alignment-asserted — the
         // `O_DIRECT` contract the fault points broke unseen while the sim
         // took the mode-blind default (F-L04-14, ADR-0119 A1).
-        self.create_inode_full(path, Vec::new(), Vec::new(), 0, mode == TierIoMode::Direct, false)
+        let (created, logged) = if inf_foundation::fault::fire(crate::fault::TIER_CREATE_FAIL) {
+            let point = crate::fault::TIER_CREATE_FAIL;
+            (Err(crate::fault::injected(point)), CallResult::Injected(point))
+        } else {
+            match self.create_inode_full(
+                path,
+                Vec::new(),
+                Vec::new(),
+                0,
+                mode == TierIoMode::Direct,
+                false,
+            ) {
+                Ok(file) if inf_foundation::fault::fire(crate::fault::TIER_CREATE_POST_FAIL) => {
+                    drop(file);
+                    let point = crate::fault::TIER_CREATE_POST_FAIL;
+                    (Err(crate::fault::injected(point)), CallResult::Injected(point))
+                }
+                created => {
+                    let logged = CallResult::of(&created);
+                    (created, logged)
+                }
+            }
+        };
+        let mut state = self.state.borrow_mut();
+        let call = DiskCall::CreateTier { left_file: state.os_names.contains_key(path) };
+        state.calls.record(call, path, logged);
+        drop(state);
+        created
     }
 
     /// The mode of *this* open, as [`open_segment_append`](Self::open_segment_append).
@@ -1607,20 +2080,22 @@ impl SegmentFs for SimDisk {
 
     fn create_meta(&self, path: &Path) -> io::Result<Self::File> {
         // No durability side effects (ADR-0017): all volatile.
-        self.create_inode(path, Vec::new(), Vec::new())
+        self.create_logged(path, || self.create_inode(path, Vec::new(), Vec::new()))
     }
 
     fn create_meta_direct(&self, path: &Path) -> io::Result<Self::File> {
-        if self.state.borrow().refuse_direct_meta {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "SimDisk: O_DIRECT refused (refuse_direct_meta)",
-            ));
-        }
-        // Volatile like `create_meta`, flagged direct: every driver write
-        // to it is alignment-asserted (ADR-0088 D3) and gated by the
-        // meta refusal budget (D3 as amended).
-        self.create_inode_full(path, Vec::new(), Vec::new(), 0, true, true)
+        self.create_logged(path, || {
+            if self.state.borrow().refuse_direct_meta {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "SimDisk: O_DIRECT refused (refuse_direct_meta)",
+                ));
+            }
+            // Volatile like `create_meta`, flagged direct: every driver
+            // write to it is alignment-asserted (ADR-0088 D3) and gated by
+            // the meta refusal budget (D3 as amended).
+            self.create_inode_full(path, Vec::new(), Vec::new(), 0, true, true)
+        })
     }
 
     fn open_dir(&self, dir: &Path) -> io::Result<Self::File> {
@@ -1658,58 +2133,43 @@ impl SegmentFs for SimDisk {
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-        let mut state = self.state.borrow_mut();
-        state.tick_op()?;
-        let parent = parent_dir(to);
-        if parent_dir(from) != parent {
-            // Same-directory only: every caller's swap protocol is, and a
-            // cross-directory rename would need two-journal ordering the
-            // model deliberately does not define.
-            return Err(io::Error::other(format!(
-                "sim disk models same-directory renames only ({} -> {})",
-                from.display(),
-                to.display()
-            )));
+        let renamed = self.rename_names(from, to);
+        if calls::is_manifest(to) {
+            let result = CallResult::of(&renamed);
+            self.state.borrow_mut().calls.record(DiskCall::ManifestRename, to, result);
         }
-        if !state.dirs.contains(&parent) {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no dir {}", parent.display()),
-            ));
-        }
-        let ino = state.os_names.remove(from).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("no file {}", from.display()))
-        })?;
-        // Replaces an existing destination atomically, like POSIX rename.
-        let clobbered = state.os_names.insert(to.to_path_buf(), ino);
-        state
-            .pending_meta
-            .entry(parent)
-            .or_default()
-            .push(MetaOp::Rename { from: from.to_path_buf(), to: to.to_path_buf() });
-        if let Some(old) = clobbered {
-            state.release_if_orphan(old);
-        }
-        Ok(())
+        renamed
     }
 
+    /// A name's removal; one on a tier file's name is logged as the tier
+    /// unlinks are, so an oracle counts every tier-file unlink whichever
+    /// call made it.
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         let mut state = self.state.borrow_mut();
-        state.tick_op()?;
-        let Some(ino) = state.os_names.remove(path) else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no file {}", path.display()),
-            ));
+        let removed = state.remove_name(path);
+        if calls::is_tier_file(path) {
+            let logged = CallResult::of(&removed);
+            state.calls.record(DiskCall::RemoveTier, path, logged);
+        }
+        removed
+    }
+
+    /// A retired tier file's unlink (ADR-0156 D3): `tier_unlink_fail` fires
+    /// here, under the disk's own borrow, before the name is touched, and
+    /// the call log records every attempt with its result, so an oracle
+    /// anchors on the disk's entry, never on the caller's report.
+    fn unlink_tier(&self, path: &Path) -> io::Result<()> {
+        let mut state = self.state.borrow_mut();
+        let (result, logged) = if inf_foundation::fault::fire(crate::fault::TIER_UNLINK_FAIL) {
+            let point = crate::fault::TIER_UNLINK_FAIL;
+            (Err(crate::fault::injected(point)), CallResult::Injected(point))
+        } else {
+            let removed = state.remove_name(path);
+            let logged = CallResult::of(&removed);
+            (removed, logged)
         };
-        let parent = parent_dir(path);
-        state
-            .pending_meta
-            .entry(parent)
-            .or_default()
-            .push(MetaOp::Remove { name: path.to_path_buf() });
-        state.release_if_orphan(ino);
-        Ok(())
+        state.calls.record(DiskCall::UnlinkTier, path, logged);
+        result
     }
 }
 
@@ -1892,9 +2352,36 @@ mod model_tests {
         assert!(bytes <= 1000 * 4096 * 2, "1000 barriers copied {bytes} bytes (O(file) per fsync)");
     }
 
+    /// A driver file fd reads the OS names of its own inode alone, beside
+    /// another namespace's open tier file, and the new name after a rename;
+    /// a directory fd, a closed fd and one never issued read none.
+    #[test]
+    fn a_file_fd_reads_the_names_of_its_inode() {
+        let disk = SimDisk::new();
+        let dir = Path::new("shard-0").join("ns-7").join("cold");
+        let other_dir = Path::new("shard-0").join("ns-8").join("cold");
+        disk.create_dir_all(&dir).expect("dirs");
+        disk.create_dir_all(&other_dir).expect("other dirs");
+        let (first, second) = (dir.join("tier-000000.itier"), dir.join("tier-000001.itier"));
+        let other_name = other_dir.join("tier-000000.itier");
+        let tier = disk.create_tier(&first, TierIoMode::Buffered).expect("tier");
+        let other = disk.create_tier(&other_name, TierIoMode::Buffered).expect("other tier");
+        let (fd, other_fd) = (tier.raw_fd().expect("fd"), other.raw_fd().expect("other fd"));
+        assert_eq!(disk.file_fd_names(fd), vec![first.clone()], "an fd names its own inode alone");
+        assert_eq!(disk.file_fd_names(other_fd), vec![other_name.clone()]);
+        disk.rename(&first, &second).expect("rename");
+        assert_eq!(disk.file_fd_names(fd), vec![second], "the fd follows its inode");
+        assert_eq!(disk.file_fd_names(other_fd), vec![other_name], "no other fd's name moved");
+        let dir_fd = disk.open_dir(&dir).expect("dir").raw_fd().expect("dir fd");
+        assert!(disk.file_fd_names(dir_fd).is_empty(), "a directory fd names no file");
+        assert!(disk.file_fd_names(-1).is_empty(), "a fd the model never issued names nothing");
+        drop(tier);
+        assert!(disk.file_fd_names(fd).is_empty(), "a closed fd names nothing");
+    }
+
     /// The family accessors read the model's own tables: open descriptors
-    /// by the name of their inode, names by the predicate, and a sync held
-    /// by the name behind its fd until the hold lifts.
+    /// by the name of their inode, names by the predicate, and a barrier
+    /// held by the name behind its fd and the hold's scope until it lifts.
     #[test]
     fn a_named_family_counts_its_open_files_and_holds_its_syncs() {
         fn is_blob(name: &Path) -> bool {
@@ -1909,14 +2396,59 @@ mod model_tests {
         assert_eq!(disk.open_files_named(is_blob), 2);
         assert_eq!(disk.names_where(is_blob).len(), 2);
         let (blob_fd, seg_fd) = (one.raw_fd().expect("fd"), seg.raw_fd().expect("fd"));
-        assert!(!disk.sync_held(blob_fd), "no hold armed");
+        let held = |fd, kind| disk.barrier_held(fd, kind);
+        assert!(!held(blob_fd, BarrierKind::Standalone), "no hold armed");
         disk.hold_syncs(Some(is_blob));
-        assert!(disk.sync_held(blob_fd));
-        assert!(!disk.sync_held(seg_fd), "the hold names one family");
+        assert!(held(blob_fd, BarrierKind::Standalone));
+        assert!(!held(seg_fd, BarrierKind::Standalone), "the hold names one family");
+        assert!(!held(blob_fd, BarrierKind::Linked), "a sync hold keeps standalone syncs alone");
+        assert!(!held(blob_fd, BarrierKind::WriteThrough), "and passes a write-through write");
         drop(two);
         assert_eq!(disk.open_files_named(is_blob), 1, "a closed handle leaves the count");
         disk.hold_syncs(None);
-        assert!(!disk.sync_held(blob_fd), "the hold lifted");
+        assert!(!held(blob_fd, BarrierKind::Standalone), "the hold lifted");
+        disk.hold_barriers(Some(is_blob));
+        for kind in [BarrierKind::Standalone, BarrierKind::Linked, BarrierKind::WriteThrough] {
+            assert!(held(blob_fd, kind), "a barrier hold keeps a {kind:?} barrier");
+        }
+        assert!(!held(seg_fd, BarrierKind::Linked), "a barrier hold names one family");
+        disk.hold_syncs(Some(is_blob));
+        assert!(!held(blob_fd, BarrierKind::Linked), "arming a sync hold replaces it");
+        disk.hold_syncs(None);
+        assert!(disk.fd_named(blob_fd, is_blob), "an fd names its inode's family");
+        assert!(!disk.fd_named(seg_fd, is_blob), "and no other");
+        assert!(!disk.fd_named(-1, is_blob), "a fd the model never issued names nothing");
+    }
+
+    /// A read hold names one family by the name behind its fd: held while
+    /// armed, not once lifted, and never on a closed descriptor, whose read
+    /// the driver then submits and the model answers `EBADF`, counted.
+    #[test]
+    fn a_named_family_holds_its_reads_until_the_hold_lifts_or_its_fd_closes() {
+        fn is_tier(name: &Path) -> bool {
+            name.extension().is_some_and(|ext| ext == "itier")
+        }
+        let disk = SimDisk::new();
+        disk.create_dir_all(Path::new("d")).expect("dirs");
+        let tier = disk.create_tier(&Path::new("d").join("tier-1.itier"), TierIoMode::Buffered);
+        let tier = tier.expect("tier");
+        let seg = disk.create_segment(&Path::new("d").join("seg-0.ilog"), 4096).expect("seg");
+        let (tier_fd, seg_fd) = (tier.raw_fd().expect("fd"), seg.raw_fd().expect("fd"));
+        assert!(!disk.read_held(tier_fd), "no hold armed");
+        disk.hold_reads(Some(is_tier));
+        assert!(disk.read_held(tier_fd));
+        assert!(!disk.read_held(seg_fd), "the hold names one family");
+        disk.hold_reads(None);
+        assert!(!disk.read_held(tier_fd), "the hold lifted");
+        disk.hold_reads(Some(is_tier));
+        drop(tier);
+        assert!(!disk.read_held(tier_fd), "a closed descriptor is never held");
+        let mut buf = [0u8; 8];
+        let at = FileOffset::new(0).expect("offset 0");
+        let read = disk.driver_read_at(tier_fd, at, &mut buf);
+        assert_eq!(read.err().and_then(|err| err.raw_os_error()), Some(libc::EBADF));
+        assert_eq!(disk.closed_fd_ops(), 1, "the closed descriptor's read is counted");
+        disk.hold_reads(None);
     }
 
     /// Perf row (L04): the determinism digest hashes the resident image

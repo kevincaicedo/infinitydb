@@ -1,3 +1,7 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test-only: whole listings of fixture directories (ADR-0202 D7)"
+)]
 //! ADR-0174 D4: a tiered namespace that no MANIFEST section names — a
 //! crash before its first checkpoint publishes, after one tier flush —
 //! recovers through the empty section: its dead-life tier files removed
@@ -23,16 +27,20 @@ const TIER_NS: NsId = NsId(17);
 const MEM_BUDGET: u64 = 3 << 20;
 
 fn tiered_keyspace() -> Keyspace {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let mut ks = fresh_keyspace();
-    ks.ns_create(NsSpec {
-        id: TIER_NS,
-        name: b"hot".to_vec(),
-        mode: NsMode::Durable,
-        fsync: Some(FsyncClass::Always),
-        policy: None,
-        maxmemory: None,
-        tier: Some(TierSpec::for_budget(MEM_BUDGET)),
-    })
+    ks.ns_create(
+        NsSpec {
+            id: TIER_NS,
+            name: b"hot".to_vec(),
+            mode: NsMode::Durable,
+            fsync: Some(FsyncClass::Always),
+            policy: None,
+            maxmemory: None,
+            tier: Some(TierSpec::for_budget(MEM_BUDGET)),
+        },
+        &census,
+    )
     .expect("tiered ns");
     ks
 }
@@ -49,13 +57,16 @@ fn fresh_pipeline(fs: &inf_log::fs::mem::MemFs) -> TierFlush<inf_log::fs::mem::M
             mode: TierIoMode::Buffered,
             file_capacity: inf_log::TIER_FILE_CAPACITY_DEFAULT,
             slice_bytes: 1 << 20,
+            record_len_max: 16 << 20,
         },
         0,
+        &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
     )
 }
 
 #[test]
 fn a_namespace_without_a_manifest_section_removes_its_dead_life_files_before_the_first_flush() {
+    let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
     let fs = inf_log::fs::mem::MemFs::new();
     let mut log = LogBuilder::new(&fs, &cfg());
     let value = vec![0x3Cu8; 512];
@@ -80,6 +91,7 @@ fn a_namespace_without_a_manifest_section_removes_its_dead_life_files_before_the
             demote,
             128,
             inf_store::KeyHasher::default(),
+            &census,
         )
         .expect("ring");
         let mut flush = fresh_pipeline(&fs);

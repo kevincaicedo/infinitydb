@@ -46,6 +46,7 @@ struct Storm {
 
 impl Storm {
     fn new() -> Storm {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         let demote = DemotionConfig::for_budget(BUDGET, PAGE);
         let table = TieredTable::new(
             AddressSpaceConfig {
@@ -56,6 +57,7 @@ impl Storm {
             demote,
             2048,
             KeyHasher::default(),
+            &census,
         )
         .expect("ring");
         let flush = TierFlush::new(
@@ -67,8 +69,10 @@ impl Storm {
                 mode: TierIoMode::Buffered,
                 file_capacity: FILE_CAPACITY,
                 slice_bytes: PAGE,
+                record_len_max: 16 << 20,
             },
             0,
+            &inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0,
         );
         Storm { table, flush, model: BTreeMap::new() }
     }
@@ -241,6 +245,7 @@ proptest! {
 /// The M4-S14 AC storm: 10⁶ random write/update/delete ops — per-file
 /// `live + dead = file bytes`, exact, with the aggregate decomposition
 /// asserted after every single op.
+// nextest-long: 20 s
 #[test]
 fn live_set_storm_million_ops() {
     let ops = if cfg!(miri) { 2_000 } else { 1_000_000 };

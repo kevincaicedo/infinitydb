@@ -9,6 +9,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
+// Each test runs the gate CLI against fixture servers it loads with many
+// connections over timed windows: two at once would share the CPUs and slow
+// each other's windows. The lock keeps the tests apart where they are threads
+// of this process (`cargo test`); under nextest each is a process of its own,
+// and the group of one thread does.
+// nextest-group: gate-exit
 #[allow(clippy::disallowed_types, reason = "serialize high-connection CLI fixtures in this test")]
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -277,6 +283,9 @@ fn zero_duration_cannot_certify_a_generator_even_when_numeric_gates_pass() {
     }
 }
 
+// nextest-alone: about 34 s. The plateau disposition reads the fixture's live
+// rate against a 5 % band, so the CPU that sibling test processes take would
+// move the verdict (ADR-0200 D7).
 #[test]
 fn m2_only_always_probes_and_enforces_measured_dispositions() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());

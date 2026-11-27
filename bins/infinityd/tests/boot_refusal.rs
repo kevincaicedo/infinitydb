@@ -22,11 +22,15 @@
 //! readiness is a `DBSIZE` answer, a refusal is the exit.
 #![cfg(target_os = "linux")]
 
+#[path = "support/node.rs"]
+mod node;
+
+use node::{Node, NodeBinary};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -49,16 +53,9 @@ fn data_root(tag: &str) -> PathBuf {
 }
 
 struct Server {
-    child: Child,
+    child: Node,
     port: u16,
     stderr: PathBuf,
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
 }
 
 impl Server {
@@ -83,14 +80,15 @@ impl Server {
 }
 
 struct Launched {
-    child: Child,
+    child: Node,
     stderr: PathBuf,
 }
 
 fn launch(dir: &Path) -> Launched {
     std::fs::create_dir_all(dir).expect("data dir");
     let stderr = dir.join(format!("stderr-{}-{}", std::process::id(), unique()));
-    let child = Command::new(env!("CARGO_BIN_EXE_infinityd"))
+    let child = NodeBinary::built()
+        .command()
         .args(["--port", "0", "--cells", "1", "--data-dir"])
         .arg(dir)
         .args(["--device-probe", "off"])

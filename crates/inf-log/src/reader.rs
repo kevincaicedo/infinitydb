@@ -38,7 +38,9 @@ use core::fmt;
 use std::io;
 use std::path::Path;
 
-use crate::frame::{FRAME_HEADER_LEN, FrameDecodeError, FrameRef, decode_frame, frame_shape};
+use crate::frame::{
+    FRAME_HEADER_LEN, FrameDecodeError, FrameHead, FrameRef, decode_frame, frame_shape,
+};
 use crate::fs::{SegmentFile, SegmentFs};
 use crate::lsn::{Lsn, SegmentId, check_segment_len};
 use crate::segment::segment_file_name;
@@ -253,6 +255,20 @@ pub struct SegmentReader<File: SegmentFile> {
     hit_eof: bool,
     end: Option<ReadEnd>,
     failed: bool,
+    /// The frame the last step returned, while its bytes are still in
+    /// `buf`: until the next step, the only code that refills (compacts)
+    /// the window, so [`held_frame`](Self::held_frame) re-issues it from
+    /// these facts without a second CRC pass.
+    held: Option<HeldFrame>,
+}
+
+/// The frame a [`SegmentReader`] last returned: its base (segment offset),
+/// where it starts in the reader's buffer, and its header facts.
+#[derive(Copy, Clone, Debug)]
+struct HeldFrame {
+    base: u32,
+    at: usize,
+    head: FrameHead,
 }
 
 impl<File: SegmentFile> fmt::Debug for SegmentReader<File> {
@@ -283,6 +299,7 @@ impl<File: SegmentFile> SegmentReader<File> {
             hit_eof: false,
             end: None,
             failed: false,
+            held: None,
         }
     }
 
@@ -322,6 +339,8 @@ impl<File: SegmentFile> SegmentReader<File> {
     /// (the failing window is left untouched — [`next_frame`]
     /// (Self::next_frame) is the fusing form).
     pub fn next_step(&mut self) -> Result<ReadStep<'_>, ReadError> {
+        // A step may refill, which moves the held frame's bytes.
+        self.held = None;
         if let Some(end) = self.end {
             return Ok(ReadStep::End(end));
         }
@@ -417,6 +436,7 @@ impl<File: SegmentFile> SegmentReader<File> {
                 // ahead of `valid`; the next peek's refill compacts from
                 // the boundary (a file ending inside the padding is a
                 // clean `FileEnd`, like any other short tail).
+                self.held = Some(HeldFrame { base: at, at: self.start, head: frame.head() });
                 self.start = self.start.saturating_add(frame.padded_len() as usize);
                 self.next_offset = next_offset;
                 Ok(ReadStep::Frame(frame))
@@ -426,6 +446,19 @@ impl<File: SegmentFile> SegmentReader<File> {
                 Err(ReadError::Frame { segment: self.segment, offset: at, error })
             }
         }
+    }
+
+    /// The frame the last [`next_step`](Self::next_step) returned, again,
+    /// when its base is `base`: the bytes it validated stay in the
+    /// reader's buffer until the next step, so a record walk that stopped
+    /// inside it resumes over the same frame with no read and no second
+    /// CRC pass (ADR-0174 A1). `None` once a later step ran, or for any
+    /// other base — the caller's typed refusal that its cursor's frame is
+    /// no longer held.
+    #[must_use]
+    pub fn held_frame(&self, base: u32) -> Option<FrameRef<'_>> {
+        let held = self.held.filter(|held| held.base == base)?;
+        held.head.reissue(self.buf.get(held.at..)?)
     }
 
     /// Records the clean end (repeated by every later step) and returns it.
@@ -528,6 +561,42 @@ impl<File: SegmentFile> SegmentReader<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The held frame: the frame the last step returned, by its base, with
+    /// the same records; gone once the next step ran, and never handed out
+    /// for another base.
+    #[test]
+    fn the_held_frame_is_the_last_frame_returned_until_the_next_step() {
+        use crate::frame::{FrameBuilder, FrameLayout, FrameStamp};
+        use crate::record::{NsId, RecordView};
+        let fs = crate::fs::mem::MemFs::new();
+        fs.create_dir_all(std::path::Path::new("shard")).unwrap();
+        let mut file = fs.create_meta(std::path::Path::new("shard/test.ilog")).unwrap();
+        let mut image = Vec::new();
+        for seq in 1..=2u64 {
+            let mut builder = FrameBuilder::new();
+            builder.append(&RecordView::StringPostImage { ns: NsId(1), key: b"k", value: b"v" });
+            let first = Lsn::new(SegmentId(0), (image.len() + FRAME_HEADER_LEN) as u32);
+            let stamp = FrameStamp { epoch: 1, seq, covered_lsn: 0 };
+            image.extend_from_slice(builder.finalize(first, stamp, FrameLayout::Packed));
+        }
+        file.write_at(0, &image).unwrap();
+        let mut reader = SegmentReader::new(file, SegmentId(0), ReaderConfig::default());
+        let first = match reader.next_step().unwrap() {
+            ReadStep::Frame(frame) => frame.first_lsn(),
+            ReadStep::End(end) => panic!("ended at {end:?}"),
+        };
+        let held = reader.held_frame(0).expect("the frame just returned");
+        assert_eq!(held.first_lsn(), first);
+        assert_eq!(held.records().count(), 1);
+        assert!(reader.held_frame(1).is_none(), "another base is not held");
+        assert!(matches!(reader.next_step().unwrap(), ReadStep::Frame(_)));
+        assert!(reader.held_frame(0).is_none(), "the next step releases the frame");
+        let second = reader.offset() - (image.len() / 2) as u32;
+        assert!(reader.held_frame(second).is_some(), "the second frame is held");
+        assert!(matches!(reader.next_step().unwrap(), ReadStep::End(_)));
+        assert!(reader.held_frame(second).is_none(), "an end holds no frame");
+    }
 
     #[test]
     fn refill_refuses_an_overreport_before_advancing_its_cursor() {

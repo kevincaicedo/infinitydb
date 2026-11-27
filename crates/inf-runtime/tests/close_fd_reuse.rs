@@ -23,12 +23,22 @@ use std::time::{Duration, Instant};
 
 use inf_alloc::{BufferPool, LeaseKind};
 use inf_runtime::{
-    BackendDriver, Completion, CompletionResult, CompletionToken, IoOp, TokenClass, UringDriver,
-    Wait,
+    BackendDriver, Completion, CompletionResult, CompletionToken, IoOp, SetupFlags, TokenClass,
+    UringDriver, Wait,
 };
+
+#[path = "support/uring_env.rs"]
+mod uring_env;
 
 const ACCEPT_TOKEN: u32 = 1;
 const PARK: Duration = Duration::from_millis(20);
+/// How long the last close may take to settle before the test calls the
+/// driver hung: a hang bound, as `pump_until`'s, never a latency budget.
+/// The two closes and the cancelled send complete in the kernel within a
+/// few of [`PARK`]'s pumps; the window ends early once all three have
+/// ended, so the verdict reads which completions arrived, not how fast
+/// (ADR-0200 D7: the CPUs are shared with every test process beside it).
+const SETTLE_HANG_BOUND: Duration = Duration::from_secs(5);
 /// Sends are one pool buffer. Loopback's MSS is 64 KiB, so a locked
 /// receive window reopens only once half of it is read (SWS avoidance):
 /// the opening read below frees ~16 KiB, the resumed send writes that
@@ -161,14 +171,16 @@ fn drain(peer: &mut TcpStream, timeout: Duration) -> usize {
 
 #[test]
 fn a_reused_fd_number_keeps_both_closes_and_never_carries_the_predecessors_bytes() {
-    // SAFETY: single-test binary, set before any thread or ring exists.
-    unsafe { std::env::set_var("INF_URING_NO_DEFER_TASKRUN", "1") };
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
     // Accepted sockets inherit the listener's (locked) send buffer.
     set_sockbuf(listener.as_raw_fd(), libc::SO_SNDBUF, 4096);
     let listener_fd = listener.into_raw_fd();
-    let mut driver = UringDriver::new(256).expect("io_uring");
+    // The no-DEFER_TASKRUN tier by the config's override; the mode is still
+    // the environment's, so the degraded CI leg runs this test degraded.
+    let config = uring_env::config().with_setup(SetupFlags::NoDeferTaskrun);
+    let mut driver = UringDriver::new(256, config).expect("io_uring");
+    uring_env::assert_engaged(&driver.capabilities());
     assert!(!driver.capabilities().defer_taskrun, "the no-DEFER_TASKRUN tier");
     let mut pool = BufferPool::new(64, BUF);
     driver.push(IoOp::AcceptArm {
@@ -252,15 +264,28 @@ fn a_reused_fd_number_keeps_both_closes_and_never_carries_the_predecessors_bytes
             .map(|c| c.token),
     );
 
-    // ---- close B; settle everything.
+    // ---- close B; settle until both closes and the blocked send have
+    // ended, or the hang bound passes (the asserts below then name what is
+    // missing). One poll after that collects a completion already posted,
+    // so a second `Closed` for either close still counts against it.
     driver.push(IoOp::Close { fd: fd_b, token: close_token(200) });
-    let settle_deadline = Instant::now() + Duration::from_millis(500);
-    while Instant::now() < settle_deadline {
-        let seen = pump(&mut driver, &mut pool, Wait::Park { timeout: Some(PARK) });
+    let settle_deadline = Instant::now() + SETTLE_HANG_BOUND;
+    loop {
+        let settled = [100, 200].iter().all(|slot| closed.iter().any(|t| t.slot() == *slot))
+            && ended.iter().any(|(t, _)| *t == blocked);
+        let wait = if settled || Instant::now() >= settle_deadline {
+            Wait::Poll
+        } else {
+            Wait::Park { timeout: Some(PARK) }
+        };
+        let seen = pump(&mut driver, &mut pool, wait);
         ended.extend(release_sends(&mut pool, &seen));
         closed.extend(
             seen.iter().filter(|c| matches!(c.result, CompletionResult::Closed)).map(|c| c.token),
         );
+        if matches!(wait, Wait::Poll) {
+            break;
+        }
     }
 
     // Regime oracle (tree-independent): A's peer saw the full sends plus

@@ -2,22 +2,39 @@
 # ADR-0106 D15/D17: document identities, current paths and one compat matrix;
 # ADR-0166 D5: every relative link in a published Markdown file resolves to a
 # published file inside this repository.
+# A directory the walk cannot read is a scope error (scripts/source_files.py).
 set -euo pipefail
-cd "${INF_CHECK_ROOT:-$(dirname "$0")/..}"
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+cd "${INF_CHECK_ROOT:-$SCRIPT_DIR/..}"
 
-python3 - <<'PY'
+INF_SCRIPT_DIR="$SCRIPT_DIR" python3 - <<'PY'
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote
 
+sys.path.insert(0, os.environ["INF_SCRIPT_DIR"])
+from source_files import WalkError, git_listing, listing, present
+
 root = Path.cwd()
 errors = []
 
+
+def walked(walk, *args):
+    """A walk's listing (scripts/source_files.py), or the scope error: a directory the walk
+    cannot read, or a git listing that fails or writes to stderr, fails the gate."""
+    try:
+        return walk(*args)
+    except WalkError as err:
+        print(f"DOC SCOPE ERROR: {err}")
+        sys.exit(2)
+
+
 # Check the index: a force-add must not bypass the output policy.
 if (root / ".git").exists():
-    tracked = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+    tracked = walked(git_listing, "ls-files", "-z").decode().split("\0")
     output = [p for p in tracked if {".artifacts", "artifacts"}.intersection(Path(p).parts[:-1])]
     if output:
         errors.append(f"DOC OUTPUT: {len(output)} tracked generated-output paths: {output[:8]}")
@@ -46,7 +63,7 @@ adrs = []
 governance = any(path.exists() for path in [*markers, docs / "milestones"])
 if governance:
     sources[markers[0]] = read_required(markers[0])
-    plans = sorted((docs / "milestones").glob("*.md"))
+    plans = walked(listing, docs / "milestones", "*.md") if (docs / "milestones").is_dir() else []
     if not plans:
         errors.append("DOC SCOPE: missing or empty parent milestone directory")
     for path in plans:
@@ -64,7 +81,7 @@ if governance:
     if not markers[1].is_dir():
         errors.append(f"DOC SCOPE: missing ADR directory {markers[1]}")
     else:
-        adrs = sorted(markers[1].glob("*.md"))
+        adrs = walked(listing, markers[1], "*.md")
     numbers = {}
     for path in adrs:
         if path.name == "README.md":
@@ -156,8 +173,9 @@ if top is None or Path(top.strip()).resolve() != base:
         "Markdown set is git's"
     )
 else:
-    listing = git_text("ls-files", "-z", "--cached", "--others", "--exclude-standard") or ""
-    published = {p for p in listing.split("\0") if p and (root / p).is_file()}
+    git_files = walked(git_listing, "-C", str(root), "ls-files", "-z", "--cached", "--others",
+                     "--exclude-standard").decode(errors="replace")
+    published = {p for p in git_files.split("\0") if p and walked(present, root / p)}
     published |= {str(d) for p in published for d in PurePosixPath(p).parents}
     for name in sorted(p for p in published if p.lower().endswith(".md")):
         md_files += 1

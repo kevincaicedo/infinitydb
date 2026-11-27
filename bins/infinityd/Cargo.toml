@@ -31,5 +31,10 @@ bench-diagnostics = ["inf-server/bench-diagnostics"]
 [target.'cfg(target_os = "linux")'.dependencies]
 inf-runtime = { workspace = true, features = ["uring"] }
 
+# The close tests set a client's receive buffer and its reset (`SO_RCVBUF`,
+# `SO_LINGER`), which std's sockets do not expose.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc.workspace = true
+
 [lints]
 workspace = true

@@ -13,6 +13,8 @@
 
 use std::collections::BTreeSet;
 
+use inf_sim::CloseLeg;
+
 fn read(rel: &str) -> String {
     let path = format!("{}/{rel}", env!("CARGO_MANIFEST_DIR"));
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
@@ -63,7 +65,8 @@ fn smoke_rows() -> Vec<String> {
 
 #[test]
 fn the_registry_is_the_cli_dispatch() {
-    let registry: BTreeSet<String> = inf_sim::SCENARIOS.iter().map(|s| (*s).to_string()).collect();
+    let registry: BTreeSet<String> =
+        inf_sim::SCENARIOS.iter().map(|row| row.name.to_string()).collect();
     let dispatched = dispatched_in_main();
     assert_eq!(
         registry,
@@ -79,12 +82,89 @@ fn the_registry_is_the_cli_dispatch() {
 #[test]
 fn every_scenario_has_a_smoke_row_and_every_row_names_a_scenario() {
     let rows = smoke_rows();
-    let registry: BTreeSet<&str> = inf_sim::SCENARIOS.iter().copied().collect();
+    let registry: BTreeSet<&str> = inf_sim::SCENARIOS.iter().map(|row| row.name).collect();
     let in_rows: BTreeSet<&str> = rows.iter().map(String::as_str).collect();
     let unrun: Vec<&&str> = registry.iter().filter(|s| !in_rows.contains(**s)).collect();
     assert!(unrun.is_empty(), "scenarios with no row in scripts/sim-smoke.sh: {unrun:?}");
     let unknown: Vec<&&str> = in_rows.iter().filter(|s| !registry.contains(**s)).collect();
     assert!(unknown.is_empty(), "sim-smoke.sh rows naming no scenario: {unknown:?}");
+}
+
+/// The `--close-leg` value of every `m0-capacity` row of the smoke runner.
+fn capacity_smoke_legs() -> BTreeSet<String> {
+    let script = read("../../scripts/sim-smoke.sh");
+    let body = script.split("rows=(").nth(1).expect("rows=( … ) in sim-smoke.sh");
+    let body = body.split(')').next().expect("closing paren");
+    body.lines()
+        .map(|line| line.trim().trim_matches('"'))
+        .filter(|row| row.split_whitespace().next() == Some("m0-capacity"))
+        .filter_map(|row| row.split("--close-leg ").nth(1))
+        .map(|rest| rest.split_whitespace().next().expect("a leg name").to_string())
+        .collect()
+}
+
+/// The legs that break the one-lane rule, each as `<leg>: <why>`: a leg on
+/// a smoke row and in `pinned` or on neither, and a pinned leg no test of
+/// `source` runs.
+fn one_lane_breaks(rows: &BTreeSet<String>, pinned: &[CloseLeg], source: &str) -> Vec<String> {
+    let mut breaks = Vec::new();
+    for leg in CloseLeg::ALL {
+        let row = rows.contains(leg.name());
+        let red = pinned.contains(&leg);
+        if row == red {
+            breaks.push(format!("{}: smoke row {row}, pinned red {red}", leg.name()));
+        }
+        if red && !source.contains(&format!("pinned_red(CloseLeg::{leg:?});")) {
+            breaks.push(format!("{}: pinned red with no test that runs it", leg.name()));
+        }
+    }
+    breaks
+}
+
+/// Every `m0-capacity` leg runs in exactly one lane: a smoke row, or
+/// `CloseLeg::PINNED_RED` with the ignored test that runs it, so a leg can
+/// be born neither unrun nor twice. A pinned test fails whatever its leg
+/// reads, so an ignore removed cannot move a leg into a third lane.
+#[test]
+fn every_capacity_leg_has_a_smoke_row_or_a_pinned_red() {
+    let rows = capacity_smoke_legs();
+    let source = read("src/harness/capacity.rs");
+    let breaks = one_lane_breaks(&rows, CloseLeg::PINNED_RED, &source);
+    assert!(breaks.is_empty(), "m0-capacity legs outside one lane: {breaks:?}");
+    let known: BTreeSet<&str> = CloseLeg::ALL.iter().map(|leg| leg.name()).collect();
+    let unknown: Vec<&String> = rows.iter().filter(|leg| !known.contains(leg.as_str())).collect();
+    assert!(unknown.is_empty(), "sim-smoke.sh rows naming no m0-capacity leg: {unknown:?}");
+}
+
+/// The one-lane rule's plants, each against this tree's rows, table and
+/// source with one leg pinned (the table's first, or the fan leg moved into
+/// it while the table is empty): a pinned leg given a smoke row, a pinned
+/// leg dropped from the table, and a pinned leg whose test is gone each
+/// break it, and the pinned leg in its one lane does not.
+#[test]
+fn the_one_lane_rule_refuses_each_plant() {
+    let leg = CloseLeg::PINNED_RED.first().copied().unwrap_or(CloseLeg::Fan);
+    let mut pinned = CloseLeg::PINNED_RED.to_vec();
+    if pinned.is_empty() {
+        pinned.push(leg);
+    }
+    let mut rows = capacity_smoke_legs();
+    rows.remove(leg.name());
+    let call = format!("pinned_red(CloseLeg::{leg:?});");
+    let mut source = read("src/harness/capacity.rs");
+    if !source.contains(&call) {
+        source.push_str(&call);
+    }
+    let broke =
+        |breaks: Vec<String>| breaks.iter().any(|b| b.starts_with(&format!("{}: ", leg.name())));
+    assert!(!broke(one_lane_breaks(&rows, &pinned, &source)), "the control: one lane");
+    let mut both = rows.clone();
+    both.insert(leg.name().to_string());
+    assert!(broke(one_lane_breaks(&both, &pinned, &source)), "a leg in both lanes");
+    let unpinned: Vec<CloseLeg> = pinned.iter().copied().filter(|other| *other != leg).collect();
+    assert!(broke(one_lane_breaks(&rows, &unpinned, &source)), "a leg in neither lane");
+    let untested = source.replace(&call, "");
+    assert!(broke(one_lane_breaks(&rows, &pinned, &untested)), "a pinned leg untested");
 }
 
 #[test]
@@ -115,14 +195,9 @@ fn the_recipe_and_the_pr_job_run_the_smoke_script() {
 #[test]
 fn every_canary_cfg_has_a_driver() {
     let cargo = read("../../Cargo.toml");
-    let line = cargo.lines().find(|l| l.contains("check-cfg")).expect("a check-cfg list");
-    let cfgs: Vec<&str> = line
-        .split("cfg(")
-        .skip(1)
-        .map(|s| s.split(')').next().expect("cfg name"))
-        .filter(|s| s.starts_with("inf_canary_"))
-        .collect();
-    assert!(!cfgs.is_empty(), "no inf_canary_* cfg in {line}");
+    let cfgs: Vec<&str> =
+        check_cfg_names(&cargo).into_iter().filter(|s| s.starts_with("inf_canary_")).collect();
+    assert!(!cfgs.is_empty(), "no inf_canary_* cfg in Cargo.toml's check-cfg list");
     let driver = read("../../scripts/sim-canaries.sh");
     for cfg in cfgs {
         assert!(
@@ -130,4 +205,70 @@ fn every_canary_cfg_has_a_driver() {
             "{cfg} is admitted by check-cfg but scripts/sim-canaries.sh never plants it"
         );
     }
+}
+
+/// The names `Cargo.toml`'s `check-cfg` array admits: one `'cfg(<name>)',`
+/// a line, the name lowercase letters, digits and `_`, from the line that
+/// ends `check-cfg = [` to the `]` that closes it. Any other line inside is
+/// refused, so a name never hides on a line that holds another.
+fn check_cfg_names(cargo: &str) -> Vec<&str> {
+    let mut lines = cargo.lines().skip_while(|l| !l.trim_end().ends_with("check-cfg = ["));
+    assert!(lines.next().is_some(), "no line of Cargo.toml ends `check-cfg = [`");
+    let mut names = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        if line.starts_with(']') {
+            assert!(!names.is_empty(), "the check-cfg list is empty");
+            return names;
+        }
+        let name = line
+            .strip_prefix("'cfg(")
+            .and_then(|rest| rest.strip_suffix(")',"))
+            .filter(|name| {
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+            .unwrap_or_else(|| panic!("a check-cfg line holds one name, `'cfg(<name>)',`: {line}"));
+        names.push(name);
+    }
+    panic!("the check-cfg list has no closing `]`");
+}
+
+/// The first two adjacent names out of byte order, a repeat included.
+fn first_out_of_order<'a>(names: &[&'a str]) -> Option<(&'a str, &'a str)> {
+    names.windows(2).find(|pair| pair[0] >= pair[1]).map(|pair| (pair[0], pair[1]))
+}
+
+/// The `check-cfg` list is one name a line in byte order, so two changes
+/// that each admit a cfg touch different lines and merge without a
+/// conflict.
+#[test]
+fn the_check_cfg_list_is_one_name_a_line_in_order() {
+    let cargo = read("../../Cargo.toml");
+    let names = check_cfg_names(&cargo);
+    if let Some((before, after)) = first_out_of_order(&names) {
+        panic!("check-cfg lists {before} before {after}: each name goes in its byte-order place");
+    }
+}
+
+/// The order check's plants: two names swapped, and one repeated.
+#[test]
+fn the_check_cfg_order_check_sees_a_swap_and_a_repeat() {
+    let swapped = "x = { check-cfg = [\n    'cfg(inf_b)',\n    'cfg(inf_a)',\n] }\n";
+    assert_eq!(first_out_of_order(&check_cfg_names(swapped)), Some(("inf_b", "inf_a")));
+    let repeated = "x = { check-cfg = [\n    'cfg(inf_a)',\n    'cfg(inf_a)',\n] }\n";
+    assert_eq!(first_out_of_order(&check_cfg_names(repeated)), Some(("inf_a", "inf_a")));
+    let sorted = "x = { check-cfg = [\n    'cfg(inf_a)',\n    'cfg(inf_b)',\n] }\n";
+    assert_eq!(check_cfg_names(sorted), ["inf_a", "inf_b"]);
+    assert_eq!(first_out_of_order(&check_cfg_names(sorted)), None);
+}
+
+/// The reader's plant: two names on one line are refused, never read as
+/// one name or as none.
+#[test]
+#[should_panic(expected = "a check-cfg line holds one name")]
+fn two_check_cfg_names_on_one_line_are_refused() {
+    check_cfg_names("x = { check-cfg = [\n    'cfg(inf_a)', 'cfg(inf_b)',\n] }\n");
 }

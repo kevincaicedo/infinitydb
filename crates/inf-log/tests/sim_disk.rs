@@ -61,7 +61,10 @@ fn tears_have_sector_granularity() {
     let sector = 512usize;
     let mut partial = 0u32;
     for seed in 0..64u64 {
-        let disk = SimDisk::with_config(SimDiskConfig { sector_bytes: sector as u32 });
+        let disk = SimDisk::with_config(SimDiskConfig {
+            sector_bytes: sector as u32,
+            ..SimDiskConfig::default()
+        });
         disk.create_dir_all(Path::new(DIR)).expect("dirs");
         let mut file = disk.create_segment(&path("seg-000000.ilog"), 4096).expect("create");
         disk.sync_dir(Path::new(DIR)).expect("dir barrier");

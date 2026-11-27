@@ -694,6 +694,7 @@ mod tests {
     /// scaled-down storm, see [`probe_ranges`]). Data integrity is verified
     /// per allocation with a fill pattern; live ranges are implicitly disjoint
     /// or the patterns would tear.
+    // nextest-long: 23 s
     #[test]
     fn storm_reconciles_byte_exact() {
         let ops: usize = if cfg!(miri) { 4_000 } else { 1_000_000 };

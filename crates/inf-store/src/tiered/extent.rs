@@ -37,6 +37,15 @@ impl TieredTable {
         (self.space.ring_bytes() / 2) as usize
     }
 
+    /// `M`: the largest encoded record this table admits (the store's one
+    /// formula, `record_len_max_in_ring`, over its ring, which the spec's
+    /// `record_len_max` reads too). A tier
+    /// round's span is at most `max(MAINTAIN-SLICE, M)` (ADR-0155 D1).
+    #[must_use]
+    pub fn record_len_max(&self) -> u64 {
+        crate::record::record_len_max_in_ring(self.space.ring_bytes())
+    }
+
     pub(super) fn clamp_blob_config(
         ring_bytes: u64,
         blob: crate::extents::BlobConfig,
@@ -313,6 +322,37 @@ impl TieredTable {
         self.extents.sweep_seed(listed, quarantined)
     }
 
+    /// The sweep seed's first stage, a batch (ADR-0174 A1.3: the seed runs
+    /// under the step budget): stamps at most `max` parked replay deaths
+    /// durable, in park order, from the table's own stamp cursor; answers
+    /// how many. [`extent_sweep_seed`](Self::extent_sweep_seed) is the three
+    /// stages whole.
+    pub fn extent_stamp_parked(&mut self, max: usize) -> usize {
+        self.extents.stamp_parked(max)
+    }
+
+    /// Parked replay deaths the sweep seed has not stamped yet.
+    #[must_use]
+    pub fn extent_parked_unstamped(&self) -> usize {
+        self.extents.parked_unstamped()
+    }
+
+    /// The sweep seed's second stage over a batch of the boot listing.
+    pub fn extent_seed_listed(&mut self, listed: &[u64]) {
+        self.extents.seed_listed(listed);
+    }
+
+    /// The sweep seed's third stage over a batch of the `.quarantine`
+    /// listing: the ids the replayed map references are appended to
+    /// `revive`, for the caller to rename back before serving (ADR-0096 D3).
+    pub fn extent_seed_quarantined(
+        &mut self,
+        quarantined: &[u64],
+        revive: &mut crate::tiered_recover::IdChunks,
+    ) {
+        self.extents.seed_quarantined(quarantined, revive);
+    }
+
     /// Applies one checkpoint tag-9 image / tail `StringExtentRef`
     /// record (ADR-0174 R5 over the extent kind — the arm of
     /// `replay_upsert_extent`, after the entry made room): blind
@@ -454,6 +494,7 @@ mod tests {
     use super::*;
 
     fn table() -> TieredTable {
+        let census = inf_foundation::bounded::CapCensus::new(inf_foundation::CellId(0)).0;
         TieredTable::new(
             AddressSpaceConfig {
                 reserve_bytes: 1 << 16,
@@ -463,6 +504,7 @@ mod tests {
             DemotionConfig::for_budget(1 << 16, 1 << 12),
             64,
             KeyHasher::default(),
+            &census,
         )
         .unwrap()
     }

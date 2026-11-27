@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use inf_log::fs::{SegmentFile, SegmentFs, SegmentIoMode, TierIoMode};
+use inf_log::fs::{OpenedDir, SegmentFile, SegmentFs, SegmentIoMode, TierIoMode};
 
 /// Prefetch granularity: matches the reader's default window so one
 /// advise = one pread.
@@ -208,6 +208,11 @@ impl<File: SegmentFile> SegmentFile for ReadAheadFile<File> {
 
 impl<F: SegmentFs> SegmentFs for ReadAheadFs<F> {
     type File = ReadAheadFile<F::File>;
+    type DirStream = F::DirStream;
+
+    fn open_listing(&self, dir: &Path) -> io::Result<OpenedDir<F::DirStream>> {
+        self.inner.open_listing(dir)
+    }
 
     fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
         self.inner.create_dir_all(dir)
@@ -215,10 +220,6 @@ impl<F: SegmentFs> SegmentFs for ReadAheadFs<F> {
 
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         self.inner.sync_dir(dir)
-    }
-
-    fn list_dir(&self, dir: &Path) -> io::Result<Vec<String>> {
-        self.inner.list_dir(dir)
     }
 
     fn create_segment(&self, path: &Path, prealloc_bytes: u64) -> io::Result<Self::File> {
@@ -288,5 +289,11 @@ impl<F: SegmentFs> SegmentFs for ReadAheadFs<F> {
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         self.inner.remove_file(path)
+    }
+
+    fn unlink_tier(&self, path: &Path) -> io::Result<()> {
+        // Explicit forward (ADR-0156 D3): the trait default would fire
+        // `tier_unlink_fail` here, above the wrapped tier's own call.
+        self.inner.unlink_tier(path)
     }
 }

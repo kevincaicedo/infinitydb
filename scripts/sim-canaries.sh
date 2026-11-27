@@ -1,16 +1,31 @@
 #!/usr/bin/env bash
-# Planted-bug canaries (ADR-0090 D5; F-L19-03 addendum, F-L19-04): each
-# `--cfg inf_canary_*` disables one load-bearing rule in the product, and
-# the scenario whose oracle owns that rule must go red on the planted
-# build — and green on the plain build. A canary the fleet never plants
+# Planted-bug canaries (ADR-0090 D5): each
+# `--cfg inf_canary_*` disables one load-bearing rule in the product,
+# removes from a harness leg what its engagement clause needs (a vacuity
+# plant), or breaks the simulator's model of a contract that a leg's oracle
+# takes as its premise (a premise plant); a vacuity plant is read in
+# `bins/inf-sim` alone, and a premise plant in `bins/inf-sim` or in the
+# simulated disk (`inf-log::fs::sim`), never on a product path. The scenario
+# whose oracle owns that rule, clause or premise must go red on the planted
+# build — and green on the plain build.
+# A canary the fleet never plants
 # proves nothing; `bins/inf-sim/tests/lanes.rs` fails when a cfg in the
 # workspace's `check-cfg` list has no row here.
-# Three row kinds:
+# Four row kinds:
 #   `<cfg> <scenario> <expected violation substring> [flags…]` — an
 #     `inf-sim` scenario (a sweep where one seed may not reach the rule).
 #     A row whose flags carry their own `--seed` runs at that seed whatever
-#     the lane's (`inf-sim` takes the last one): a named regression seed;
-#   `<cfg> crate-test <package> <lib|test:NAME> <test name> [witness…]` —
+#     the lane's (`inf-sim` takes the last one): a named regression seed.
+#     A log line carrying `VACUOUS` is an engagement clause, not the oracle
+#     seeing the planted violation: it is a catch only where the substring
+#     is the clause's own name, standing whole and closed by `:` or ` —`
+#     (a vacuity row: `VACUOUS seed 0x1 cell 0: <substring> — …`,
+#     `VACUOUS <substring>: …`, `<substring>: DRAW VACUOUS: …`). A planted
+#     log whose every line carrying the substring is a clause it does not
+#     name (`<substring> VACUOUS`, `<substring> leg VACUOUS`, a clause's
+#     text) is red for another reason;
+#   `<cfg> crate-test <package>[/<feature>[,<feature>…]] <lib|test:NAME>
+#     <test name> [witness…]` —
 #     a crate's own test, for a rule whose oracle lives below the simulator
 #     (the store-tier index rows, ADR-0139). The planted build must report
 #     exactly that test `FAILED`; a build that is red for any other
@@ -21,7 +36,10 @@
 #     assertion that the planted log must also carry, for a test with more
 #     than one way to fail. A row on `inf-sim` builds with `--features
 #     dst`, as every simulator recipe does (ADR-0107 D1): its tests do not
-#     compile without it;
+#     compile without it. The features after the package's `/` are the
+#     package's own that the test needs (`inf-runtime/uring`: its io_uring
+#     driver and tests exist only under them), passed to both builds, so
+#     the plain and the planted leg run the same test;
 #   `<cfg> loom <package> <test name> <witness>` — a Loom model in the
 #     package's library, for a memory ordering no other oracle can see
 #     (ADR-0159 A1.6): built `--cfg loom --cfg <cfg>` in release, judged
@@ -29,14 +47,240 @@
 #     control. The planted log must also carry `<witness>`, a whitespace-
 #     free piece of the model's own assertion: a Loom budget panic, the
 #     model's VACUOUS check or an `expect` also fail the test, and none of
-#     them is the oracle seeing the stale effect.
+#     them is the oracle seeing the stale effect;
+#   `<cfg> binary <instrument> <token> <flags…>` — the shipped node built
+#     twice and read by an `inf-bench` instrument, for a plant whose
+#     evidence is the node's resident memory, which no test inside the node
+#     sees. The plain node builds once a lane and the planted one once a
+#     cfg, each `cargo build --release -p infinityd` alone with RUSTFLAGS
+#     set (empty on the plain one), so the node is built as it ships and the
+#     plant is its cfg alone; `inf-bench` builds once a lane by its own
+#     command into the plain node's directory, first, and each instrument's
+#     `--preflight` runs once a lane before any node builds. The row runs
+#     `inf-bench <instrument> --base <plain> --candidate <planted>
+#     <flags…>` and is caught when that exits 1 with a line beginning
+#     `<token>:`. The plain node is the run's own control, its same-binary
+#     boots within the row's control (the instrument's exit 1 needs them),
+#     so no plain leg runs apart, and none runs under
+#     INF_CANARY_CONTROLS_ONLY: the row is named there and not run. The
+#     flags are a plant's: without `--plant-bytes-cell`, or with
+#     `--budget-bytes-cell`, the row is a scope error. Exit 0 is NOT CAUGHT;
+#     any exit but 1 with the token, or 2 withheld (below), is red for
+#     another reason.
+# Every row of the other kinds runs its plain control first, and the
+# control's own output must not carry the row's substring or witness: a line every run prints —
+# a summary, a header, a report — carries it on any red as well, so a
+# planted log naming it says nothing of the oracle, and the row is refused
+# before its plant is built. A crate-test or loom control runs with
+# `--show-output`, so a passing test's own prints are read too.
+# A row's label, `<cfg> <kind> <subject>`, heads every line about it (one
+# cfg owns many rows): the kind `crate-test`, `loom`, `scenario` or
+# `binary`, the subject the test's name, the scenario and its flags, or the
+# instrument. Every row is read before the first build: a cfg that is not
+# `inf_canary_<name>`, the name of letters, digits and `_` (the cfg names
+# the row's planted directory), a wrong arity for its kind, an empty feature
+# list, a target neither `lib` nor `test:NAME`, an instrument or token
+# spelled otherwise than letters, digits, `_` and `-`, or a word beginning
+# `deadline=` that is not the row's last or not `deadline=<N>s` (below) is a
+# scope error. The deadline word is no part of the row's kind: the arity, the
+# label, a witness and a flag list are read without it.
+# A run that judged nothing is neither caught nor NOT CAUGHT: a crate test
+# or Loom model that exits 0 with no verdict line for its test (cargo built
+# no such test on this host), a scenario that exits 0 with a line beginning
+# `WITHHELD:`, an instrument (a preflight, a binary row's run) that exits 2
+# with a line beginning `WITHHELD:` (the host or the node is outside its
+# scope). Linux is the lane's authoritative host (the shipped backend and
+# the nightly run there), and there such a row is red; on another host it
+# is NOT RUN, named in the summary, and the lane passes when every other row
+# does and one was caught (ADR-0106 D18's rule for a host-bound plant).
+# No other non-zero exit is judged nothing: a compile error, or cargo
+# refusing a feature, is red on every host. On a row whose features name
+# `uring`, a panic whose message begins `io_uring` (the test could not build
+# its ring) is named as io_uring unavailable on this host.
+# A row's red never stops another: every build and run of every kind is
+# judged, and the lane's verdict waits for the last row.
+# Every run has a deadline, the plain control's and the planted leg's alike:
+# a crate test's or Loom model's run of its test, a simulator's run, an
+# instrument's run and its preflight. A test leg builds first, alone
+# (`--no-run`, the command its build ahead runs; a build that fails is the
+# leg's status and log, as a compile error was), so a run's deadline bounds
+# the test and never a compile. The deadline is the row kind's
+# (kind_deadline_s holds each value and the data it was read from) or, when
+# the row's last word is `deadline=<N>s` (N 1 to 99999, no leading zero; never
+# a witness word or a flag), the row's own. Every build has one too, the
+# build deadline: a leg's build, each simulator and node build, and a build
+# ahead from its start. A run or a build is a job in a process group of its
+# own; past its deadline that whole group (cargo, the test, every node it
+# started) is sent SIGTERM, then SIGKILL once 3 s pass, and the run reads
+# `HUNG after <N> s`: red on every host, on the plain leg a control that is
+# not green, on the planted one never a catch whatever its log holds, as a row
+# is caught by its oracle alone and a run that cannot end stalls the lane. A
+# build ahead past it is ended and the leg builds again. A run that ends in
+# time with a process of its group still alive (a node it did not reap) has
+# that process named and its group ended. The limit: a process that leaves the
+# group (a new session or group) is out of the lane's reach, so the pre-pass
+# refuses a Rust file that spells a way out (the process-group premise, below).
+# A red leg's log is quoted by its panics: each `panicked at` line and the
+# message lines after it (at most 4 panics of 8 lines, 160 bytes a line), then
+# its last 5 lines, libtest's summary.
+# Rows run grouped by cfg, each cfg at its first row's place in the table
+# and its rows in the table's order, so the output's order is not the
+# table's; each row keeps its own verdict. A planted cfg builds in
+# `target/canary-<cfg>`, which goes once its last row is judged, or at exit
+# when a signal stops the run; SIGKILL leaves it.
+# Builds at once: the planted builds of INF_CANARY_BUILDS cfgs (K, default 4,
+# at most 4) run at once. While a cfg's rows are judged, the next K - 1 cfgs
+# are built ahead, each in a background job of its own that runs, one after
+# another and each once, the commands its rows' planted legs run (a test's
+# with `--no-run`), its output in a log of its own. A cfg's build ahead is
+# waited for before its first row, and every leg still runs its own command,
+# which finds its units built: each row is judged on its own cfg's build, in
+# the order above, as at K = 1, which builds nothing ahead. A build ahead that
+# failed is named with its log's last lines, and the leg builds again in
+# order, its output then in the lane's. A planted simulator is built ahead
+# only once the plain one is built. A cfg runs alone when it holds a binary
+# row, or a crate-test or Loom row whose test `.config/nextest.toml` runs
+# alone (an override with `threads-required = "num-test-threads"`, as the
+# config's own gate parses it): it is never built ahead, and before its rows
+# every build ahead ends and none starts until they are judged, as the node's
+# resident memory, a test's time bound or a rate it reads would move with a
+# build beside it.
+# At most K planted directories live at once. A run a signal stops sends
+# each build ahead's process group and the row's run in flight SIGTERM, then
+# SIGKILL after 3 s, and waits until every group is gone before their
+# directories go.
+# The lane's compiles share J jobs: CARGO_BUILD_JOBS as cargo reads it (a
+# count, `default`, or a negative count taken from the host's processors),
+# else the host's processors; a cargo config's `build.jobs` is not read. At
+# K > 1 the lane names to every cargo a job pool of J - K tokens
+# (CARGO_MAKEFLAGS, `--jobserver-auth=fifo:<path>`; a cargo that inherits a
+# pool ignores its own job bound), each of its at most K cargos holding one
+# job of its own, and K is at most J: with nothing built ahead (the first cfg,
+# or one that runs alone) the cargo in the foreground has 1 + J - K jobs. A
+# pool inherited through CARGO_MAKEFLAGS, MAKEFLAGS or MFLAGS is a scope error
+# at K > 1, as each of the lane's cargos would hold a job that pool does not
+# count. Every command the lane runs has the pool's descriptor closed: a
+# cargo opens the pool by its path. Controls alone and the table-only read
+# build nothing ahead and read neither J nor a pool.
+# Each row's elapsed seconds follow its verdict (`<label>: elapsed`), and a
+# cfg's build ahead, its seconds and the wait for it head the cfg's rows, so
+# the log alone breaks a run down.
+# CARGO_ENCODED_RUSTFLAGS is unset for the whole lane: cargo reads it before
+# RUSTFLAGS, so a set one would drop every plant's `--cfg` without a word.
 # Usage: scripts/sim-canaries.sh [seed]
+# INF_CANARY_CONTROLS_ONLY=1 runs every row's control alone and judges no
+# plant: the sweep of that rule over the table, much cheaper than the lane.
+# INF_CANARY_TABLE_ONLY=1 reads the table alone (every row well formed, the
+# ordered part in its order) and builds and runs nothing: `just check`'s
+# reading of the table, through the gates' self-test.
+# Sharding: INF_CANARY_SHARD=I/K runs the rows of every K-th cfg from the
+# I-th, cfgs counted by their first row in the table, so a cfg's planted
+# build is made in one shard and the K shards run every row exactly once
+# (the nightly's matrix: the whole lane outlasts one runner's job limit).
 # Fixture mode (scripts/check-scripts-selftest.sh): INF_CANARY_ROWS_FILE
-# replaces the row table and INF_CANARY_CARGO the cargo binary.
+# replaces the row table, INF_CANARY_CARGO the cargo binary,
+# INF_CANARY_SIM_TARGET the directory every run path is read from, a
+# scenario row's simulators and a binary row's nodes and `inf-bench`
+# (`target`; a stub cargo builds nothing there), and INF_CANARY_BENCH the
+# `inf-bench` a binary row runs, which the lane then does not build.
+# INF_CANARY_BENCH, like INF_CANARY_HOST below, is a scope error without
+# INF_CANARY_ROWS_FILE or beside a real cargo. INF_CANARY_SIM_TARGET
+# beside a real cargo (no INF_CANARY_CARGO, or one whose `--version` answers
+# as cargo does) is a scope error: a row judges the simulators its own build
+# wrote in this checkout's root (ADR-0204). INF_CANARY_HOST replaces
+# `uname -s`, and only there: without INF_CANARY_ROWS_FILE, or beside a real
+# cargo, it is a scope error, so a real run is judged on its own host.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+unset CARGO_ENCODED_RUSTFLAGS
 seed=${1:-0xC0FFEE}
 CARGO=${INF_CANARY_CARGO:-cargo}
+sim_target=${INF_CANARY_SIM_TARGET:-target}
+controls_only=${INF_CANARY_CONTROLS_ONLY:-0}
+case "$controls_only" in
+  0 | 1) ;;
+  *)
+    echo "sim-canaries: SCOPE ERROR — INF_CANARY_CONTROLS_ONLY wants 0 or 1, got '$controls_only'"
+    exit 1
+    ;;
+esac
+table_only=${INF_CANARY_TABLE_ONLY:-0}
+case "$table_only" in
+  0 | 1) ;;
+  *)
+    echo "sim-canaries: SCOPE ERROR — INF_CANARY_TABLE_ONLY wants 0 or 1, got '$table_only'"
+    exit 1
+    ;;
+esac
+# K, the cfgs' planted builds at once, is bounded by anonymous memory. The
+# lane runs on the dev box in a scope whose memory.max is 12 GiB, with no
+# swap: page cache counts toward the cap and fills it, the kernel reclaims
+# that cache there, and only memory it cannot reclaim, anonymous memory above
+# all, kills the run whole past the cap. Four planted test builds at once
+# peaked at 6.0 GiB there, four simulators at 5.4 GiB and six at 7.5 GiB, each
+# cargo on 10 jobs of its own (the pool holds them lower), and a simulation
+# beside them at 3.5 GiB. Those peaks count page cache too, so they bound the
+# anonymous memory from above: four builds and a run take at most about
+# 9.5 GiB of the 12, and a fifth build would leave the run less than it
+# takes. The box's heavy-run wrapper (box-heavy.sh) records each run's
+# anonymous peak (memory.stat's anon, sampled each second), its memory.events
+# and its memory stall: the instrument for this bound.
+readonly builds_max=4
+builds=${INF_CANARY_BUILDS:-4}
+case "$builds" in
+  [1-9]) [ "$builds" -le "$builds_max" ] ;;
+  *) false ;;
+esac || {
+  echo "sim-canaries: SCOPE ERROR — INF_CANARY_BUILDS wants 1 to $builds_max, got '$builds'"
+  exit 1
+}
+# Controls alone and the table-only read build no plant, so nothing ahead.
+if [ "$controls_only" -eq 1 ] || [ "$table_only" -eq 1 ]; then builds=1; fi
+# J, the jobs the lane's compiles share at K > 1, read as cargo reads
+# CARGO_BUILD_JOBS: a count, `default`, or a negative count from the
+# processors, at least 1.
+build_jobs=1
+if [ "$builds" -gt 1 ]; then
+  processors=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+  build_jobs=${CARGO_BUILD_JOBS:-default}
+  case "$build_jobs" in
+    default) build_jobs=$processors ;;
+    [1-9] | [1-9][0-9] | [1-9][0-9][0-9]) ;;
+    -[1-9] | -[1-9][0-9] | -[1-9][0-9][0-9])
+      build_jobs=$((processors + build_jobs))
+      if [ "$build_jobs" -lt 1 ]; then build_jobs=1; fi
+      ;;
+    *)
+      echo "sim-canaries: SCOPE ERROR — at INF_CANARY_BUILDS $builds, CARGO_BUILD_JOBS wants a" \
+        "count of 1 to 999, a negative one or 'default', got '$build_jobs'"
+      exit 1
+      ;;
+  esac
+  if [ "$builds" -gt "$build_jobs" ]; then builds=$build_jobs; fi
+fi
+if [ "$builds" -gt 1 ]; then
+  for inherited in "${CARGO_MAKEFLAGS:-}" "${MAKEFLAGS:-}" "${MFLAGS:-}"; do
+    case " $inherited" in
+      *" --jobserver-auth="* | *" --jobserver-fds="*)
+        echo "sim-canaries: SCOPE ERROR — at INF_CANARY_BUILDS $builds a job pool is inherited" \
+          "('$inherited'): set INF_CANARY_BUILDS=1, or run the lane outside that pool"
+        exit 1
+        ;;
+    esac
+  done
+fi
+if [ -n "${INF_CANARY_HOST:-}" ] && [ -z "${INF_CANARY_ROWS_FILE:-}" ]; then
+  echo "sim-canaries: SCOPE ERROR — INF_CANARY_HOST is the self-test's stub route and needs" \
+    "INF_CANARY_ROWS_FILE: unset INF_CANARY_HOST, so the table is judged on this host"
+  exit 1
+fi
+if [ -n "${INF_CANARY_BENCH:-}" ] && [ -z "${INF_CANARY_ROWS_FILE:-}" ]; then
+  echo "sim-canaries: SCOPE ERROR — INF_CANARY_BENCH is the self-test's stub route and needs" \
+    "INF_CANARY_ROWS_FILE: unset INF_CANARY_BENCH, so each binary row runs the inf-bench" \
+    "the lane builds"
+  exit 1
+fi
+host=${INF_CANARY_HOST:-$(uname -s)}
 
 rows=(
   # ADR-0090 D5: the segment-blind scanner takes a foreign segment's
@@ -53,6 +297,10 @@ rows=(
   # (`plane/tiered.rs::read_value`), so both rows prove those teeth.
   "inf_canary_reply_lie m2-durable REPLY"
   "inf_canary_reply_lie m4-tiered REPLY"
+  # Issue #11: the re-resolve after a cold wait takes a RAM record as
+  # inline without reading its type, so a GET beside a read that promoted
+  # a blob's 24-byte reference serves the reference (phase 7d's pair).
+  "inf_canary_promoted_extent_inline m4-tiered PROMOTED-EXTENT"
   # ADR-0139 D2 rule 2 at the wire tier: the alias view is always empty,
   # so `DEL` of one alias takes the shared entry from the survivor — the
   # `m45-backfill` alias leg's from-scratch truth must see it.
@@ -191,17 +439,16 @@ rows=(
   # The group is every unsent write: a whole 1 MiB round offered at once,
   # above the class cap at the hostile share.
   "inf_canary_tier_group_whole_round m4-tier-budget TIER-CAP --tier-leg two-1mb-hostile"
-  # The issue visit starts at index 0 and continues past a refusal: at the
-  # hostile share the second namespace's group waits past n × T_c.
-  "inf_canary_tier_turn_index_order m4-tier-budget TIER-TURN --tier-leg two-1mb-hostile"
-  # The same plant at the two-cell binary, the light-load leg: the starved
-  # namespace's ready group waits past n × T_c, read from INFO beside the
-  # replies (its writer's own bound is four group bounds, so the replies
-  # stay +OK). The both-backlogged leg is not a row: at the real device
-  # its planted starvation depends on when the light namespace's groups
-  # become ready relative to the heavy one's, so it cannot go red
-  # reliably; it stays a test of the fair build.
-  "inf_canary_tier_turn_index_order crate-test inf-server test:node_e2e a_lightly_loaded_tiered_namespace_beside_a_backlog_acknowledges_every_write a ready group waited"
+  # The issue visit starts at index 0 and continues past a refusal: on the
+  # thief leg the thief, first in the visit, takes every opening while it
+  # holds a sealed backlog, and the second namespace's group, larger on
+  # bytes and not smaller on ops, waits for that backlog, past n × T_c.
+  # The plant's one row: with rounds bounded by the slice, a second
+  # namespace with small groups is served between a backlog's rounds
+  # whatever the visit order, and at the binary a starved writer's typed
+  # timeout fails a test before its witness, so the binary tests stay
+  # tests of the fair build.
+  "inf_canary_tier_turn_index_order m4-tier-budget TIER-TURN --tier-leg two-1mb-thief"
   # A retry group reaches the driver with no offer: the spend falls below
   # what the disk saw, on the retry arm.
   "inf_canary_tier_retry_ungranted m4-tier-budget TIER-SPEND --tier-leg two-8mb --plant tier-write-eio"
@@ -217,6 +464,14 @@ rows=(
   # read below the confirmable length reaches frames a held round has not
   # written, and the driver answers short.
   "inf_canary_cold_window_staged_len crate-test inf-server lib a_cold_read_below_the_confirmable_length_fills_its_window_while_a_round_is_held the window is filled"
+  # ADR-0155 D2/D3: the tier round's plan reserves one batch window fewer
+  # than its span takes — the round envelope test's stage must stop at the
+  # take past the reservation.
+  "inf_canary_tier_plan_window_short crate-test inf-log lib the_round_envelope_holds_over_its_two_hundred_cases past the round plan's reservation"
+  # ADR-0155 D5: the round's windows return to the pool at its last
+  # write's send — the custody test's held completion must read a
+  # recycled window.
+  "inf_canary_tier_window_early_put crate-test inf-log lib a_held_completion_reads_its_own_window_until_the_round_ends reads a recycled window"
   # ADR-0163 D2: the cell's loop never takes its serve mark, so the census
   # its containers registered with stays assembling — what a loop marking
   # another census leaves. The assembly rule's liveness, on every cell; no
@@ -229,6 +484,156 @@ rows=(
   # row holds 17 and the census's cap bound reads it over.
   "inf_canary_cap_minus_one m4-epoch-marks cap-row-unfilled --marks-leg wedge"
   "inf_canary_cap_admits_at_cap m4-epoch-marks cap-high-water-over --marks-leg wedge"
+  # The first plant read by the census's crossing rule on the same leg:
+  # the marks cross their cap on every seed, and one short the row answers
+  # `Full` at 15 live, below the 16 it admits now — a crossing short of
+  # the cap, which only that clause prints.
+  "inf_canary_cap_minus_one m4-epoch-marks cap-crossed-short --marks-leg wedge"
+  # The same two plants on the fsync ledger's frame queue, on the reorder
+  # window's leg, whose wedged plain write fills the queue on every seed.
+  # One short, the frame's hold answers at 15 of its 16 and the leg's clause
+  # reads the queue's row below its cap on a cell that held a frame for it;
+  # at the cap the queue takes a 17th frame, which the census reads over
+  # its cap.
+  "inf_canary_cap_minus_one m2-reorder-window frame-queue-unfilled"
+  "inf_canary_cap_admits_at_cap m2-reorder-window cap-high-water-over"
+  # The leg's vacuity plant: no wedge, so the queue never fills and the
+  # leg's engagement reads it.
+  "inf_canary_reorder_wedge_zero m2-reorder-window frame-queue-unengaged"
+  # The fsync ledger's rotation class on the ledger-wedge leg, whose sim
+  # disk holds a seal while the log keeps rotating. The seals left out of
+  # their class's count: the rotations run unpaced and three or more
+  # segment ids appear inside the hold, which the leg's disk clause reads
+  # from the sim disk's names, and the hold counter reads none.
+  "inf_canary_ledger_rotation_unpaced m2-ledger-wedge wedge-ids-over --wedge-leg main"
+  "inf_canary_ledger_rotation_unpaced m2-ledger-wedge wedge-hold-uncounted --wedge-leg main"
+  # The same plant read by the derived-counter clause: each unpaced
+  # rotation owes a fresh segment's prealloc barrier, and behind the held
+  # seal those barriers stay unfolded until their class is at its budget,
+  # so MAINTAIN skips the next one, which the clause reads (0 on every
+  # durable scenario's plain build).
+  "inf_canary_ledger_rotation_unpaced m2-ledger-wedge ledger-prealloc-deferred --wedge-leg main"
+  # The ack map sized as the frame queue alone: inside the hold sixteen
+  # write-through frames keep their points behind the held seal, and the
+  # seventeenth finds the map full, which the derived-counter clause reads.
+  "inf_canary_ack_map_window_only m2-ledger-wedge ack-map-held --wedge-leg main"
+  # The leg's three vacuity plants, one per clause: the log `Buffered` (no
+  # class-upgrade rotation, so no arming), the hold on the first segment
+  # (no fdatasync names it after the arming), and a 1 ms hold (too short
+  # for sixteen frames to land behind the seal).
+  "inf_canary_wedge_buffered m2-ledger-wedge wedge-arming-unreached --wedge-leg main"
+  "inf_canary_wedge_wrong_name m2-ledger-wedge wedge-hold-unengaged --wedge-leg main"
+  "inf_canary_wedge_short_hold m2-ledger-wedge wedge-window-unreached --wedge-leg main"
+  # The first plant at the edges of the capped holders no leg fills to
+  # their cap, at the unit tier, each test's own token: the fsync ledger
+  # (44, the class budgets' sum), the ack map (61, the queue, the ledger
+  # and one) and a tier round's holders (70 writes, 4 barriers, 3 effects,
+  # 2 staged seals). Each test probes a holder of the cap before any push
+  # that would meet the product's fail-stop.
+  "inf_canary_cap_minus_one crate-test inf-log lib the_ledger_cap_admits_every_class_at_its_budget ledger-edge-short"
+  "inf_canary_cap_minus_one crate-test inf-server lib the_ack_map_cap_admits_the_queue_the_ledger_and_one ack-map-edge-short"
+  "inf_canary_cap_minus_one crate-test inf-log lib every_round_holder_admits_the_widest_round round-edge-short"
+  # The first plant at the marks' cap edge, at both unit tiers: 15 and 16
+  # ack classes held with the watermark held keep one mark each. One
+  # short, the 16th class merges into the back, and the edge's count
+  # assertion reads 15 where 16 by its token, which no other assertion of
+  # the two tests prints.
+  "inf_canary_cap_minus_one crate-test inf-server lib fifteen_and_sixteen_sealed_ticks_hold_one_mark_each_without_a_crossing marks-edge-short"
+  "inf_canary_cap_minus_one crate-test inf-server lib fifteen_and_sixteen_sealed_ticks_keep_one_mark_each_and_cross_nothing marks-edge-short"
+  # The same plant on a `Retire` slab, whose arm admits one occupant fewer
+  # than its capacity now: two slots retire one at a time (the high water
+  # stays 1, the capacity now falls to 2), so the fill answers `Full` at 1
+  # live and the census's crossing rule reads the row crossed below its
+  # capacity now. Two slots live before the retirements would raise the
+  # high water to 2 first, and the rule could not go red.
+  "inf_canary_cap_minus_one crate-test inf-sim lib a_retire_slab_crossing_after_two_retirements_reads_its_capacity_now cap-crossed-short"
+  # The same plant on a map, whose admission compare admits one entry
+  # fewer than its cap on a serving row: the fill answers `Full` at 3 of
+  # 4 live, and the census's crossing rule reads the row crossed below its
+  # capacity now, which for a map is always its cap.
+  "inf_canary_cap_minus_one crate-test inf-sim lib a_map_crossing_while_serving_reads_its_full_cap cap-crossed-short"
+  # ADR-0171 A2.2: the slab's access skips the instance compare, so another
+  # slab's live handle, holding the same index and generation, reads and
+  # takes this slab's occupant; the two-instance model test reads it.
+  "inf_canary_slab_instance_blind crate-test inf-foundation lib another_slabs_live_handle_is_stale_and_changes_neither slab-instance-blind"
+  # The same plant on the timer set (ADR-0194 D6): two sets on one census,
+  # built and reserved alike, so another set's owner names a live owner of
+  # this set; its close must be Stale, and planted it releases that owner.
+  "inf_canary_slab_instance_blind crate-test inf-runtime test:timer_model another_sets_close_releases_nothing another set's close is Stale"
+  # ADR-0154 D2: a cancel removes its arm's entry. Planted, it leaves it,
+  # and the model reads the heap's entries off its Armed owners.
+  "inf_canary_timer_lazy_cancel crate-test inf-runtime test:timer_model the_set_matches_the_model_on_two_sets_driven_alike the bijection"
+  # ADR-0154 D3: nothing falls due before its rounded deadline. Planted,
+  # the minimum is due a millisecond early.
+  "inf_canary_timer_fires_early crate-test inf-runtime test:timer_model the_set_matches_the_model_on_two_sets_driven_alike the set's due is the model's"
+  # ADR-0154 D2: no position is handed out while its owner's callback
+  # runs. Planted, a close in the callback frees the position at once.
+  "inf_canary_timer_reuse_in_callback crate-test inf-runtime test:timer_model the_set_matches_the_model_on_two_sets_driven_alike D2's outcome for a close"
+  # A heap entry stays fresh by order: a close removes an Armed owner's
+  # entry before its position's take. Planted, the entry outlives the take.
+  "inf_canary_timer_close_keeps_entry crate-test inf-runtime test:timer_model the_set_matches_the_model_on_two_sets_driven_alike the bijection"
+  # ADR-0154 D3: a turn begins at most 64 timer callbacks, each spending
+  # one unit of its allowance. Planted, a callback spends none, and the
+  # delivery test's turn begins all 65 due timers.
+  "inf_canary_timer_allowance_unspent crate-test inf-runtime test:reactor sixty_five_due_timers_take_two_turns_and_no_park callbacks begun per iteration"
+  # ADR-0154 D3: a due timer is ready work, which the park decision polls
+  # on. Planted, the decision parks on it, at spin_iters 1 and 0.
+  "inf_canary_timer_park_hides_due crate-test inf-runtime test:reactor sixty_five_due_timers_take_two_turns_and_no_park callbacks begun per iteration"
+  # ADR-0154 D4: the everysec tick arms its successor a second on. Planted,
+  # it ticks once, so the fill scenario's one everysec writer, with no
+  # always barrier to cover its frames, loses acked writes at the cut, and
+  # the audit's everysec bound reads them.
+  "inf_canary_everysec_no_successor m2-fill-tick DURABILITY"
+  # ADR-0154 D1: the server's timer cap is its role count, every position
+  # reserved at the assembly. Planted one short, every assembly's last
+  # reserve is refused before the cell's loop exists, by its own token.
+  "inf_canary_timer_owners_short m0-smoke timer-owners-full-at-assembly"
+  # ADR-0163 D2: the census is born serving, so the timer set's `Assembly`
+  # row registers and fills after the serve mark: the census counts each
+  # as an assembly violation, and the census verdict reads the count.
+  "inf_canary_serve_mark_first m0-smoke cap-assembly-violated"
+  # ADR-0089, ADR-0092 D1: a hold arms its window, so a parked loop wakes
+  # to seal it. Planted, each hold's episode holds its owner's arm cancelled
+  # at the build and arms nothing: TM3 reads a held frame's park outliving
+  # its window on both hold legs, and the binary's owning cell reads one
+  # timer armed at most, its everysec owner's.
+  "inf_canary_hold_arms_nothing m2-fill-tick held-park-outlives-window --park-at-once"
+  "inf_canary_hold_arms_nothing m2-group-hold held-park-outlives-window --park-at-once"
+  "inf_canary_hold_arms_nothing crate-test infinityd test:timer_owners a_burst_of_fill_episodes_leaves_one_fill_timer_per_cell its everysec and fill owners"
+  # TM3's engagement: planted, the oracle reads no held state, so a leg's
+  # run judges nothing and is vacuous.
+  "inf_canary_wake_never_held m2-fill-tick held-park-unengaged --park-at-once"
+  "inf_canary_wake_never_held m2-group-hold held-park-unengaged --park-at-once"
+  # ADR-0118 D2: the accept retry re-arms a parked listener one window
+  # after its failure. Planted, its callback pushes no accept arm: on the
+  # broken-listener leg, which no `Close` resumes, the accept-retry oracle
+  # reads every parked arm still open at the run's end, and the queued
+  # clients stall.
+  "inf_canary_accept_retry_no_rearm m0-smoke accept-retry-missing --plant accept-broken"
+  # The accept-retry oracle's engagement: planted, it reads no park, so the
+  # leg's run judges nothing and is vacuous.
+  "inf_canary_accept_retry_park_unread m0-smoke accept-retry-unengaged --plant accept-broken"
+  # The accept-retry leg rests on the driver contract: a `Close` resumes an
+  # exhaustion park only. Planted in the simulator's driver, a `Close`
+  # resumes the broken park too, and the oracle reads each park resumed with
+  # no retry.
+  "inf_canary_accept_close_resumes_any m0-smoke accept-retry-by-close --plant accept-broken"
+  # The retry waits its window, so a persistent failure costs one accept a
+  # window, never a spin (ADR-0118 D2). Planted, the failure re-arms the
+  # listener at once, and the oracle reads each retry before its deadline.
+  "inf_canary_accept_retry_at_once m0-smoke accept-retry-early --plant accept-broken"
+  # The retry falls due within its rounding millisecond of the window
+  # (ADR-0154 D3). Planted, it falls due 2 ms past the window, and the
+  # oracle reads each retry past its bound.
+  "inf_canary_accept_retry_late m0-smoke accept-retry-late --plant accept-broken"
+  # The oracle judges each park against its own deadline, so a retry one
+  # rounding millisecond early is red as well: the timer set's due test
+  # planted a millisecond early (the model's row above), on this leg.
+  "inf_canary_timer_fires_early m0-smoke accept-retry-early --plant accept-broken"
+  # ADR-0151 D5: a retire step drops the rest of the slab whole, the retire
+  # path every site uses. On a serving cell the census counts the unsliced
+  # drop, and this debug build asserts it with its token.
+  "inf_canary_unsliced_drop crate-test inf-foundation lib a_live_slab_retires_by_steps_with_no_unsliced_drop unsliced-drop"
   # The same two plants on the extent-seal window's burst leg. One short,
   # the window holds 15 of its 16 and the leg's engagement reads it
   # unfilled; at the cap it admits a 17th extent barrier, which the census
@@ -236,10 +641,27 @@ rows=(
   "inf_canary_cap_minus_one m4-extent-window cap-row-unfilled --window-leg burst"
   "inf_canary_cap_admits_at_cap m4-extent-window cap-high-water-over --window-leg burst"
   "inf_canary_cap_admits_at_cap m4-extent-window extent-handles-over --window-leg burst"
+  # The first plant read by the crossing rule on the burst, which must
+  # cross the window: one short, it answers `Full` at 15 of its 16.
+  "inf_canary_cap_minus_one m4-extent-window cap-crossed-short --window-leg burst"
+  # The first plant on the window's cap leg, whose 16 writers each hold at
+  # most one entry, so at exactly the cap the window fills and never
+  # crosses. One short, the row holds 15 of its 16 and the 16th arrival of
+  # the first burst finds the window full and parks: both of the leg's
+  # clauses read it, each by its own token, on every seed (the refusal is
+  # the writer count's, not the timing's).
+  "inf_canary_cap_minus_one m4-extent-window cap-row-unfilled --window-leg cap"
+  "inf_canary_cap_minus_one m4-extent-window cap-row-crossed --window-leg cap"
   # ADR-0163 D2 — the extent-seal window's queue, one plant per rule. The
   # handout skips its wakes: the writers parked behind the first window are
   # never woken, and the run stops with replies owed.
   "inf_canary_extent_window_no_wake m4-extent-window writer-left-parked --window-leg burst"
+  # The same plant reaches the burst's file count: the client that left
+  # while parked is never woken, so its write never lands, and the files
+  # created fall one short of the writes acknowledged and the writes of the
+  # clients that left (16 against 16 and 1 on 256 of 256 seeds from
+  # 0xC0FFEE, so one seed catches).
+  "inf_canary_extent_window_no_wake m4-extent-window extent-files-under-writes --window-leg burst"
   # The handout wakes every parked writer and each retries as an arrival:
   # some 50 cold resolves at once overflow a cold FIFO of 16 places, and a
   # writer reads `BUSY`.
@@ -259,19 +681,32 @@ rows=(
   # are not durable, so the wedge leg's cut (the first extent reclaim after
   # a crossing) loses an acknowledged blob value's extent. Only some seeds
   # do: the cut must land while the later class's write-through entry is
-  # still in flight. On the planted build 115 of 1,024 seeds from 0xC0FFEE
-  # are red (about 1 in 9; the longest green run is 53 seeds), so the row
-  # sweeps 128, where all green has a chance of about 2e-7. The rule: at
+  # still in flight. On the planted build 104 of 1,024 seeds from 0xC0FFEE
+  # are red (about 1 in 10; the longest green run is 72 seeds), so the row
+  # sweeps 256, where all green has a chance of about 1e-12. The rule: at
   # least twice the seeds that bring that chance below 1e-3 at the measured
-  # rate (58 here); re-measure on 1,024 seeds whenever the wedge leg's
+  # rate (130 here); re-measure on 1,024 seeds whenever the wedge leg's
   # traffic changes. The expected text is the audit's token for a key whose
   # extent read fails after the reboot, which no other violation carries.
-  "inf_canary_epoch_mark_keeps_old_seq m4-epoch-marks blob-extent-unreadable --marks-leg wedge --sweep 128"
+  "inf_canary_epoch_mark_keeps_old_seq m4-epoch-marks blob-extent-unreadable --marks-leg wedge --sweep 256"
   # The class search answers the builder for every seq: a tick replaces the
   # back by every later pair, so a standalone over the written frame leaves
   # its death waiting — the model test reads the reclaim epoch below the
   # uncapped rule's.
   "inf_canary_epoch_mark_class_blind crate-test inf-server lib a_standalone_over_the_written_frame_reclaims_its_death below the list's"
+  # The marks' everysec leg, below the cap: no wedge, so every merge is
+  # exact, no crossing, and at least two marks held. A class search that
+  # reads every seq above the watermark as its own class merges nothing:
+  # the hundreds of ticks inside one barrier period fill the marks and
+  # cross their cap. On the planted build 256 of 256 seeds from 0xC0FFEE
+  # are red (at least 16 crossings a cell), so one seed catches;
+  # re-measure on 256 seeds whenever the leg's traffic changes.
+  "inf_canary_epoch_mark_class_per_seq m4-epoch-marks everysec-marks-crossed --marks-leg everysec"
+  # The class-blind search on the same leg: every tick replaces the back,
+  # so one mark is held where the leg holds two, and its vacuity clause
+  # reads it. On the planted build 256 of 256 seeds from 0xC0FFEE are red
+  # (one mark on every cell), so one seed catches.
+  "inf_canary_epoch_mark_class_blind m4-epoch-marks everysec-marks-unheld --marks-leg everysec"
   # ADR-0174 D2 rule 6: `room` answers `Demote(tail)` where the need lies
   # above the tail — no pad. The room property judges every demote target
   # (a page multiple above the head, at or below the tail) and the placed
@@ -371,11 +806,65 @@ rows=(
   # last step, so the hand-over's drain bound (one barrier and the
   # rebuild's reads) is what sees it.
   "inf_canary_replay_settle_doubled crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget SETTLE BUDGET VIOLATION"
-  # The same oracle's other two rules: a frame's yield that leaves the
-  # charge out (at 8 MiB a step spans several demote steps), and a driver
-  # that charges no boot I/O (a step wrote tier bytes uncharged).
-  "inf_canary_replay_yield_uncharged crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget passes the budget by more than one frame's unit"
+  # The same oracle's other two rules: a replay step's yield test that
+  # leaves the boot I/O out (at 8 MiB a step spans several demote steps),
+  # and a driver that charges no boot I/O (a step wrote tier bytes
+  # uncharged).
+  "inf_canary_replay_yield_uncharged crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget passes the budget by more than one record's unit"
   "inf_canary_replay_charge_dropped crate-test inf-server test:recover_replay_steps every_step_yields_at_the_first_boundary_where_its_reads_and_charge_reach_the_budget tier files grew under a charge of 0"
+  # ADR-0174 A1, a replay step bounded by its budget and one unit: the
+  # step judge prices each step from what the filesystem saw. Planted, the
+  # frame walk never asks its budget and a demote step runs whole inside
+  # the step that enters the frame (the shape before the walk resumed
+  # inside a frame); or the seal walk ignores the budget left.
+  "inf_canary_recover_frame_whole crate-test inf-server test:recover_replay_steps a_frame_of_rewrites_of_demoted_keys_is_replayed_under_the_step_judge JUDGE"
+  "inf_canary_recover_seal_unbudgeted crate-test inf-server test:recover_replay_steps a_frame_of_rewrites_of_demoted_keys_is_replayed_under_the_step_judge JUDGE"
+  # A delete that read its demoted copy is a priced answer the walk asks
+  # after. Planted, it answers unpriced: a whole walk runs every read.
+  "inf_canary_recover_del_unasked crate-test inf-server test:recover_replay_steps a_frame_of_deletes_of_demoted_keys_asks_after_each_priced_delete JUDGE"
+  # Every record is applied once, in log order, at every budget: budget
+  # independence against the run that never parks. Planted, a resumed walk
+  # passes a record that needs room (a key absent), or applies its last
+  # consumed record again (the counters differ).
+  "inf_canary_recover_skip_on_resume crate-test inf-server test:recover_replay_steps every_budget_recovers_the_state_of_the_unparked_boot BUDGET INDEPENDENCE"
+  "inf_canary_recover_twice_on_resume crate-test inf-server test:recover_replay_steps every_budget_recovers_the_state_of_the_unparked_boot BUDGET INDEPENDENCE"
+  # The begin-LSN test runs on every walk. Planted, only on one that starts
+  # at a frame's entry: a resumed walk applies records older than the
+  # checkpoint.
+  "inf_canary_recover_begin_skip_entry_only crate-test inf-server test:recover_replay_steps a_parked_frame_across_the_begin_lsn_skips_below_and_applies_above_once BEGIN:"
+  # The move that leaves no record runs the record iterator's end check.
+  # Planted, the frame ends on its count alone and a short-count frame
+  # boots.
+  "inf_canary_recover_frame_end_counted crate-test inf-server test:recover_replay_steps a_frame_whose_count_is_short_refuses_the_boot_at_every_budget SHORT COUNT"
+  # A record's room asks count across suspensions (ADR-0174 D2 rule 1, A1.3).
+  # Planted, a resumed demote step's room question counts as a new ask.
+  "inf_canary_recover_room_reask_counted crate-test inf-server test:recover_replay_steps room_asks_count_across_suspensions_and_the_hostile_spec_boots RoomAsks"
+  # A walk that fits asks its budget once. Planted, a whole walk asks after
+  # every record.
+  "inf_canary_recover_ask_per_record crate-test inf-server test:recover_replay_steps a_unit_that_fits_asks_once_per_frame_and_per_section ASK COUNT"
+  # A checkpoint step yields at the next record or entry inside a section,
+  # and asks after each index-sidecar section. Planted, a section's walk
+  # never parks: a records section's demote steps run inside the step that
+  # enters it, an entry section applies every entry, and a run of sidecar
+  # sections loads in one step.
+  "inf_canary_recover_section_whole crate-test inf-server test:recover_replay_steps a_records_section_of_rewrites_of_cold_keys_is_loaded_under_the_step_judge (Ick)"
+  "inf_canary_recover_section_whole crate-test inf-server test:recover_replay_steps entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge ENTRIES"
+  "inf_canary_recover_section_whole crate-test inf-server test:recover_replay_steps a_run_of_index_sidecar_sections_yields_after_each_section JUDGE"
+  # The end of the checkpoint's releases are RAM units at their price.
+  # Planted, they charge nothing: one step walks the whole list.
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge RELEASES"
+  # A resumed section walk passes no record unapplied. Planted, it passes
+  # a record that needs room (the boot refuses, or a key is absent).
+  "inf_canary_recover_skip_on_resume crate-test inf-server test:recover_replay_steps every_budget_recovers_the_checkpoint_of_the_unparked_boot BUDGET INDEPENDENCE"
+  # A step that parks inside the section it entered adds to its work gauge
+  # the section's bytes it left. Planted, it adds their price: the RAM price
+  # of every entry no step has applied yet.
+  "inf_canary_recover_parked_priced crate-test inf-server test:recover_replay_steps entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge GAUGE"
+  # The end of the checkpoint releases its listed addresses in settle order
+  # at every step budget. Planted, a call that resumes inside the list
+  # releases its batch in reverse.
+  "inf_canary_replay_release_reordered crate-test inf-store lib the_end_of_the_checkpoint_releases_blob_references_in_settle_order two a call"
+  "inf_canary_replay_release_reordered crate-test inf-server test:recover_replay_steps every_budget_recovers_the_checkpoint_of_the_unparked_boot reclaim queue's order"
   # ADR-0061 D6: the 0x05 pass lists the entry of a record the walk imaged
   # (a ticket winner below the watermark, ADR-0093 A12) — the boot
   # registers the extent at both addresses and its count stays one above
@@ -403,37 +892,1565 @@ rows=(
   # until it ends. Pinned at the watermark alone, a winner whose ticket
   # ends under the walk loses the hold the moment its own pin lifts.
   "inf_canary_ckpt_pin_at_watermark crate-test inf-store test:tiered_replay a_ticket_that_ends_before_the_images_keeps_its_winner_imaged the walk holds release at its lowest image"
+  # ADR-0190: a reply's outcome travels beside its bytes. An error in
+  # RESP3's second encoding (`!`) turns red the oracle that owns "an error
+  # is `-` on the wire"; the plane rows are green under it once no site
+  # reads a first byte.
+  "inf_canary_resp3_blob_error crate-test inf-wire lib resp2_surface_is_byte_exact"
+  # The writer leaves an error's outcome `Success`: a refused remote pair
+  # reads as an applied one and the fan answers `+OK`.
+  "inf_canary_reply_outcome_untagged crate-test inf-server lib reply_outcome_mset_remote_error_leg_is_the_reply"
+  # The owner tags an error reply `Bytes` on the fabric: the counted fold
+  # takes the leg's error for a non-count success.
+  "inf_canary_fabric_error_as_bytes crate-test inf-server lib reply_outcome_dbsize_drain_error_is_the_reply"
+  # ADR-0191 D1: a segment holds the largest frame its staging ring can
+  # seal. Planted, the geometry skips that row: the pair the simulator
+  # first met (4 MiB of staging beside 64 KiB segments) is built, and the
+  # geometry's own oracle reads the missing refusal.
+  "inf_canary_log_geometry_unchecked crate-test inf-log test:geometry segment_below_the_largest_frame_is_refused expected SegmentBelowFrame"
+  # ADR-0199 D1: the sync due is a coverage target. Planted, a tick over a
+  # covering entry, once counted covered, owes one byte past the queue: the
+  # due a flag kept, which no barrier on a quiet cell discharges.
+  "inf_canary_due_outlives_coverage crate-test inf-log lib a_tick_over_a_covering_standalone_owes_nothing a due with nothing to cover outlives every barrier"
+  # ADR-0199 D2.4: only coverage that reaches the target discharges it.
+  # Planted, the target reads covered while any entry is unfolded, so a
+  # standalone that leaves a frame in flight outside it discharges the due.
+  "inf_canary_due_covered_by_any_entry crate-test inf-log lib everysec_due_survives_a_standalone_that_leaves_a_frame_in_flight B's bytes are queued outside the coverage"
+  # ADR-0199 D3 at the stop: the first plant again, on the shape that holds
+  # every log fdatasync from the stop's arming. The quiet cell's stranded due
+  # holds its drain, and the clean-stop liveness verdict names the term.
+  "inf_canary_due_outlives_coverage m2-stop-tick BarrierOwed"
+  # The stop-tick shape's vacuity plants: the hold never armed, and a hold
+  # lifted 1 ms after it engages, before a tick can meet a held barrier (at
+  # a seed whose final-sync request does not itself land over a covering
+  # entry: there a 1 ms hold still counts a covered tick).
+  "inf_canary_stop_tick_unheld m2-stop-tick stop-tick-unheld"
+  "inf_canary_stop_tick_short_hold m2-stop-tick stop-tick-uncovered --seed 0xC0FFEE"
+  # The hand-over's units are priced (ADR-0174 A1.3): a parked death stamped
+  # or an extent id seeded at the RAM unit price, a revive rename at the
+  # file-operation price, a probe group the ticket rebuild scans at its
+  # bytes. Planted, they charge nothing: one step runs every stage.
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge STAMPS"
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge SEEDS"
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge RENAMES"
+  "inf_canary_recover_probe_uncharged crate-test inf-server test:recover_replay_steps the_end_of_a_boot_at_size_is_handed_over_under_the_step_judge GROUPS"
+  # A step that parks inside the section or the frame it read adds the bytes
+  # it left to its work gauge, so the gauge reads at least what the step
+  # read. Planted, a park adds nothing of its unit: the gauge reads under.
+  "inf_canary_recover_parked_dropped crate-test inf-server test:recover_replay_steps entry_sections_and_the_end_of_the_checkpoint_are_applied_under_the_step_judge under the step's reads"
+  "inf_canary_recover_parked_dropped crate-test inf-server test:recover_replay_steps a_frame_of_rewrites_of_demoted_keys_is_replayed_under_the_step_judge under the step's reads"
+  # ADR-0189 D2, D3, D5: the catalog writer and the DDL notice, one plant
+  # per rule, each oracle reading the disk or the wire. The slot and the
+  # word published before the META write: a requester reads its answer
+  # while the writer is held inside that write.
+  "inf_canary_ns_answer_before_swap crate-test inf-server test:catalog_requests an_answer_waits_for_its_own_meta_write answered before its META write returned"
+  # The epoch taken at send: the second sender's swap answers first, and
+  # the word decreases when the held DDL's own swap lands.
+  "inf_canary_ns_epoch_at_send crate-test inf-server test:catalog_requests a_create_held_before_its_send_is_answered_after_its_own_meta the published word decreased"
+  "inf_canary_ns_epoch_at_send crate-test inf-server test:catalog_requests a_drop_held_before_its_send_is_answered_after_its_own_meta the published word decreased"
+  # The payload shaped before the state moves: a DDL's own META lacks its
+  # change.
+  "inf_canary_ns_intent_after_shape crate-test inf-server test:catalog_requests every_payload_carries_the_ddl_in_flight own META names the namespace"
+  # The strip keeps a dropped namespace's index records: the written META
+  # does not decode.
+  "inf_canary_ns_index_record_kept crate-test inf-server test:catalog_requests an_index_on_the_dropped_namespace_leaves_meta_with_it IndexUnknownNamespace"
+  # A refusal writes META: the recording file system sees it.
+  "inf_canary_ns_refusal_writes_meta crate-test inf-server test:catalog_requests a_refused_request_writes_nothing the refusal touched the disk"
+  # The `ns_drop_after_meta` exit forgets its notice: the next DDL meets a
+  # pending one.
+  "inf_canary_ns_notice_forgotten crate-test inf-server test:node_e2e a_ddl_stopped_after_its_answer_leaves_no_ddl_pending another namespace DDL is pending"
+  # ADR-0148 D4: a namespace id moves only when the catalog writer accepts
+  # its CREATE, by one, never past u32::MAX - 1; the wire's ids oracle reads
+  # each +OK's id. The reservation committed when made: every refusal after
+  # it spends the id, and the next +OK's id skips.
+  "inf_canary_ns_id_spent_on_refusal crate-test inf-server test:node_e2e every_accepted_create_takes_the_last_committed_id_plus_one the id is not its successor"
+  # The exhaustion check off: the spent counter issues u32::MAX, and wraps.
+  "inf_canary_ns_id_wraps crate-test inf-server test:node_e2e the_last_namespace_id_is_issued_once_and_then_the_space_refuses no id follows the last issuable one"
+  # ADR-0189 D6, N7: the cap counts the slot its own admission takes. The
+  # verdict forgets it and (I) is off: a durable DROP at 256 tombstones,
+  # none ready, is admitted and META holds a 257th.
+  "inf_canary_ns_cap_unreserved crate-test inf-server test:catalog_requests a_durable_drop_at_the_cap_writes_no_257th_tombstone the cap admitted a 257th"
+  # ADR-0189 D6, N14: the cap is the writer's verdict alone. The program
+  # paces on the gauge word's ready count before it asks, a count the
+  # writer folded before the cells published: the stale fold paces.
+  "inf_canary_ns_cap_from_gauges crate-test inf-server test:node_e2e a_drop_at_the_cap_with_every_tombstone_ready_issues_no_pacing_checkpoint a pacing checkpoint beside its cleanup"
+  "inf_canary_ns_cap_from_gauges m2-ns-drop-window STALE-FOLD"
+  # ADR-0189 D5: the origin applies a DROP before its request, the order
+  # the receipt replaces: a checkpoint the origin publishes in the wait
+  # omits the namespace, and a cut before the answer loses its share.
+  "inf_canary_ns_apply_before_swap crate-test inf-server test:node_e2e a_checkpoint_inside_a_durable_drop_wait_keeps_every_acked_key writes acknowledged before the drop are not served"
+  "inf_canary_ns_apply_before_swap m2-ns-drop-window DROP-WINDOW-LOSS --seed 0xd0a50002"
+  # ADR-0189 D3 step 5: a pending drop is not stripped from a payload, so
+  # a lagging export inside the DROP's window keeps the namespace in META.
+  "inf_canary_ns_pending_drop_kept m2-ns-drop-window LAGGING-EXPORT-DROP"
+  # ADR-0189 D5: the rollback keeps the CREATE's notice, which posts as the
+  # rollback replaces it, and the writer matches notices by id alone: the
+  # CREATE's notice retires the rollback's drop, and a lagging export
+  # brings the namespace back.
+  "inf_canary_ns_notice_at_replacement m2-ns-drop-window LAGGING-EXPORT-ROLLBACK"
+  # The same post at replacement, kind and id matching kept: the stale
+  # notice is counted, and the DST's zero assertion goes red.
+  "inf_canary_ns_notice_posted_at_replacement m2-ns-drop-window NOTICE-STALE"
+  # ADR-0148 D4 (F9): the directory's generation is bumped `Relaxed`, or
+  # before the publish's slot stores; either way a cell's pass can record
+  # the new generation and read the old slot, so it never passes again and
+  # the Retiring grant's receipt is never written.
+  "inf_canary_grants_generation_relaxed loom inf-foundation loom_a_pass_that_sees_the_generation_sees_the_retiring F9:"
+  "inf_canary_grants_generation_first loom inf-foundation loom_a_pass_that_sees_the_generation_sees_the_retiring F9:"
+  # ADR-0148 D2: the writer returns a tiered grant at its CREATE's notice,
+  # while every cell holds the owner: the next tiered CREATE's apply finds
+  # its position held and answers an internal error.
+  "inf_canary_grant_return_at_create_applied m4-ns-lifetimes REPLY:"
+  # ADR-0148 D4: the reclaim accepts any receipt, so one left from an
+  # earlier grant of the position returns a grant whose owners still hold
+  # it on a cell: the CREATE granted it finds the position held.
+  "inf_canary_receipt_id_blind m4-ns-lifetimes REPLY:"
+  # ADR-0202 D1, D2, D5: a directory listing resumes one bounded batch at a
+  # time, and every name present from the open to its end is returned once.
+  # Planted, the std stream drops the name a full batch could not take.
+  "inf_canary_listing_carry_dropped crate-test inf-log test:dir_listing a_listing_ends_its_batches_at_both_bounds returned 0 times"
+  # The in-memory streams resume at their batch's first name, not its
+  # greatest: the next batch returns that batch's names again.
+  "inf_canary_listing_resume_rewinds crate-test inf-log test:dir_listing a_listing_ends_its_batches_at_both_bounds mem: ONCE:"
+  # A stream answers More with an empty batch before its End.
+  "inf_canary_listing_more_empty crate-test inf-log test:dir_listing a_listing_ends_its_batches_at_both_bounds MORE EMPTY"
+  # ADR-0174 A1, ADR-0202: the start step's tier map runs under the step
+  # budget, one unit at a time. Planted, it asks its budget only between
+  # namespaces: a namespace's files and whole listing run in one step.
+  "inf_canary_recover_map_whole crate-test inf-server test:recover_replay_steps the_start_of_a_boot_at_size_is_mapped_under_the_step_judge JUDGE"
+  # Planted, a reseal verifies every retained frame in one unit.
+  "inf_canary_recover_reseal_whole crate-test inf-server test:recover_replay_steps the_start_of_a_boot_at_size_is_mapped_under_the_step_judge JUDGE"
+  # ADR-0202 D3: a listed name the stream returns again after its removal
+  # is that earlier removal. Planted, the second removal refuses the boot.
+  "inf_canary_recover_listing_repeat_refused crate-test inf-server test:recover_replay_steps the_start_of_a_boot_takes_a_repeated_name_as_its_earlier_removal REPEAT: the boot refused"
+  # The same rule in m4-tiered's listing-repeat class (ADR-0202 D5): the
+  # post-drop reboot's sweep reads its dropped namespace past one batch over
+  # the disk's repeat mode, and planted, a repeated name refuses that reboot.
+  "inf_canary_recover_listing_repeat_refused m4-tiered post-drop-reboot-failed --listing-repeats"
+  # A premise plant in the simulated disk: a call that served a repeat moves
+  # its key past one name it never returns, so a repeat takes a fresh name's
+  # place. The leg's residue oracle and the repeat-mode test see the name.
+  "inf_canary_listing_repeat_skips m4-tiered survived --listing-repeats"
+  "inf_canary_listing_repeat_skips crate-test inf-log test:dir_listing the_repeat_mode_returns_removed_names_again_and_moves_no_key ONCE: untouched"
+  # A vacuity plant: the leg writes no residue, so every sweep fits one batch
+  # and the draw's engagement check must read it unengaged.
+  "inf_canary_listing_residue_unscaled m4-tiered listing-repeats-unengaged --listing-repeats"
+  # ADR-0202 D3: a boot consumer of a listing counts a `Removed` only, never
+  # a `Gone`, a repeated name's earlier removal. Planted, the live map counts
+  # a `Gone`: the boot's dead-life count reads above the files it removed.
+  "inf_canary_recover_map_gone_counted crate-test inf-server test:recover_replay_steps the_start_of_a_boot_takes_a_repeated_name_as_its_earlier_removal REPEAT: REMOVED"
+  # Planted, the dropped namespace's sweep counts a `Gone`: its swept count
+  # reads above the names its directory held.
+  "inf_canary_recover_sweep_gone_counted crate-test inf-server test:recover_replay_steps the_start_of_a_boot_takes_a_repeated_name_as_its_earlier_removal REPEAT: SWEPT"
+  # ADR-0148 D3: a drop returns its position and publishes its receipt at
+  # once, the owner parked aside with its handles open: the successor the
+  # returned grant admits is flushed beside the dropped owner's files, so a
+  # 65th directory holds open files under one shard.
+  "inf_canary_grant_return_at_drop m4-ns-lifetimes LIFETIMES:"
+  # ADR-0148 D3: the terminal step ignores the extent readers' holds and the
+  # extent fence: a held extent read and barrier keep the dropped
+  # namespace's directory open while its successor flushes.
+  "inf_canary_lifetime_holds_ignored m4-ns-lifetimes LIFETIMES:"
+  # ADR-0148 D3: a dropped namespace's owner closes its handles at the drop,
+  # whatever the cold reads queued on its files: a read held at the device
+  # across the DROP is then submitted on a closed descriptor.
+  "inf_canary_drop_closes_handles m4-ns-lifetimes CUSTODY:"
+  "inf_canary_drop_closes_handles m4-tiered CUSTODY:"
+  # ADR-0003 A1.7 — the wake bridge's lane, one plant per load-bearing
+  # ordering and per protocol rule, each red on the Loom model that holds
+  # it (`Causality` is Loom's report on a tomb: a free not ordered after an
+  # access, or an access after a free).
+  # A foreign drop decrements in one read-modify-write and sets Q in a
+  # second: the owner's reuse lands between them.
+  "inf_canary_wake_drop_notify_split loom inf-foundation loom_a_foreign_last_drop_never_races_the_owners_reuse Causality"
+  # The push's compare-and-swap is Relaxed: a take reads a stale link.
+  "inf_canary_wake_push_relaxed loom inf-foundation loom_pushes_and_drains_lose_no_bridge drained-once"
+  # The drain clears Q before it reads the link: a push between them
+  # rewrites it.
+  "inf_canary_wake_clear_before_link loom inf-foundation loom_pushes_and_drains_lose_no_bridge drained-once"
+  # Neither the foreign lane nor a close compares its count with
+  # LANE_COUNT_MAX: the count wraps, and the child exits instead of aborting.
+  "inf_canary_wake_count_unbounded crate-test inf-foundation lib a_foreign_lane_clone_at_the_bound_aborts not by SIGABRT"
+  # A foreign call adds to waker_foreign_ops after its push: the
+  # executor's drop can free the stack first.
+  "inf_canary_wake_count_after_push loom inf-foundation loom_the_executors_drop_never_races_a_foreign_call Causality"
+  # A foreign wake sets W and not Q, so it pushes nothing: the wake is lost.
+  "inf_canary_wake_without_queue loom inf-foundation loom_two_foreign_wakes_against_a_drain_are_delivered_once delivered-at-least-once"
+  # The foreign swap of the lane word is Relaxed: a drop that pushes
+  # nothing is not ordered before the last drop's free.
+  "inf_canary_wake_lane_relaxed loom inf-foundation loom_a_closed_headers_last_drops_free_it_once Causality"
+  # The drain's take is Relaxed: it reads a stale link.
+  "inf_canary_wake_take_relaxed loom inf-foundation loom_pushes_and_drains_lose_no_bridge drained-once"
+  # The drain's clear is Relaxed: a last drop that found Q set is not
+  # ordered before the owner's reuse.
+  "inf_canary_wake_clear_relaxed loom inf-foundation loom_a_foreign_last_drop_never_races_the_owners_reuse Causality"
+  # A close's swap is Relaxed: the owner part's drop is not ordered before
+  # another thread's free.
+  "inf_canary_wake_close_relaxed loom inf-foundation loom_a_closed_headers_last_drops_free_it_once Causality"
+  # The release of a stack count is Relaxed: the stack's freer does not
+  # follow the other count's release.
+  "inf_canary_wake_retain_relaxed loom inf-foundation loom_the_executors_drop_never_races_a_foreign_call Causality"
+  # A closed header's last drop frees it with Q set: the last take then
+  # reaches the freed bridge.
+  "inf_canary_closed_free_ignores_queue loom inf-foundation loom_the_executors_drop_never_races_a_foreign_call Causality"
+  # A tiered table's seal marks: the stride planted at one commit page, so
+  # a ring past the cap's reach fills the marks and the back mark takes
+  # later starts, which the stride test reads as a crossing at its widest
+  # window.
+  "inf_canary_seal_mark_stride_one crate-test inf-store lib the_stride_keeps_the_seal_marks_under_their_cap_at_every_window stride-short"
+  # The first plant at a tiered table's marks' cap edges, at the unit tier:
+  # no leg fills them (the stride keeps the seal marks at half their cap,
+  # the window's arithmetic the hole marks at two of three). One short, the
+  # 8,192nd seal mark merges into the back and the third planted hole is
+  # refused, each read by its edge test's own token.
+  "inf_canary_cap_minus_one crate-test inf-store lib the_seal_marks_cap_admits_its_last_mark_and_merges_the_next seal-marks-edge-short"
+  "inf_canary_cap_minus_one crate-test inf-store lib the_hole_marks_cap_admits_three_and_refuses_a_fourth hole-marks-edge-short"
+  # The same stride plant at the pressure storm's wide ring, whose engagement
+  # is the stride above one commit page: planted at one page, the leg's stride
+  # clause is VACUOUS by its own name.
+  "inf_canary_seal_mark_stride_one m4-pressure pressure-stride-unengaged --pressure-leg wide-ring"
+  # The executor's lanes (ADR-0003 A1): each plant breaks one rule of the wake header, and
+  # the test that holds the rule goes red at its own assertion.
+  # The lane compare answers the owner part on every thread: a foreign wake counts nothing.
+  "inf_canary_waker_owner_unchecked crate-test inf-runtime test:waker_threads a_wake_from_another_thread_takes_the_foreign_lane one foreign wake, counted"
+  # Reuse reads `o` and not the lane word: a slot whose header a foreign clone names is freed.
+  "inf_canary_wake_reuse_owner_count_only crate-test inf-runtime test:waker_threads a_foreign_clone_keeps_a_finished_tasks_header a foreign clone keeps the finished task's header"
+  # A completing first poll frees its slot with a wake queued: the next task is polled twice.
+  "inf_canary_ready_ignores_queued crate-test inf-runtime test:waker_threads a_foreign_wake_queued_for_a_finished_task_never_polls_the_next the next task was polled once"
+  # The swap that leaves a closed header unnamed and unqueued frees nothing.
+  "inf_canary_closed_header_kept crate-test inf-runtime test:waker_close an_executor_dropped_before_its_threads_last_wakers_frees_each_at_its_drop the array, freed whole"
+  "inf_canary_closed_header_kept crate-test inf-runtime test:waker_close executors_created_and_dropped_keep_nothing allocated less freed over both threads"
+  # The owner lane's half of the count's bound: an owner clone at the bound does not abort.
+  "inf_canary_wake_count_unbounded crate-test inf-runtime lib an_owner_lane_clone_at_the_bound_aborts not by SIGABRT"
+  # An owner-lane drop settles a Finished, undecided header: inside the future's own drop.
+  "inf_canary_settle_on_dead crate-test inf-runtime test:waker_threads a_future_that_keeps_its_own_waker_clone_is_freed_once linked no reclaim"
+  # An owner-lane drop of a Retired header's last waker does not settle it.
+  "inf_canary_settle_held_skipped crate-test inf-runtime test:waker_threads a_waker_dropped_during_another_tasks_poll_frees_the_first_held_header reclaimed"
+  # ADR-0003 A1.2.7: every park a cell loop issues carries a timeout of at most its ceiling;
+  # planted, a park with no timer armed passes none and waits without limit.
+  "inf_canary_park_without_ceiling crate-test inf-runtime test:reactor an_idle_park_carries_its_ceiling at most its ceiling"
+  # Every waker operation takes the foreign lane: the simulator's wiring check reads the count
+  # above 0, and the binary at two cells, where cells are threads, reads it on its cells.
+  "inf_canary_waker_foreign_lane_always m0-smoke waker-foreign-ops"
+  "inf_canary_waker_foreign_lane_always crate-test infinityd test:waker_cells no_waker_takes_the_foreign_lane_at_two_cells waker_foreign_ops above 0"
+  # ADR-0173 D1, D4: the cross-cell JSON.MGET gather admits every leg
+  # without charging its account. The gather oracle serves the split
+  # fixture at L - 1, where only the whole crosses; m3-document's model
+  # refuses its repeated audit, which the planted gather serves.
+  "inf_canary_json_gather_unaccounted crate-test inf-server test:node_e2e every_split_json_row_is_charged_whole_in_a_numbered_database reply mismatch"
+  "inf_canary_json_gather_unaccounted m3-document REPLY"
+  # ADR-0192 D3: the publish fan's legs are general sends that wait for a
+  # credit, as if none were kept for the fan; each owner's pump waits for a
+  # credit only the other owner's replies return, and the liveness detector
+  # reads the stall.
+  "inf_canary_fan_draws_general m1-pub-cross STALL"
+  # ADR-0192 D2: a general send may take the fan's last credit; a leg then
+  # finds none and is counted before it waits, and the run's end reads the
+  # count on every cell.
+  "inf_canary_reserve_unguarded m1-pub-cross RESERVE"
+  # The thief leg's premise: a thief of two writers with a tenth of its
+  # window mutable seals late and holds a backlog below its slice inside the
+  # wait bound's window, so the leg's premise clause reads it vacuous (a
+  # vacuity plant, read in the simulator alone).
+  "inf_canary_thief_premise_short m4-tier-budget thief-premise-short --tier-leg two-1mb-thief"
+  # The spend's queued term reads the driver's own queue, which every entry
+  # drains, in place of the cell loop's, where a grant waits one step: the
+  # equality breaks at the first step a grant waits, and no step finds a
+  # tier op queued (a vacuity plant, read in the simulator alone).
+  "inf_canary_tier_spend_driver_queue m4-tier-budget TIER-SPEND --tier-leg two-1mb-thief"
+  "inf_canary_tier_spend_driver_queue m4-tier-budget tier-spend-unqueued --tier-leg two-1mb-thief"
+  # ADR-0181 R4: a cold-read host mints each identity pair once and never returns one; planted,
+  # a cancelled request's pair returns to the issuer, so the next request repeats its ids.
+  "inf_canary_cold_identity_recycled crate-test inf-runtime lib every_identity_the_issuer_mints_is_fresh_and_typed_by_parity an id repeats"
+  # ADR-0181 R2: a turn's cold delivery runs before either executor pass; planted, it runs at
+  # parse_execute's head, so with remote_first_execute a woken task polls first.
+  "inf_canary_cold_delivery_after_execute crate-test inf-runtime test:reactor a_turns_cold_delivery_precedes_a_woken_tasks_poll_in_both_modes polled before the turn's delivery"
+  # ADR-0181 R2: a parked loop never holds ready cold delivery; planted, the park veto ignores
+  # it, so an idle loop parks with a ready window.
+  "inf_canary_cold_park_without_delivery crate-test inf-runtime test:reactor a_ready_cold_window_keeps_the_loop_from_parking parked with ready delivery"
+  # The same plant on the shipped plane over the sim driver: the server's
+  # before_park asks the same function, so at spin_iters 0 a cell whose turn
+  # left cold-read members to visit begins an iteration parked.
+  "inf_canary_cold_park_without_delivery crate-test inf-sim lib a_cell_with_cold_members_to_visit_begins_no_iteration_parked began parked while the step before it left cold-read members"
+  # ADR-0181 R1: one host turn visits at most 64 cold-read members, one allowance a turn shared
+  # by every delivery call. Planted, each receipt renews the allowance; an orphaned member
+  # spends no unit; coldstorm begins a turn at each pump. m4-cold's dense and cancel-all legs
+  # count each round's visits independently of the host.
+  "inf_canary_cold_delivery_budget_per_cqe m4-cold cold-delivery-work-over --cold-leg dense"
+  "inf_canary_cold_cancel_uncharged m4-cold cold-delivery-work-over --cold-leg cancel-all"
+  "inf_canary_cold_turn_budget_per_pump m4-cold cold-delivery-work-over --cold-leg dense"
+  # ADR-0181 R2 (A1.1): every lend of a native iteration, at any step, shares one turn, built at
+  # its first lend. Planted, every lend builds the turn, so one iteration visits more than 64.
+  "inf_canary_cold_turn_per_lend crate-test inf-runtime test:reactor every_lend_of_an_iteration_shares_one_turn share one turn"
+  # ADR-0181 R2 (A1.1): a native iteration in which no step lends builds no turn. Planted, the
+  # loop builds one as each iteration begins: the loop's stamp moves with no lend, and on the
+  # shipped plane over the sim driver it moves after a burst's last member is visited.
+  "inf_canary_cold_turn_eager crate-test inf-runtime test:reactor an_iteration_that_lends_nothing_builds_no_turn lent nothing built a turn"
+  "inf_canary_cold_turn_eager crate-test inf-sim lib a_cell_with_cold_members_to_visit_begins_no_iteration_parked built a cold turn after the burst's last member"
+  # ADR-0181 R1: a turn visits 64 cold-read members, so m4-tiered's phase 7e answers a burst of
+  # ready members within ⌈members / 64⌉ + 2 steps of its receipt. Planted, a turn visits 8, and
+  # each of the scenario's four smoke forms answers late.
+  "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late"
+  "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late --plant tier-read-eio"
+  "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late --replay-above-window"
+  "inf_canary_cold_turn_of_eight m4-tiered cold-burst-late --listing-repeats"
+  # m4-tiered's phase 7e delivers a cold burst in rounds: a reader that reads again after its
+  # resume (its candidate held another key's record) is judged against the next round's receipt,
+  # and a reader still waiting at the third round's bound is a stuck client. Planted, the phase
+  # allows no round after the first, and the regression seed's re-reader stalls at the cap.
+  "inf_canary_cold_burst_one_round m4-tiered cold-burst-round-cap --seed 0x51ee0630"
+  # A held read shows that some reader reads again, not that each one left does, so phase 7e
+  # releases no round while the owner's cold host has a member left to visit. Planted, a turn that
+  # no new receipt precedes leaves the host's last ready member unvisited, and at the regression
+  # seed the round's re-read is held while that member waits.
+  "inf_canary_cold_ready_left_to_receipt m4-tiered cold-burst-unvisited --seed 0x51ee0630"
+  # Past a round's bound phase 7e judges the host's pending count at every step to the next
+  # release: the count the wait begins with and each step's own. Planted, the host's last ready
+  # member waits until the 15th delivery turn after its receipt's own, so it is visited on the
+  # shortest wait's last step; or until the 7th, the wait's first step.
+  "inf_canary_cold_ready_left_fifteen_turns m4-tiered cold-burst-unvisited --seed 0x51ee0630"
+  "inf_canary_cold_ready_left_seven_turns m4-tiered cold-burst-unvisited --seed 0x51ee0630"
+  # m4-tiered's SCAN batching oracle judges a page that put 16 tier reads or more at its cell's
+  # device once the cell held the whole command, no other reader's among them, and is red when
+  # every driver entry that took a read took one. Planted, a page awaits each cold key before it
+  # names the next. At the seed the plain build judges 6 pages and sets 3 aside (the corpus test
+  # the_scan_batching_oracle_judges_pages_and_sets_others_aside holds both), and planted, its
+  # judged pages are red.
+  "inf_canary_scan_chunk_of_one m4-tiered scan-one-read-an-entry --seed 0x51ee082e"
+)
+# The rows above keep the order they were added in and take no new row:
+# `historical_rows` counts them, and falls only as one is deleted. The rows
+# below are ordered by cfg name (byte order, a cfg's rows together), and a
+# new row joins them in its cfg's place, so two changes that each add a row
+# touch different lines and merge without a conflict.
+historical_rows=294
+ordered_rows=(
+  # A first poll's compare is the watermark gate's proof of coverage: Ready only when the
+  # watermark is at or above the wait's LSN (ADR-0177 D5). Planted, the compare answers covered
+  # for any LSN, and a wait above the watermark is Ready at its first poll.
+  "inf_canary_ack_wait_covered_early crate-test inf-runtime test:watermark_gate the_gate_wakes_exactly_the_models_covered_waits_in_lsn_order above the watermark"
+  # A queued watermark wait's drop removes its entry from the gate's heap at its node's position
+  # (ADR-0177 D5). Planted, the drop skips the removal and releases the node, so after the
+  # queued drops the heap holds more entries than the model's queued waits, the pool as many nodes.
+  "inf_canary_ack_wait_drop_keeps_entry crate-test inf-runtime test:watermark_gate every_drop_leaves_the_heap_and_the_pool_at_once the heap's and the pool's counts"
+  # The same plant where the product drops a queued wait, in its executor's drop: three writers
+  # parked, closed by a FIN and a reset, then the node dropped as the cut drops it. Planted, no
+  # removal runs, and the gate's view reads 3 queued where 0.
+  "inf_canary_ack_wait_drop_keeps_entry crate-test inf-sim lib a_task_its_executor_drops_with_its_wait_queued_leaves_the_heap waits-left-at-the-cut"
+  # The heap's hook stores each placed entry's position in its node, so a queued drop removes
+  # its own entry (ADR-0177 D5). Planted, the store is skipped, and a drop removes the entry at
+  # a position that names another.
+  "inf_canary_ack_wait_no_position crate-test inf-runtime test:watermark_gate every_drop_leaves_the_heap_and_the_pool_at_once a queued node's position names its entry"
+  # A pushed watermark entry sifts to its place by LSN, so the heap's minimum is the least
+  # queued LSN (ADR-0177 D5). Planted, every entry orders as one and none moves: in falling
+  # order an advance leaves a covered wait under a higher minimum.
+  "inf_canary_ack_wait_no_sift crate-test inf-runtime test:watermark_gate the_gate_wakes_exactly_the_models_covered_waits_in_lsn_order woke other than the model"
+  # A sync's batch draws on the turn's wake count, which the LOG step alone refills, so several
+  # syncs reaped in one turn wake at most the budget between two LOG steps (ADR-0177 A2.2).
+  # Planted, each sync's batch takes a full budget, and two covering completions in one turn
+  # leave 3 waits queued where 5.
+  "inf_canary_ack_wakes_allowance_ignored crate-test inf-sim lib several_covering_syncs_in_one_turn_wake_at_most_the_budget wakes-past-the-budget"
+  # The LOG step wakes the next batch of a sync's covered acks, so a storm's waits past the
+  # first batch leave a turn apart and an owing cell never parks (ADR-0177 A2.2). Planted, the
+  # LOG step wakes none: the waits after R read off the schedule, and R + 1 parks while owing.
+  # One row a witness, both in the bound row's one message.
+  "inf_canary_ack_wakes_log_batch_skipped crate-test inf-sim lib acks_past_the_budget_follow_the_loops_schedule_and_an_owing_cell_never_parks wakes-schedule"
+  "inf_canary_ack_wakes_log_batch_skipped crate-test inf-sim lib acks_past_the_budget_follow_the_loops_schedule_and_an_owing_cell_never_parks parked-owing"
+  # A barrier hold keeps every barrier on the files it names: a standalone sync, a write's
+  # linked sync and a write-through write, each whole until the hold lifts. Planted,
+  # hold_barriers keeps standalone syncs alone, and the frame barriers complete while held.
+  "inf_canary_barrier_hold_standalone_only crate-test inf-sim test:disk a_barrier_hold_keeps_every_barrier_until_it_lifts barrier-completed-while-held"
+  # ADR-0148 D4: every payload of the reservation is reserved fallibly.
+  # Planted, the receipts are made by an infallible `collect`, and the child
+  # whose receipts' allocation is refused dies by SIGABRT.
+  "inf_canary_boot_payload_infallible crate-test inf-server test:tier_boot_reservation boot_reservation_refusals_are_typed CHILD_SIGNALED:"
+  # ADR-0148 D4: no cell is built after a refused boot reservation. Planted,
+  # the assembly reserves again and builds the node regardless.
+  "inf_canary_boot_reservation_ignored crate-test inf-server test:tier_boot_reservation boot_reservation_refusals_are_typed CELL_BUILT_AFTER_REFUSAL:"
+  # The capped slab's admission compare on the `conn` class, whose cap is the cell's share
+  # (ADR-0177 D2), at its control: the fan leg's share of clients on one cell. One task short,
+  # the class holds 3 of its 4 and the last client's accept is refused there, so the leg reads
+  # the row unfilled and crossed, each clause by its own token.
+  "inf_canary_cap_minus_one m0-capacity cap-row-unfilled --close-leg fan"
+  "inf_canary_cap_minus_one m0-capacity cap-row-crossed --close-leg fan"
+  # The same plant on the tasks leg, whose draining slots keep the share's `occupied < C`
+  # refusing ahead of the class: one task short, the first wave holds 3 of 4, and every accept
+  # the share then admits is refused at the class instead, which never crosses on the plain build.
+  "inf_canary_cap_minus_one m0-capacity cap-row-unfilled --close-leg tasks"
+  "inf_canary_cap_minus_one m0-capacity cap-row-crossed --close-leg tasks"
+  # ADR-0157 D3: a cell's every failure after its transport part arrived
+  # exits without a destructor. Planted, its error returns from the cell,
+  # dropping the part and the plane: exit 101, not 1.
+  "inf_canary_cell_exit_drops_plane crate-test infinityd test:graceful_stop a_held_control_thread_ends_the_stop_at_its_deadline HELD_NODE_EXIT:"
+  "inf_canary_cell_exit_drops_plane crate-test infinityd test:graceful_stop a_cell_failure_after_its_part_arrived_exits_one CELL_FAILURE_EXIT:"
+  # A slot takes the largest power-of-two chunk one 64 KiB allocation holds, at most 64 slots,
+  # and the builder takes no other count (ADR-0194 A1). Planted, chunk_slots_for answers 64 at
+  # every width, the fixed chunk, and a slab of 1,032 B slots in chunks of 32 is refused.
+  "inf_canary_chunk_slots_fixed crate-test inf-foundation lib a_slot_takes_the_largest_chunk_one_allocation_holds wide-slot-refused"
+  # The same plant on the shipped classes (ADR-0194 A1): `conn`'s slot at 64 a chunk is past
+  # one allocation, so the node's layout refuses its class at boot.
+  "inf_canary_chunk_slots_fixed crate-test inf-server lib every_class_registers_at_its_chunk class-refused"
+  # The checkpoint wait list holds its one key from its build, before the cell serves, its map
+  # filled whole at assembly (ADR-0177 D5). Planted, the build holds a second key, past the
+  # map's cap of one, and the plane's assembly refuses it.
+  "inf_canary_ckpt_waiter_key_extra m0-smoke ckpt-waiter-keys-full-at-assembly"
+  # A close ends the receive: the io_uring driver queues the fd's cancels before the close and
+  # posts Closed after them, so no Recv with bytes follows Closed. Planted, Close posts Closed
+  # as it queues the close, ahead of the reap that brings the bytes. One row a shape: the
+  # receive and the close in one enter on the shipped ring, and the receive armed an enter
+  # earlier on a ring without deferred task work.
+  "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_with_receive_posts_no_recv_after_closed recv-after-closed"
+  "inf_canary_close_posts_closed_early crate-test inf-runtime/uring test:driver_conformance close_posts_no_recv_after_closed recv-after-closed"
+  # A close runs the queue to its end (ADR-0123 A2): a draining slot holds it. Planted, Closed
+  # drops the queue, and the reset client's queued SETs never run.
+  "inf_canary_closed_conn_queue_dropped m0-capacity closed-queue-unrun --close-leg close"
+  # Closed wakes a parked pump, so its draining slot retires and frees its conn task. Planted,
+  # the wake is skipped, and a closed connection keeps its task and its slot.
+  "inf_canary_closed_pump_not_woken crate-test inf-server lib a_closed_connection_frees_its_conn_task conn-task-kept"
+  # A half-closed slot parses the bytes reaped beside its end of stream (ADR-0196 A1.1). Planted,
+  # PARSE releases a flushing or closing Peer entry unparsed, and the SET sent before the FIN
+  # never runs.
+  "inf_canary_closing_inbox_released m0-capacity pre-eof-unrun --close-leg eof-with-data"
+  # A closing slot holds no descriptor, so nothing is sent after its Close (X1). Planted, it keeps
+  # a copy and RESPOND sends to it; the net reads bytes for a closed fd.
+  "inf_canary_closing_slot_sends m0-capacity bytes-after-close --close-leg close"
+  # A client row is inserted only through the plane's admission. Planted, SETNAME and the
+  # state mirror insert, and a command run after Closed puts the closed client back.
+  "inf_canary_command_registers_client m0-capacity ghost-client-row --close-leg registry-reset"
+  # ADR-0156 D1: a file a landed swap retired keeps its owner until its
+  # unlink answers. Planted, the commit drops the owner, and the life after
+  # the cut's R0 file is on the disk when its window closes.
+  "inf_canary_commit_retirement_forgets m4-ns-lifetimes RETIRE-R0"
+  # A compaction read is taken only by spending a slot of its pass's room, so no namespace is
+  # marked in flight with no task to run its chain (ADR-0177 D2). Planted, the read is taken
+  # and marked first, the room asked after, and a one-slot pass marks its second namespace.
+  "inf_canary_compact_take_before_permit crate-test inf-server lib a_full_compact_room_paces_and_marks_nothing compact-mark-without-slot"
+  # A connection's slot and task end only after its close, so a client that has read a reply
+  # and is not closed holds both (O1's third clause). Planted, a pump whose queue is empty after
+  # its first reply returns and vacates its slot, the socket left open, and the admitted reader
+  # outnumbers its cell's slots.
+  "inf_canary_conn_owner_lost m0-capacity conn-under-clients --close-leg close"
+  # A slot stays occupied until its pump returns, so the conn tasks alive equal the occupied
+  # slots at every step (O1). Planted, the slot is vacated at Closed, before its pump returns,
+  # and O1 reads fewer slots than tasks.
+  "inf_canary_conn_slot_frees_at_closed m0-capacity conn-tasks-unequal --close-leg close"
+  # The same plant on the tasks leg's engagement: a slot that vacates at Closed never drains, so
+  # no client reads the maxclients refusal while its cell's occupied slots outnumber its clients.
+  "inf_canary_conn_slot_frees_at_closed m0-capacity drain-refusal-unengaged --close-leg tasks"
+  # The `conn` class's slots are the cell's share (ADR-0177 D2), resident whole from its build
+  # and billed by the idle row. Planted, it is built over (1 + k) C slots, k from its stride:
+  # the idle node's resident memory a cell rises by k x C x s_conn, 2,500 x 3,104 B at 4 cells
+  # (k = 1), over the idle-resident tool's 256 KiB control a cell, which the plain node's three
+  # boots stay within. The bytes are that product at the stride the plane's layout test prints;
+  # a stride that moves moves them with it.
+  "inf_canary_conn_slots_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 7760000 --control-bytes-cell 262144 --plant-row conn-tasks"
+  # A finished conn task's header is reclaimed once no waker names it, so a settled node holds no
+  # Retired conn header (O1's leak clause). Planted, the pump keeps a clone of its own waker past
+  # its return: the reset client's header stays Retired with every per-step clause green.
+  "inf_canary_conn_waker_kept m0-capacity conn-retired-kept --close-leg close"
+  # ADR-0156 D1: a failed create spends no file id. Planted, the id moves
+  # before `create_tier`, so the create after a failure names a fresh path.
+  "inf_canary_create_id_spent_on_failure m4-ns-lifetimes FAILED-CREATE --lifetimes-leg create-fault"
+  # ADR-0156 D1: a failed create's file is owned until its unlink answers.
+  # Planted, the slot is left empty, so the next create meets the name: Ok
+  # with no unlink between, or `EEXIST` where the file was made.
+  "inf_canary_create_residue_dropped m4-ns-lifetimes FAILED-CREATE --lifetimes-leg create-fault"
+  # ADR-0156 D1: no create runs while its residue's job is out. Planted, a
+  # create runs with the residue's unlink held, before that unlink.
+  "inf_canary_create_while_residue_out m4-ns-lifetimes FAILED-CREATE --lifetimes-leg create-fault"
+  # The credit wait list holds one key for each peer from its build, before the cell serves,
+  # its map filled whole at assembly (ADR-0177 D5). Planted, the build also holds the cell's
+  # own id, past the map's cap of `cells - 1`, and the plane's assembly refuses it.
+  "inf_canary_credit_waiter_key_extra m0-smoke credit-waiter-keys-full-at-assembly"
+  # The DDL wait list holds its one key from its build, as the checkpoint list does. Planted,
+  # the build holds a second key, and the plane's assembly refuses it.
+  "inf_canary_ddl_waiter_key_extra m0-smoke ddl-waiter-keys-full-at-assembly"
+  # The divert parks an origin's durable apply behind its pump while the pump is applying or
+  # holds its work (ADR-0083 D1), so an origin has one open gated slot, its back (ADR-0177 D6).
+  # Planted, the queue alone diverts: a flat write runs inline while a tiered write of the same
+  # origin holds its slot on a held cold read, and the flat write's open stops the cell.
+  "inf_canary_divert_queue_only m0-capacity second-open-slot --close-leg gated-cold"
+  # ADR-0156 D3: a dropped namespace's tier files leave only through the
+  # control thread's worker. Planted, the walk unlinks them on the cell, and
+  # the disk logs a cell-marked tier-file unlink after recovery.
+  "inf_canary_drain_unlink_on_cell m4-ns-lifetimes RETIRE-STEP"
+  # The same plant on m4-tiered's drop race: the dropped namespace's file is
+  # unlinked under a cell's mark after its DROP answered.
+  "inf_canary_drain_unlink_on_cell m4-tiered DROP-CLAUSE"
+  # The slab's draining count, which the accept's active share reads, leaves with a draining
+  # slot's removal (ADR-0123 A1). Planted, the removal keeps it, and MAINTAIN's sweep asserts
+  # the count against its own walk once the first drained slot vacates: the lowered plane test
+  # at its thaw, the tasks-lowered leg at its admitted clients' ends.
+  "inf_canary_draining_count_kept crate-test inf-server lib a_draining_slot_counts_against_the_boot_share_alone draining-count-drift"
+  "inf_canary_draining_count_kept m0-capacity draining-count-drift --close-leg tasks-lowered"
+  # A Peer parser ends at the run-out once a take of the inbox completed since its stamp
+  # (ADR-0196 D2). Planted, the run-out's test reads false, and the FIN-only client's slot never
+  # closes.
+  "inf_canary_draining_reader_never_ends m0-capacity half-close-unclosed --close-leg stall"
+  # The same plant read by O1's leak half: the FIN-only client's task and slot are kept together,
+  # so the per-step clauses stay green and the settled cell holds a slot its leg did not keep.
+  "inf_canary_draining_reader_never_ends m0-capacity slot-not-vacant --close-leg stall"
+  # A draining Peer parser parses the entries a stall held past Closed (ADR-0196 D2). Planted,
+  # PARSE releases them, and the reset client's SETs never run.
+  "inf_canary_draining_releases_held_entry m0-capacity pre-eof-unrun --close-leg stall"
+  # A draining slot vacates only after its 1→0 deltas are acknowledged, so the stop's barrier
+  # counts it until then. Planted, the slot vacates first, and the stop passes with deltas in
+  # flight.
+  "inf_canary_draining_vacates_before_acks crate-test inf-server lib the_stop_waits_for_a_draining_slots_acks quiet-before-acks"
+  # The end of stream keeps the parser and answers what was read before it (ADR-0196 A1.1).
+  # Planted, it closes the slot at once, and the half-closed client misses its replies: one row
+  # with the last chunk and the FIN in one reap, one behind a held reply.
+  "inf_canary_eof_closes_at_once m0-capacity half-close-unanswered --close-leg half-close-eof-with-data"
+  "inf_canary_eof_closes_at_once m0-capacity half-close-unanswered --close-leg half-close"
+  # An `always` write whose verdict is an error reply leaves at once, not gated (ADR-0177 D6).
+  # Planted, the error waits as a verdict for the next record's `seq`, and so for the hold.
+  "inf_canary_error_reply_gated m0-capacity error-held --close-leg gated-error"
+  # The executor's drop drops every live future in place and resumes past one whose drop
+  # unwinds, then closes, frees and releases as it would have. Planted, the drop stops at that
+  # future, and the slabs are freed under the live futures after it.
+  "inf_canary_executor_drop_stops_at_unwind crate-test inf-runtime test:executor the_executors_drop_resumes_past_an_unwinding_drop drop-unwind-stopped"
+  # The first poll runs in its class's spare, in its slot, where every later poll and the drop
+  # find it (ADR-0194 D1's note), and a wake it raises is kept. Planted, the cell moves to another
+  # slot of its class at the task's next activation, and the future reads a second address.
+  "inf_canary_first_poll_off_slot crate-test inf-runtime test:executor the_first_poll_runs_in_its_slot_and_keeps_its_wake first-poll-moved"
+  # A first poll that unwinds hands the spare's handle to its task's header, so the executor's
+  # drop drops its future in place, and the next first poll makes another slot its spare.
+  # Planted, the spare keeps the handle and the header has none: nothing counts the task, and
+  # the executor's drop never reaches its future.
+  "inf_canary_first_poll_unwind_unowned crate-test inf-runtime test:executor a_first_poll_that_unwinds_holds_its_slot_until_the_drop first-poll-unwind-unowned"
+  # Planted, a Pending first poll leaves its header Idle and unlinked, and the wake it raised is
+  # lost.
+  "inf_canary_first_poll_wake_dropped crate-test inf-runtime test:executor the_first_poll_runs_in_its_slot_and_keeps_its_wake first-poll-wake-lost"
+  # A flushing publisher's own frames ride its publish's reply (ADR-0101 D4): the defer branch
+  # comes before the flushing slot's answer. Planted, the answer comes first, and the own
+  # message is dropped.
+  "inf_canary_flushing_drops_own_frame crate-test inf-server lib own_frame_rides_reply_after_protocol_error own-frame-dropped"
+  # An immediate close (`CLIENT KILL`, the output cap, `timeout`) of a flushing slot runs its
+  # queue to its end, unanswered (ADR-0123 A2 rule 3). Planted, the close drops the queue: a
+  # half-closed slot's and a marked slot's queued `SET` and `INCR` never run.
+  "inf_canary_flushing_kill_drops_queue crate-test inf-server lib a_kill_of_a_half_closed_slot_runs_its_queue_unanswered flushing-kill-queue-unrun"
+  "inf_canary_flushing_kill_drops_queue crate-test inf-server lib a_kill_of_a_marked_slot_runs_its_queue_unanswered flushing-kill-queue-unrun"
+  # A flushing slot is written no message published after its mark (ADR-0196 D4). Planted, the
+  # delivery writes into it, and a message follows the subscriber's +OK.
+  "inf_canary_flushing_takes_delivery m0-capacity push-after-quit --close-leg quit-subscriber"
+  # A fabric holder whose waiter drops waits, Orphaned, for its request's one completion, so no
+  # completion finds a later occupant (ADR-0177 D4). Planted, it frees at the drop. The crate test
+  # polls a wait to Waiting, drops it and counts the holders beside the key it kept. The scenario
+  # reaches the row from the wire: a fan of reads answers at its first failed leg and drops the
+  # rest, so a namespace KEYS whose first peer lacks the namespace drops the held peer's wait
+  # with its request out; planted, the late reply finds the slot at its next generation, and the
+  # report reads the stale completion.
+  "inf_canary_gate_frees_on_drop crate-test inf-runtime lib an_orphaned_holder_frees_at_its_late_completion orphan-freed-at-drop"
+  "inf_canary_gate_frees_on_drop m0-capacity gate-stale --close-leg orphan"
+  # The fabric gate's holders are resident from its build (ADR-0177 D8 with A1), billed by the
+  # idle row. Planted, the gate is built over 2 H: the idle node's resident memory a cell rises
+  # by H x s_h, 83,075 x 48 B at 4 cells, over the idle-resident tool's 256 KiB control a cell.
+  # The bytes are that product at the stride the plane's layout test prints; a stride that
+  # moves moves them with it.
+  "inf_canary_gate_holders_doubled binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 3987600 --control-bytes-cell 262144 --plant-row fabric-gate-holders"
+  # A fabric reserve takes one of its task's units, so a fan wider than 32 legs runs in windows
+  # and the share's fans stay within the gate's holders (ADR-0177 D4). Planted, it grants
+  # without a unit: each fan holds a holder a leg until its last is sent, and the gate fills.
+  "inf_canary_gate_units_unbounded m0-capacity gate-full --close-leg fan"
+  # An `always` apply whose verdict is a reply drops its gated ticket, which releases its slot
+  # (ADR-0177 D6), so its origin's next apply opens one. Planted, the drop releases nothing, the
+  # error's slot stays at the origin's back, and the next write's open stops the cell.
+  "inf_canary_gated_drop_kept m0-capacity second-open-slot --close-leg gated-error"
+  # The gated task publishes an `always` verdict only once the owner's fsync watermark covers
+  # its record (ADR-0177 D3). Planted, it publishes every filled front, so a remote `always`
+  # write is acknowledged before it is durable and the power cut loses it. The lane seed's cut
+  # meets no such ack; this named seed's does.
+  "inf_canary_gated_ignores_watermark m2-durable DURABILITY --seed 0xc1000c"
+  # The same plant on a peer's credits' worth of remote `always` writes while the owner's
+  # fsync is held: no barrier completes, so at every seed the acks are read under the hold.
+  "inf_canary_gated_ignores_watermark m0-capacity acked-under-hold --close-leg gated-hold"
+  # The `gated` task is one task of its cell, made at plane start before the cell serves; its
+  # class's one slot is full at assembly (ADR-0177 D2). Planted, plane start makes a second, and
+  # the class refuses it there.
+  "inf_canary_gated_pump_extra m0-smoke gated-tasks-full-at-assembly"
+  # A subscriber counts as a receiver until the server reads its end of stream (ADR-0196 A1.2).
+  # Planted, the count reads the parser, not the stream, so a half-closed one is counted.
+  "inf_canary_half_closed_counted crate-test inf-server lib half_closed_subscriber_not_counted count-after-eof"
+  # A finished task's slot is freed only when no waker names its header: it stays Retired
+  # until that waker's drop (ADR-0177 D2). Planted, it is freed under a clone, and the stale
+  # clone wakes the next task; the second row reaches the plant on a first poll Ready, the fast
+  # arm, where the escaped clone must keep the finished task Retired.
+  "inf_canary_header_reused_with_wakers crate-test inf-runtime test:waker_threads a_retired_slot_is_never_reused_while_a_waker_names_its_header no stale clone activates the new occupant"
+  "inf_canary_header_reused_with_wakers crate-test inf-runtime test:executor escaped_waker_clone_on_fast_path_is_harmless the escaped clone keeps the finished task Retired"
+  # A keyed wait dropped under its queue's hold keeps its slot until the hold is released
+  # (ADR-0177 D4), so the hold reads that slot and no later occupant. Planted, the drop frees the
+  # slot at once, and the gate holds one slot fewer than the model.
+  "inf_canary_keyed_hold_frees_on_drop crate-test inf-runtime lib the_keyed_gate_holds_what_its_model_holds slots-held"
+  # A dropped keyed wait takes its route and its stored waker in the same step (ADR-0177 D4).
+  # Planted, the drop leaves both: the hold reads it waiting, the routes fill, and a gate of 8
+  # answers full.
+  "inf_canary_keyed_route_kept_on_drop crate-test inf-runtime lib a_dropped_keyed_wait_leaves_no_route route-kept-on-drop"
+  # MAINTAIN takes a compaction or shadow read only by spending a slot of its class's room, and
+  # counts a namespace the room cannot serve (ADR-0177 D2), which no simulated run reaches: every
+  # life's census reads the count 0. Planted, the room reads short at every pass, and the
+  # namespaces with shadow reads owed are paced.
+  "inf_canary_maint_room_short m4-tiered maint-paced"
+  # The plane's mark ends the parser at once (QUIT's rule). Planted, it is a side flag beside a
+  # live parser, and a SET reaped after a QUIT, while its +OK is unsent, runs.
+  "inf_canary_mark_applied_late crate-test inf-server lib a_set_after_quit_does_not_run post-quit-ran"
+  # The mark of a slot whose receive is disarmed pushes one RecvArm (ADR-0196 A1.3). Planted, it
+  # pushes none.
+  "inf_canary_mark_keeps_disarmed crate-test inf-server lib mark_rearms_a_disarmed_receive no-rearm-at-mark"
+  # A subscriber marked by `QUIT` whose stream is open still counts as a receiver, as Redis's
+  # does (ADR-0196 D4, A1.2). Planted, the open stream reads as uncounted.
+  "inf_canary_marked_slot_uncounted crate-test inf-server lib half_closed_subscriber_not_counted count-after-eof"
+  # A named reservation dropped unpublished advances its slot's generation (ADR-0194 D1 with
+  # A2), so the handle it named names no later occupant. Planted, the drop keeps the
+  # generation, and the next named reservation of the slot names the same handle.
+  "inf_canary_named_drop_keeps_generation crate-test inf-foundation lib a_dropped_named_reservation_names_no_later_occupant id-reused"
+  # The net's own invariant: no chunk of an fd is posted after its end of stream. Its close
+  # legs' shared reap posts a closed client's last chunk and its EOF in one reap, data first;
+  # planted, the EOF goes first and the chunk after it.
+  "inf_canary_net_data_after_eof crate-test inf-sim lib a_shared_reap_posts_the_chunk_before_the_end_of_stream net-data-after-eof"
+  # A cell makes one ns-apply pump per peer at plane start, the class's `N - 1` slots full at
+  # assembly (ADR-0177 D2). Planted, plane start makes one more, and the class refuses it there.
+  "inf_canary_ns_apply_pump_extra m0-smoke ns-apply-tasks-full-at-assembly"
+  # The owner pump is one task of its cell, made at plane start before the cell serves; its
+  # class's one slot is full at assembly (ADR-0177 D2). Planted, plane start makes a second, and
+  # the class refuses it there.
+  "inf_canary_owner_pub_pump_extra m0-smoke owner-pub-tasks-full-at-assembly"
+  # The parked-bytes gauge sums the bytes behind the entries in the per-origin deques: a pop
+  # subtracts its entry's (ADR-0177 D6). Planted, a pop subtracts nothing, so the peer that
+  # parked the small-credit leg's applies reads its gauge above 0 once every reply is in.
+  "inf_canary_parked_bytes_kept m0-capacity parked-bytes-kept --close-leg small-credit"
+  # A per-origin deque holds its origin's credits, so the general window an origin fills is
+  # never refused (ADR-0177 D6). Planted, it holds two fewer, and the window's last is refused.
+  "inf_canary_parked_cap_short m0-capacity parked-refused --close-leg small-credit"
+  # A per-origin deque holds its origin's credits' worth of ops, so none is refused (ADR-0177
+  # D6); the durable driver reads the refusals at each life's end. Planted, a deque holds one.
+  "inf_canary_parked_deque_of_one m2-durable PARKED"
+  # A command queued for a connection's parked pump wakes it by id: the pump parks only after it
+  # reads its queue empty with nothing pending (ADR-0177 D2). Planted, PARSE queues the command
+  # and wakes nothing, so a deferred command's client waits for a reply no task makes.
+  "inf_canary_parked_pump_not_woken m0-adversarial STALL --cells 4"
+  # A reply PARSE writes itself (-LOADING, a protocol error) leaves after every reply the
+  # connection owed before it: the route queues it behind them. Planted, it is written into out
+  # whatever the route, ahead of the owed replies: the plane test and the DST leg.
+  "inf_canary_parse_reply_around_queue crate-test inf-server lib protocol_error_answers_after_deferred reply-order"
+  "inf_canary_parse_reply_around_queue m0-capacity reply-order --close-leg protocol-order"
+  # ADR-0156 D3: a control post sends the worker's wake after its message.
+  # Planted, it sends none, and a waiting worker sleeps with the message
+  # queued.
+  "inf_canary_post_rings_no_wake loom inf-foundation loom_the_worker_never_waits_with_a_job_published_or_a_message_queued LOST_WAKE:"
+  # A QUIT the pump runs empties the queue behind it. Planted, the queue is kept, and the SETs
+  # behind the QUIT run.
+  "inf_canary_quit_keeps_queue m0-capacity post-quit-ran --close-leg deferred-quit"
+  # The end of stream ends the receive (ADR-0196 A1.3). Planted, the end-of-stream arm re-arms
+  # the half-closed slot, and the net refuses an arm after its EOF.
+  "inf_canary_rearm_after_eof m0-capacity recv-armed-after-eof --close-leg half-close"
+  # ADR-0156 D3: a dropped namespace's receipt waits for every job's result. Planted, the
+  # terminal step ignores the jobs out: with the worker held, the cell test's MAINTAIN
+  # publishes the receipt with jobs out, and the simulator's successor CREATE is accepted while
+  # the dropped namespace's tier files are still on the disk.
+  "inf_canary_receipt_jobs_out_ignored crate-test inf-server lib a_drained_namespaces_receipt_waits_for_its_jobs_out RECEIPT_WITH_JOBS_OUT:"
+  "inf_canary_receipt_jobs_out_ignored m4-ns-lifetimes HELD-WORKER"
+  # The registries drop a connection when its queue is empty, so a queued SUBSCRIBE's 0→1
+  # precedes the close's 1→0 in one task. Planted, the removal runs at Closed, before the drain,
+  # and the owner keeps counting the closed client.
+  "inf_canary_registry_dropped_at_closed m0-capacity sub-count-after-close --close-leg subscribe-reset"
+  # A slab's release drops its occupant where it lies, after the counts and the free chain are
+  # written (ADR-0194 D1's second note). Planted, it moves the occupant out as a take does and
+  # drops it off its slot, at another address than the one the slab lent.
+  "inf_canary_release_moves_occupant crate-test inf-foundation lib release_drops_the_occupant_where_it_lies release-moved"
+  # A general send keeps one credit free for the publish fan (ADR-0192 D2), so an origin parks
+  # at most 7 applies at a peer of 8 credits. Planted, the guard is gone and all 8 arrive.
+  "inf_canary_reserve_unguarded m0-capacity applies-high-water --close-leg small-credit"
+  # ADR-0156 D3: the worker's wake holds no message's slot or turn. Planted,
+  # the bell rings into the control channel, and each ring takes the turn
+  # of a message queued behind it.
+  "inf_canary_retire_bell_in_channel crate-test inf-server lib a_message_waits_no_turn_behind_the_bell MESSAGE_BEHIND_WAKE:"
+  # ADR-0156 D3: a cell's turn that published jobs rings the node's bell.
+  # Planted, it rings none, and the worker waits on an empty circuit with a
+  # job published and nothing left to wake it.
+  "inf_canary_retire_bell_silent loom inf-foundation loom_the_worker_never_waits_with_a_job_published_or_a_message_queued LOST_WAKE:"
+  # ADR-0156 D3: the worker waits only after a whole circuit of empty visits.
+  # Planted, it waits after any pass that took no job, with a later lane's
+  # job queued and nothing left to wake it.
+  "inf_canary_retire_block_after_empty_pass crate-test inf-server lib a_last_lanes_job_is_served_before_any_wait WAIT_UNWOKEN:"
+  # ADR-0156 D1: a retiring file's bytes count against its namespace's disk
+  # budget until its terminal result. Planted, a `Retry` leaves them out, so
+  # the budget at the sim disk's bytes refuses nothing.
+  "inf_canary_retire_charge_released_on_retry m4-ns-lifetimes RETIRE-CHARGE --lifetimes-leg disk"
+  # ADR-0156 D3: a final close consumes its number on every outcome.
+  # Planted, the retry after a close error closes that number again, which a
+  # sentinel opened since has reused.
+  "inf_canary_retire_close_twice crate-test inf-server lib a_retry_after_a_close_error_never_closes_the_number_again SENTINEL_CLOSED:"
+  # ADR-0156 D2: a job position is Free only at its result's consumption.
+  # Planted, a position counts as free once the worker took its request, so
+  # a ninth owner is admitted while eight results are unconsumed.
+  "inf_canary_retire_credit_at_dequeue crate-test inf-server lib a_position_frees_only_at_its_results_consumption NINTH_ADMITTED:"
+  # ADR-0156 D4: a pass resumes at the lane after the last one it visited.
+  # Planted, each pass starts at lane 0 and a later lane is never served.
+  "inf_canary_retire_cursor_reset crate-test inf-server lib every_ready_lane_is_served_within_its_share_of_passes LANE_UNSERVED:"
+  # O3's stop clause: no file of a namespace dropped in the life is on the
+  # disk after its graceful stop. A premise plant, read in the simulator
+  # alone: a tier file no owner holds is made under a dropped namespace just
+  # before the stop.
+  "inf_canary_retire_drop_at_stop m4-ns-lifetimes RETIRE-STOP"
+  # ADR-0156 D3: a retried file waits one injected millisecond after its
+  # `Retry`'s consumption. Planted, the walk offers it before its due, and
+  # the pace leg's retry lands within a 200 µs step of its failure.
+  "inf_canary_retire_due_ignored m4-ns-lifetimes RETRY-PACE --lifetimes-leg pace"
+  # ADR-0156 D3, ADR-0157 D3: a cell releases its endpoints only with every
+  # position Free. Planted, it releases them with a result unconsumed.
+  "inf_canary_retire_join_early crate-test inf-server lib the_stop_releases_only_with_every_position_free OWNER_UNCONSUMED:"
+  # ADR-0156 D3: the worker returns every owner in a result. Planted, a
+  # `Retry` result is dropped, and its owner with it, never consumed.
+  "inf_canary_retire_result_dropped crate-test inf-server lib each_outcome_returns_its_owner OWNER_DROPPED:"
+  # ADR-0156 D3: a result's publish is followed by the parked cell's wake.
+  # Planted, the result is published silently and the parked cell sleeps.
+  "inf_canary_retire_result_wake_silent crate-test inf-server lib a_parked_cell_is_woken_by_its_results RESULT_WAKE_MISSING:"
+  # The same plant on one thread: a result published between the cell's final check and its
+  # park wakes no cell.
+  "inf_canary_retire_result_wake_silent crate-test inf-server lib a_result_published_between_the_check_and_the_park_wakes_the_cell WAKE_IN_GAP_LOST:"
+  # ADR-0154 A1: a consumed `Retry` arms the retirement role at its due.
+  # Planted, it arms nothing, and the idle cell's role stays Idle.
+  "inf_canary_retire_timer_unarmed crate-test inf-sim lib tf1_a_retried_files_due_arms_the_retirement_role TF1-ROLE:"
+  # ADR-0156 D4: a turn makes at most 64 visits, a pinned owner's included.
+  # Planted, a pinned visit is not charged, and the turn reaches the file
+  # behind 64 pinned ones.
+  "inf_canary_retire_walk_unpaced crate-test inf-server lib a_turn_charges_its_retirement_visits_and_makes_at_most_sixty_four examined"
+  # O3's window opens with no harness hold. A premise plant, read in the
+  # simulator alone: the worker stays held at the opening.
+  "inf_canary_retire_window_held_open m4-ns-lifetimes RETIRE-OPEN"
+  # ADR-0156 D3: an idle worker waits on its wake. Planted, it never waits,
+  # a busy loop on an idle node.
+  "inf_canary_retire_worker_never_waits crate-test inf-server lib an_idle_worker_waits_after_one_empty_circuit NO_WAIT:"
+  # ADR-0156 D4: a window's files end within ⌈F / 8⌉ + 5c + 1 steps.
+  # Planted, a worker pass runs one job, so the full pass's 16 files and the
+  # life after the cut's 9 outlast their bounds.
+  "inf_canary_retire_worker_one_job m4-ns-lifetimes RETIRE-BOUND"
+  "inf_canary_retire_worker_one_job m4-ns-lifetimes REBOOT-BOUND"
+  # ADR-0156 D4: a worker pass runs at most 8 jobs. Planted, it ignores them,
+  # and the full pass's step unlinks 16 tier files.
+  "inf_canary_retire_worker_unpaced m4-ns-lifetimes RETIRE-STEP"
+  # ADR-0157 D3: a backing owner dropped before its retirement leaks
+  # silently instead of failing stop.
+  "inf_canary_ring_drop_live_silent crate-test inf-fabric lib a_backing_dropped_before_its_retirement_fails_stop FAIL_STOP_MISSING:"
+  # ADR-0157 D3: an endpoint touches nothing after its release. Planted, the producer's drop
+  # writes a slot, or reads the header's `mask`, after its decrement; the model whose owner
+  # retires before the fixture's thread join reports that access as a causality violation.
+  "inf_canary_ring_header_after_release loom inf-fabric loom_retained_retirement_before_the_thread_join Causality"
+  # ADR-0157 D3, D5: the retained ring's endpoint release made
+  # `Relaxed`, the owner's join load made `Relaxed`, a join after one
+  # release, or the producer's release before its last publication's tail
+  # store: a join before the fixture's thread join reads a stale tail, or
+  # joins while the fixture holds an endpoint.
+  "inf_canary_ring_join_after_one loom inf-fabric loom_retained_join_waits_while_the_consumer_is_held JOIN_WITH_HELD_ENDPOINT:"
+  "inf_canary_ring_join_relaxed loom inf-fabric loom_retained_join_sees_both_endpoints_final_writes JOIN_VISIBILITY_GAP:"
+  "inf_canary_ring_release_before_write loom inf-fabric loom_retained_join_sees_both_endpoints_final_writes JOIN_VISIBILITY_GAP:"
+  "inf_canary_ring_release_relaxed loom inf-fabric loom_retained_join_sees_both_endpoints_final_writes JOIN_VISIBILITY_GAP:"
+  # The slot write after the release, on the same model as the header read above.
+  "inf_canary_ring_slot_after_release loom inf-fabric loom_retained_retirement_before_the_thread_join Causality"
+  # The resumable JSON serializer: a step's rules, one plant each, read by the frozen serializer
+  # and the per-step holds of `inf-doc`'s `ser_tests`.
+  # A value's indentation starts at the depth of the wrapper it nests in. Planted, at 0.
+  "inf_canary_ser_base_ignored crate-test inf-doc lib the_reply_walk_agrees_with_the_frozen_walker the reply bytes differ"
+  # A check step stops at its budgets. Planted, it runs to the document's end.
+  "inf_canary_ser_check_whole crate-test inf-doc lib a_check_step_examines_at_most_its_budgets a check step examined past its budgets"
+  # A string check whose window ends inside a character resumes at the last boundary the
+  # window proved. Planted, at the window's end.
+  "inf_canary_ser_check_window_end crate-test inf-doc lib a_check_window_that_ends_inside_a_character_resumes_at_its_boundary the check's verdict on four-byte characters differs"
+  # A string resumes at its next source byte. Planted, at its first.
+  "inf_canary_ser_drop_straddle crate-test inf-doc lib a_string_of_escapes_straddles_every_step_edge the sliced bytes run past the whole run's length"
+  # A step yields at its work budget. Planted, the budget is not read.
+  "inf_canary_ser_ignore_nodes crate-test inf-doc lib a_step_visits_at_most_its_work_budget_and_one_value a step visited past its work budget"
+  # A tabled key's bytes lie in the dictionary. Planted, they are read from the region.
+  "inf_canary_ser_key_in_region crate-test inf-doc/doc-intern-keys lib a_tabled_key_straddles_every_step_edge the tabled key's bytes differ"
+  # The measure pass counts what the emit pass writes. Planted, it skips a break's indentation.
+  "inf_canary_ser_measure_skips_separators crate-test inf-doc lib the_measure_equals_the_emitted_length the measure differs"
+  # A step with option lengths other than the first measure step's is refused. Planted, taken.
+  "inf_canary_ser_options_unchecked crate-test inf-doc lib a_step_with_changed_option_lengths_is_refused changed options were measured"
+  # A root string is stepped like any string. Planted, it is one token, written whole.
+  "inf_canary_ser_root_str_atomic crate-test inf-doc lib a_root_string_is_stepped_at_every_entry a step wrote past its byte budget"
+  # A string's scan reads no further than its window. Planted, to the string's next escape.
+  "inf_canary_ser_scan_to_escape crate-test inf-doc lib a_step_scans_no_further_than_its_window a step examined past its window"
+  # A step that yields has written. Planted, the byte check reads one byte early, and a step of
+  # one byte yields before it writes.
+  "inf_canary_ser_yield_early crate-test inf-doc lib sliced_steps_equal_the_whole_run_at_every_budget_pair a yield wrote nothing"
+  # A step that yields under a bounded entry is not the value's end. Planted, it is taken for it.
+  "inf_canary_ser_yield_is_ok crate-test inf-doc lib the_bounded_mapping_agrees_with_the_frozen_walker_at_every_limit the bounded verdict differs"
+  # A Pending first poll takes its class's spare as its task's slot, so no id names the spare
+  # (ADR-0177 D2). Planted, the task takes the spare's handle but the spare stays set, and the
+  # next first poll writes over the suspended task, at its address.
+  "inf_canary_spare_kept_past_suspend crate-test inf-runtime test:executor the_spare_serves_no_task_an_id_names spare-under-id"
+  # The stop's mark ends every parser (ADR-0196 A1.1). Planted, it reaches active slots alone,
+  # and a SET held past the stop runs.
+  "inf_canary_stop_skips_peer_reader crate-test inf-server lib stop_ends_every_reader set-after-stop"
+  # ADR-0124 D3, ADR-0157 D4: the stop reads its lane's release one load a
+  # turn. Planted, it waits for the release in a loop, so a held control
+  # thread holds the cell past its stop deadline.
+  "inf_canary_stop_waits_worker crate-test infinityd test:graceful_stop a_held_control_thread_ends_the_stop_at_its_deadline HELD_NODE_NO_EXIT:"
+  # A class handle carries its slab's `SlabInstance`, which `reserve` compares first (ADR-0171
+  # A2.1). Planted, the compare is skipped, and another executor's class, built alike, is
+  # granted.
+  "inf_canary_task_class_instance_blind crate-test inf-runtime test:executor a_class_and_a_task_of_one_executor_are_foreign_to_another_built_alike not Granted on the other"
+  # An id's lookup reads its task's header after the class's instance compare and the index's
+  # bound against the class's slots: two censuses of one cell mint equal instances (ADR-0194
+  # D5). Planted, the bound is skipped, and another executor's id reads past the header array.
+  "inf_canary_task_id_index_unbounded crate-test inf-runtime test:executor an_id_another_class_minted_past_this_class_is_stale a header's index lies in its array"
+  # The sweep counts each visit that keeps a connection the server owes past its clock
+  # (`idle_sweep_deferrals_cell`, ADR-0193 D4), the instrument's liveness. Planted, the visit
+  # is kept and not counted, and the held client's test reads no deferral.
+  "inf_canary_timeout_deferral_uncounted crate-test inf-sim lib timeout_spares_a_command_held_at_a_frozen_peer deferrals-unread"
+  # `timeout` judges no client of a stalled cell: the sweep reads the stall's end the plane
+  # keeps (ADR-0193 D1, D2). Planted, it reads none, and a client whose PING the stall holds
+  # unread is closed during the stall.
+  "inf_canary_timeout_judges_stalled_cell crate-test inf-sim lib timeout_spares_the_replies_of_a_stalled_cell reply-owed-close"
+  # `timeout` judges a connection only when the server owes it nothing (ADR-0193 D1). Planted,
+  # the sweep closes a slot the server owes past its clock, as the receive clock alone did:
+  # the client of a command held at a frozen peer, and of an `always` write held on the
+  # device's barrier, is closed before its reply, and no deferral is counted.
+  "inf_canary_timeout_receive_clock_only crate-test inf-sim lib timeout_spares_a_command_held_at_a_frozen_peer reply-owed-close"
+  "inf_canary_timeout_receive_clock_only crate-test inf-sim lib timeout_spares_an_always_write_held_on_its_fsync reply-owed-close"
+  # A send is activity: the offer and its completion restart the clock (ADR-0193 D2).
+  # Planted, neither stores it, and a client answered after a two-timeout hold is closed a
+  # step after its reply.
+  "inf_canary_timeout_send_not_activity crate-test inf-sim lib timeout_spares_a_command_held_at_a_frozen_peer reaped-before-window"
+  # A slot is idle since the later of its clock and its cell's last stall's end (ADR-0193 D2).
+  # Planted, the clock alone, and at the stall's end a client whose PING waits in the net for a
+  # receive buffer is closed with it unread.
+  "inf_canary_timeout_since_ignores_stall crate-test inf-sim lib timeout_spares_the_replies_of_a_stalled_cell reply-owed-close"
+  # ADR-0156 D3: only a consumed `Unlinked` or `AlreadyAbsent` drops a file's
+  # owner. Planted, the cell drops it at any result, so a failed unlink is
+  # never retried, and the dropped namespace's file is on the disk once
+  # every dropped owner has drained.
+  "inf_canary_unlink_result_ignored m4-ns-lifetimes RETIRE-WINDOW"
+  # The io_uring driver dispatches a reap's completions in the kernel's order, so the bytes a
+  # peer wrote before its FIN, posted in one reap with the end of stream, come first. Planted,
+  # the reap is dispatched last first, and the end of stream comes before the bytes.
+  "inf_canary_uring_cqe_order_reversed crate-test inf-runtime/uring test:driver_conformance multishot_recv_posts_data_before_eof eof-before-data"
+  # The end of stream ends the receive: io_uring re-arms a finished multishot receive only after
+  # a positive result. Planted, a zero result re-arms it too, and the half-closed socket posts
+  # a second zero-length Recv.
+  "inf_canary_uring_eof_rearms crate-test inf-runtime/uring test:driver_conformance eof_ends_the_receive recv-after-eof"
+  # A wait dropped while queued unlinks its node and gives it back to the cell's pool in the
+  # same step (ADR-0177 D5). Planted, the drop leaves the node linked: the pool keeps it, and a
+  # thousand drops on one key fill the pool and starve the first polls after them.
+  "inf_canary_wait_drop_keeps_node crate-test inf-runtime lib a_wait_dropped_while_queued_leaves_no_entry wait-node-kept"
+  # The cell's wait nodes and its watermark gate's entry array, one entry a node, are resident
+  # from the pool's build (ADR-0177 D5, D8 with A1), inside the gate row's per-cell remainder.
+  # Planted, the pool and its array are built over (1 + k) T, k the fewest counts of T whose
+  # node and entry bytes pass ten times the idle-resident tool's 256 KiB control a cell: the
+  # idle node's resident memory a cell rises by k x T x (s_node + s_entry), 12 x 2,825 x
+  # (56 + 24) B at 4 cells. The bytes are that product at the strides the bill's test reads; a
+  # stride that moves moves them with it.
+  "inf_canary_wait_nodes_oversized binary idle-resident IDLE-RESIDENT-OVER --plant-bytes-cell 2712000 --control-bytes-cell 262144 --plant-row wait-nodes"
+  # A word resolves its slot by the generation bits it carries, the low bits of the occupant's
+  # (ADR-0194 D6 with A2). Planted, the whole generation is compared with the field, and from
+  # a slot's 2²³-th use its word reads Stale.
+  "inf_canary_word_resolve_unmasked crate-test inf-foundation lib a_word_resolves_its_slot_past_the_field_width key-stale-past-width"
+  # The same plant at the shipped topology: every cell's fabric holders start two uses short of
+  # the key's generation field, so a fan's word past it resolves stale and its reply is lost.
+  "inf_canary_word_resolve_unmasked m0-capacity fan-reply-lost --close-leg holder-near-wrap"
 )
 if [ -n "${INF_CANARY_ROWS_FILE:-}" ]; then
+  # A fixture's table is ordered whole.
   [ -f "$INF_CANARY_ROWS_FILE" ] || { echo "sim-canaries: no rows file $INF_CANARY_ROWS_FILE"; exit 2; }
-  rows=()
-  while IFS= read -r line; do [ -n "$line" ] && rows+=("$line"); done < "$INF_CANARY_ROWS_FILE"
+  rows=() ordered_rows=()
+  while IFS= read -r line; do [ -n "$line" ] && ordered_rows+=("$line"); done < "$INF_CANARY_ROWS_FILE"
+elif [ "${#rows[@]}" -ne "$historical_rows" ]; then
+  echo "sim-canaries: SCOPE ERROR — the table's first part holds ${#rows[@]} rows, not" \
+    "$historical_rows: a new row goes in the ordered part, in its cfg's place"
+  exit 1
 fi
+rows+=(${ordered_rows[@]+"${ordered_rows[@]}"})
 [ "${#rows[@]}" -gt 0 ] || { echo "sim-canaries: SCOPE ERROR — no canary rows"; exit 1; }
 
-fail=0
-log=$(mktemp)
-[ -n "$log" ] && [ -f "$log" ] || { echo "sim-canaries: mktemp failed"; exit 2; }
-trap '[ -n "$log" ] && [ -f "$log" ] && rm -f "$log"' EXIT
+# crate_package_ok <package[/features]>: the row's package token is a
+# package name, alone or with a `/` and a comma-separated list of feature
+# names; an empty list (`pkg/`) or an empty name in it is malformed.
+crate_package_ok() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*)?$ ]]
+}
 
-# crate_test <cfg> <package> <lib|test:NAME> <test name> <witness, or empty>
-crate_test() {
-  local cfg=$1 package=$2 target=$3 name=$4 witness=$5 target_args
-  case "$target" in
+# binary_flags_ok <flag…>: a binary row's flags are a plant's: they name
+# `--plant-bytes-cell` and never `--budget-bytes-cell`. A plant's bytes
+# separate it from the plain node's same-binary boots, so a caught row has
+# its control green by construction; a budget names no such separation.
+binary_flags_ok() {
+  local flag plant=0
+  for flag in "$@"; do
+    case "$flag" in
+      --plant-bytes-cell) plant=1 ;;
+      --budget-bytes-cell) return 1 ;;
+    esac
+  done
+  [ "$plant" -eq 1 ]
+}
+
+# kind_deadline_s <kind>: a run's deadline in seconds on a row of that kind, `crate-test`,
+# `loom`, `binary` or a scenario's name, or, for the kind `build`, of each build the lane
+# runs. A deadline is a hang bound: it ends a run that would wait forever and never decides
+# pass or fail, so it sits far above the slowest run a sound build makes. A row kind's is 6
+# times the slowest row of that kind the lane timed on the dev box (24 cores, K = 4: the
+# whole lanes of 2026-11-19 and the rows of 2026-11-25 and 26), rounded up to a minute. A
+# row's elapsed holds both its legs, and on the table's first cfg its planted build too, so
+# one run takes at most that. The 6 is a guess at the nightly's hosted runner, untimed: 16 GB
+# on 4 vCPUs, or 7 GB on 2, as its workflow says, where the slowest tests run 10 threads, so
+# 2.5 or 5 times fewer cores, on slower ones; a hang then costs its shard minutes of the job's
+# 360.
+#   crate-test  96.2 s  inf_canary_recover_sweep_gone_counted's boot-at-size test   600 s
+#   loom        58.6 s  inf_canary_post_rings_no_wake's model                      360 s
+#   scenario    88.3 s  inf_canary_foreign_segment's m2-recycle --sweep 64         540 s
+#   binary      91 s    idle-resident's run (its catch line's second figure, 90 or  600 s
+#                       91 s in 22 runs; the row's 160.5 s holds the planted node's build)
+#   build       148.2 s the slowest build ahead (K = 4); an hour holds a cold one on  3600 s
+#                       the runner many times over, and ends a build that cannot end
+# 2026-11-26: the four row kinds' values are the dev box's; each is to be read again from the
+# first timed nightly's `<label>: elapsed` lines, as 6 times its kind's slowest there.
+# A row whose runs need more carries its own deadline, `deadline=<N>s` as its last word,
+# with the reason in its comment.
+kind_deadline_s() {
+  case "$1" in
+    crate-test) echo 600 ;;
+    loom) echo 360 ;;
+    binary) echo 600 ;;
+    build) echo 3600 ;;
+    *) echo 540 ;;
+  esac
+}
+
+# row_words <row>: sets `words`, the row's words (split as every reader of a row splits
+# it, on blanks and tabs) less a last `deadline=<N>s`, and row_deadline_s, that N, or empty
+# where the row takes its kind's (kind_deadline_s). Non-zero when a word begins `deadline=`
+# and is not the last one spelled `deadline=<N>s`, N 1 to 99999 with no leading zero: a
+# misspelt deadline read as a witness word or a flag would leave its row on the kind's
+# without a word. The pre-pass and the run read a row through it alone, so both read its
+# deadline one way; a row that holds no `deadline=` anywhere is its words already.
+row_words() {
+  local word count
+  # shellcheck disable=SC2206
+  words=($1)
+  row_deadline_s=''
+  case "$1" in *deadline=*) ;; *) return 0 ;; esac
+  count=${#words[@]}
+  if [ "$count" -gt 0 ] && [[ "${words[$((count - 1))]}" =~ ^deadline=([1-9][0-9]{0,4})s$ ]]; then
+    row_deadline_s=${BASH_REMATCH[1]}
+    words=("${words[@]:0:$((count - 1))}")
+  fi
+  for word in ${words[@]+"${words[@]}"}; do
+    case "$word" in deadline=*) return 1 ;; esac
+  done
+}
+
+# row_ok <row>: the row starts with its cfg, `inf_canary_<name>` with a name
+# of letters, digits and `_`, as the cfg names the row's planted directory
+# under the root: another spelling could name a path outside it or another
+# directory of it. Its words are its kind's: `<cfg> crate-test
+# <package[/features]> <lib|test:NAME> <test> [witness…]`, `<cfg> loom
+# <package> <test> <witness>`, `<cfg> binary <instrument> <token>
+# <flags…>`, or a scenario's `<cfg> <scenario> <expected> [flags…]`, each
+# with or without a last `deadline=<N>s` (row_words), read without it.
+cfg_spelled='^inf_canary_[A-Za-z0-9_]+ '
+binary_word='^[A-Za-z0-9][A-Za-z0-9_-]*$'
+row_ok() {
+  local parts
+  [[ "$1" =~ $cfg_spelled ]] || return 1
+  row_words "$1" || return 1
+  parts=(${words[@]+"${words[@]}"})
+  case "${parts[1]:-}" in
+    crate-test)
+      [ "${#parts[@]}" -ge 5 ] && crate_package_ok "${parts[2]}" \
+        && [[ "${parts[3]}" =~ ^(lib|test:[A-Za-z0-9_-]+)$ ]]
+      ;;
+    loom) [ "${#parts[@]}" -eq 5 ] ;;
+    binary)
+      [ "${#parts[@]}" -ge 5 ] && [[ "${parts[2]}" =~ $binary_word ]] \
+        && [[ "${parts[3]}" =~ $binary_word ]] && binary_flags_ok "${parts[@]:4}"
+      ;;
+    *) [ "${#parts[@]}" -ge 3 ] ;;
+  esac
+}
+
+# row_label <row words…>: `<cfg> <kind> <subject>`, the subject a crate
+# test's or Loom model's name, a binary row's instrument, or a scenario with
+# its flags.
+row_label() {
+  case "$2" in
+    crate-test) echo "$1 crate-test $5" ;;
+    loom) echo "$1 loom $4" ;;
+    binary) echo "$1 binary $3" ;;
+    *) echo "$1 scenario $2${4:+ ${*:4}}" ;;
+  esac
+}
+
+# rows_out_of_order <row…>: prints the first row whose cfg sorts before the
+# cfg of the row above it, in byte order; non-zero when there is none. Every
+# reader of a pipe here reads it whole: under pipefail an awk that exits
+# early kills its writer with SIGPIPE on a long input, and the pipeline's
+# status is then the writer's 141, not the reader's verdict.
+rows_out_of_order() {
+  printf '%s\n' "$@" | LC_ALL=C awk '
+    !found && NR > 1 && $1 < cfg { print $0 " (after " cfg ")"; found = 1 }
+    { cfg = $1 }
+    END { exit !found }'
+}
+
+# The pre-pass: every row of the table is read before the first build.
+for row in "${rows[@]}"; do
+  row_ok "$row" || { echo "sim-canaries: SCOPE ERROR — malformed row: $row"; exit 1; }
+done
+if [ "${#ordered_rows[@]}" -gt 0 ] && misplaced=$(rows_out_of_order "${ordered_rows[@]}"); then
+  echo "sim-canaries: SCOPE ERROR — a row out of its cfg's place: $misplaced"
+  exit 1
+fi
+# The process-group premise (run_deadline): a run ends as its process group, so a process
+# that leaves the group (a new session or group) outlives the run's end, and the lane sees
+# nothing of it. No Rust file under crates/, bins/ or tests/ may spell a way out: `setsid`,
+# `setpgid`, `setpgrp`, `process_group` or `pre_exec` (which runs any code in the child) on
+# any line is a scope error naming it, until the lane ends such a process by another means.
+# It reads text: a name split in the text is review's. The lane's own table is read with the
+# tree it runs in; a rows file, the self-test's stub route, reads no tree.
+# shellcheck source=source-files.sh
+. scripts/source-files.sh
+group_scan=''
+if [ -z "${INF_CANARY_ROWS_FILE:-}" ]; then
+  rust_files=$(source_files '*.rs' crates bins tests) || {
+    echo "sim-canaries: SCOPE ERROR — the process-group premise cannot list crates/, bins/ and" \
+      "tests/"
+    exit 1
+  }
+  [ -n "$rust_files" ] || { echo "sim-canaries: SCOPE ERROR — no Rust file to read"; exit 1; }
+  IFS=$'\n' read -r -d '' -a rust_list <<<"$rust_files" || true
+  escape=$(LC_ALL=C awk '/setsid|setpgid|setpgrp|process_group|pre_exec/ {
+      print FILENAME ":" FNR ": " substr($0, 1, 120); found = 1
+    }
+    END { exit found ? 3 : 0 }' "${rust_list[@]}") || {
+    status=$?
+    if [ "$status" -eq 3 ]; then
+      echo "sim-canaries: SCOPE ERROR — a Rust file names a way out of a process group, which a" \
+        "run's end cannot reach:"
+      printf '%s\n' "$escape" | sed -n '1,5p'
+    else
+      echo "sim-canaries: SCOPE ERROR — the process-group premise could not read its files"
+    fi
+    exit 1
+  }
+  group_scan="; ${#rust_list[@]} Rust files read, none leaving its process group"
+fi
+if [ "$table_only" -eq 1 ]; then
+  echo "sim-canaries: table only: ${#rows[@]} rows well formed, the last ${#ordered_rows[@]}" \
+    "ordered by cfg$group_scan; nothing built or run"
+  exit 0
+fi
+if [ -n "${INF_CANARY_SHARD:-}" ]; then
+  if ! [[ "$INF_CANARY_SHARD" =~ ^(0|[1-9][0-9]*)/([1-9][0-9]*)$ ]] \
+      || [ "${BASH_REMATCH[1]}" -ge "${BASH_REMATCH[2]}" ]; then
+    echo "sim-canaries: SCOPE ERROR — INF_CANARY_SHARD wants I/K with 0 <= I < K, got '$INF_CANARY_SHARD'"
+    exit 1
+  fi
+  shard_i=${BASH_REMATCH[1]} shard_k=${BASH_REMATCH[2]}
+  cfgs=() picked=()
+  for row in "${rows[@]}"; do
+    row_cfg=${row%% *} index=-1
+    for j in "${!cfgs[@]}"; do
+      if [ "${cfgs[$j]}" = "$row_cfg" ]; then index=$j; break; fi
+    done
+    if [ "$index" -lt 0 ]; then index=${#cfgs[@]}; cfgs+=("$row_cfg"); fi
+    if [ $((index % shard_k)) -eq "$shard_i" ]; then picked+=("$row"); fi
+  done
+  echo "sim-canaries: shard $shard_i/$shard_k: ${#picked[@]} of ${#rows[@]} rows (${#cfgs[@]} cfgs)"
+  [ "${#picked[@]}" -gt 0 ] || { echo "sim-canaries: SCOPE ERROR — shard $shard_i/$shard_k holds no cfg"; exit 1; }
+  rows=("${picked[@]}")
+fi
+
+# Every build lands in this checkout's target root, each planted cfg in a
+# directory of its own there (its RUSTFLAGS differ), and every leg runs the
+# binary its own build made, whatever CARGO_TARGET_DIR holds (ADR-0198 A2).
+# shellcheck source=target-root.sh
+. scripts/target-root.sh
+target_root_setup "$(pwd -P)"
+# The simulator directory and the host are the self-test's stub routes: a
+# real cargo builds into the root and runs on this host, so a row read
+# elsewhere would judge another build, and one judged as another host's
+# could read a red as not run. A cargo is real when none is named, or when
+# it answers `--version` as cargo does: the real one or a wrapper passing
+# through to it.
+cargo_is_real() {
+  local answer=
+  if [ -n "${INF_CANARY_CARGO:-}" ]; then answer=$("$CARGO" --version 2>/dev/null || true); fi
+  case "${INF_CANARY_CARGO:+named}:$answer" in
+    : | named:"cargo "[0-9]*) return 0 ;;
+  esac
+  return 1
+}
+if [ -n "${INF_CANARY_SIM_TARGET:-}" ] && cargo_is_real; then
+  echo "sim-canaries: SCOPE ERROR — INF_CANARY_SIM_TARGET is the self-test's stub route, and" \
+    "this cargo is a real one: unset INF_CANARY_SIM_TARGET, so each row reads what it built" \
+    "in $TARGET_ROOT"
+  exit 1
+fi
+if [ -n "${INF_CANARY_HOST:-}" ] && cargo_is_real; then
+  echo "sim-canaries: SCOPE ERROR — INF_CANARY_HOST is the self-test's stub route, and this" \
+    "cargo is a real one: unset INF_CANARY_HOST, so each row is judged on this host"
+  exit 1
+fi
+if [ -n "${INF_CANARY_BENCH:-}" ] && cargo_is_real; then
+  echo "sim-canaries: SCOPE ERROR — INF_CANARY_BENCH is the self-test's stub route, and this" \
+    "cargo is a real one: unset INF_CANARY_BENCH, so each binary row runs the inf-bench" \
+    "its own build made"
+  exit 1
+fi
+
+fail=0 caught=0 controls_green=0
+not_run=()
+work=$(mktemp -d "${TMPDIR:-/tmp}/sim-canaries.XXXXXX")
+case "$work" in
+  */sim-canaries.??????) [ -d "$work" ] || { echo "sim-canaries: mktemp failed"; exit 2; } ;;
+  *) echo "sim-canaries: mktemp failed"; exit 2 ;;
+esac
+# The builds ahead, by the cfg's index in cfg_order (below): the job's
+# process id, its start, and once it is waited for its exit status and the
+# wait, each empty before.
+ahead_pid=() ahead_began=() ahead_status=() ahead_waited=()
+# groups_end <what> <process group…>: each group ends: it is sent SIGTERM, then
+# SIGKILL once 3 s pass, and the end polls each group until no process of it
+# is left but a zombie, its tick a 1 s read of the `tick` FIFO nobody writes (a
+# tick that is no FIFO would read at once, so the end then sends SIGKILL at
+# once); past 10 s it names the groups left, red. The poll is group_alive's:
+# the process table (`ps`), a group alive while a process of it is listed that
+# is not a zombie, and `kill -0` only when the table cannot be read: a killed
+# process whose reaper is slow to collect it (an orphan left to the user's
+# service manager, say) answers `kill -0` until it is reaped, where the table
+# lists it as a zombie, so the poll ends at its next tick, whatever the
+# reaper's pace. Only then is each group's leader, a job of the lane, waited
+# for, so a leader that ignores SIGTERM never holds the poll.
+groups_end() {
+  local what=$1 pid alive tick=0 kill_at=3
+  shift
+  [ "$#" -gt 0 ] || return 0
+  for pid in "$@"; do kill -TERM -- "-$pid" 2>/dev/null || true; done
+  if [ -p "$work/tick" ]; then exec 4<>"$work/tick"; else kill_at=0; fi
+  while :; do
+    alive=''
+    for pid in "$@"; do
+      group_alive "$pid" >/dev/null || continue
+      alive="$alive $pid"
+    done
+    [ -n "$alive" ] || break
+    if [ "$tick" -eq "$kill_at" ]; then
+      for pid in $alive; do kill -KILL -- "-$pid" 2>/dev/null || true; done
+    elif [ "$tick" -ge 10 ] || [ "$kill_at" -eq 0 ]; then
+      echo "   red: the process groups of $what$alive outlived SIGKILL"
+      fail=1
+      break
+    fi
+    if [ "$kill_at" -gt 0 ]; then read -r -t 1 -u 4 _ || true; fi
+    tick=$((tick + 1))
+  done
+  if [ "$kill_at" -gt 0 ]; then exec 4>&-; fi
+  for pid in "$@"; do wait "$pid" 2>/dev/null || true; done
+}
+# The run in flight (run_deadline, below): its process id, which names its
+# process group, and its deadline's watcher job, each empty between runs.
+run_pid='' run_watch=''
+# jobs_stop: every job of the lane still running ends: the deadline's watcher
+# at once (SIGKILL; it holds nothing), then, through groups_end, the run in
+# flight and every build ahead not yet waited for, each a whole process group
+# (cargo, and every compiler, linker, test and node it started). A job started
+# but not yet recorded when a signal came is in `jobs -p`.
+jobs_stop() {
+  local j pid groups=' '
+  if [ -n "$run_watch" ]; then
+    kill -KILL "$run_watch" 2>/dev/null || true
+    wait "$run_watch" 2>/dev/null || true
+    run_watch=''
+  fi
+  if [ -n "$run_pid" ]; then groups="$groups$run_pid "; fi
+  for j in ${ahead_pid[@]+"${!ahead_pid[@]}"}; do
+    [ -z "${ahead_status[$j]:-}" ] || continue
+    ahead_status[$j]=stopped
+    groups="$groups${ahead_pid[$j]} "
+  done
+  for pid in $(jobs -p 2>/dev/null); do
+    case "$groups" in *" $pid "*) ;; *) groups="$groups$pid " ;; esac
+  done
+  [ -n "${groups// /}" ] || return 0
+  # shellcheck disable=SC2086 # the groups' ids, one word each
+  groups_end "the lane's jobs" $groups
+}
+# On any exit every job ends first, each whole process group; then the
+# work directory goes, and so do the planted directory of the cfg whose rows
+# were running and of each cfg a build ahead was started for (ahead_began, set
+# before the fork, so a build a signal stopped before its process id was
+# recorded is counted too; remove_planted, below), so a run a
+# signal stops leaves no planted build behind. The signals are trapped for the
+# order: the run or build in flight, a job, ends with the builds ahead before
+# anything is removed, so the removal never runs beside a cargo still writing
+# into the directory, where an untrapped signal runs the exit trap at once.
+# SIGKILL runs no trap and leaves the jobs.
+planted_cfg=
+trap 'jobs_stop
+  case "$work" in */sim-canaries.??????) rm -rf -- "$work" ;; esac
+  [ -z "$planted_cfg" ] || remove_planted "$planted_cfg"
+  for j in ${ahead_began[@]+"${!ahead_began[@]}"}; do remove_planted "${cfg_order[$j]}"; done' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+log=$work/planted.log
+control=$work/control.log
+# The tick of every timed wait (groups_end, run_deadline): a FIFO nobody
+# writes, each reader opening it both ways, so a read never meets an end of
+# file and lasts its whole timeout.
+mkfifo "$work/tick" || { echo "sim-canaries: mkfifo failed"; exit 2; }
+# The job pool at K > 1: J - K one-byte tokens in a FIFO the lane holds open
+# both ways, so a token given back never blocks and a take never reads an end
+# of file; a cargo that inherits a pool ignores its own job bound. J - K is
+# under 1,000 bytes, which any system's pipe buffer holds.
+if [ "$builds" -gt 1 ]; then
+  mkfifo "$work/pool" || { echo "sim-canaries: mkfifo failed"; exit 2; }
+  exec 3<>"$work/pool"
+  token=$builds
+  while [ "$token" -lt "$build_jobs" ]; do
+    printf + >&3
+    token=$((token + 1))
+  done
+  export CARGO_MAKEFLAGS="-j --jobserver-auth=fifo:$work/pool"
+fi
+
+# control_names <token> <control log>: zero when the plain build's own log
+# carries the row's substring or witness, read as bytes with the control
+# bytes dropped; prints 160 bytes of the first such line from 60 before the
+# token. The whole log is read, so no writer of the pipe is cut short.
+control_names() {
+  tr -d '\000-\010\013-\037\177' <"$2" | TOKEN=$1 LC_ALL=C awk '
+    !found && (at = index($0, ENVIRON["TOKEN"])) > 0 {
+      from = at > 60 ? at - 60 : 1
+      print (from > 1 ? "..." : "") substr($0, from, 160)
+      found = 1
+    }
+    END { exit !found }'
+}
+
+# refuse_printed <what> <token>: the row's verdict when its control printed
+# the token (control_names' line in $printed).
+refuse_printed() {
+  echo "   no catch possible: the plain build prints the $1 '$2' too, so any red reads caught:"
+  echo "   $printed"
+  fail=1
+}
+
+# judged_nothing <kind> <exit status> <log> [<test name>]: zero, printing
+# the reason, when a run judged nothing: a crate test or Loom model that
+# exited 0 with no verdict line for its test, a scenario that exited 0 with
+# a line beginning `WITHHELD:`, an instrument (kind `binary`: a preflight or
+# a binary row's run) that exited 2 with one. Any other exit is never
+# judged nothing.
+judged_nothing() {
+  local line
+  case "$1:$2" in
+    crate-test:0 | loom:0)
+      if grep -Eq -- "^test ([A-Za-z0-9_]+::)*$4 \\.\\.\\. " "$3"; then return 1; fi
+      echo "no test $4 ran"
+      ;;
+    scenario:0 | binary:2)
+      line=$(tr -d '\000-\010\013-\037\177' <"$3" | LC_ALL=C awk '
+        !found && /^WITHHELD:/ { print substr($0, 1, 160); found = 1 }
+        END { exit !found }') || return 1
+      echo "$line"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# nothing_judged <label> <reason>: the row's verdict on a run that judged
+# nothing: red on Linux, the lane's host; elsewhere not run, and named.
+nothing_judged() {
+  if [ "$host" = Linux ]; then
+    echo "   red: judged nothing on the lane's host: $1 ($2)"
+    fail=1
+  else
+    echo "   NOT RUN on $host: $1 ($2)"
+    not_run+=("$1")
+  fi
+}
+
+# uring_unavailable <package[/features]> <log>: on a row whose features name
+# `uring`, prints the message line of a panic that begins `io_uring` (the
+# test could not build its ring: seccomp, an old kernel); non-zero when the
+# row names no such feature or the log holds no such panic.
+uring_unavailable() {
+  case ",${1#*/}," in
+    *,uring,*) [ "$1" != "${1%%/*}" ] || return 1 ;;
+    *) return 1 ;;
+  esac
+  tr -d '\000-\010\013-\037\177' <"$2" | LC_ALL=C awk '
+    !found && after_panic && /^io_uring/ { print substr($0, 1, 160); found = 1 }
+    { after_panic = ($0 ~ /panicked at /) }
+    END { exit !found }'
+}
+
+# plain_red <what> <log>: the row's verdict when its plain leg is not green.
+plain_red() {
+  echo "   red for another reason: the plain build does not pass $1 (a canary needs a green" \
+    "control):"
+  red_excerpt "$2"
+  fail=1
+}
+
+# red_excerpt <log>: what a red leg's log says of its failure: each line holding
+# `panicked at` and the lines of its message after it, up to a blank line, a
+# `note:` or `stack backtrace:` line or a test's `---- ` header (at most 4
+# panics of 8 lines), then the log's last 5 lines, libtest's summary; every line
+# read as bytes with the control bytes dropped and cut at 160 bytes, so a log's
+# line of any length or bytes prints bounded. The whole log is read, so no
+# writer of the pipe is cut short.
+red_excerpt() {
+  tr -d '\000-\010\013-\037\177' <"$1" | LC_ALL=C awk '
+    /panicked at / { taking = panics++ < 4 ? 8 : 0 }
+    taking && !/panicked at / && (/^$/ || /^note: / || /^stack backtrace:/ || /^---- /) {
+      taking = 0
+    }
+    taking { print substr($0, 1, 160); taking-- }
+    { last[NR % 5] = substr($0, 1, 160) }
+    END { for (line = NR > 5 ? NR - 4 : 1; line <= NR; line++) print last[line % 5] }'
+}
+
+# hung_red <plain|planted|preflight> <seconds> <whose> <log>: the row's verdict
+# when a run passed its deadline (run_deadline ended its whole process group):
+# red, on the plain leg a control that is not green, on the planted leg never a
+# catch, whatever its log holds; <whose> names the deadline, `the row's`, the
+# kind's (`the crate-test`) or `the build`.
+hung_red() {
+  case "$1" in
+    plain)
+      echo "   HUNG after $2 s ($3 deadline) on the plain build: its process group is ended," \
+        "and a canary needs a green control:"
+      ;;
+    planted)
+      echo "   HUNG after $2 s ($3 deadline) on the planted build: its process group is ended," \
+        "and a hang is never a catch:"
+      ;;
+    preflight)
+      echo "   HUNG after $2 s ($3 deadline) in the preflight: its process group is ended:"
+      ;;
+  esac
+  red_excerpt "$4"
+  fail=1
+}
+
+# group_alive <process group>: prints the process ids and names of the group's
+# processes that are not zombies, read from the process table (`ps`), comma
+# separated, and is non-zero when none is; when the table cannot be read, a
+# group `kill -0` reaches is alive, its processes unnamed.
+group_alive() {
+  local table
+  table=$(ps -A -o pgid= -o pid= -o stat= -o comm= 2>/dev/null) || {
+    kill -0 -- "-$1" 2>/dev/null || return 1
+    echo "processes the table does not list"
+    return 0
+  }
+  printf '%s\n' "$table" | LC_ALL=C awk -v g="$1" '$1 == g && $3 !~ /^Z/ {
+      printf "%s%s %s", (live++ ? ", " : ""), $2, substr($4, 1, 32)
+    }
+    END { if (live) printf "\n"; exit !live }'
+}
+
+# wait_bounded <job> <seconds>: the lane waits for its job at most <seconds>. A
+# watcher job reads the tick for <seconds>, then signals the lane (SIGUSR1,
+# again each second until it is stopped), which ends the wait; the watcher is
+# stopped once the wait ends. run_status is the job's exit status, and run_late
+# is 1 when the seconds passed first: the job then still runs, or ended on the
+# deadline's tick, and its status is not its own. The signal's trap is the
+# lane's for its whole life, and run_late is read only once the watcher is gone,
+# so a signal it sent before it was stopped is counted.
+run_late=0 run_status=0 run_late_s='' run_late_whose=''
+trap 'run_late=1' USR1
+wait_bounded() {
+  run_late=0 run_status=0
+  {
+    read -r -t "$2" -u 4 _ 4<>"$work/tick" || true
+    while kill -USR1 "$$" 2>/dev/null; do read -r -t 1 -u 4 _ 4<>"$work/tick" || true; done
+  } </dev/null >/dev/null 2>&1 3>&- &
+  run_watch=$!
+  wait "$1" || run_status=$?
+  kill -KILL "$run_watch" 2>/dev/null || true
+  wait "$run_watch" 2>/dev/null || true
+  run_watch=''
+}
+
+# run_deadline <seconds> <whose> <log|-> <command…>: one run, bounded. The
+# command, an executable the lane forks with no shell between (so its parent is
+# the lane), runs as a job in a process group of its own, stdin and the pool's
+# descriptor closed, its output the log, written whole, or the lane's own for
+# `-`, and the lane waits for it at most <seconds> (wait_bounded). Past them the
+# run's whole group ends (groups_end), and run_late is 1, with the seconds and
+# <whose> deadline they were in run_late_s and run_late_whose. A run that ends
+# in time and leaves a process of its group alive (a node it did not reap) has
+# that process named and its group ended, so nothing it started outlives it:
+# the run's verdict is still its own.
+run_deadline() {
+  local seconds=$1 whose=$2 out=$3 left
+  shift 3
+  set -m
+  if [ "$out" = - ]; then
+    "$@" </dev/null 3>&- &
+  else
+    "$@" </dev/null >"$out" 2>&1 3>&- &
+  fi
+  run_pid=$!
+  set +m
+  wait_bounded "$run_pid" "$seconds"
+  if [ "$run_late" -eq 1 ]; then
+    run_late_s=$seconds run_late_whose=$whose
+    groups_end "a run past its deadline" "$run_pid"
+  elif kill -0 -- "-$run_pid" 2>/dev/null && left=$(group_alive "$run_pid"); then
+    echo "   left behind: the run ended with processes of its group alive ($left); the group" \
+      "is ended"
+    groups_end "a run's leftovers" "$run_pid"
+  fi
+  run_pid=''
+}
+
+# leg_run <seconds> <whose> <log> <command…> -- <test arguments…>: a test leg.
+# Its build alone (`<command…> --no-run`, the command a build ahead runs), under
+# the build deadline (kind_deadline_s build), then, built, its run (`<command…>
+# -- <test arguments…>`) under <whose> deadline of <seconds>, each a bounded run
+# (run_deadline) writing the log whole. A build that fails leaves its status in
+# run_status and its output as the leg's log, judged as a compile error always
+# was: red for another reason; a build past its deadline reads late, as a run.
+leg_run() {
+  local seconds=$1 whose=$2 out=$3
+  local -a command
+  shift 3
+  command=()
+  while [ "$#" -gt 0 ] && [ "$1" != -- ]; do
+    command+=("$1")
+    shift
+  done
+  run_deadline "$(kind_deadline_s build)" "the build" "$out" "${command[@]}" --no-run
+  if [ "$run_late" -eq 1 ] || [ "$run_status" -ne 0 ]; then return 0; fi
+  run_deadline "$seconds" "$whose" "$out" "${command[@]}" "$@"
+}
+
+# build_bounded <what> <command…>: a build the lane runs in its own output under
+# the build deadline (run_deadline); non-zero when it failed or passed the
+# deadline, which it names: the caller reads either as the build failed.
+build_bounded() {
+  local what=$1
+  shift
+  run_deadline "$(kind_deadline_s build)" "the build" - "$@"
+  if [ "$run_late" -eq 1 ]; then
+    echo "   HUNG after $run_late_s s (the build deadline) building $what: its process group" \
+      "is ended"
+    return 1
+  fi
+  [ "$run_status" -eq 0 ]
+}
+
+# now_ds: the clock in tenths of a second, for the times the log prints:
+# bash 5's EPOCHREALTIME where it is set, else whole seconds (bash 3.2).
+now_ds() {
+  local t=${EPOCHREALTIME:-}
+  t=${t/,/.}
+  if [ -n "$t" ]; then
+    echo $((${t%.*} * 10 + 10#${t#*.} / 100000))
+  else
+    echo $((SECONDS * 10))
+  fi
+}
+
+# tenths <ds>: tenths of a second as seconds, `<s>.<d>`.
+tenths() {
+  local ds=$1
+  if [ "$ds" -lt 0 ]; then ds=0; fi
+  echo "$((ds / 10)).$((ds % 10))"
+}
+
+# crate_target_args <package[/features]> <lib|test:NAME>: a crate-test row's
+# target and features, in target_args: one list for its plain control, its
+# planted leg and its cfg's build ahead, so the control runs the test the
+# planted build is judged by and the leg finds its units built.
+crate_target_args() {
+  local package=${1%%/*}
+  case "$2" in
     lib) target_args=(--lib) ;;
-    test:*) target_args=(--test "${target#test:}") ;;
-    *) echo "   SCOPE ERROR: target '$target' is neither lib nor test:NAME"; fail=1; return ;;
+    *) target_args=(--test "${2#test:}") ;;
   esac
   if [ "$package" = inf-sim ]; then target_args+=(--features dst); fi
+  if [ "$1" != "$package" ]; then target_args+=(--features "${1#*/}"); fi
+}
+
+# The planted builds, each command in one place: a row's planted leg runs it,
+# and its cfg's build ahead runs the same, a test's built alone (`--no-run`),
+# as the leg's own build is before its run names the test (`-- <test>`).
+# planted_sim <cfg>: sets `leg` to the planted simulator's build command.
+planted_sim() {
+  leg=(env "RUSTFLAGS=--cfg $1" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim
+    --target-dir "$TARGET_ROOT/canary-$1")
+}
+# planted_crate_test <cfg> <package>: sets `leg` to the planted test command of
+# the crate's target in target_args (crate_target_args), an executable (`env`)
+# and its arguments, so a run of it is the lane's own child (run_deadline).
+planted_crate_test() {
+  leg=(env "RUSTFLAGS=--cfg $1" "$CARGO" test -p "$2" "${target_args[@]}"
+    --target-dir "$TARGET_ROOT/canary-$1")
+}
+# planted_loom <cfg> <package>: sets `leg` to the planted Loom models' command,
+# as planted_crate_test does.
+planted_loom() {
+  leg=(env "RUSTFLAGS=--cfg loom --cfg $1" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$2" --release
+    --lib --target-dir "$TARGET_ROOT/canary-$1")
+}
+
+# crate_test <label> <cfg> <package[/features]> <lib|test:NAME> <test name>
+# <witness, or empty>: each leg under the row's deadline (row_deadline_s).
+crate_test() {
+  local label=$1 cfg=$2 spec=$3 target=$4 name=$5 witness=$6 package=${3%%/*} target_args
+  local status reason printed
+  local -a leg
+  crate_target_args "$spec" "$target"
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
-  echo "== canary $cfg: $package $target $name on the planted build must go red"
-  if RUSTFLAGS="--cfg $cfg" "$CARGO" test -p "$package" "${target_args[@]}" \
-      --target-dir "target/canary-crate" -- "$name" > "$log" 2>&1; then
+  echo "== canary $label: $spec $target on the plain build must stay green"
+  leg_run "$row_deadline_s" "$row_deadline_from" "$control" "$CARGO" test -p "$package" \
+    "${target_args[@]}" --target-dir "$TARGET_ROOT" -- "$name" --show-output
+  status=$run_status
+  if [ "$run_late" -eq 1 ]; then
+    hung_red plain "$run_late_s" "$run_late_whose" "$control"
+    return
+  fi
+  if reason=$(judged_nothing crate-test "$status" "$control" "$name"); then
+    nothing_judged "$label" "$reason"
+    return
+  fi
+  if [ "$status" -ne 0 ] && printed=$(uring_unavailable "$spec" "$control"); then
+    echo "   red: io_uring unavailable on this host ($printed)"
+    fail=1
+    return
+  fi
+  if [ "$status" -ne 0 ] || ! grep -Eq -- "${verdict}ok" "$control"; then
+    plain_red "'$name'" "$control"
+    return
+  fi
+  if [ -n "$witness" ] && printed=$(control_names "$witness" "$control"); then
+    refuse_printed witness "$witness"
+    return
+  fi
+  controls_green=$((controls_green + 1))
+  if [ "$controls_only" -eq 1 ]; then return; fi
+  echo "== canary $label: $spec $target on the planted build must go red"
+  planted_crate_test "$cfg" "$package"
+  leg_run "$row_deadline_s" "$row_deadline_from" "$log" "${leg[@]}" -- "$name"
+  status=$run_status
+  if [ "$run_late" -eq 1 ]; then
+    hung_red planted "$run_late_s" "$run_late_whose" "$log"
+  elif reason=$(judged_nothing crate-test "$status" "$log" "$name"); then
+    nothing_judged "$label" "$reason"
+  elif [ "$status" -eq 0 ]; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"
+    fail=1
+  elif printed=$(uring_unavailable "$spec" "$log"); then
+    echo "   red: io_uring unavailable on this host ($printed)"
     fail=1
   elif ! grep -Eq -- "${verdict}FAILED" "$log"; then
     echo "   red for another reason (expected 'test $name ... FAILED'):"
-    tail -5 "$log"
+    red_excerpt "$log"
     fail=1
   elif grep -Fq -- "VACUOUS" "$log"; then
     echo "   red for another reason (the test's engagement check, not its oracle):"
@@ -441,105 +2458,696 @@ crate_test() {
     fail=1
   elif [ -n "$witness" ] && ! grep -Fq -- "$witness" "$log"; then
     echo "   red for another reason (expected the oracle's assertion '$witness'):"
-    tail -5 "$log"
+    red_excerpt "$log"
     fail=1
   elif [ -n "$witness" ]; then
     echo "   caught: $(grep -F -m1 -- "$witness" "$log" | cut -c1-160)"
+    caught=$((caught + 1))
   else
     echo "   caught: $(grep -E -m1 -- "${verdict}FAILED" "$log")"
-  fi
-  echo "== canary $cfg: $package $target $name on the plain build must stay green"
-  if ! "$CARGO" test -p "$package" "${target_args[@]}" -- "$name" > "$log" 2>&1 \
-      || ! grep -Eq -- "${verdict}ok" "$log"; then
-    echo "   the plain build does not pass '$name' (a canary needs a green control):"
-    tail -5 "$log"
-    fail=1
+    caught=$((caught + 1))
   fi
 }
 
-# loom_test <cfg> <package> <test name> <witness>: the model under
+# loom_test <label> <cfg> <package> <test name> <witness>: the model under
 # `--cfg loom`, planted and plain, each in its own target dir (RUSTFLAGS
-# differ).
+# differ), each leg under the row's deadline (row_deadline_s).
 loom_test() {
-  local cfg=$1 package=$2 name=$3 witness=$4
+  local label=$1 cfg=$2 package=$3 name=$4 witness=$5 status reason printed
+  local -a leg
   local verdict="^test ([A-Za-z0-9_]+::)*${name} \\.\\.\\. "
-  echo "== canary $cfg: $package loom $name on the planted build must go red"
-  if RUSTFLAGS="--cfg loom --cfg $cfg" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" \
-      --release --lib --target-dir "target/canary-loom" -- "$name" > "$log" 2>&1; then
+  echo "== canary $label: $package on the plain loom build must stay green"
+  leg_run "$row_deadline_s" "$row_deadline_from" "$control" env "RUSTFLAGS=--cfg loom" \
+    LOOM_MAX_PREEMPTIONS=3 \
+    "$CARGO" test -p "$package" --release --lib --target-dir "$TARGET_ROOT/loom" -- "$name" \
+    --show-output
+  status=$run_status
+  if [ "$run_late" -eq 1 ]; then
+    hung_red plain "$run_late_s" "$run_late_whose" "$control"
+    return
+  fi
+  if reason=$(judged_nothing loom "$status" "$control" "$name"); then
+    nothing_judged "$label" "$reason"
+    return
+  fi
+  if [ "$status" -ne 0 ] || ! grep -Eq -- "${verdict}ok" "$control"; then
+    plain_red "the loom model '$name'" "$control"
+    return
+  fi
+  if printed=$(control_names "$witness" "$control"); then
+    refuse_printed witness "$witness"
+    return
+  fi
+  controls_green=$((controls_green + 1))
+  if [ "$controls_only" -eq 1 ]; then return; fi
+  echo "== canary $label: $package on the planted loom build must go red"
+  planted_loom "$cfg" "$package"
+  leg_run "$row_deadline_s" "$row_deadline_from" "$log" "${leg[@]}" -- "$name"
+  status=$run_status
+  if [ "$run_late" -eq 1 ]; then
+    hung_red planted "$run_late_s" "$run_late_whose" "$log"
+  elif reason=$(judged_nothing loom "$status" "$log" "$name"); then
+    nothing_judged "$label" "$reason"
+  elif [ "$status" -eq 0 ]; then
     echo "   NOT CAUGHT: the planted build ran green (the model has no teeth)"
     fail=1
   elif ! grep -Eq -- "${verdict}FAILED" "$log"; then
     echo "   red for another reason (expected 'test $name ... FAILED'):"
-    tail -5 "$log"
+    red_excerpt "$log"
     fail=1
   elif ! grep -Fq -- "$witness" "$log"; then
     echo "   red for another reason (expected the model's assertion '$witness'):"
-    tail -5 "$log"
+    red_excerpt "$log"
     fail=1
   else
     echo "   caught: $(grep -F -m1 -- "$witness" "$log" | cut -c1-160)"
-  fi
-  echo "== canary $cfg: $package loom $name on the plain loom build must stay green"
-  if ! RUSTFLAGS="--cfg loom" LOOM_MAX_PREEMPTIONS=3 "$CARGO" test -p "$package" --release \
-      --lib --target-dir "target/loom" -- "$name" > "$log" 2>&1 \
-      || ! grep -Eq -- "${verdict}ok" "$log"; then
-    echo "   the plain loom build does not pass '$name' (a canary needs a green control):"
-    tail -5 "$log"
-    fail=1
+    caught=$((caught + 1))
   fi
 }
 
+# token_catches <token> <log>: the log's lines naming a scenario row's
+# expected violation substring, read as bytes with the control bytes dropped
+# (a violation line may quote a key's raw bytes), less every engagement
+# clause the token does not name. A line carrying `VACUOUS` is kept only
+# where the token stands whole (no name character before it) and is closed
+# by `:` or ` —`, the clause's name; wherever else it stands — before the
+# word, as a leg's name, in the clause's text — the line is an engagement
+# clause, not the oracle. Non-zero when no line is left.
+token_catches() {
+  tr -d '\000-\010\013-\037\177' <"$2" | TOKEN=$1 LC_ALL=C awk '
+    function names_clause(line, token,    from, at, pos, before, after) {
+      from = 1
+      while (from <= length(line) && (at = index(substr(line, from), token)) > 0) {
+        pos = from + at - 1
+        before = pos > 1 ? substr(line, pos - 1, 1) : " "
+        after = substr(line, pos + length(token))
+        if (before !~ /[A-Za-z0-9_-]/ && (substr(after, 1, 1) == ":" || index(after, " —") == 1))
+          return 1
+        from = pos + 1
+      }
+      return 0
+    }
+    index($0, ENVIRON["TOKEN"]) == 0 { next }
+    index($0, "VACUOUS") == 0 || names_clause($0, ENVIRON["TOKEN"]) { print; kept = 1 }
+    END { exit !kept }'
+}
+
+# The plain simulator: 0 not built yet, 1 built, 2 its build failed (every
+# scenario row then reads that red, and no planted simulator is built).
 sim_built=0
 # A plain leg is the scenario, its flags and the seed, not the plant: rows
-# that share one share its run (three rows run m4-recovery
-# --replay-above-window at the lane seed, about 34 s each).
-plain_green="|"
-for row in "${rows[@]}"; do
-  # shellcheck disable=SC2206
-  parts=($row)
-  cfg=${parts[0]}
-  if [ "${parts[1]}" = crate-test ]; then
-    [ "${#parts[@]}" -ge 5 ] || { echo "sim-canaries: SCOPE ERROR — malformed row: $row"; exit 1; }
-    crate_test "$cfg" "${parts[2]}" "${parts[3]}" "${parts[4]}" "${parts[*]:5}"
-    continue
-  fi
-  if [ "${parts[1]}" = loom ]; then
-    [ "${#parts[@]}" -eq 5 ] || { echo "sim-canaries: SCOPE ERROR — malformed row: $row"; exit 1; }
-    loom_test "$cfg" "${parts[2]}" "${parts[3]}" "${parts[4]}"
-    continue
-  fi
-  name=${parts[1]}; expect=${parts[2]}; flags=("${parts[@]:3}")
+# that share one share its run and its log (three rows run m4-recovery
+# --replay-above-window at the lane seed, about 34 s each), and the run's
+# deadline is its first row's. A leg's log is `leg-<index>.log`, its index its
+# place in `control_legs`, matched whole; `control_state` holds the leg's
+# verdict at the same index: `green`, `red`, `nothing` with the reason after a
+# space, or `hung` with the deadline's seconds and whose it was.
+control_legs=()
+control_state=()
+
+# scenario_row <label> <cfg> <scenario> <expected> [flags…]: each run under
+# the row's deadline (row_deadline_s).
+scenario_row() {
+  local label=$1 cfg=$2 name=$3 expect=$4 leg index j status reason printed catches planted
+  local hung
+  local -a flags
+  flags=("${@:5}")
   if [ "$sim_built" -eq 0 ]; then
-    "$CARGO" build --release -p inf-sim --features dst --bin inf-sim
     sim_built=1
+    build_bounded "the plain inf-sim" \
+      "$CARGO" build --release -p inf-sim --features dst --bin inf-sim --target-dir "$TARGET_ROOT" \
+      || sim_built=2
   fi
-  plain=target/release/inf-sim
-  target="target/canary-$cfg"
-  echo "== canary $cfg: building inf-sim with --cfg $cfg into $target"
-  RUSTFLAGS="--cfg $cfg" "$CARGO" build --release -p inf-sim --features dst --bin inf-sim \
-    --target-dir "$target"
-  planted="$target/release/inf-sim"
-  echo "== canary $cfg: $name ${flags[*]} (lane seed $seed) on the planted build must go red"
-  if "$planted" --scenario "$name" --seed "$seed" "${flags[@]}" > "$log" 2>&1; then
+  if [ "$sim_built" -eq 2 ]; then
+    echo "== canary $label: the plain inf-sim build"
+    echo "   red for another reason (the plain build failed; its output is above)"
+    fail=1
+    return
+  fi
+  leg="$name ${flags[*]:-}" index=-1
+  for j in ${control_legs[@]+"${!control_legs[@]}"}; do
+    if [ "${control_legs[$j]}" = "$leg" ]; then index=$j; break; fi
+  done
+  if [ "$index" -ge 0 ]; then
+    echo "== canary $label: on the plain build: ${control_state[$index]%% *} above, not run again"
+  else
+    echo "== canary $label: on the plain build must stay green"
+    index=${#control_legs[@]}
+    control_legs+=("$leg")
+    run_deadline "$row_deadline_s" "$row_deadline_from" "$work/leg-$index.log" \
+      "$sim_target/release/inf-sim" --scenario "$name" --seed "$seed" ${flags[@]+"${flags[@]}"}
+    status=$run_status
+    if [ "$run_late" -eq 1 ]; then
+      control_state+=("hung $run_late_s $run_late_whose")
+    elif reason=$(judged_nothing scenario "$status" "$work/leg-$index.log"); then
+      control_state+=("nothing $reason")
+    elif [ "$status" -ne 0 ]; then
+      control_state+=(red)
+    else
+      control_state+=(green)
+    fi
+  fi
+  case "${control_state[$index]}" in
+    nothing\ *)
+      nothing_judged "$label" "${control_state[$index]#nothing }"
+      return
+      ;;
+    hung\ *)
+      hung=${control_state[$index]#hung }
+      hung_red plain "${hung%% *}" "${hung#* }" "$work/leg-$index.log"
+      return
+      ;;
+    red)
+      plain_red "'${leg% }'" "$work/leg-$index.log"
+      return
+      ;;
+    green) ;;
+    *)
+      echo "   red: the plain leg's state '${control_state[$index]}' is none the lane writes"
+      fail=1
+      return
+      ;;
+  esac
+  if printed=$(control_names "$expect" "$work/leg-$index.log"); then
+    refuse_printed substring "$expect"
+    return
+  fi
+  controls_green=$((controls_green + 1))
+  if [ "$controls_only" -eq 1 ]; then return; fi
+  echo "== canary $label: building inf-sim with --cfg $cfg into $TARGET_ROOT/canary-$cfg"
+  planted_sim "$cfg"
+  if ! build_bounded "the planted inf-sim" "${leg[@]}"; then
+    echo "   red for another reason (the planted build failed; its output is above)"
+    fail=1
+    return
+  fi
+  planted="$sim_target/canary-$cfg/release/inf-sim"
+  echo "== canary $label: lane seed $seed on the planted build must go red"
+  run_deadline "$row_deadline_s" "$row_deadline_from" "$log" "$planted" --scenario "$name" \
+    --seed "$seed" ${flags[@]+"${flags[@]}"}
+  status=$run_status
+  if [ "$run_late" -eq 1 ]; then
+    hung_red planted "$run_late_s" "$run_late_whose" "$log"
+  elif reason=$(judged_nothing scenario "$status" "$log"); then
+    nothing_judged "$label" "$reason"
+  elif [ "$status" -eq 0 ]; then
     echo "   NOT CAUGHT: the planted build ran green (the oracle has no teeth)"
     fail=1
   elif ! grep -q -- "$expect" "$log"; then
     echo "   red for another reason (expected a violation mentioning '$expect'):"
-    tail -5 "$log"
+    red_excerpt "$log"
+    fail=1
+  elif ! catches=$(token_catches "$expect" "$log"); then
+    # Each line naming the token is an engagement clause it does not name:
+    # the run missed a regime, and the oracle judged nothing.
+    echo "   red for another reason (the leg's engagement clause, not its oracle):"
+    grep -a -m1 -- "$expect" "$log" | tr -d '\000-\010\013-\037\177' | cut -c1-160
     fail=1
   else
-    # A violation line may quote a key's raw bytes: read the log as text
-    # and drop the control bytes, or the catch prints nothing.
-    echo "   caught: $(grep -a -m1 -- "$expect" "$log" | tr -d '\000-\010\013-\037\177' | cut -c1-160)"
+    echo "   caught: $(cut -c1-160 <<<"${catches%%$'\n'*}")"
+    caught=$((caught + 1))
   fi
-  leg="$name ${flags[*]}"
-  if [[ "$plain_green" == *"|$leg|"* ]]; then
-    echo "== canary $cfg: $name ${flags[*]} on the plain build: green above, not run again"
-    continue
+}
+
+# The binary rows' shared builds, each once a lane, beside the plain node:
+# 0 not built yet, 1 built, 2 its build failed (every binary row then reads
+# that red, and no node is built for it). `inf-bench` is the named stub's
+# in a fixture and is not built then.
+bench_built=0 node_built=0
+bench=${INF_CANARY_BENCH:-$sim_target/canary-plain/release/inf-bench}
+plain_node=$sim_target/canary-plain/release/infinityd
+# Each instrument's preflight, once a lane, under the binary kind's deadline
+# (kind_deadline_s): its name in `preflight_names` and, at the same index, its
+# verdict in `preflight_state`, `ok`, `red` or `nothing` with the reason after
+# a space, or `hung` with the deadline's seconds; its log
+# `preflight-<index>.log`.
+preflight_names=()
+preflight_state=()
+
+# binary_preflights: before the first row, `inf-bench` built once (when no
+# stub is named) and each binary row's instrument preflighted once, so a
+# host outside an instrument's scope builds no node at all.
+binary_preflights() {
+  local row name j index status reason seconds
+  local -a parts
+  for row in "${rows[@]}"; do
+    # shellcheck disable=SC2206
+    parts=($row)
+    [ "${parts[1]}" = binary ] || continue
+    name=${parts[2]} index=-1
+    for j in ${preflight_names[@]+"${!preflight_names[@]}"}; do
+      if [ "${preflight_names[$j]}" = "$name" ]; then index=$j; break; fi
+    done
+    [ "$index" -lt 0 ] || continue
+    if [ "$bench_built" -eq 0 ]; then
+      bench_built=1
+      if [ -z "${INF_CANARY_BENCH:-}" ]; then
+        echo "== binary rows: building inf-bench into $TARGET_ROOT/canary-plain"
+        build_bounded "inf-bench" env RUSTFLAGS= "$CARGO" build --release -p inf-bench \
+          --target-dir "$TARGET_ROOT/canary-plain" || bench_built=2
+      fi
+    fi
+    index=${#preflight_names[@]}
+    preflight_names+=("$name")
+    if [ "$bench_built" -eq 2 ]; then preflight_state+=(unbuilt); continue; fi
+    echo "== binary rows: $name --preflight"
+    seconds=$(kind_deadline_s binary)
+    run_deadline "$seconds" "the binary" "$work/preflight-$index.log" "$bench" "$name" --preflight
+    status=$run_status
+    tr -d '\000-\010\013-\037\177' <"$work/preflight-$index.log" \
+      | LC_ALL=C awk 'NR <= 3 { print "   " substr($0, 1, 160) }'
+    if [ "$run_late" -eq 1 ]; then
+      preflight_state+=("hung $seconds")
+    elif reason=$(judged_nothing binary "$status" "$work/preflight-$index.log"); then
+      preflight_state+=("nothing $reason")
+    elif [ "$status" -eq 0 ]; then
+      preflight_state+=(ok)
+    else
+      preflight_state+=("red $status")
+    fi
+  done
+}
+
+# token_line <token> <log>: the first line that begins `<token>:`, read as
+# bytes with the control bytes dropped, 160 of them; non-zero when none. A
+# token inside another line (an error quoting it) is no verdict.
+token_line() {
+  tr -d '\000-\010\013-\037\177' <"$2" | TOKEN="$1:" LC_ALL=C awk '
+    !found && index($0, ENVIRON["TOKEN"]) == 1 { print substr($0, 1, 160); found = 1 }
+    END { exit !found }'
+}
+
+# binary_row <label> <cfg> <instrument> <token> [flags…]: the instrument's run
+# under the row's deadline (row_deadline_s), its node builds unbounded.
+binary_row() {
+  local label=$1 cfg=$2 name=$3 token=$4 index=-1 j state status reason line built_at ran_at
+  local -a flags
+  flags=("${@:5}")
+  if [ "$controls_only" -eq 1 ]; then
+    echo "== canary $label: its control is the plain node inside its planted run: not run here"
+    return
   fi
-  echo "== canary $cfg: $name ${flags[*]} on the plain build must stay green"
-  "$plain" --scenario "$name" --seed "$seed" "${flags[@]}" > /dev/null
-  plain_green+="$leg|"
+  for j in ${preflight_names[@]+"${!preflight_names[@]}"}; do
+    if [ "${preflight_names[$j]}" = "$name" ]; then index=$j; break; fi
+  done
+  state=unbuilt
+  if [ "$index" -ge 0 ]; then state=${preflight_state[$index]}; fi
+  case "$state" in
+    unbuilt)
+      echo "== canary $label: the inf-bench build"
+      echo "   red for another reason (the inf-bench build failed; its output is above)"
+      fail=1
+      return
+      ;;
+    nothing\ *)
+      nothing_judged "$label" "${state#nothing }"
+      return
+      ;;
+    red\ *)
+      echo "== canary $label: $name --preflight"
+      echo "   red for another reason (the preflight exited ${state#red }):"
+      red_excerpt "$work/preflight-$index.log"
+      fail=1
+      return
+      ;;
+    hung\ *)
+      echo "== canary $label: $name --preflight"
+      hung_red preflight "${state#hung }" "the binary" "$work/preflight-$index.log"
+      return
+      ;;
+    ok) ;;
+    *)
+      echo "== canary $label: $name --preflight"
+      echo "   red: the preflight's state '$state' is none the lane writes"
+      fail=1
+      return
+      ;;
+  esac
+  if [ "$node_built" -eq 0 ]; then
+    node_built=1
+    echo "== binary rows: building the plain infinityd into $TARGET_ROOT/canary-plain"
+    build_bounded "the plain infinityd" env RUSTFLAGS= "$CARGO" build --release -p infinityd \
+      --target-dir "$TARGET_ROOT/canary-plain" || node_built=2
+  fi
+  if [ "$node_built" -eq 2 ]; then
+    echo "== canary $label: the plain infinityd build"
+    echo "   red for another reason (the plain build failed; its output is above)"
+    fail=1
+    return
+  fi
+  echo "== canary $label: building infinityd with --cfg $cfg into $TARGET_ROOT/canary-$cfg"
+  built_at=$SECONDS
+  if ! build_bounded "the planted infinityd" env "RUSTFLAGS=--cfg $cfg" "$CARGO" build --release \
+      -p infinityd --target-dir "$TARGET_ROOT/canary-$cfg"; then
+    echo "   red for another reason (the planted build failed; its output is above)"
+    fail=1
+    return
+  fi
+  echo "== canary $label: the planted node against the plain one must read $token"
+  ran_at=$SECONDS
+  run_deadline "$row_deadline_s" "$row_deadline_from" "$log" "$bench" "$name" \
+    --base "$plain_node" --candidate "$sim_target/canary-$cfg/release/infinityd" "${flags[@]}"
+  status=$run_status
+  if [ "$run_late" -eq 1 ]; then
+    hung_red planted "$run_late_s" "$run_late_whose" "$log"
+  elif reason=$(judged_nothing binary "$status" "$log"); then
+    nothing_judged "$label" "$reason"
+  elif [ "$status" -eq 0 ]; then
+    echo "   NOT CAUGHT: the instrument read the planted node within (the plant has no teeth):"
+    tail -3 "$log"
+    fail=1
+  elif [ "$status" -eq 1 ] && line=$(token_line "$token" "$log"); then
+    echo "   caught: $line ($((ran_at - built_at)) s + $((SECONDS - ran_at)) s)"
+    caught=$((caught + 1))
+  elif [ "$status" -eq 2 ]; then
+    line=$(tr -d '\000-\010\013-\037\177' <"$log" | LC_ALL=C awk '
+      !found && /^NO VERDICT:/ { print substr($0, 1, 160); found = 1 }
+      END { if (!found) print "no NO VERDICT line" }')
+    echo "   red for another reason (the instrument gave no verdict): $line"
+    fail=1
+  else
+    echo "   red for another reason (exit $status, expected 1 and a line beginning '$token:'):"
+    red_excerpt "$log"
+    fail=1
+  fi
+}
+
+# A planted cfg's build serves its own rows alone: its RUSTFLAGS give every
+# unit a hash of its own, so no other cfg reuses an artifact, and kept, the
+# builds outgrow the disk (over 100 GB for the whole table). So each cfg
+# builds in `canary-<cfg>` under the root, whatever its rows' kinds; its rows
+# run together, cfgs in the order of their first rows and a cfg's rows in
+# the table's, each judged as its own; and the directory goes once the last
+# of them is judged, caught or red: at most K planted cfgs' builds at once
+# (one at K = 1), whatever the table's order. The removal is the root's own,
+# target_root_remove: a directory directly below this checkout's root that
+# holds no work tree and no other root, the walk of ADR-0204 D2.
+seen_cfgs=" "
+cfg_order=() grouped=()
+for row in "${rows[@]}"; do
+  case "$seen_cfgs" in
+    *" ${row%% *} "*) ;;
+    *)
+      cfg_order+=("${row%% *}")
+      seen_cfgs="$seen_cfgs${row%% *} "
+      ;;
+  esac
+done
+for row_cfg in "${cfg_order[@]}"; do
+  for row in "${rows[@]}"; do
+    if [ "${row%% *}" = "$row_cfg" ]; then grouped+=("$row"); fi
+  done
+done
+rows=("${grouped[@]}")
+# The tests the nextest config runs alone, read at K > 1, where they schedule,
+# from the config's own gate (`check-nextest-config.sh --print-alone`), which
+# parses `.config/nextest.toml` as TOML and holds the one copy of the filter
+# forms: each override with `threads-required = "num-test-threads"` gives its
+# filter's binary (`<package>` a library's tests, `<package>::<target>` an
+# integration test's, `*<package>` every binary of the package, from
+# `package(<package>)`) in alone_binary and its test (empty for every test)
+# in alone_test, at one index. A missing or unreadable config, or a run-alone
+# filter in none of the forms, is the gate's scope error and the lane's.
+alone_binary=() alone_test=()
+if [ "$builds" -gt 1 ]; then
+  alone_rows=$(env -u INF_CHECK_ROOT scripts/check-nextest-config.sh --print-alone 2>&1) || {
+    echo "sim-canaries: SCOPE ERROR — at INF_CANARY_BUILDS $builds the tests the nextest config" \
+      "runs alone schedule the lane, and its gate cannot name them:"
+    printf '%s\n' "$alone_rows" | sed -n '1,5p'
+    exit 1
+  }
+  while IFS='|' read -r alone_id alone_package alone_name; do
+    [ -n "$alone_id$alone_package" ] || continue
+    if [ -n "$alone_package" ]; then
+      alone_binary+=("*$alone_package")
+    else
+      alone_binary+=("$alone_id")
+    fi
+    alone_test+=("$alone_name")
+  done <<<"$alone_rows"
+fi
+
+# runs_alone <row words…>: zero when the row is a crate-test or Loom row whose
+# test the nextest config runs alone: its binary (a Loom model's is its
+# package's library tests) and its test name, which a filter's
+# `test(=<path>)` names whole or as the path's last segment.
+runs_alone() {
+  local package binary name j
+  case "$2" in
+    crate-test)
+      package=${3%%/*} name=$5 binary=$package
+      case "$4" in test:*) binary="$package::${4#test:}" ;; esac
+      ;;
+    loom) package=$3 name=$4 binary=$package ;;
+    *) return 1 ;;
+  esac
+  for j in ${alone_binary[@]+"${!alone_binary[@]}"}; do
+    case "${alone_binary[$j]}" in "$binary" | "*$package") ;; *) continue ;; esac
+    case "${alone_test[$j]}" in "" | "$name" | *"::$name") return 0 ;; esac
+  done
+  return 1
+}
+
+# cfg_kinds, at a cfg's index in cfg_order: what its build ahead may build,
+# ` tests` when it holds a crate-test or Loom row and ` sim` a scenario row;
+# or why the cfg runs alone, which none builds ahead: ` binary` when it holds
+# a binary row, else ` alone` when a test row's test runs alone. One pass, as
+# a cfg's rows stand together.
+cfg_kinds=() kinds= row_cfg=
+for row in "${rows[@]}"; do
+  # shellcheck disable=SC2206
+  parts=($row)
+  if [ "${parts[0]}" != "$row_cfg" ]; then
+    [ -z "$row_cfg" ] || cfg_kinds+=("$kinds")
+    row_cfg=${parts[0]} kinds=
+  fi
+  case "$kinds:${parts[1]}" in
+    " binary":* | *:binary) kinds=" binary" ;;
+    " alone":*) ;;
+    *:crate-test | *:loom)
+      if runs_alone "${parts[@]}"; then
+        kinds=" alone"
+      else
+        case "$kinds" in *tests*) ;; *) kinds="$kinds tests" ;; esac
+      fi
+      ;;
+    *) case "$kinds" in *sim*) ;; *) kinds="$kinds sim" ;; esac ;;
+  esac
+done
+[ -z "$row_cfg" ] || cfg_kinds+=("$kinds")
+
+# ahead_build <cfg>: the body of a cfg's build ahead, a background job: the
+# planted builds its rows' legs run, one after another and each once, in the
+# table's order, with stdin closed; a binary row's never, and a scenario
+# row's only once the plain simulator is built (as the job was started). The
+# job's seconds go to `ahead-<cfg>.ds`; it exits with its first failed
+# build's status, after every build ran.
+ahead_build() {
+  local cfg=$1 row key made=" " status=0 built began package target_args
+  local -a parts leg
+  began=$(now_ds)
+  for row in "${rows[@]}"; do
+    [ "${row%% *}" = "$cfg" ] || continue
+    # shellcheck disable=SC2206
+    parts=($row)
+    package=${parts[2]%%/*}
+    case "${parts[1]}" in
+      crate-test) key="test:${parts[2]}:${parts[3]}" ;;
+      loom) key="loom:$package" ;;
+      binary) continue ;;
+      *)
+        [ "$sim_built" -eq 1 ] || continue
+        key=sim
+        ;;
+    esac
+    case "$made" in *" $key "*) continue ;; esac
+    made="$made$key "
+    built=0
+    case "$key" in
+      test:*)
+        crate_target_args "${parts[2]}" "${parts[3]}"
+        planted_crate_test "$cfg" "$package"
+        3>&- "${leg[@]}" --no-run
+        ;;
+      loom:*)
+        planted_loom "$cfg" "$package"
+        3>&- "${leg[@]}" --no-run
+        ;;
+      sim)
+        planted_sim "$cfg"
+        3>&- "${leg[@]}"
+        ;;
+    esac </dev/null >>"$work/ahead-$cfg.log" 2>&1 || built=$?
+    if [ "$status" -eq 0 ]; then status=$built; fi
+  done
+  echo $(($(now_ds) - began)) >"$work/ahead-$cfg.ds"
+  return "$status"
+}
+
+# ahead_start <index>: the build ahead of the cfg at that index of cfg_order,
+# a job in a process group of its own, so jobs_stop ends its compilers too.
+ahead_start() {
+  ahead_began[$1]=$(now_ds)
+  set -m
+  ahead_build "${cfg_order[$1]}" </dev/null >/dev/null 2>&1 &
+  ahead_pid[$1]=$!
+  set +m
+}
+
+# ahead_fill <index>: the builds ahead of the K - 1 cfgs after the one at
+# <index>, each not yet started and with a build to make now: a test or Loom
+# row's, or a scenario row's once the plain simulator is built. A cfg left
+# out is taken up by a later fill while it is in the window.
+ahead_fill() {
+  local j=$(($1 + 1))
+  while [ "$j" -lt $(($1 + builds)) ] && [ "$j" -lt "${#cfg_order[@]}" ]; do
+    if [ -z "${ahead_pid[$j]:-}" ]; then
+      case "${cfg_kinds[$j]}:$sim_built" in
+        *tests*:* | *sim*:1) ahead_start "$j" ;;
+      esac
+    fi
+    j=$((j + 1))
+  done
+}
+
+# ahead_reap <index>: the cfg's build ahead, if started, waited for once, at
+# most until the build deadline (kind_deadline_s build) from its start passes:
+# then its whole group ends and its status is `hung`. Its status and the wait
+# kept.
+ahead_reap() {
+  local status began left_s
+  [ -n "${ahead_pid[$1]:-}" ] && [ -z "${ahead_status[$1]:-}" ] || return 0
+  began=$(now_ds)
+  left_s=$(($(kind_deadline_s build) - (began - ahead_began[$1]) / 10))
+  if [ "$left_s" -lt 1 ]; then left_s=1; fi
+  wait_bounded "${ahead_pid[$1]}" "$left_s"
+  status=$run_status
+  if [ "$run_late" -eq 1 ]; then
+    groups_end "a build ahead past its deadline" "${ahead_pid[$1]}"
+    status=hung
+  fi
+  ahead_status[$1]=$status
+  ahead_waited[$1]=$(($(now_ds) - began))
+}
+
+# ahead_drain: every build ahead started, waited for.
+ahead_drain() {
+  local j
+  for j in ${ahead_pid[@]+"${!ahead_pid[@]}"}; do ahead_reap "$j"; done
+}
+
+# ahead_join <index>: before the cfg's first row, its build ahead waited for
+# and named: its seconds and the wait, or its failure and its log's last lines.
+ahead_join() {
+  local cfg=${cfg_order[$1]} built
+  [ -n "${ahead_pid[$1]:-}" ] || return 0
+  ahead_reap "$1"
+  built=$(cat "$work/ahead-$cfg.ds" 2>/dev/null || echo 0)
+  case "${ahead_status[$1]}" in
+    0)
+      echo "== canary $cfg: built ahead in $(tenths "$built") s, $(tenths "${ahead_waited[$1]}")" \
+        "s waited for"
+      ;;
+    hung)
+      echo "== canary $cfg: its build ahead passed the build deadline ($(kind_deadline_s build) s" \
+        "from its start) and is ended; each row's leg builds again, in order:"
+      red_excerpt "$work/ahead-$cfg.log"
+      ;;
+    *)
+      echo "== canary $cfg: its build ahead failed (exit ${ahead_status[$1]} after" \
+        "$(tenths "$built") s); each row's leg builds again, in order:"
+      tail -5 "$work/ahead-$cfg.log"
+      ;;
+  esac
+}
+
+# remove_planted <cfg>: the cfg's planted directory, through the root's own
+# removal (row_ok spelled the cfg); refused or failed, it is red.
+remove_planted() {
+  local dir=$TARGET_ROOT/canary-$1 removed
+  if [ ! -e "$dir" ] && [ ! -L "$dir" ]; then return 0; fi
+  if removed=$(target_root_remove "$dir" 2>&1); then
+    echo "== canary $1: its planted build $removed removed"
+  else
+    echo "   red: $dir is not removed: $removed"
+    fail=1
+  fi
+}
+
+if [ "$host" = Linux ]; then echo "host: Linux $(uname -r)"; fi
+if [ "$builds" -gt 1 ]; then
+  echo "builds: $builds cfgs' planted builds at once, on $build_jobs jobs (a pool of" \
+    "$((build_jobs - builds)) tokens)"
+elif [ "$controls_only" -eq 0 ]; then
+  echo "builds: one cfg's planted build at a time"
+fi
+start=$SECONDS
+if [ "$controls_only" -eq 0 ]; then binary_preflights; fi
+cfg_index=-1
+for index in "${!rows[@]}"; do
+  # shellcheck disable=SC2206
+  parts=(${rows[$index]})
+  if [ "${parts[0]}" != "$planted_cfg" ]; then
+    cfg_index=$((cfg_index + 1))
+    planted_cfg=${parts[0]}
+    if [ "$builds" -gt 1 ]; then
+      case "${cfg_kinds[$cfg_index]}" in
+        " binary") alone="a binary row" ;;
+        " alone") alone="a test .config/nextest.toml runs alone" ;;
+        *) alone= ;;
+      esac
+      if [ -n "$alone" ]; then
+        echo "== canary $planted_cfg: its rows run alone ($alone): every build ahead ends, and" \
+          "none starts until they are judged"
+        ahead_drain
+      else
+        ahead_fill "$cfg_index"
+      fi
+      ahead_join "$cfg_index"
+    fi
+  fi
+  # The row's words without its deadline (the pre-pass read each), and the
+  # deadline every run of the row is held to.
+  row_words "${rows[$index]}"
+  parts=("${words[@]}")
+  row_deadline_from="the row's"
+  if [ -z "$row_deadline_s" ]; then
+    case "${parts[1]}" in
+      crate-test | loom | binary) row_deadline_from="the ${parts[1]}" ;;
+      *) row_deadline_from="the scenario" ;;
+    esac
+    row_deadline_s=$(kind_deadline_s "${parts[1]}")
+  fi
+  label=$(row_label "${parts[@]}")
+  began=$(now_ds)
+  case "${parts[1]}" in
+    crate-test)
+      crate_test "$label" "${parts[0]}" "${parts[2]}" "${parts[3]}" "${parts[4]}" "${parts[*]:5}"
+      ;;
+    loom) loom_test "$label" "${parts[0]}" "${parts[2]}" "${parts[3]}" "${parts[4]}" ;;
+    binary) binary_row "$label" "${parts[0]}" "${parts[@]:2}" ;;
+    *) scenario_row "$label" "${parts[0]}" "${parts[@]:1}" ;;
+  esac
+  echo "== canary $label: elapsed $(tenths $(($(now_ds) - began))) s"
+  next=${rows[$((index + 1))]:-}
+  if [ "${next%% *}" != "${parts[0]}" ]; then
+    remove_planted "${parts[0]}"
+    planted_cfg=
+  fi
 done
 if [ "$fail" -ne 0 ]; then echo "sim-canaries: FAILED"; exit 1; fi
-echo "sim-canaries: ${#rows[@]} canaries caught, plain builds green (seed $seed)"
+judged=$caught
+if [ "$controls_only" -eq 1 ]; then judged=$controls_green; fi
+if [ "$judged" -eq 0 ]; then echo "sim-canaries: SCOPE ERROR — no row ran on $host"; exit 1; fi
+not_run_text=
+if [ "${#not_run[@]}" -gt 0 ]; then
+  not_run_text=$(printf '; %s' "${not_run[@]}")
+  not_run_text=", ${#not_run[@]} not run on $host (${not_run_text#; })"
+fi
+if [ "$controls_only" -eq 1 ]; then
+  echo "sim-canaries: controls only: $judged rows' controls green$not_run_text, none printing its" \
+    "row's substring or witness, no plant judged, in $((SECONDS - start)) s (seed $seed)"
+  exit 0
+fi
+echo "sim-canaries: $judged canaries caught$not_run_text, plain builds green in" \
+  "$((SECONDS - start)) s (seed $seed)"

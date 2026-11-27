@@ -3,13 +3,13 @@
     clippy::disallowed_types,
     reason = "test-only: filesystem fixtures outside cell code (ADR-0144 D5)"
 )]
-//! M2-S06 integration: `always` acks gate on the durability watermark.
+//! `always` acks gate on the durability watermark (ADR-0177 D5).
 //! The oracle — **no response leaves the cell before the watermark covers
 //! its LSN** — is asserted inside every ack future (support harness) and
-//! swept here across seeded random completion schedules; the wake-storm AC
-//! is proven at the executor level (bounded drain under the EXECUTE
-//! budget). The full sim-tier oracle (power cuts, 10k seeds) binds at
-//! M2-S18/S19 on the sim disk.
+//! swept here across seeded random completion schedules; one fsync's wake
+//! storm is bounded at the mechanism tier (the gate wakes a budget a turn,
+//! ADR-0177 A2). The full sim-tier oracle (power cuts, 10k seeds) is the
+//! simulator's durable scenario on its simulated disk.
 
 mod support;
 
@@ -19,10 +19,12 @@ use std::rc::Rc;
 
 use inf_alloc::BufferPool;
 use inf_foundation::CellId;
-use inf_foundation::bounded::CapCensus;
+use inf_foundation::bounded::{Cap, CapCensus, CapFill};
 use inf_foundation::time::{Nanos, VirtualClock};
-use inf_log::{FsyncClass, SegmentConfig, StagingConfig};
-use inf_runtime::{CellExecutor, CellLoop, LoopConfig, WatermarkGate};
+use inf_log::{FsyncClass, LogGeometry, SegmentConfig, StagingConfig};
+use inf_runtime::{
+    CellLoop, ExecutorLayout, ExecutorProgress, LoopConfig, TaskAdmission, WaitNodes, WatermarkGate,
+};
 use support::{DurablePlane, IoMode, ScriptedDriver, test_dir};
 
 /// Deterministic xorshift64* (L7: no ambient randomness).
@@ -48,19 +50,24 @@ fn run_schedule(seed: u64, dir: &Path) {
         driver.delays.push_back(rng.below(4) as u32);
     }
     let clock = Rc::new(VirtualClock::new(Nanos::ZERO));
-    let (_census, serve_mark) = CapCensus::new(CellId(0));
+    let (census, serve_mark) = CapCensus::new(CellId(0));
+    let (timer_set, everysec_owner) = support::everysec_timers(&census);
     let mut lp = CellLoop::new(
         driver,
         Rc::clone(&clock),
         BufferPool::new(4, 1024),
         LoopConfig::default(),
         serve_mark,
+        timer_set,
+        support::loop_executor(&census),
     );
     // Small segments: rotation + seal fsyncs interleave with linked ones.
+    let staging = StagingConfig::with_capacity(16 << 10);
+    let segment = SegmentConfig { segment_bytes: 16 << 10, ..Default::default() };
     let mut plane = DurablePlane::new(
         dir,
-        StagingConfig::with_capacity(16 << 10),
-        SegmentConfig { segment_bytes: 16 << 10, ..Default::default() },
+        LogGeometry::new(staging, segment).expect("geometry"),
+        everysec_owner,
     );
     plane.jobs_per_iter = 1 + rng.below(24) as usize;
     let mut always = 0;
@@ -84,7 +91,7 @@ fn run_schedule(seed: u64, dir: &Path) {
         assert!(iters < 200_000, "schedule {seed:#x} failed to quiesce");
         let quiesced = plane.jobs.is_empty()
             && plane.staging.is_empty()
-            && plane.in_flight.is_empty()
+            && plane.commit.frames_unwritten() == 0
             && plane.commit.pending_fsyncs() == 0;
         idle = if quiesced { idle + 1 } else { 0 };
     }
@@ -109,48 +116,82 @@ fn no_ack_before_covering_fsync_across_random_schedules() {
     }
 }
 
-/// S06 wake-storm AC (mechanism tier): one fsync completion releasing 50k
-/// gated futures is O(N) ready-queue appends drained across iterations
-/// under the EXECUTE budget — never one unbounded burst. The wall-clock
-/// p99.9 < 2 ms row binds on the reference box (S22).
+/// The wake storm at the mechanism tier (ADR-0177 A2): one fsync completion
+/// covers 50,000 gated futures. `advance` wakes none; the gate wakes them a
+/// budget at a time, as the durable cell's LOG steps call it, each turn one
+/// `wake_covered` and one EXECUTE pass at the same 1,024, so the storm leaves
+/// over 49 turns, in LSN order, no call past its budget and no turn's pass
+/// past EXECUTE's. The wall-clock bound, foreground p99.9 < 2 ms through the
+/// storm, binds on the reference box; this test reads no time.
 #[test]
-fn wake_storm_50k_drains_under_the_execute_budget() {
+fn wake_storm_50k_drains_a_budget_a_turn() {
     const WAITERS: u64 = 50_000;
-    const BUDGET: usize = 1024;
-    let mut executor = CellExecutor::new(4096);
-    let gate = WatermarkGate::new();
+    /// A turn's wakes and its EXECUTE pass: the durable cell's wakes between
+    /// two LOG steps, `ACK_WAKES_PER_TURN`, which `inf-server` owns and this
+    /// crate cannot reach, so `inf-server`'s tie holds this copy equal to it;
+    /// and the loop's default EXECUTE budget, which the wake budget may not
+    /// pass.
+    const WAKE_BUDGET: usize = 1_024;
+    /// The turns the storm takes: one a budget of waits.
+    const TURNS: usize = WAITERS.div_ceil(WAKE_BUDGET as u64) as usize;
+    /// The storm's waiters, all alive at once.
+    const STORM: Cap = Cap::entries::<{ WAITERS as u32 }>("storm-waiters", CapFill::Serving);
+    /// The gate's pool: a wait node for each waiter (ADR-0177 D5).
+    const STORM_NODES: Cap = Cap::entries::<{ WAITERS as u32 }>("storm-nodes", CapFill::Serving);
+    async fn storm_waiter(gate: WatermarkGate, lsn: u64, order: Rc<RefCell<Vec<u64>>>) {
+        gate.wait_for(lsn).await;
+        order.borrow_mut().push(lsn);
+    }
+    let (census, _mark) = CapCensus::new(CellId(0));
+    let mut layout = ExecutorLayout::new(&census);
+    let class = layout.class(&storm_waiter, STORM).expect("the storm's class");
+    let mut executor = layout.build().expect("no class refuses");
+    let pool = WaitNodes::build(STORM_NODES, &census).expect("the storm's pool");
+    let gate = WatermarkGate::build(pool.seat);
     let order = Rc::new(RefCell::new(Vec::with_capacity(WAITERS as usize)));
     for lsn in 1..=WAITERS {
         let gate = gate.clone();
         let order = Rc::clone(&order);
-        executor.spawn_local(async move {
-            gate.waiter(lsn).await;
-            order.borrow_mut().push(lsn);
-        });
+        let TaskAdmission::Granted(permit) = executor.reserve(class) else {
+            panic!("the storm's class holds every waiter");
+        };
+        permit.spawn_local(move || storm_waiter(gate, lsn, order));
     }
     // Futures suspend on first poll (spawn queues them once).
-    while executor.run_ready(BUDGET) == BUDGET {}
-    executor.run_ready(BUDGET);
+    while executor.run_ready(WAKE_BUDGET).entries() == WAKE_BUDGET {}
+    executor.run_ready(WAKE_BUDGET);
     assert_eq!(gate.waiting(), WAITERS as usize);
 
     // ONE fsync completion advances the watermark over all of them.
-    assert_eq!(gate.advance(WAITERS), WAITERS as usize);
+    gate.advance(WAITERS);
+    assert_eq!(
+        executor.run_ready(WAKE_BUDGET),
+        ExecutorProgress::default(),
+        "advance itself woke a wait"
+    );
+    assert!(gate.owes(), "the advance owes the storm's wakes");
 
-    let mut slices = 0;
+    let mut turns = 0;
     let mut polled_total = 0;
-    loop {
-        let polled = executor.run_ready(BUDGET);
-        if polled == 0 {
+    // One turn more than the storm needs: a gate still owing after it fails below.
+    for _ in 0..=TURNS {
+        if !gate.owes() {
             break;
         }
-        assert!(polled <= BUDGET, "EXECUTE budget violated by a wake storm");
-        polled_total += polled;
-        slices += 1;
+        let woken = gate.wake_covered(WAKE_BUDGET);
+        assert!(woken <= WAKE_BUDGET, "a call woke {woken}, past its budget");
+        let pass = executor.run_ready(WAKE_BUDGET);
+        let batch = ExecutorProgress { tasks_polled: woken, slots_reclaimed: 0 };
+        assert_eq!(pass, batch, "turn {turns}: the pass runs the batch it woke");
+        polled_total += pass.tasks_polled;
+        turns += usize::from(woken > 0);
     }
+    assert!(!gate.owes(), "wakes still owed after {TURNS} turns");
+    assert_eq!(turns, TURNS, "the storm leaves a budget a turn");
     assert_eq!(polled_total, WAITERS as usize, "every gated future resumed");
-    assert_eq!(slices, WAITERS.div_ceil(BUDGET as u64) as usize, "drain spread across slices");
+    assert_eq!(gate.waiting(), 0, "no wait left on the gate");
     assert_eq!(executor.live_tasks(), 0, "no leaked tasks after the storm");
-    // FIFO by LSN: the gate wakes in BTreeMap (LSN) order and the ready
+    // FIFO by LSN: the gate wakes in its heap's (LSN) order and the ready
     // queue preserves it.
     let order = order.borrow();
     assert!(order.windows(2).all(|w| w[0] < w[1]), "wake order must be FIFO by LSN");

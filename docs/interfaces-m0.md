@@ -126,8 +126,12 @@ impl Arena {
 > slots). Failure: a construction refusal releases partial backing and
 > takes part in the all-cells boot barrier, and task-identity exhaustion
 > is a typed refusal before any effect, never a wrap (ADR-0149 D1–D3). The
-> signatures below are the implemented shape; the replacement above is not
-> built.
+> executor's replacement is built as the ADR-0177 note below amends it
+> (an erased class id, no `Closed`): `run_ready` returns
+> `ExecutorProgress`, the tasks polled and the slots reclaimed apart, each
+> entry charged against the slice budget, so their sum is at most it. The
+> gate part is built as the same note amends it; `IoGate` takes no
+> cleanup parameter: its fixed cleanup is the default, `DropValue`.
 
 > **Accepted 2026-09-22, implementation open — ADR-0151:** fixed storage
 > and bounded cell maps narrows `KeyedGate` keys to the runtime's sealed,
@@ -140,8 +144,13 @@ impl Arena {
 > and never through a caller's `Hash` or comparison. A map answers
 > `Occupied`, `Vacant` or `Full`, and a vacant slot fixes the key and
 > every tree position before the payload is built (ADR-0151 D1, D2).
+> Built: both key bounds are sealed. A keyed gate's key is a `GateKey`
+> (`u64`, `CompletionToken` or the cold gate's `LogicalId`, each routed by
+> its exact word), and a wait list's is a `ListKey`, bounded by the
+> foundation's sealed `ExactKey`; no crate outside the runtime implements
+> either.
 
-> **Accepted 2026-10-19, implementation open — ADR-0177:** the executor
+> **Accepted 2026-10-19, built — ADR-0177:** the executor
 > and the gates, as this decision rebuilds them, change the ADR-0149
 > note above and, for the fabric gate only, what the ADR-0151 note says
 > of gate keys. A task class is an erased `TaskClass` id from
@@ -159,14 +168,52 @@ impl Arena {
 > replaces `has_waiter(key)` in the cold-read note below, and the holder
 > returns at `release(hold)`. The cold gate is built with `ColdReads`,
 > not before the cell serves, until the cold-read host is built before
-> serving (a deviation, expiry 2026-11-30). `WaitList` and
+> serving (a deviation, expiry 2027-01-31). `WaitList` and
 > `WatermarkGate` take one wait node per parked task from a per-cell
 > pool; `WaitList`'s keys, FIFO, `wake_one`, `wake_all` and baton are
 > unchanged, and no type joins the suspension primitives sketched below.
-> No wire, durable or token layout changes. The old signatures below do
-> not establish that the replacement is built.
+> No wire, durable or token layout changes. Built: D2's task classes,
+> `reserve`'s four answers, `wake(TaskId)` and `park()`; D4's fabric gate,
+> with its units, minted keys and orphaned holders, and the keyed gates'
+> holds, `has_waiter` deleted; and D7's generation policies. A keyed
+> gate's key is a `GateKey`, its exact `u64` word: `u64`,
+> `CompletionToken` or the cold gate's `LogicalId`, a sealed set that no
+> crate outside the runtime implements. D5 is built. A cell
+> builds one wait-node pool before it serves: `WaitNodes::build` answers
+> its `T` nodes, one for each task slot of its classes, on its census
+> (row `wait-nodes`), with the seat of its one `WatermarkGate`, the gate's
+> heap entries built in the pool's steps. Each of the cell's `WaitList`s
+> takes the pool at its constructor, and `WatermarkGate::build(seat)`
+> consumes the seat, which is move-only, so a pool has one gate. A
+> list's wait takes its node at its first poll, not at
+> `wait(key)`, so a key's FIFO is in first-poll order, and returns it at
+> the poll that reads its wake or at its drop; dropped while queued, it
+> unlinks in O(1). `WaitList::unit` keeps the unit key's one pair of ends
+> in its own state, with no map and no refusal. `WaitList::keyed` holds
+> every key it serves in a capped map filled at its build and admits none
+> after: a refused map, or a cap short of its keys, answers `KeysRefused`
+> before the cell serves. A list's keys are the unit key, `u8`, `u16`,
+> `u32`, `u64` and `CellId` (ADR-0151 D1). A first poll that finds no
+> free node, or no entry for its key, counts `wait_nodes_full` in
+> `INFO tripwires`, wakes its task and is Ready at its next poll with no
+> wake landed: `ListWait::starved()` says so, and a caller that counts
+> on a wake waits again. The watermark gate is a minimum heap by LSN over
+> the same pool: a wait at or below the watermark is Ready at its first
+> poll with no node; above it, it takes a node and a heap entry at that
+> poll and gives both back at the poll that reads its wake or at its
+> drop, so no cancelled state exists (`interfaces-m2` section 2 holds
+> its rows). The executor's and the gate module's lines below are as
+> built.
 
-> **Accepted 2026-10-19, implementation open — ADR-0003 A1:** a standard
+> **Accepted 2026-11-20, built — ADR-0177 A2:**
+> `WatermarkGate`'s wake is budgeted. `advance(lsn)` moves the watermark
+> and wakes nothing; `wake_covered(budget)` wakes the queued waits at or
+> below it in LSN order, at most `budget` a call, and answers how many;
+> `owes()` says whether a covered wait may be left. The durable plane
+> calls it at a sync's completion and at the head of each LOG step, at
+> most `ACK_WAKES_PER_TURN` (1,024) between two LOG steps of a cell.
+
+> **Accepted 2026-10-19, built — ADR-0003 A1:** a standard
 > `Waker` is thread-safe. Its data names a `Sync` wake bridge whose only
 > atomics are its foreign lane's; on its own cell's thread a waker
 > operation runs no atomic read-modify-write. A wake from another thread
@@ -180,9 +227,9 @@ impl Arena {
 > "bridge wakers (no atomics on the owner lane)". No signature in this
 > document changes.
 
-> **Accepted 2026-09-22, implementation open — ADR-0154:** fixed timer
-> ownership and bounded callback delivery replaces TimerWheel/TimerId and
-> the raw-key on_timer contract below. Fallible boot construction admits
+> **Accepted 2026-09-22, built for D1–D3 — ADR-0154:** fixed timer ownership and
+> bounded callback delivery: a typed `on_timer` notice from owners the
+> host reserved, never a raw key. Fallible boot construction admits
 > fixed TimerSet owner positions and an indexed minimum heap.
 > Cancel/replace physically removes the prior entry; owner/arm identities
 > are checked and do not wrap. Delivery keeps the position through
@@ -196,9 +243,9 @@ impl Arena {
 > stale result; and close wins over a successor. A deadline is normalized
 > to no earlier than the next millisecond after the current turn, and
 > clock-range exhaustion is a typed error before arming (ADR-0154 D1–D3).
-> The sketch below is the implemented shape; the replacement above is not
-> built. The ten phases, one backend entry and existing gates remain
-> unchanged.
+> The sketch below is the built shape. The ten phases, one backend entry
+> and existing gates remain unchanged. D4's cold-host role and A1's
+> retirement role are not yet built.
 
 > **Accepted 2026-09-22, implementation open — ADR-0147:** bounded accept
 > admission and terminal parking replaces native multishot accept with
@@ -293,12 +340,15 @@ impl Arena {
 > ColdWait` + `drain(push) → issued` — bounded per-class intent FIFOs,
 > per-cell device-QD cap, 3:1 foreground:maintain deficit, and
 > adjacent/overlapping same-file coalescing with shared-window `ColdDone`
-> fan-out (last drop releases the lease). `on_completion` gains the
-> injected `now_us` and returns the delivered-waiter count. The driver
-> contract is untouched: a merged read is one ordinary `TierRead` whose
+> fan-out (last drop releases the lease). `on_completion` gained the
+> injected `now_us` and returned the delivered-waiter count;
+> `record_completion` and `deliver_ready` have replaced it (ADR-0181 R1,
+> below). The driver contract is untouched: a merged read is one ordinary `TierRead` whose
 > window fits one pool buffer (the `ReadFixed` upgrade applies only to a
 > registered pool).
-> `KeyedGate` gains `has_waiter` (drain-side stale-intent skip). No
+> `KeyedGate` gained `has_waiter` (drain-side stale-intent skip);
+> `waiting(&GateHold)`, asked through the queued intent's hold, has
+> replaced it (ADR-0177 D4, above). No
 > `IoOp`/`CompletionResult`/`TokenClass` layout change.
 >
 > **Amended 2026-09-30 (ADR-0167 D3):** `enqueue`
@@ -329,10 +379,12 @@ impl Arena {
 > keeps counting reads that await the device; pending-delivery members and
 > windows and delivery work get their own counters; and `cold_read_p99_us`
 > samples at logical delivery, with device-to-delivery delay observed
-> apart (ADR-0152 D3, D4). The `on_completion` fan-out above is the
-> implemented shape; this replacement is not built.
+> apart (ADR-0152 D3, D4). The receipt, the budgeted delivery, the park
+> veto and these counters are built, in the signature the ADR-0181 note
+> below gives, and the `on_completion` fan-out is gone; the fixed waiter
+> and window storage is not yet built.
 
-> **Accepted 2026-09-22, implementation open — ADR-0152 A1:** the optional
+> **Accepted 2026-09-22, built — ADR-0152 A1:** the optional
 > early executor pass precedes `parse_execute`. The A1 correction adds a
 > default-no-op `CellPlane::before_execute` hook after FABRIC-IN and
 > before both scheduled executor passes, borrowing one native-turn cold
@@ -362,8 +414,26 @@ impl Arena {
 > `COLD_PREPARATION_WORK_PER_TURN` (64 each), are `inf-runtime::limits`
 > constants; `record_completion` takes the outcome as `Result<(), i32>`
 > and returns `ColdReceipt`, not `()`; and `enqueue` takes the tiered
-> lifetime its pin key names. The three notes above summarize it. Not
-> built.
+> lifetime its pin key names. The three notes above summarize it. Built:
+> the two limits, `record_completion`'s signature, the `before_execute`
+> delivery with its park veto, the stored readiness and the identity pairs
+> with `ColdRefused::IdentityExhausted`. Not yet built: `enqueue`'s
+> lifetime argument, the preparation budget in `drain` and
+> `drain_budgeted`, `ColdWait`'s cancellation notice, the retry timer and
+> the fixed storage.
+
+> **Accepted 2026-11-13, built — ADR-0181 A1:** the native cold turn is
+> built at an iteration's first lend, never as the iteration begins. The
+> loop keeps one private turn slot beside its groups and stamps it with
+> the iteration count, which advances as each iteration begins and is
+> always on; a lend whose slot another iteration built builds both
+> budgets whole, and every later lend of the iteration shares what they
+> left, at any step. The delivery lend is a call,
+> `with_cold_delivery_budget(|budget| …)`, that charges the Foreground
+> group the units its call spent as it returns; the preparation lend
+> settles nothing. An iteration in which no step lends builds no turn and
+> stores none, and the server's hook lends only when its host holds
+> ready delivery.
 
 > **Accepted 2026-09-22, implementation open — ADR-0153:** cold-pool
 > construction and native registration establishes a fallible chunked pool
@@ -418,7 +488,9 @@ pub enum IoOp {
 pub struct Completion { pub token: CompletionToken, pub result: CompletionResult }
 pub enum CompletionResult {
     Accepted { fd: RawFd },
-    Recv { buf: BufferId, len: u32 },      // len == 0 ⇒ peer closed (EOF)
+    Recv { buf: BufferId, len: u32 },      // len == 0 ⇒ peer closed (EOF): the arm's last
+                                            // completion; no Recv for the fd follows it until a
+                                            // RecvArm (ADR-0196 A1.3)
     RecvDropped,                            // pool dry; recv paused, re-arm needed
     Sent { buf: BufferId },
     Closed,
@@ -449,36 +521,72 @@ pub trait BackendDriver {
 }
 // impls: KqueueDriver (macOS dev tier) · UringDriver (linux + --features uring) · SimDriver (inf-sim)
 
-// Executor (ADR-0003 A1): !Send futures, bridge wakers (no atomics on the owner lane), slab tasks.
-// NOTE: the original sketch (`poll_immediate -> PollImmediate<F>` returning
-// the future on Pending) was unsound — a !Unpin future cannot move after its
-// first poll. The shipped shape places the future into stable storage BEFORE
-// the first poll and promotes in place; Ready still allocates nothing (reused
-// scratch buffer + recycled header, no task slot).
+// Executor (ADR-0003 A1, ADR-0177 D2): !Send futures, bridge wakers (no atomics on the owner
+// lane), one fixed slab a task class, built before the cell serves. A permit's future is placed
+// in its class's spare slot before its first poll, polled where it lies and dropped there: Ready
+// at the first poll keeps no task, and a slot a waker still names is held Retired until that
+// waker's last drop, then reclaimed by run_ready. A slot whose u64 generation is spent retires
+// for good; a class with no slot left answers Exhausted, the cell's fail-stop (ADR-0177 D7).
+pub struct ExecutorLayout;                  // a cell's classes, each slab on the cell's census
 pub struct CellExecutor;
-pub struct TaskId;                          // {slot, generation}; stale ids detectable
+pub struct TaskClass;                       // erased and Copy; reserve checks its slab's instance
+pub struct TaskId;                          // {class, slot, generation}; stale ids detectable
+pub enum TaskAdmission<'a, F> { Granted(TaskPermit<'a, F>), Full, Exhausted, Foreign }
 pub enum PollImmediate { Completed, Suspended(TaskId) }
+pub enum Woken { Queued, AlreadyRunnable, Stale }
+pub struct ExecutorProgress { pub tasks_polled: usize, pub slots_reclaimed: usize }
+impl ExecutorLayout {
+    pub fn new(census: &Rc<CapCensus>) -> ExecutorLayout;
+    /// The factory is read for its future's type and never called.
+    pub fn class<Args, Fac: TaskFactory<Args>>(&mut self, factory: &Fac, cap: Cap)
+        -> Result<TaskClass, CapError>;
+    pub fn build(self) -> Result<CellExecutor, ExecutorInitError>;
+}
 impl CellExecutor {
-    pub fn new(capacity: usize) -> Self;
-    /// Fast path: poll in place once; Completed ⇒ no slot, no malloc, no waker kept.
-    pub fn poll_immediate<F: Future<Output = ()> + 'static>(&mut self, fut: F) -> PollImmediate;
-    pub fn spawn_local<F: Future<Output = ()> + 'static>(&mut self, fut: F) -> TaskId;
-    pub fn run_ready(&mut self, budget: usize) -> usize;   // tasks polled this slice
-    pub fn live_tasks(&self) -> usize;                     // slab occupancy (leak assert)
+    pub fn reserve<F: Future<Output = ()> + 'static>(&mut self, class: TaskClass)
+        -> TaskAdmission<'_, F>;
+    pub fn wake(&mut self, id: TaskId) -> Woken;          // the owner's wake, by id
+    pub fn run_ready(&mut self, budget: usize) -> ExecutorProgress;  // apart; sum ≤ budget
+    pub fn has_ready(&self) -> bool;
+    pub fn live_tasks(&self) -> usize;
     pub fn is_live(&self, id: TaskId) -> bool;
 }
-// Suspension primitives (typed, the only ways to suspend — `gate` module):
-pub struct KeyedGate<K, V>;        // single-waiter primitive; complete() may precede first poll
-pub type FabricGate<V> = KeyedGate<u64, V>;   // token-keyed; V = fabric reply payload
-                                              // (inf-fabric is ABOVE this crate in the DAG)
+// A permit borrows its executor: used in the step that reserved it, never across an await.
+impl<F: Future<Output = ()> + 'static> TaskPermit<'_, F> {
+    /// Fast path: poll once in place; Completed ⇒ no task kept, the slot stays the spare.
+    pub fn poll_immediate(self, make: impl FnOnce() -> F) -> PollImmediate;
+    pub fn spawn_local(self, make: impl FnOnce() -> F) -> TaskId;   // polled by run_ready
+}
+pub fn park() -> Park;      // a leaf future: suspends once, stores no waker, woken by wake(id)
+// Suspension primitives (typed, the only ways to suspend: the `gate` module and park() above):
+// A gate's holders are fixed at its build; a value no waiter takes goes to its fixed Cleanup,
+// and complete() answers Delivered or Orphan. One waiter a key; complete() may precede first poll.
+pub struct KeyedGate<K: GateKey, V, C: Cleanup<V> = DropValue>;  // the caller's key (ADR-0177 D4)
+    // K: u64, CompletionToken or LogicalId; GateKey is sealed (ADR-0151 D1)
+    // build(cap, &census): routes and holders of cap; reserve(key) -> Granted(permit) | Duplicate
+    // | Full; permit.register() -> wait, or register_held() -> (wait, GateHold); waiting(&hold);
+    // release(hold); complete(key, value)
+pub struct FabricGate<V, C: Cleanup<V> = DropValue>;  // mints its key; V = fabric reply payload
+    // build(origin, units_max, holders, &census, &nodes); units(n) -> Option<GateUnits>;
+    // reserve(&units) -> Granted(permit) | NoUnit | Full; permit.key() is the request's
+    // FabricToken word; permit.register(&gate, sent) -> GateWait; complete(&gate, key, value,
+    // now); a wait dropped before its value leaves its holder Orphaned until the reply
+    // (inf-fabric is ABOVE this crate in the DAG)
 pub type IoGate = KeyedGate<CompletionToken, CompletionResult>;  // M7 seam, exists at M0
-pub struct WaitList<K>;            // key-keyed FIFO; wake_one/wake_all; baton-pass on drop
-pub struct WatermarkGate;          // LSN-keyed; advance(lsn) wakes all ≤ lsn
+pub struct WaitList<K: ListKey>;   // key-keyed FIFO; wake_one/wake_all; baton-pass on drop;
+                                   // unit(&nodes) or keyed(&nodes, cap, &census, keys)
+                                   // -> Result<_, KeysRefused>; a ListWait reads starved()
+pub struct WatermarkGate;          // LSN-keyed min-heap over the pool: build(seat); wait_for(lsn);
+                                   // advance(to) wakes none; wake_covered(budget) -> woken, in
+                                   // LSN order; owes() -> bool (ADR-0177 D5, A2)
+// Not a suspension primitive: the cell's wait-node pool, taken by every WaitList (ADR-0177 D5).
+pub struct WaitNodes;              // build(cap, &census) -> Result<WaitPool, CapError>; T nodes
+pub struct WaitPool { pub nodes: WaitNodes, pub seat: WatermarkSeat }  // seat: move-only, one gate
 
 // Reactor loop skeleton: the 10 steps with budgets + always-on iteration histogram.
 pub trait CellPlane {
     fn on_completion(&mut self, cx: &mut LoopCx<'_>, c: Completion);   // 1 REAP dispatch
-    fn on_timer(&mut self, cx: &mut LoopCx<'_>, key: u64) {}           // timer fired
+    fn on_timer<'n>(&mut self, cx: &mut LoopCx<'_>, notice: &'n TimerNotice) -> TimerOutcome<'n> { TimerOutcome::Complete } // one due arm
     fn fabric_in(&mut self, cx: &mut LoopCx<'_>) {}                    // 2
     fn before_execute(&mut self, cx: &mut LoopCx<'_>) {}               // execute prelude, ADR-0152 A1
     fn parse_execute(&mut self, cx: &mut LoopCx<'_>);                  // 3+4
@@ -490,14 +598,14 @@ pub trait CellPlane {
 pub struct LoopCx<'a> {            // ops pushed here ride the NEXT single submit (L3)
     pub now: Nanos,
     pub pool: &'a mut BufferPool, pub executor: &'a mut CellExecutor,
-    pub timers: &'a mut TimerWheel,
+    // timers(&mut self) -> Timers<'_>: arm, cancel, close, phase, successor, armed_max
     // push(IoOp) · budget(GroupClass) · charge(GroupClass, units) · note_fabric(msgs)
-    // Private delivery and preparation budgets initialized once per native iteration.
+    // A private cold turn, both budgets, built at an iteration's first lend.
 }
-pub struct ColdDeliveryBudget { remaining: u32 } // private, non-Copy; no public reset/constructor
-pub struct ColdPreparationBudget { remaining: u32 } // same restrictions, separate allowance
+pub struct ColdDeliveryBudget { remaining: u32, spent: u32 } // private, non-Copy; no public reset/constructor
+pub struct ColdPreparationBudget { remaining: u32, spent: u32 } // same restrictions, separate allowance
 impl LoopCx<'_> {
-    pub fn cold_delivery_budget(&mut self) -> &mut ColdDeliveryBudget;
+    pub fn with_cold_delivery_budget<R>(&mut self, serve: impl FnOnce(&mut ColdDeliveryBudget) -> R) -> R;
     pub fn cold_preparation_budget(&mut self) -> &mut ColdPreparationBudget;
 }
 pub struct CellLoop<D: BackendDriver, C: Clock>;
@@ -508,9 +616,13 @@ impl CellLoop {
     pub fn tripwires(&self) -> [(&'static str, u64); 5];   // frozen names, M0-S19 scrape
 }
 
-// Timer wheel v0 + scheduler groups v0 (E2 scope):
-pub struct TimerWheel;  // 6×64 hierarchical, 1 ms tick; insert/cancel/advance/next_deadline
-pub struct TimerId;     // generation-checked (stale cancels rejected)
+// Timer set (ADR-0154) + scheduler groups v0 (E2 scope):
+pub struct TimerSet;       // build(Cap, &census) -> Result<_, CapError>; reserve(route) -> Reserved
+pub struct TimerOwner;     // a reserved position: slot, generation, the set's identity; not Clone
+pub struct TimerArm;       // an owner and its arm sequence (Copy): cancel acts on this arm only
+pub struct TimerNotice;    // the delivered arm and its route; only TimerSet::begin makes one
+pub struct Successor<'n>;  // the notice's next deadline, checked when made; borrows it, not Clone
+pub enum TimerOutcome<'n> { Complete, Successor(Successor<'n>) }
 pub enum GroupClass { Foreground, Maintenance }
 pub struct GroupScheduler;  // deficit-weighted, burst-capped; refill/budget/charge
 ```
@@ -533,6 +645,30 @@ pub struct GroupScheduler;  // deficit-weighted, burst-capped; refill/budget/cha
 > (ADR-0150 D3, D4, A1). The codec and data-credit sketch below are the
 > implemented shape: these additions are not built, and they bound no
 > retained reply's bytes.
+
+> **ADR-0212 (2026-11-26), implementation open:** ADR-0212 supersedes
+> ADR-0150 whole and restates the note above, with these additions.
+> `StreamReady` also carries `measured:u8` and `length:u64`: the stream's
+> whole encoded length, when its producer measured it before the first
+> byte. `StreamResult` gains result `3`, `Released`: the producer's own
+> end of a read stream. A progress token comes from one `u64` counter a
+> directed pair and is never reused. `MeshConfig` gains
+> `progress_credits`, at least 1, and a ring needs `ring_capacity ≥ 2 ×
+> (data_credits + progress_credits)`: 16 in the shipped mesh, 1 at the
+> default. A reply of at most one chunk travels inline and a larger one
+> streams (ADR-0212 D3, D4). Not built.
+
+> **ADR-0190 (2026-10-29):** `Outcome` has
+> `ErrorReply(&'a [u8])`, outcome tag 7, encoded as `Bytes` is: a leg's
+> reply whose outcome is `Error`. `Bytes` keeps tag 1 and carries only a
+> reply whose outcome is `Success`. The tag is set from the reply's
+> outcome where the owner sends and read back into it where the origin
+> decodes, never from the bytes. `ErrCode` has `EmptyReply`, wire value
+> 5: the origin's refusal of a zero-byte `Bytes` or `ErrorReply`, made
+> where the owned reply is built, never in the codec, which stays total
+> and decodes a zero-length reply. An unknown tag is still a decode error.
+> Tag 6 is `StreamReady` (ADR-0150, above). The sketch below is the
+> shape (ADR-0190 D3).
 
 ```rust
 pub struct FabricToken(pub u64);           // {origin_cell:16, seq:48}; reply-routing key
@@ -561,7 +697,8 @@ pub enum Op<'a> {
     /// incoming credit backs custody until then. This lifetime is unbuilt.
     AdoptConn { token: FabricToken, fd: u32 },
 }
-pub enum Outcome<'a> { Ok, Bytes(&'a [u8]), Int(i64), Nil, Bool(bool), Err(ErrCode) }
+pub enum Outcome<'a> { Ok, Bytes(&'a [u8]), ErrorReply(&'a [u8]), Int(i64), Nil, Bool(bool),
+                       Err(ErrCode) }   // ErrorReply: tag 7; ErrCode::EmptyReply: 5
 pub fn encode(op: &Op<'_>, out: &mut Vec<u8>);
 pub fn decode(frame: &[u8]) -> Result<Op<'_>, CodecError>;
 
@@ -571,18 +708,33 @@ pub fn decode(frame: &[u8]) -> Result<Op<'_>, CodecError>;
 // retained backing owner and two non-cloneable endpoints, fallible
 // construction, eight slots for ADR-0156's cleanup jobs, capacity-first
 // reservation and explicit budgeted retirement. Existing ring/mesh
-// signatures are unchanged. The variant is unbuilt.
+// signatures are unchanged. Built: both variants run one algorithm.
 pub struct Producer<T>; pub struct Consumer<T>;
 pub fn ring<T>(capacity: usize) -> (Producer<T>, Consumer<T>);
 impl Producer<T> { pub fn try_push(&mut self, v: T) -> Result<(), T>;
                    pub fn publish_batch(&mut self, it: impl Iterator<Item=T>) -> usize; }
 impl Consumer<T> { pub fn consume_batch(&mut self, max: usize, f: impl FnMut(T)) -> usize; }
+// The retained variant (RETAINED_RING_SLOTS = 8; each block ≤ 65,536 B):
+impl RetainedRing<T> { pub fn admit() -> Result<Self, RingLayoutRefused>;
+    pub fn build_step(&mut self, steps: &mut RingSteps) -> RingPhase;
+    pub fn split(&mut self) -> Option<(RetainedProducer<T>, RetainedConsumer<T>)>;
+    pub fn cancel(&mut self) -> RingPhase; pub fn join(&mut self) -> RingPhase;
+    pub fn retire_step(&mut self, steps: &mut RingSteps, sink: impl FnOnce(T)) -> RingPhase; }
+   // a drop before RingPhase::Terminal fails stop and frees nothing
+impl RetainedProducer<T> { pub fn reserve(&mut self, want: usize) -> Reservation<'_, T>; }
+impl Reservation<'_, T> { pub fn permit(&mut self) -> Option<Permit<'_, '_, T>>;
+                          pub fn publish(self) -> usize; }   // its drop publishes too
+impl Permit<'_, '_, T> { pub fn write(self, v: T); }
+impl RetainedConsumer<T> { pub fn consume_batch(&mut self, max: usize, f: impl FnMut(T)) -> usize; }
+   // each endpoint's drop is its one Release decrement; the join is an Acquire zero
 
 // Mesh: N×(N−1) ring pairs + single-writer doorbells + credit flow control.
 // (implemented — the code is the spec)
 pub struct MeshConfig { pub ring_capacity: usize, pub data_credits: u32 }
-   // construction asserts ring_capacity ≥ 2 × data_credits: the reserved
-   // reply headroom that makes `reply` infallible (deadlock freedom).
+impl MeshConfig { pub const fn has_reply_headroom(self) -> bool; }
+   // has_reply_headroom: ring_capacity ≥ 2 × data_credits, the relation's
+   // one statement, which construction asserts: the reserved reply headroom
+   // that makes `reply` infallible (deadlock freedom).
 pub enum SendError { NoCredit { needed: u32, available: u32 } }
 pub struct Mesh;
 pub struct CellFabric;                      // one per cell; moved to its thread
@@ -607,6 +759,32 @@ impl CellFabric {
     pub fn stats(&self) -> FabricStats;
 }
 ```
+
+> **ADR-0192 (2026-10-29), built:** deadlock freedom holds
+> under a condition on the server. A reply sent in the drain pass that read
+> its op cannot wait: `reply` is credit-free and the drain never blocks or
+> sends. A reply a cell defers past that drain may wait only on (a) its own
+> cell's loop — staging space, the durable watermark, a cold read, an extent
+> turn, a tail stall, an earlier op in the namespace queue — or on (b) data
+> ops sent from credits no deferrable op can hold, each answered in the
+> drain pass that reads it, and the earlier ops in the publish queue, whose
+> consumer waits only on such ops. No task holds a resource of (a) while it
+> waits on a general credit or on the reply to a general op. A reply to a
+> (b) op is sent in a drain, so holding a queue across it closes no cycle.
+> The server spends a cell's credits toward a peer through two paths only.
+> A general send stages only if at least one credit toward the peer stays
+> free after it; its op is a point op, never a `Batch`, so it costs one.
+> The owner's publish fan may take that last one, with at most one fan leg
+> in flight toward each peer (a fan settles before the next opens), so a
+> fan leg never waits. A cross-cell transaction's credits reserved at
+> admission come from the general window. `MeshConfig` gains
+> `has_reply_headroom`, the one statement of the ring relation above,
+> which construction asserts. The shipped binary and the simulator build
+> every mesh through one checked constructor, which refuses
+> `data_credits ≤ 1`, a ring that is not a power of two and a mesh
+> `has_reply_headroom` refuses; test meshes keep a debug assertion. `send`,
+> `reply`, `drain`, `SendError` and the relation's value are unchanged. The
+> block above is the built shape (ADR-0192 D1, D2, D5).
 
 **Execution origin (ADR-0115 D2–D5).** `Apply` and `ApplyNs` carry
 `program: bool`: `false` for forwarded client argv, `true` for legs composed
@@ -633,6 +811,47 @@ between cells in one process, not authentication or an ACL capability
 > frames could outlive accumulator maintenance. The lending shape also
 > compiler-enforces the "frames never outlive EXECUTE unless copied"
 > retention rule.
+
+> **ADR-0190 (2026-10-29):** a reply carries its
+> outcome beside its bytes. `ReplyOutcome::{Success, Error}` is one byte
+> the writer sets. A `ReplyBuf` holds a reply's bytes with where the reply
+> began and its outcome (the ADR-0190 A1 note below): a `ReplyStream`
+> opens one at its buffer's end, `OpenReply::new` clears its buffer and
+> opens one at 0. `OwnedReply` is the closed form, built only by
+> `OpenReply::finish`, by `ReplyBuf::detach` (a copy of the reply's
+> bytes with its outcome, the buffer left at the reply's start) or by
+> `OwnedReply::received(bytes, outcome) -> Result<OwnedReply, ZeroByteReply>`,
+> which refuses zero bytes and returns them; `OwnedReply::reopen` is the
+> inverse of `finish`, bytes and outcome kept. A reply is read through
+> `outcome()`, `is_error()`, `bytes()` and `into_bytes()`; an open
+> reply's bytes are its buffer's from its start, read through its
+> `bytes()`. `RespWriter::new` takes `&mut ReplyBuf`, not `&mut Vec<u8>`;
+> its frame methods are as before, and it has `encoded(bytes)`, the one entry for bytes another writer
+> encoded (a nested element, a frame after the first), which leaves the
+> outcome alone — a whole reply is moved, never pasted. `error` and
+> `error_bytes` set `Error` only when they write the reply's first frame;
+> a nested error element leaves the outcome; `rollback` to the reply's
+> start, and `clear`, reset it to `Success` and leave every byte before
+> the reply's start. The outcome is `Error` iff
+> the reply's top-level frame is an error line, and no reader of a reply
+> decides from its bytes. The sketch below is the shape (ADR-0190 D1).
+
+> **ADR-0190 A1 (2026-10-30):** the open reply
+> lives beside its buffer. `ReplyBuf` owns its bytes with the reply's
+> start and outcome and has no public constructor: it is reached as
+> `&mut ReplyBuf` from a `ReplyStream` (a buffer of successive replies,
+> a connection's output or an owner's reply scratch), whose `open()`
+> starts the next reply at the buffer's end with outcome `Success`, or
+> from an `OpenReply` (one owned reply over a pool buffer, opened at 0),
+> whose `reply()` lends it. `Reply<B>`, `ReplyBuf::over` and
+> `OpenReply::lend` go. `RespWriter::new` takes `&mut ReplyBuf`; the
+> writer holds the reply and the protocol, and its frame methods are as
+> before. A stream's buffer is read, sent, appended to and emptied only
+> between replies (`as_bytes`, `consume`, `emit`, `discard`).
+> `OwnedReply::success()` answers a `SuccessView` of a
+> `Success` reply's bytes, or `ErrorPassthrough` for an `Error` reply;
+> a value decoder of a leg's bytes takes only a `SuccessView`, so no
+> decoder reads a reply whose outcome was not read.
 
 ```rust
 // Parser: per-connection state over borrowed input; a frame that spans feeds
@@ -664,7 +883,12 @@ pub struct ArgvRef<'a>;   // argv[i] -> &'a [u8]; offset-based over the frame;
 
 // Serializer: RESP2/RESP3 selected per connection (HELLO).
 pub enum Protocol { Resp2, Resp3 }
-pub struct RespWriter<'b>;                  // over &mut Vec<u8> (a wire buffer)
+pub enum ReplyOutcome { Success, Error }    // ADR-0190 D1: set by the writer
+pub struct ReplyBuf;                        // one open reply: bytes, its start, its outcome
+pub struct ReplyStream;                     // successive replies: open / emit / consume
+pub struct OpenReply;                       // one reply over a pool buffer: reply / finish
+pub struct OwnedReply;                      // finish / detach / received(bytes, outcome)
+pub struct RespWriter<'b>;                  // over &mut ReplyBuf (one reply)
   // simple / error / error_bytes / int / bulk / null / null_array /
   // array_header / map_header / bool / double / verbatim / big_number —
   // RESP2/3 variants selected by `Protocol`; stack-buffer itoa, no allocation.
@@ -708,9 +932,13 @@ pub struct CommandMeta {
     pub flags: CmdFlags,                    // READONLY | WRITE | ADMIN | FAST
     pub keys: KeySpec,                      // { first: u8, last: i8, step: u8 }; 0 = no keys
 }
-pub fn lookup(name: &[u8]) -> Option<&'static CommandMeta>;  // perfect hash: clear bit 5
-    // of every byte, pack two u64 words with the length XORed into the high one,
-    // two multiplies, one probe, two word compares
+pub fn lookup(name: &[u8]) -> Option<&'static CommandMeta>;  // perfect hash over
+    // bit-5-cleared words with the length mixed in; the probed entry's length is
+    // compared, then its bytes with only the letters' case ignored
+    // 2026-10-31 note: lookup(x) is Some exactly when x equals a registry name under
+    // ASCII case folding of letters: the same length, and byte for byte equal with
+    // a-z read as A-Z. A longer spelling whose added bytes fold to zero, and a
+    // non-letter byte changed in bit 5 alone, are unknown commands.
 pub fn extract_keys<'v, 'a>(meta: &CommandMeta, argv: &'v ArgvRef<'a>) -> KeyIter<'v, 'a>;
 pub fn key_spec(meta: &CommandMeta, subcommand: Option<&[u8]>) -> KeySpec;
     // ADR-0104: the routing truth — `meta.keys`, or the subcommand-scoped row
@@ -832,12 +1060,57 @@ impl SlotRouter {
 > replacements are not built; the sketches below are the implemented
 > execution and observer interfaces.
 
+> **ADR-0212 (2026-11-26), implementation open:** ADR-0212 supersedes
+> ADR-0150 whole and restates the note above. A command reserves its
+> reply's room in its connection's reply account before its first effect,
+> one receiver of one chunk for each reply that is not a fixed shape, and
+> stays unexecuted while that does not fit. A cap may release the stream
+> of a read-only command; it never releases the reply of a command that
+> is not read-only (ADR-0212 D1, D2, D8, D9). Not built.
+
+> **ADR-0190 (2026-10-29):** `execute` and
+> `execute_slices` take `out: &mut ReplyBuf` in place of
+> `&mut Vec<u8>`, as does every reply parameter of the crate (none is
+> generic; an owned open reply lends its `ReplyBuf` through `reply()`);
+> a writer of several replies, the parse stage's batch or the drain,
+> holds a `ReplyStream` and opens one reply per command. Every reply the
+> plane holds, forwards or gathers is
+> an `OwnedReply`: the caller reads `outcome()` after `execute` returns,
+> and no site of `inf-server` decides success or failure from a reply's
+> first byte, prefix or length: the `KEYS` and `SCAN` programs read each
+> leg's outcome first, as `PUBSUB CHANNELS` does. A write stages its
+> durable effects only when its reply's outcome is `Success`, or the
+> command stages despite an
+> error, through one function. A fan's refused leg (`Err(code)`) is the
+> fan's failure, never `+OK`, rendered with one text. Every command
+> writes at least one top-level frame; its outcome is the frame at the
+> reply's start. Pub/sub confirmations are one frame per name and RESP3
+> pushes follow a reply (Redis's shapes); one frame per case is the
+> compat oracle's assertion, not a rule of this seam.
+> `scripts/check-reply-outcome.sh` refuses a first-byte or prefix
+> comparison in production `crates/inf-server/src`; a sanctioned site
+> carries `reply-outcome-allow: <reason>`. Outside the functions that
+> set and read a reply's tag, it also refuses a path through `Outcome`
+> to anything but a non-reply variant (`Ok`, `Int`, `Nil`, `Bool`,
+> `Err`), a path through `ReplyOutcome`, and another name for either
+> enum; no marker sanctions one. The sketch below is the shape
+> (ADR-0190 D2, D4, A2).
+
+> **ADR-0190 A1 (2026-10-30):** `execute` and
+> every reply parameter take `out: &mut ReplyBuf`, with no lifetime;
+> the parse stage's batch holds the connection's `ReplyStream` and the
+> drain the owner's reply scratch, each opening one reply per command
+> it runs. The `KEYS` and `SCAN`
+> programs read each leg's outcome first, as `PUBSUB CHANNELS` does: an
+> `Error` leg is the reply, untouched; a `Success` leg without its
+> header answers `ERR cross-cell program reply malformed`.
+
 ```rust
 pub struct ConnCx { pub proto: Protocol, pub id: u64 }   // HELLO state
 /// One parsed command → store ops → RESP2/3 reply bytes. All commands
 /// enter through the inf-wire registry (lookup → arity → key spec).
 pub fn execute(argv: &ArgvRef<'_>, store: &mut CellStore, cx: &mut ConnCx,
-               now: Nanos, out: &mut Vec<u8>);
+               now: Nanos, out: &mut ReplyBuf);
 ```
 
 Reply bytes are oracle-pinned by the compat harness (`tests/compat`):
@@ -851,6 +1124,37 @@ made precise 2026-09-16 when the simulator's independent model read the
 sentence as "typed error on every command").
 
 ## 6c. `inf-server` — node assembly (M0 E6/E7 substrate; implemented)
+
+> **Accepted 2026-10-29, built — ADR-0123 A2:** a connection slot is one
+> of four states, `Active`, `Flushing`, `Closing` and `Draining`; the
+> vacant slab entry is outside them. A close of the flush shape (`QUIT`, a
+> protocol error, the stop's mark) moves an `Active` slot to `Flushing`:
+> nothing read after the mark is parsed, the replies of the commands read
+> before it are sent, and the descriptor closes once they are. An
+> immediate close (`timeout`, `CLIENT KILL`, the output cap) closes the
+> slot at once. The queue runs to its end at every close but for the
+> commands behind a `QUIT`, inline or queued, which never run: at
+> `Closed` the queue, the connection's execution state and its pump move
+> into `Draining`, and the local registries drop the connection when the
+> pump reads its queue empty, after its last command. The output buffer
+> and the descriptor exist only in `Active` and `Flushing`, so no reply
+> byte reaches a closed socket; every writer into the output buffer (the
+> pump, the parse's replies, pub/sub delivery, a publisher's own frames)
+> answers from the slot's state.
+
+> **Accepted 2026-10-30, built — ADR-0196 and its A1:** the bytes a
+> connection read before its end of stream run in whatever state parses
+> them: the reader outlives `Closed`, in `Draining`, until it holds no
+> bytes, and `QUIT` or a protocol error ends it in every state. The
+> peer's end of stream is a mark of the flush shape that keeps the
+> reader, so the commands read before it run and are answered and the
+> descriptor closes once their replies are sent; only a receive or send
+> error is the peer gone, and then the commands run unanswered. After the
+> mark a slot takes only what the commands read before it owe: a
+> `Flushing` slot is written no published message, and it counts as a
+> receiver until the server reads its end of stream. Redis frees a client
+> when it reads its end of stream; the compatibility matrix's `QUIT` and
+> `CLIENT` rows state the differences (ADR-0196 D6, A1.6).
 
 ```rust
 /// One cell's complete data plane over any BackendDriver (uring in
@@ -895,13 +1199,28 @@ pub struct NodeInfo { /* Cells: tripwires, raw_counters, wire_buffers_bytes,
                          fabric_rtt_p50_ns, cell, cells */ }
 ```
 
-**Cap census extension note (ADR-0163 D2):** `ServerPlane::new(...)` builds
-the cell's cap census (`inf_foundation::bounded::CapCensus`) with its `cell`
-and returns `(ServerPlane, ServeMark)`; `CellLoop::new(driver, clock, pool,
-config, serve_mark)` takes that mark and consumes it as its first
-`run_iteration` begins, so every step before it is the cell's assembly. The
-mark is a token the census mints once, never `Clone`: a census is marked at
-most once. `NodeInfo::cap_census` holds the census for the cell's readers.
+**Cap census extension note (ADR-0163 D2, ADR-0154 D1, ADR-0189 D4):**
+`ServerPlane::new(cell, cells, listener, seed, fabric, node, observer,
+route_local_only)` builds the cell's cap census
+(`inf_foundation::bounded::CapCensus`) with its `cell`; then, on that census,
+the keyspace it serves from `seed` (`KeyspaceSeed::build`, the keyspace's one
+builder: `Cataloged` from the boot catalog, `Uncataloged` from a host's
+namespace specs), so every capped store of the cell registers on that census;
+then the cell's `TimerSet` and the server's timer owners
+(`ServerTimers::build`, their one constructor); and only then writes `node`
+(the cell, the cell count and `NodeInfo::cap_census`). The plane keeps the
+owners and returns the set. It returns `Result<(ServerPlane, ServeMark,
+TimerSet), PlaneBuildError>`: `PlaneBuildError::Seed(NsError)` when the seed
+is refused (a catalog the seeding refuses, a spec refused, or a seeded
+table's build refused) and `PlaneBuildError::Timers(TimerAssemblyError)` when
+the timer assembly is. Either refusal returns no plane and writes nothing to
+`node`, and what was built drops with the census while it assembles.
+`CellLoop::new(driver, clock, pool,
+config, serve_mark, timer_set)` takes that mark and set and consumes the mark
+as its first `run_iteration` begins, so every step before it is the cell's
+assembly. The mark is a token the census mints once, never `Clone`: a census
+is marked at most once. `NodeInfo::cap_census` holds the census for the
+cell's readers.
 
 `inf-runtime::net` (assembly helpers, keeps bins `forbid(unsafe_code)`):
 `listen_reuseport(port) -> TcpListener` · `bound_port` ·

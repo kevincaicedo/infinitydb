@@ -268,7 +268,7 @@ pub fn cmd_gate_run_m4(flags: &Flags) -> Result<(), String> {
     let replicates: usize = flags.usize_or("replicates", 6)?;
     let duration: u64 = flags.u64_or("duration", 10)?;
     let cells: u16 = flags.u16_or("cells", 4)?;
-    let infinityd = flags.str_or("infinityd-bin", "target/release/infinityd");
+    let infinityd = flags.str_or("infinityd-bin", &crate::cli::default_infinityd_bin());
     let baseline_bin = flags.get("baseline-bin").map(str::to_string);
     let reference_box = flags.bool("reference-box");
     let pin_args: Vec<String> = flags

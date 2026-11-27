@@ -147,6 +147,7 @@ dependencies = [
  "inf-server",
  "inf-store",
  "inf-wire",
+ "libc",
  "serde_json",
 ]
 
@@ -389,6 +390,7 @@ name = "inf-fabric"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "inf-alloc",
  "inf-foundation",
  "loom",
  "proptest",
@@ -464,6 +466,7 @@ dependencies = [
  "inf-foundation",
  "inf-log",
  "inf-runtime",
+ "inf-server",
  "inf-simd",
  "inf-store",
  "inf-wire",
@@ -543,6 +546,7 @@ dependencies = [
  "inf-runtime",
  "inf-server",
  "inf-store",
+ "libc",
 ]
 
 [[package]]

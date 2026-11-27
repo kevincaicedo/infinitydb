@@ -36,7 +36,7 @@ use inf_foundation::varint;
 
 use crate::error::DocError;
 use crate::header::{FLAG_INTERNED, HEADER_LEN};
-use crate::limits::DEPTH_MAX;
+use crate::limits::{CHAR_BYTES_MAX, DEPTH_MAX};
 
 pub(crate) const TAG_NULL: u8 = 0xA0;
 pub(crate) const TAG_FALSE: u8 = 0xA1;
@@ -165,12 +165,26 @@ impl<'a> Dict<'a> {
         true
     }
 
-    /// Resolve id → key bytes. O(id) walk — dicts are small and the hot
-    /// lookup path resolves the *needle* once, then compares ids.
-    fn get(&self, id: usize) -> Option<&'a [u8]> {
+    /// The table's bytes, for a reader that holds positions in them (empty
+    /// on plain tapes).
+    #[inline]
+    pub(crate) fn bytes(&self) -> &'a [u8] {
         #[cfg(feature = "doc-intern-keys")]
         {
-            crate::intern::dict_region_get(self.table, id)
+            self.table
+        }
+        #[cfg(not(feature = "doc-intern-keys"))]
+        &[]
+    }
+
+    /// Where id's key lies in [`Self::bytes`], `start..end`. An O(id) walk:
+    /// dicts are small, and the hot lookup path resolves the *needle* once,
+    /// then compares ids.
+    #[inline]
+    fn span(&self, id: usize) -> Option<(usize, usize)> {
+        #[cfg(feature = "doc-intern-keys")]
+        {
+            crate::intern::dict_region_span(self.table, id)
         }
         #[cfg(not(feature = "doc-intern-keys"))]
         {
@@ -398,6 +412,7 @@ pub(crate) fn nesting_depth(value: &[u8]) -> usize {
 }
 
 /// One open container scope during validation.
+#[derive(Debug)]
 struct Scope {
     /// Absolute body offset where this container's region ends.
     end: usize,
@@ -471,43 +486,280 @@ impl<'a> DictCheck<'a> {
 
 /// Walk a body as exactly one canonical root value. Iterative, explicit
 /// stack, depth-capped (the L9 decoder rule). O(n) single pass (plus the
-/// dict bookkeeping on interned tapes).
+/// dict bookkeeping on interned tapes): [`CheckWalk`] run to its end.
 pub(crate) fn validate_body(body: &[u8], dict: &[u8]) -> Result<(), DocError> {
-    let mut stack: Vec<Scope> = Vec::new();
     let mut dict_check = DictCheck::new(dict);
-    let mut off = 0usize;
-    let mut root_seen = false;
-    loop {
-        // Close every scope that ends exactly here; a scope can only close
-        // on its recorded end because child extents never cross it.
-        while let Some(top) = stack.last() {
-            debug_assert!(off <= top.end);
-            if off != top.end {
+    let mut walk = CheckWalk::new();
+    let end = walk.run::<false>(body, &mut dict_check, CheckBudget::NONE)?;
+    debug_assert_eq!(end, CheckEnd::Done, "an unbounded check runs to its end");
+    dict_check.finish()
+}
+
+/// How one run of a [`CheckWalk`] ended.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CheckEnd {
+    /// A budget is spent and the body is not: the next run resumes.
+    Yield,
+    /// The body is exactly one canonical root value.
+    Done,
+}
+
+/// What one bounded run of a [`CheckWalk`] may examine: `tokens_max`
+/// tokens (a tag with its length or varint, at most 11 B), and
+/// `bytes_max` bytes of string payload, passed by at most
+/// [`CHECK_OVERSHOOT_BYTES_MAX`](crate::limits::CHECK_OVERSHOOT_BYTES_MAX)
+/// (the tail of one character). Crossing: [`CheckEnd::Yield`]. An
+/// unbounded run reads neither.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct CheckBudget {
+    pub(crate) bytes_max: usize,
+    pub(crate) tokens_max: usize,
+}
+
+impl CheckBudget {
+    const NONE: CheckBudget = CheckBudget { bytes_max: usize::MAX, tokens_max: usize::MAX };
+}
+
+/// A string whose UTF-8 check is in flight: the bytes before `at` are
+/// checked, and `at` is a character boundary.
+#[derive(Copy, Clone, Debug)]
+struct StrCheck {
+    data_at: usize,
+    at: usize,
+    end: usize,
+    is_key: bool,
+}
+
+/// What one run examined, for the harnesses that hold a step to its
+/// budget: read from the walk, never from the caller's own arithmetic.
+#[cfg(any(test, fuzzing))]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CheckTally {
+    pub tokens: usize,
+    pub string_bytes: usize,
+}
+
+/// The canonical check as a resumable walk (ADR-0169 D4's predicate): the
+/// scope stack, the next offset, and a string's next unchecked byte. The
+/// state is positions into a body the caller presents again, unchanged, at
+/// every run; nothing here borrows it. [`validate_body`] runs it once to
+/// the end; a stepped caller runs it under a [`CheckBudget`], so a
+/// document's check is O(document) across runs and bounded in each.
+#[derive(Debug)]
+pub(crate) struct CheckWalk {
+    stack: Vec<Scope>,
+    off: usize,
+    root_seen: bool,
+    string: Option<StrCheck>,
+    #[cfg(any(test, fuzzing))]
+    tally: CheckTally,
+}
+
+impl CheckWalk {
+    pub(crate) fn new() -> CheckWalk {
+        CheckWalk {
+            stack: Vec::new(),
+            off: 0,
+            root_seen: false,
+            string: None,
+            #[cfg(any(test, fuzzing))]
+            tally: CheckTally::default(),
+        }
+    }
+
+    /// What the last bounded run examined.
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn tally(&self) -> CheckTally {
+        self.tally
+    }
+
+    /// One bounded run over `body`, the plain tape this walk has seen at
+    /// every earlier run. It examines at least one token or one string
+    /// byte, so a walk that yields has advanced.
+    pub(crate) fn step(&mut self, body: &[u8], budget: CheckBudget) -> Result<CheckEnd, DocError> {
+        debug_assert!(budget.bytes_max > 0 && budget.tokens_max > 0, "a step has a budget");
+        // Planted: the check ignores its budgets and runs to its end.
+        let budget = if cfg!(inf_canary_ser_check_whole) { CheckBudget::NONE } else { budget };
+        // A stepped document is plain: its dictionary check has nothing to do.
+        let mut dict_check = DictCheck::new(&[]);
+        let end = self.run::<true>(body, &mut dict_check, budget)?;
+        if end == CheckEnd::Done {
+            dict_check.finish()?;
+        }
+        Ok(end)
+    }
+
+    /// The walk's one loop. `BOUNDED = false` compiles every budget read
+    /// out: the state is locals of a walk that never yields, and a string
+    /// is checked whole.
+    #[inline(always)]
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: a token is at least one byte of the body, so the count of tokens one \
+                  run examines is at most `body.len() <= isize::MAX`"
+    )]
+    fn run<const BOUNDED: bool>(
+        &mut self,
+        body: &[u8],
+        dict_check: &mut DictCheck<'_>,
+        budget: CheckBudget,
+    ) -> Result<CheckEnd, DocError> {
+        let mut off = self.off;
+        let mut root_seen = self.root_seen;
+        let mut spent = Spent::default();
+        // A string in flight: the last run's, or the token just read.
+        let mut string = if BOUNDED { self.string.take() } else { None };
+        loop {
+            if BOUNDED && let Some(checking) = string.take() {
+                let window = budget.bytes_max;
+                match check_str_window(body, checking, window, &mut spent.string_bytes)? {
+                    Some(rest) => return Ok(self.suspend(off, root_seen, Some(rest), spent)),
+                    None => {
+                        dict_check_key(body, checking, dict_check)?;
+                        off = checking.end;
+                    }
+                }
+            }
+            close_scopes(&mut self.stack, off)?;
+            if off == body.len() {
                 break;
             }
-            if top.is_obj && !top.expects_key {
-                return Err(DocError::BadKey); // closed mid-pair
+            if BOUNDED
+                && (spent.tokens >= budget.tokens_max || spent.string_bytes >= budget.bytes_max)
+            {
+                return Ok(self.suspend(off, root_seen, None, spent));
             }
-            stack.pop();
+            if self.stack.is_empty() {
+                if root_seen {
+                    return Err(DocError::BadLength); // trailing bytes after root
+                }
+                root_seen = true;
+            }
+            let limit = self.stack.last().map_or(body.len(), |s| s.end);
+            let key_position = self.stack.last().is_some_and(|s| s.is_obj && s.expects_key);
+            let stack = &mut self.stack;
+            off = validate_one::<BOUNDED>(
+                body,
+                off,
+                limit,
+                key_position,
+                stack,
+                dict_check,
+                &mut string,
+            )?;
+            spent.tokens += 1;
         }
-        if off == body.len() {
+        if !root_seen {
+            return Err(DocError::Truncated); // empty body: a document has a root
+        }
+        debug_assert!(self.stack.is_empty());
+        if BOUNDED {
+            self.suspend(off, root_seen, None, spent);
+        }
+        Ok(CheckEnd::Done)
+    }
+
+    /// Writes a bounded run's locals back, the one place they are stored,
+    /// and names the end of a run that stops short.
+    #[inline]
+    fn suspend(
+        &mut self,
+        off: usize,
+        root_seen: bool,
+        string: Option<StrCheck>,
+        spent: Spent,
+    ) -> CheckEnd {
+        self.off = off;
+        self.root_seen = root_seen;
+        self.string = string;
+        #[cfg(any(test, fuzzing))]
+        {
+            self.tally = CheckTally { tokens: spent.tokens, string_bytes: spent.string_bytes };
+        }
+        let _ = spent;
+        CheckEnd::Yield
+    }
+}
+
+/// Closes every scope that ends exactly at `off`. A scope can only close on
+/// its recorded end, because child extents never cross it.
+#[inline(always)]
+fn close_scopes(stack: &mut Vec<Scope>, off: usize) -> Result<(), DocError> {
+    while let Some(top) = stack.last() {
+        debug_assert!(off <= top.end);
+        if off != top.end {
             break;
         }
-        if stack.is_empty() {
-            if root_seen {
-                return Err(DocError::BadLength); // trailing bytes after root
-            }
-            root_seen = true;
+        if top.is_obj && !top.expects_key {
+            return Err(DocError::BadKey); // closed mid-pair
         }
-        let limit = stack.last().map_or(body.len(), |s| s.end);
-        let key_position = stack.last().is_some_and(|s| s.is_obj && s.expects_key);
-        off = validate_one(body, off, limit, key_position, &mut stack, &mut dict_check)?;
+        stack.pop();
     }
-    if !root_seen {
-        return Err(DocError::Truncated); // empty body: a document has a root
+    Ok(())
+}
+
+/// What one run has spent of its [`CheckBudget`].
+#[derive(Copy, Clone, Default)]
+struct Spent {
+    tokens: usize,
+    string_bytes: usize,
+}
+
+/// A checked key's own rule: a tabled key is never plain-encoded.
+#[inline]
+fn dict_check_key(
+    body: &[u8],
+    string: StrCheck,
+    dict_check: &DictCheck<'_>,
+) -> Result<(), DocError> {
+    if string.is_key {
+        dict_check.check_plain_key(&body[string.data_at..string.end])?;
     }
-    debug_assert!(stack.is_empty());
-    dict_check.finish()
+    Ok(())
+}
+
+/// Checks `string`'s UTF-8 from its next byte over one window: the bytes
+/// the budget has left, and never fewer than one whole character (4 B), so
+/// a window that ends inside a character still passes the characters
+/// before it. `Ok(None)`: the string is checked. `Ok(Some(rest))`: the
+/// budget is spent, and `rest` resumes at a character boundary — the last
+/// one the window proved, never the window's end.
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: `at <= end <= body.len() <= isize::MAX`; the window is at most \
+              `end - at`, and `valid_up_to()` is at most the window; `spent` counts bytes of \
+              one body"
+)]
+fn check_str_window(
+    body: &[u8],
+    string: StrCheck,
+    bytes_max: usize,
+    spent: &mut usize,
+) -> Result<Option<StrCheck>, DocError> {
+    let mut at = string.at;
+    while at < string.end {
+        if *spent >= bytes_max {
+            return Ok(Some(StrCheck { at, ..string }));
+        }
+        let window = (bytes_max - *spent).max(CHAR_BYTES_MAX).min(string.end - at);
+        *spent += window;
+        match str::from_utf8(&body[at..at + window]) {
+            Ok(_) => at += window,
+            Err(error) => {
+                // A sequence that is wrong, or one the string itself cuts short.
+                if error.error_len().is_some() || at + window == string.end {
+                    return Err(DocError::BadUtf8);
+                }
+                debug_assert!(error.valid_up_to() > 0, "a 4-byte window holds a character");
+                at += if cfg!(inf_canary_ser_check_window_end) {
+                    window // planted: resume inside the character
+                } else {
+                    error.valid_up_to()
+                };
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Validate one plain canonical headerless idoc value and return its root.
@@ -527,13 +779,15 @@ pub fn canonical_fragment(bytes: &[u8]) -> Result<ValueRef<'_>, DocError> {
               addend is a const <= 9, a u8 or u24 length, or a varint length (<= 10), so each \
               sum fits the 64-bit usize inf-foundation const-asserts"
 )]
-fn validate_one(
+#[inline(always)]
+fn validate_one<const BOUNDED: bool>(
     body: &[u8],
     off: usize,
     limit: usize,
     key_position: bool,
     stack: &mut Vec<Scope>,
     dict_check: &mut DictCheck<'_>,
+    string: &mut Option<StrCheck>,
 ) -> Result<usize, DocError> {
     debug_assert!(off < limit);
     debug_assert!(limit <= body.len());
@@ -554,6 +808,11 @@ fn validate_one(
         if !is_string {
             return Err(DocError::BadKey);
         }
+        if BOUNDED {
+            let top = stack.last_mut().expect("key position implies an open object");
+            top.expects_key = false;
+            return str_token(body, off, limit, true, string);
+        }
         let (data_at, next) = validate_str(body, off, limit)?;
         dict_check.check_plain_key(&body[data_at..next])?;
         let top = stack.last_mut().expect("key position implies an open object");
@@ -569,6 +828,9 @@ fn validate_one(
         top.expects_key = true;
     }
     if is_string {
+        if BOUNDED {
+            return str_token(body, off, limit, false, string);
+        }
         return validate_str(body, off, limit).map(|(_, next)| next);
     }
     if tag.cast_signed() >= FIXINT_MIN_TAG {
@@ -617,8 +879,35 @@ fn validate_one(
     }
 }
 
+/// The stepped check's string token: its extent now, its bytes by the
+/// caller's windows. Returns the data offset, where the windows begin.
+#[inline(always)]
+fn str_token(
+    body: &[u8],
+    off: usize,
+    limit: usize,
+    is_key: bool,
+    string: &mut Option<StrCheck>,
+) -> Result<usize, DocError> {
+    let (data_at, end) = str_extent(body, off, limit)?;
+    *string = Some(StrCheck { data_at, at: data_at, end, is_key });
+    Ok(data_at)
+}
+
 /// Validate one string form (canonical width + UTF-8); returns the data
 /// offset and the next offset.
+#[inline]
+fn validate_str(body: &[u8], off: usize, limit: usize) -> Result<(usize, usize), DocError> {
+    let (data_at, end) = str_extent(body, off, limit)?;
+    if str::from_utf8(&body[data_at..end]).is_err() {
+        return Err(DocError::BadUtf8);
+    }
+    Ok((data_at, end))
+}
+
+/// One string form's extent, its canonical width checked and its bytes
+/// not yet read: the data offset and the next offset, inside `limit`.
+#[inline(always)]
 #[allow(
     clippy::arithmetic_side_effects,
     reason = "bound: body[off] is indexed first, so off < body.len() <= isize::MAX; every \
@@ -626,7 +915,7 @@ fn validate_one(
               sum fits the 64-bit usize inf-foundation const-asserts; \
               `t - FIXSTR_BASE` is under its `FIXSTR_BASE..=0x9F` guard"
 )]
-fn validate_str(body: &[u8], off: usize, limit: usize) -> Result<(usize, usize), DocError> {
+fn str_extent(body: &[u8], off: usize, limit: usize) -> Result<(usize, usize), DocError> {
     let (data_at, len) = match body[off] {
         t if (FIXSTR_BASE..=0x9F).contains(&t) => (off + 1, (t - FIXSTR_BASE) as usize),
         TAG_STR8 => {
@@ -654,9 +943,6 @@ fn validate_str(body: &[u8], off: usize, limit: usize) -> Result<(usize, usize),
     let end = data_at + len;
     if end > limit {
         return Err(DocError::Truncated);
-    }
-    if str::from_utf8(&body[data_at..end]).is_err() {
-        return Err(DocError::BadUtf8);
     }
     Ok((data_at, end))
 }
@@ -694,8 +980,41 @@ pub(crate) fn skip_value(body: &[u8], off: usize) -> usize {
     }
 }
 
-/// Decode one validated value at `off`; returns it plus the next offset.
+/// Decode one validated value at `off`; returns it plus the next offset:
+/// [`value_at`]'s positions as borrowed views. The token is decoded there,
+/// once.
 #[inline]
+pub(crate) fn read_value<'a>(body: &'a [u8], dict: Dict<'a>, off: usize) -> (ValueRef<'a>, usize) {
+    let (value, next) = value_at(body, off);
+    let view = match value {
+        ValueAt::Null => ValueRef::Null,
+        ValueAt::Bool(b) => ValueRef::Bool(b),
+        ValueAt::I64(i) => ValueRef::I64(i),
+        ValueAt::F64(f) => ValueRef::F64(f),
+        ValueAt::Str { start } => ValueRef::Str(DocStr(&body[start..next])),
+        ValueAt::Obj { start } => ValueRef::Obj(ObjRef { entries: &body[start..next], dict }),
+        ValueAt::Arr { start } => ValueRef::Arr(ArrRef { body: &body[start..next], dict }),
+    };
+    (view, next)
+}
+
+/// One validated value as positions in its body: a string's payload or a
+/// container's body begins at `start` and ends where the token does.
+#[derive(Copy, Clone, Debug)]
+pub(crate) enum ValueAt {
+    Null,
+    Bool(bool),
+    I64(i64),
+    F64(f64),
+    Str { start: usize },
+    Obj { start: usize },
+    Arr { start: usize },
+}
+
+/// One validated value at `off` as positions, and the next offset: the one
+/// decode of a value token. A walker that holds no borrow across a
+/// suspension keeps the positions; [`read_value`] hands them out as views.
+#[inline(always)]
 #[allow(
     clippy::arithmetic_side_effects,
     reason = "bound: body[off] is indexed first, so off < body.len() <= isize::MAX; every \
@@ -703,68 +1022,97 @@ pub(crate) fn skip_value(body: &[u8], off: usize) -> usize {
               sum fits the 64-bit usize inf-foundation const-asserts; \
               `tag - FIXSTR_BASE` is under its `FIXSTR_BASE..=0x9F` guard"
 )]
-pub(crate) fn read_value<'a>(body: &'a [u8], dict: Dict<'a>, off: usize) -> (ValueRef<'a>, usize) {
+pub(crate) fn value_at(body: &[u8], off: usize) -> (ValueAt, usize) {
     debug_assert!(off < body.len());
     let tag = body[off];
     if tag.cast_signed() >= FIXINT_MIN_TAG {
-        return (ValueRef::I64(i64::from(tag.cast_signed())), off + 1);
+        return (ValueAt::I64(i64::from(tag.cast_signed())), off + 1);
     }
     if (FIXSTR_BASE..=0x9F).contains(&tag) {
-        let len = (tag - FIXSTR_BASE) as usize;
-        return (ValueRef::Str(DocStr(&body[off + 1..off + 1 + len])), off + 1 + len);
+        return (ValueAt::Str { start: off + 1 }, off + 1 + (tag - FIXSTR_BASE) as usize);
     }
     match tag {
-        TAG_NULL => (ValueRef::Null, off + 1),
-        TAG_FALSE => (ValueRef::Bool(false), off + 1),
-        TAG_TRUE => (ValueRef::Bool(true), off + 1),
+        TAG_NULL => (ValueAt::Null, off + 1),
+        TAG_FALSE => (ValueAt::Bool(false), off + 1),
+        TAG_TRUE => (ValueAt::Bool(true), off + 1),
         TAG_I64 => {
             let (raw, used) =
                 varint::decode_u64(&body[off + 1..]).expect("validated varint decodes");
-            (ValueRef::I64(unzigzag(raw)), off + 1 + used)
+            (ValueAt::I64(unzigzag(raw)), off + 1 + used)
         }
         TAG_F64 => {
             let bits =
                 u64::from_le_bytes(body[off + 1..off + 9].try_into().expect("validated extent"));
-            (ValueRef::F64(f64::from_bits(bits)), off + 9)
+            (ValueAt::F64(f64::from_bits(bits)), off + 9)
         }
-        TAG_STR8 => {
-            let len = body[off + 1] as usize;
-            (ValueRef::Str(DocStr(&body[off + 2..off + 2 + len])), off + 2 + len)
-        }
-        TAG_STR24 => {
-            let len = read_u24(body, off + 1);
-            (ValueRef::Str(DocStr(&body[off + 4..off + 4 + len])), off + 4 + len)
-        }
-        TAG_OBJ => {
-            let len = read_u24(body, off + 1);
-            let entries = &body[off + 4..off + 4 + len];
-            (ValueRef::Obj(ObjRef { entries, dict }), off + 4 + len)
-        }
-        TAG_ARR => {
-            let len = read_u24(body, off + 1);
-            (ValueRef::Arr(ArrRef { body: &body[off + 4..off + 4 + len], dict }), off + 4 + len)
-        }
+        TAG_STR8 => (ValueAt::Str { start: off + 2 }, off + 2 + body[off + 1] as usize),
+        TAG_STR24 => (ValueAt::Str { start: off + 4 }, off + 4 + read_u24(body, off + 1)),
+        TAG_OBJ => (ValueAt::Obj { start: off + 4 }, off + 4 + read_u24(body, off + 1)),
+        TAG_ARR => (ValueAt::Arr { start: off + 4 }, off + 4 + read_u24(body, off + 1)),
         _ => unreachable!("validated tape has no unknown tags"),
     }
 }
 
 /// Read one validated object key: a string form, or an interned-key ref
-/// resolved against the dict.
+/// resolved against the dict. [`key_at`]'s positions as a borrowed view.
+fn read_key<'a>(body: &'a [u8], dict: Dict<'a>, off: usize) -> (DocStr<'a>, usize) {
+    match key_at(body, dict, off) {
+        (KeyAt::Body { start, end }, next) => (DocStr(&body[start..end]), next),
+        (KeyAt::Dict { start, end }, next) => (DocStr(&dict.bytes()[start..end]), next),
+    }
+}
+
+/// Where one object key's bytes lie: a string form's payload in the body,
+/// or a tabled key's entry in the dictionary, each `start..end`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum KeyAt {
+    Body { start: usize, end: usize },
+    Dict { start: usize, end: usize },
+}
+
+/// One validated object key at `off` as positions — where its bytes lie —
+/// and the offset of its value: the one decode of a key token. A key is a
+/// string form or a table reference; its extent is read from its tag
+/// inline, as [`ObjRef::get`] reads it. [`read_key`] hands the positions
+/// out as a view.
+#[inline(always)]
 #[allow(
     clippy::arithmetic_side_effects,
-    reason = "bound: body[off] is indexed first, so off < body.len() <= isize::MAX and off + 3 \
-              fits usize"
+    reason = "bound: body[off] is indexed first, so off < body.len() <= isize::MAX; every \
+              addend is a const <= 4 or a u8 or u24 length, so each sum fits the 64-bit usize \
+              inf-foundation const-asserts; `tag - FIXSTR_BASE` is under its \
+              `FIXSTR_BASE..=0x9F` guard"
 )]
-fn read_key<'a>(body: &'a [u8], dict: Dict<'a>, off: usize) -> (DocStr<'a>, usize) {
-    if body[off] == TAG_KEYREF {
-        let id = u16::from_le_bytes([body[off + 1], body[off + 2]]) as usize;
-        let bytes = dict.get(id).expect("validated keyref resolves");
-        return (DocStr(bytes), off + 3);
+pub(crate) fn key_at(body: &[u8], dict: Dict<'_>, off: usize) -> (KeyAt, usize) {
+    let tag = body[off];
+    if tag == TAG_KEYREF {
+        return keyref_at(body, dict, off);
     }
-    match read_value(body, dict, off) {
-        (ValueRef::Str(s), next) => (s, next),
-        _ => unreachable!("validated object key positions hold strings"),
-    }
+    // Keys are string forms; fixstr (≤ 31 bytes) dominates.
+    let (start, len) = if (FIXSTR_BASE..=0x9F).contains(&tag) {
+        (off + 1, (tag - FIXSTR_BASE) as usize)
+    } else if tag == TAG_STR8 {
+        (off + 2, body[off + 1] as usize)
+    } else if tag == TAG_STR24 {
+        (off + 4, read_u24(body, off + 1))
+    } else {
+        unreachable!("validated object key positions hold strings")
+    };
+    let end = start + len;
+    (KeyAt::Body { start, end }, end)
+}
+
+/// A tabled key's entry in the dictionary: an O(id) walk of the table.
+#[cold]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "bound: body[off] is a key reference's tag, so its 3 bytes lie in the body and \
+              off + 3 <= body.len() <= isize::MAX"
+)]
+fn keyref_at(body: &[u8], dict: Dict<'_>, off: usize) -> (KeyAt, usize) {
+    let id = u16::from_le_bytes([body[off + 1], body[off + 2]]) as usize;
+    let (start, end) = dict.span(id).expect("validated keyref resolves");
+    (KeyAt::Dict { start, end }, off + 3)
 }
 
 impl<'a> ObjRef<'a> {
@@ -925,6 +1273,218 @@ impl<'a> Iterator for ArrIter<'a> {
     }
 }
 
+/// The canonical check as it stood before it became a resumable walk, kept
+/// whole for the tests: the loop, the token check and the string check. The
+/// stepped check's verdict is held equal to this copy's on every input. It
+/// shares the dictionary bookkeeping, which a stepped document never
+/// engages: a stepped document is plain.
+#[cfg(test)]
+pub(crate) mod frozen {
+    use inf_foundation::varint;
+
+    use super::{
+        DictCheck, FIXINT_MAX, FIXINT_MIN, FIXINT_MIN_TAG, FIXSTR_BASE, STR8_MIN_LEN,
+        STR24_MIN_LEN, TAG_ARR, TAG_F64, TAG_FALSE, TAG_I64, TAG_KEYREF, TAG_NULL, TAG_OBJ,
+        TAG_STR8, TAG_STR24, TAG_TRUE, read_u24, unzigzag,
+    };
+    use crate::error::DocError;
+    use crate::limits::DEPTH_MAX;
+
+    /// One open container scope during validation.
+    struct Scope {
+        /// Absolute body offset where this container's region ends.
+        end: usize,
+        /// Objects track key/value alternation; arrays don't.
+        is_obj: bool,
+        /// In an object: the next element must be a key.
+        expects_key: bool,
+    }
+
+    /// Walk a body as exactly one canonical root value. Iterative, explicit
+    /// stack, depth-capped (the L9 decoder rule). O(n) single pass (plus the
+    /// dict bookkeeping on interned tapes).
+    pub(crate) fn validate_body(body: &[u8], dict: &[u8]) -> Result<(), DocError> {
+        let mut stack: Vec<Scope> = Vec::new();
+        let mut dict_check = DictCheck::new(dict);
+        let mut off = 0usize;
+        let mut root_seen = false;
+        loop {
+            // Close every scope that ends exactly here; a scope can only close
+            // on its recorded end because child extents never cross it.
+            while let Some(top) = stack.last() {
+                debug_assert!(off <= top.end);
+                if off != top.end {
+                    break;
+                }
+                if top.is_obj && !top.expects_key {
+                    return Err(DocError::BadKey); // closed mid-pair
+                }
+                stack.pop();
+            }
+            if off == body.len() {
+                break;
+            }
+            if stack.is_empty() {
+                if root_seen {
+                    return Err(DocError::BadLength); // trailing bytes after root
+                }
+                root_seen = true;
+            }
+            let limit = stack.last().map_or(body.len(), |s| s.end);
+            let key_position = stack.last().is_some_and(|s| s.is_obj && s.expects_key);
+            off = validate_one(body, off, limit, key_position, &mut stack, &mut dict_check)?;
+        }
+        if !root_seen {
+            return Err(DocError::Truncated); // empty body: a document has a root
+        }
+        debug_assert!(stack.is_empty());
+        dict_check.finish()
+    }
+
+    /// Validate a single value (or object key) starting at `off`, bounded by
+    /// `limit`. Pushes a scope for containers; returns the next offset.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: body[off] is indexed first, so off < body.len() <= isize::MAX; every \
+                  addend is a const <= 9, a u8 or u24 length, or a varint length (<= 10), so each \
+                  sum fits the 64-bit usize inf-foundation const-asserts"
+    )]
+    fn validate_one(
+        body: &[u8],
+        off: usize,
+        limit: usize,
+        key_position: bool,
+        stack: &mut Vec<Scope>,
+        dict_check: &mut DictCheck<'_>,
+    ) -> Result<usize, DocError> {
+        debug_assert!(off < limit);
+        debug_assert!(limit <= body.len());
+        let tag = body[off];
+        // Key positions accept only string forms; everything else is a value.
+        let is_string = matches!(tag, TAG_STR8 | TAG_STR24) || (FIXSTR_BASE..=0x9F).contains(&tag);
+        if key_position {
+            if tag == TAG_KEYREF && dict_check.active() {
+                if off + 3 > limit {
+                    return Err(DocError::Truncated);
+                }
+                let id = u16::from_le_bytes([body[off + 1], body[off + 2]]) as usize;
+                dict_check.use_ref(id)?;
+                let top = stack.last_mut().expect("key position implies an open object");
+                top.expects_key = false;
+                return Ok(off + 3);
+            }
+            if !is_string {
+                return Err(DocError::BadKey);
+            }
+            let (data_at, next) = validate_str(body, off, limit)?;
+            dict_check.check_plain_key(&body[data_at..next])?;
+            let top = stack.last_mut().expect("key position implies an open object");
+            top.expects_key = false;
+            return Ok(next);
+        }
+        // A completed value in an object flips it back to expecting a key.
+        // Containers count as the value at push time (matches the builder).
+        if let Some(top) = stack.last_mut()
+            && top.is_obj
+        {
+            debug_assert!(!top.expects_key);
+            top.expects_key = true;
+        }
+        if is_string {
+            return validate_str(body, off, limit).map(|(_, next)| next);
+        }
+        if tag.cast_signed() >= FIXINT_MIN_TAG {
+            return Ok(off + 1); // fixint: 0x00..=0x7F and 0xE0..=0xFF
+        }
+        match tag {
+            TAG_NULL | TAG_FALSE | TAG_TRUE => Ok(off + 1),
+            TAG_I64 => {
+                // Truncation and non-minimal encodings are indistinguishable
+                // to the varint decoder; both refuse.
+                let (raw, used) = varint::decode_u64(&body[off + 1..limit])
+                    .ok_or(DocError::NonCanonical("i64 varint"))?;
+                let v = unzigzag(raw);
+                if (FIXINT_MIN..=FIXINT_MAX).contains(&v) {
+                    return Err(DocError::NonCanonical("fixint-range i64 tag"));
+                }
+                Ok(off + 1 + used)
+            }
+            TAG_F64 => {
+                let end = off + 9;
+                if end > limit {
+                    return Err(DocError::Truncated);
+                }
+                let bits =
+                    u64::from_le_bytes(body[off + 1..end].try_into().expect("9-byte extent"));
+                if !f64::from_bits(bits).is_finite() {
+                    return Err(DocError::NonCanonical("non-finite f64"));
+                }
+                Ok(end)
+            }
+            TAG_OBJ | TAG_ARR => {
+                if off + 4 > limit {
+                    return Err(DocError::Truncated);
+                }
+                if stack.len() == DEPTH_MAX {
+                    return Err(DocError::DepthExceeded);
+                }
+                let len = read_u24(body, off + 1);
+                let end = off + 4 + len;
+                if end > limit {
+                    return Err(DocError::BadLength);
+                }
+                stack.push(Scope { end, is_obj: tag == TAG_OBJ, expects_key: tag == TAG_OBJ });
+                Ok(off + 4)
+            }
+            _ => Err(DocError::BadTag(tag)),
+        }
+    }
+
+    /// Validate one string form (canonical width + UTF-8); returns the data
+    /// offset and the next offset.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "bound: body[off] is indexed first, so off < body.len() <= isize::MAX; every \
+                  addend is a const <= 9, a u8 or u24 length, or a varint length (<= 10), so each \
+                  sum fits the 64-bit usize inf-foundation const-asserts; \
+                  `t - FIXSTR_BASE` is under its `FIXSTR_BASE..=0x9F` guard"
+    )]
+    fn validate_str(body: &[u8], off: usize, limit: usize) -> Result<(usize, usize), DocError> {
+        let (data_at, len) = match body[off] {
+            t if (FIXSTR_BASE..=0x9F).contains(&t) => (off + 1, (t - FIXSTR_BASE) as usize),
+            TAG_STR8 => {
+                if off + 2 > limit {
+                    return Err(DocError::Truncated);
+                }
+                let len = body[off + 1] as usize;
+                if len < STR8_MIN_LEN {
+                    return Err(DocError::NonCanonical("str8 under 32 bytes"));
+                }
+                (off + 2, len)
+            }
+            TAG_STR24 => {
+                if off + 4 > limit {
+                    return Err(DocError::Truncated);
+                }
+                let len = read_u24(body, off + 1);
+                if len < STR24_MIN_LEN {
+                    return Err(DocError::NonCanonical("str24 under 256 bytes"));
+                }
+                (off + 4, len)
+            }
+            _ => unreachable!("caller matched a string tag"),
+        };
+        let end = data_at + len;
+        if end > limit {
+            return Err(DocError::Truncated);
+        }
+        if str::from_utf8(&body[data_at..end]).is_err() {
+            return Err(DocError::BadUtf8);
+        }
+        Ok((data_at, end))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -943,7 +1503,15 @@ mod tests {
         body.extend_from_slice(&1.25f64.to_bits().to_le_bytes());
         for (limit, expected) in [(9, Err(DocError::Truncated)), (10, Ok(10))] {
             assert_eq!(
-                validate_one(&body, 1, limit, false, &mut Vec::new(), &mut DictCheck::new(&[])),
+                validate_one::<false>(
+                    &body,
+                    1,
+                    limit,
+                    false,
+                    &mut Vec::new(),
+                    &mut DictCheck::new(&[]),
+                    &mut None
+                ),
                 expected
             );
         }
